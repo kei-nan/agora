@@ -1,8 +1,8 @@
 [package]
-name = "solochain-template-runtime"
-description = "A solochain runtime template built with Substrate, part of Polkadot Sdk."
+name = "agora-runtime"
+description = "Agora — blockchain democracy platform runtime."
 version = "0.1.0"
-license = "Unlicense"
+license = "AGPL-3.0-only"
 authors.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -27,6 +27,15 @@ pallet-balances.workspace = true
 pallet-grandpa.workspace = true
 pallet-sudo.workspace = true
 pallet-template.workspace = true
+pallet-identity-zk.workspace = true
+pallet-voting.workspace = true
+pallet-treasury-ledger.workspace = true
+pallet-courts.workspace = true
+pallet-constitution.workspace = true
+ark-bn254.workspace = true
+ark-groth16.workspace = true
+ark-serialize.workspace = true
+ark-ff.workspace = true
 pallet-timestamp.workspace = true
 pallet-transaction-payment-rpc-runtime-api.workspace = true
 pallet-transaction-payment.workspace = true
@@ -51,7 +60,11 @@ sp-version = { features = ["serde"], workspace = true }
 substrate-wasm-builder = { optional = true, workspace = true, default-features = true }
 
 [features]
-default = ["std"]
+# dev-mode: enables PassthroughZkVerifier (accepts all ZK proofs). Must be disabled before
+# any testnet/mainnet deployment. A production build without this feature will fail to compile
+# until a real Rarimo Groth16 verifier is wired into pallet_identity_zk::Config.
+default = ["std", "dev-mode"]
+dev-mode = []
 std = [
 	"codec/std",
 	"frame-benchmarking?/std",
@@ -67,6 +80,15 @@ std = [
 	"pallet-grandpa/std",
 	"pallet-sudo/std",
 	"pallet-template/std",
+	"pallet-identity-zk/std",
+	"pallet-voting/std",
+	"pallet-treasury-ledger/std",
+	"pallet-courts/std",
+	"pallet-constitution/std",
+	"ark-bn254/std",
+	"ark-groth16/std",
+	"ark-serialize/std",
+	"ark-ff/std",
 	"pallet-timestamp/std",
 	"pallet-transaction-payment-rpc-runtime-api/std",
 	"pallet-transaction-payment/std",
@@ -113,6 +135,11 @@ try-runtime = [
 	"pallet-grandpa/try-runtime",
 	"pallet-sudo/try-runtime",
 	"pallet-template/try-runtime",
+	"pallet-identity-zk/try-runtime",
+	"pallet-voting/try-runtime",
+	"pallet-treasury-ledger/try-runtime",
+	"pallet-courts/try-runtime",
+	"pallet-constitution/try-runtime",
 	"pallet-timestamp/try-runtime",
 	"pallet-transaction-payment/try-runtime",
 	"sp-runtime/try-runtime",

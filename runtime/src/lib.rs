@@ -7,6 +7,7 @@ pub mod apis;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarks;
 pub mod configs;
+pub mod verifier;
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -61,8 +62,8 @@ impl_opaque_keys! {
 // https://docs.substrate.io/main-docs/build/upgrade#runtime-versioning
 #[sp_version::runtime_version]
 pub const VERSION: RuntimeVersion = RuntimeVersion {
-	spec_name: alloc::borrow::Cow::Borrowed("solochain-template-runtime"),
-	impl_name: alloc::borrow::Cow::Borrowed("solochain-template-runtime"),
+	spec_name: alloc::borrow::Cow::Borrowed("agora-runtime"),
+	impl_name: alloc::borrow::Cow::Borrowed("agora-runtime"),
 	authoring_version: 1,
 	// The version of the runtime specification. A full node will not attempt to use its native
 	//   runtime in substitute for the on-chain Wasm runtime unless all of `spec_name`,
@@ -225,4 +226,20 @@ mod runtime {
 	// Include the custom logic from the pallet-template in the runtime.
 	#[runtime::pallet_index(7)]
 	pub type Template = pallet_template;
+
+	// Agora pallets
+	#[runtime::pallet_index(8)]
+	pub type Identity = pallet_identity_zk;
+
+	#[runtime::pallet_index(9)]
+	pub type Voting = pallet_voting;
+
+	#[runtime::pallet_index(10)]
+	pub type TreasuryLedger = pallet_treasury_ledger;
+
+	#[runtime::pallet_index(11)]
+	pub type Courts = pallet_courts;
+
+	#[runtime::pallet_index(12)]
+	pub type Constitution = pallet_constitution;
 }

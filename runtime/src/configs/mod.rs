@@ -32,7 +32,7 @@ use frame_support::{
 		IdentityFee, Weight,
 	},
 };
-use frame_system::limits::{BlockLength, BlockWeights};
+use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_runtime::{traits::One, Perbill};
@@ -42,7 +42,7 @@ use sp_version::RuntimeVersion;
 use super::{
 	AccountId, Aura, Balance, Balances, Block, BlockNumber, Hash, Nonce, PalletInfo, Runtime,
 	RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin, RuntimeTask,
-	System, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
+	System, DAYS, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -161,4 +161,111 @@ impl pallet_sudo::Config for Runtime {
 impl pallet_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_template::weights::SubstrateWeight<Runtime>;
+}
+
+// ── Agora pallets ────────────────────────────────────────────────────────────
+
+/// Passthrough ZK verifier: accepts any proof during development.
+/// Gated behind `dev-mode` feature — a production build without that feature will
+/// fail to compile here, forcing a real Rarimo Groth16 verifier to be wired in.
+#[cfg(feature = "dev-mode")]
+pub struct PassthroughZkVerifier;
+
+#[cfg(feature = "dev-mode")]
+impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
+	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		true
+	}
+}
+
+#[cfg(feature = "dev-mode")]
+impl pallet_identity_zk::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type ZkVerifier = PassthroughZkVerifier;
+	/// TODO: replace with a court-controlled multisig origin once pallet-courts has a dedicated
+	/// SuspensionOrigin council. Using root for now.
+	type SuspensionOrigin = EnsureRoot<AccountId>;
+}
+
+#[cfg(not(feature = "dev-mode"))]
+impl pallet_identity_zk::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Real Rarimo Groth16 BN254 verifier. Requires runtime/assets/vk_sha256.bin and
+	/// vk_sha1.bin to be populated (see scripts/convert_vk.py).
+	type ZkVerifier = crate::verifier::RarimoGroth16Verifier;
+	type SuspensionOrigin = EnsureRoot<AccountId>;
+}
+
+/// Runtime implements CitizenChecker by calling pallet-identity's is_active_citizen.
+/// Returns false for both unregistered accounts and accounts with active suspensions.
+impl pallet_voting::CitizenChecker<AccountId> for Runtime {
+	fn is_active_citizen(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+
+	fn total_citizens() -> u32 {
+		pallet_identity_zk::TotalCitizens::<Runtime>::get()
+	}
+}
+
+impl pallet_voting::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// No single delegate may hold more than 33% of voting power (future: enforce by %).
+	type DelegationCap = ConstU8<33>;
+	/// Absolute ceiling: at most 1 000 direct delegators per (topic, delegate) for now.
+	type MaxDelegationsPerDelegate = ConstU32<1_000>;
+	/// Walk at most 10 hops when checking for delegation cycles.
+	type MaxDelegationDepth = ConstU8<10>;
+	/// Number of budget categories citizens can allocate QV tokens across.
+	type BudgetCategoryCount = ConstU32<10>;
+	type CitizenChecker = Runtime;
+}
+
+impl pallet_treasury_ledger::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Balance = Balance;
+}
+
+/// Runtime implements CitizenSelector by reading pallet-identity's indexed storage.
+impl pallet_courts::CitizenSelector<AccountId> for Runtime {
+	fn citizen_at(index: u32) -> Option<AccountId> {
+		pallet_identity_zk::CitizenIndex::<Runtime>::get(index)
+	}
+	fn total_citizens() -> u32 {
+		pallet_identity_zk::TotalCitizens::<Runtime>::get()
+	}
+}
+
+/// Runtime implements LawEnforcer by calling pallet-constitution's internal function.
+impl pallet_courts::LawEnforcer for Runtime {
+	fn invalidate_law(law_id: u32) -> sp_runtime::DispatchResult {
+		pallet_constitution::Pallet::<Runtime>::invalidate_law_internal(law_id)
+	}
+}
+
+/// Runtime implements TreasuryEnforcer by calling pallet-treasury-ledger's internal function.
+impl pallet_courts::TreasuryEnforcer for Runtime {
+	fn freeze_department(department_id: u32) -> sp_runtime::DispatchResult {
+		pallet_treasury_ledger::Pallet::<Runtime>::freeze_department_internal(department_id)
+	}
+}
+
+impl pallet_courts::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Citizens have 7 days to appeal an AI ruling.
+	type AppealWindowBlocks = ConstU32<{ 7 * DAYS }>;
+	type CitizenSelector = Runtime;
+	type LawEnforcer = Runtime;
+	type TreasuryEnforcer = Runtime;
+}
+
+impl pallet_constitution::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Constitutional amendments require 30 days of deliberation before ratification.
+	type ConstitutionalDeliberationBlocks = ConstU32<{ 30 * DAYS }>;
+	/// TODO: replace with a democratic collective / referendum origin once pallet-voting
+	/// referendum pipeline is complete.
+	type LegislatureOrigin = EnsureRoot<AccountId>;
+	/// 1 000 citizen signatures required to trigger a referendum.
+	type PetitionThreshold = ConstU32<1_000>;
 }

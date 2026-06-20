@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for Agora desktop","local":true,"windows":["main"],"permissions":["core:default","shell:allow-open","http:default","store:default","notification:default"]}}

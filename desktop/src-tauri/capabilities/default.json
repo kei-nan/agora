@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/schema/acl/schemas/capability.schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for Agora desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "http:default",
+    "store:default",
+    "notification:default"
+  ]
+}

@@ -1,0 +1,74 @@
+.page-layout {
+  display: flex;
+  gap: 24px;
+  height: 100%;
+  min-height: 0;
+}
+
+.list-panel {
+  width: 340px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+.page-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.loading, .empty { color: var(--text-muted); font-size: 13px; }
+
+.item-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+
+.item-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+.item-row:hover { background: var(--bg-hover); }
+.item-row.selected { background: var(--bg-selected); border-color: var(--accent-dim); }
+
+.item-title { flex: 1; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-meta { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+
+.status-chip, .tier-chip, .amount-chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+.status-active    { background: #1a3a1a; color: var(--green); }
+.status-passed    { background: #1a2a1a; color: var(--green); }
+.status-rejected  { background: #3a1a1a; color: var(--red); }
+.status-pending   { background: #2a2a1a; color: var(--yellow); }
+.status-upheld    { background: #1a2a1a; color: var(--green); }
+.status-overturned{ background: #3a1a1a; color: var(--red); }
+
+.tier-constitutional { background: #1e1040; color: #a78bfa; }
+.tier-ordinary       { background: #1a1a2a; color: #7a9ef7; }
+
+.amount-chip { background: var(--bg-hover); color: var(--text); }
+
+.detail-title { font-size: 18px; font-weight: 700; }
+.detail-meta  { font-size: 13px; color: var(--text-muted); }
+.detail-summary { font-size: 14px; line-height: 1.7; color: var(--text); }
+.ipfs-link { font-size: 12px; color: var(--accent); }

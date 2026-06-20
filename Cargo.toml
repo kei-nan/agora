@@ -1,21 +1,35 @@
 [workspace.package]
-license = "MIT-0"
-authors = ["Parity Technologies <admin@parity.io>"]
-homepage = "https://paritytech.github.io/polkadot-sdk/"
-repository = "https://github.com/paritytech/polkadot-sdk-solochain-template.git"
+license = "AGPL-3.0-only"
+authors = ["kei-nan"]
+homepage = "https://github.com/kei-nan/agora"
+repository = "https://github.com/kei-nan/agora"
 edition = "2021"
 
 [workspace]
 members = [
     "node",
     "pallets/template",
+    "pallets/pallet-identity",
+    "pallets/pallet-voting",
+    "pallets/pallet-treasury-ledger",
+    "pallets/pallet-courts",
+    "pallets/pallet-constitution",
     "runtime",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-solochain-template-runtime = { path = "./runtime", default-features = false }
+agora-runtime = { path = "./runtime", default-features = false }
 pallet-template = { path = "./pallets/template", default-features = false }
+pallet-identity-zk = { path = "./pallets/pallet-identity", default-features = false }
+pallet-voting = { path = "./pallets/pallet-voting", default-features = false }
+pallet-treasury-ledger = { path = "./pallets/pallet-treasury-ledger", default-features = false }
+pallet-courts = { path = "./pallets/pallet-courts", default-features = false }
+pallet-constitution = { path = "./pallets/pallet-constitution", default-features = false }
+ark-bn254 = { version = "0.4", default-features = false }
+ark-groth16 = { version = "0.4", default-features = false }
+ark-serialize = { version = "0.4", default-features = false }
+ark-ff = { version = "0.4", default-features = false }
 clap = { version = "4.5.13" }
 frame-benchmarking-cli = { version = "47.0.0", default-features = false }
 frame-metadata-hash-extension = { version = "0.8.0", default-features = false }
