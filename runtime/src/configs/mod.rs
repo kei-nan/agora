@@ -35,7 +35,7 @@ use frame_support::{
 use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-use sp_runtime::{traits::One, Perbill};
+use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, Perbill};
 use sp_version::RuntimeVersion;
 
 // Local module imports
@@ -161,6 +161,38 @@ impl pallet_sudo::Config for Runtime {
 impl pallet_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_template::weights::SubstrateWeight<Runtime>;
+}
+
+// ── Randomness ───────────────────────────────────────────────────────────────
+
+/// Block-hash-based randomness source wired into pallets via the `Randomness` trait.
+///
+/// Mixes the 5 most recent block hashes with the caller's subject bytes, making
+/// manipulation require control of 5 consecutive authorship slots rather than one.
+/// This is still NOT safe against a determined adversary with significant stake.
+/// TODO: Replace with Babe/SASSAFRAS VRF randomness before any real deployment.
+pub struct BlockHashRandomness;
+
+impl frame_support::traits::Randomness<[u8; 32], BlockNumber> for BlockHashRandomness {
+	fn random(subject: &[u8]) -> ([u8; 32], BlockNumber) {
+		let current = frame_system::Pallet::<Runtime>::block_number();
+		let mut entropy = [0u8; 32];
+		for lag in 0u32..5 {
+			let n = current.saturating_sub(lag);
+			let h = frame_system::Pallet::<Runtime>::block_hash(n);
+			for (i, b) in h.as_ref().iter().enumerate() {
+				entropy[i % 32] ^= b;
+			}
+		}
+		// Mix in subject bytes for domain separation so different callers get different seeds.
+		for (i, b) in subject.iter().enumerate() {
+			entropy[i % 32] ^= b;
+		}
+		let out_hash = BlakeTwo256::hash(&entropy);
+		let mut out = [0u8; 32];
+		out.copy_from_slice(out_hash.as_ref());
+		(out, current)
+	}
 }
 
 // ── Agora pallets ────────────────────────────────────────────────────────────
@@ -313,6 +345,8 @@ impl pallet_courts::Config for Runtime {
 	/// TODO: replace with a dedicated oracle account origin in production.
 	type OracleOrigin = EnsureRoot<AccountId>;
 	type CitizenSuspender = Runtime;
+	/// TODO: replace with Babe/SASSAFRAS VRF randomness before mainnet.
+	type Randomness = BlockHashRandomness;
 }
 
 /// Runtime implements CitizenChecker for pallet-constitution (petition/sign gating).

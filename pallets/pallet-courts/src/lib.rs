@@ -10,7 +10,7 @@ pub use pallet::*;
 pub mod pallet {
 
     use codec::{Decode, DecodeWithMemTracking, Encode};
-    use frame_support::pallet_prelude::*;
+    use frame_support::{pallet_prelude::*, traits::Randomness as RandomnessTrait};
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Hash as HashT, Saturating};
 
@@ -93,6 +93,9 @@ pub mod pallet {
         type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender;
+        /// On-chain randomness source for jury selection. Wire to a VRF-backed source
+        /// (Babe/SASSAFRAS) before mainnet.
+        type Randomness: RandomnessTrait<[u8; 32], BlockNumberFor<Self>>;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
@@ -342,29 +345,18 @@ pub mod pallet {
         }
 
         /// Pick `jury_size` unique citizens at random.
-        /// Entropy is XOR of hashes from the 5 most recent blocks, making manipulation
-        /// require control of 5 consecutive authorship slots instead of just one.
-        /// NOTE: True unpredictability requires VRF (Babe/SASSAFRAS randomness) — a
-        /// commit-reveal scheme or on-chain VRF should replace this before mainnet.
+        /// Entropy comes from `T::Randomness`; for mainnet wire Babe/SASSAFRAS VRF here.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
             total: u32,
         ) -> Result<BoundedVec<T::AccountId, ConstU32<21>>, DispatchError> {
-            let current = frame_system::Pallet::<T>::block_number();
-            let mut entropy = [0u8; 32];
-            for lag in 0u32..5 {
-                let n = current.saturating_sub(BlockNumberFor::<T>::from(lag));
-                let h = frame_system::Pallet::<T>::block_hash(n);
-                for (i, b) in h.as_ref().iter().enumerate() {
-                    entropy[i % 32] ^= b;
-                }
-            }
+            let (raw, _) = T::Randomness::random(&case_id.to_le_bytes());
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
             let max_attempts = total.saturating_add(jury_size as u32).saturating_mul(3);
             while (jurors.len() as u8) < jury_size && nonce < max_attempts {
-                let seed_input = (entropy, case_id, nonce).encode();
+                let seed_input = (raw, case_id, nonce).encode();
                 let hash = T::Hashing::hash(&seed_input);
                 let bytes = hash.as_ref();
                 let idx = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % total;
