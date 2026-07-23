@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useState, ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/invoke";
 
 export interface Message {
   role: "user" | "assistant";

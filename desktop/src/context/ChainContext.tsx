@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/invoke";
 
 type ChainStatus = "connecting" | "syncing" | "ready" | "error";
 

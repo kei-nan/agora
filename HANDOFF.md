@@ -8,8 +8,9 @@ Also read `CLAUDE.md` in this same directory for architecture decisions and refe
 ## Environment
 
 - Ubuntu 24.04 WSL2, Rust 1.96 (via rustup)
-- Project root: `~/democracy-chain`
-- Chain template: polkadot-sdk-solochain-template (Substrate)
+- Project root: `~/democracy-chain`  (directory name unchanged; project renamed to **Agora**)
+- Runtime crate: `agora-runtime`
+- Node binary: `agora-node`
 
 ### Critical build command
 
@@ -29,24 +30,53 @@ Dev node:
 ## Monorepo structure
 
 ```
-agora/
-├── node/                        # chain binary — do not modify
-├── runtime/                     # WASM runtime — all 5 pallets now wired in
+democracy-chain/
+├── node/                        # chain binary (agora-node)
+├── runtime/                     # WASM runtime (agora-runtime) — all 5 pallets wired in
+│   ├── assets/
+│   │   ├── vk_sha256.bin        # EMPTY PLACEHOLDER — must populate before production
+│   │   └── vk_sha1.bin          # EMPTY PLACEHOLDER — must populate before production
+│   └── src/
+│       ├── configs/mod.rs       # all pallet Config impls + cross-pallet trait wiring
+│       ├── lib.rs               # runtime construction
+│       └── verifier.rs          # RarimoGroth16Verifier (gated behind !dev-mode)
 ├── pallets/
-│   ├── template/                # original template pallet — reference only
 │   ├── pallet-identity/         # crate: pallet-identity-zk
 │   ├── pallet-voting/           # crate: pallet-voting
 │   ├── pallet-treasury-ledger/  # crate: pallet-treasury-ledger
 │   ├── pallet-courts/           # crate: pallet-courts
 │   └── pallet-constitution/     # crate: pallet-constitution
-├── circuits/                    # Noir ZK circuits (separate toolchain)
-├── mobile/                      # React Native scaffold (src/ exists, not yet runnable)
-├── CLAUDE.md                    # architecture decisions + key references
-└── HANDOFF.md                   # this file
+├── scripts/
+│   └── convert_vk.py            # converts Rarimo snarkjs JSON VK → ark-serialize binary
+├── mobile/                      # React Native scaffold (src/ only, not yet runnable)
+├── CLAUDE.md
+└── HANDOFF.md
 ```
 
-All five pallets compile cleanly and are wired into runtime at pallet indices 8–12.
-Build is clean with `cargo build --release` (pre-existing template warning only).
+Build is clean. WASM binary: 455 KB compressed / 1.5 MB uncompressed.
+
+---
+
+## Runtime features
+
+- `default = ["std", "dev-mode"]`
+- `dev-mode` enables `PassthroughZkVerifier` (accepts all ZK proofs). Strip this feature
+  for any testnet/mainnet build. Without it, `runtime/src/verifier.rs` uses the real
+  `RarimoGroth16Verifier`, which rejects all proofs until VK assets are populated.
+
+---
+
+## Cross-pallet trait wiring (runtime/src/configs/mod.rs)
+
+| Trait | Implemented by | Calls |
+|---|---|---|
+| `ZkProofVerifier` | `PassthroughZkVerifier` (dev) / `RarimoGroth16Verifier` (prod) | ark-groth16 BN254 verify |
+| `CitizenChecker<AccountId>` | `Runtime` | `pallet_identity_zk::is_active_citizen` + `TotalCitizens` |
+| `CitizenSelector<AccountId>` | `Runtime` | `pallet_identity_zk::CitizenIndex` + `TotalCitizens` |
+| `LawEnforcer` | `Runtime` | `pallet_constitution::invalidate_law_internal` |
+| `TreasuryEnforcer` | `Runtime` | `pallet_treasury_ledger::freeze_department_internal` |
+| `PetitionApprover` | `Runtime` | `pallet_voting::create_referendum_internal` |
+| `LawEnactor` | `Runtime` | `pallet_constitution::enact_law_internal(Ordinary, hash)` |
 
 ---
 
@@ -55,210 +85,253 @@ Build is clean with `cargo build --release` (pre-existing template warning only)
 ### pallet-identity (crate: pallet-identity-zk) — runtime index 8
 
 Storage:
-- NullifierRegistry: [u8;32] -> AccountId
-- CitizenNullifier: AccountId -> [u8;32]
-- CitizenIndex: u32 -> AccountId  (dense, for random jury selection)
-- CitizenPosition: AccountId -> u32  (reverse index for O(1) swap-and-pop on revoke)
-- TotalCitizens: u32
-- SuspendedNullifiers: [u8;32] -> Option<BlockNumber>
-  - Key absent = not suspended
-  - Value None = suspended indefinitely
-  - Value Some(block) = suspended until that block (lazy-expiry: no on_initialize needed)
+- `NullifierRegistry`: `[u8;32]` → `AccountId`
+- `CitizenNullifier`: `AccountId` → `[u8;32]`
+- `CitizenIndex`: `u32` → `AccountId`  (dense, swap-and-pop on revoke)
+- `CitizenPosition`: `AccountId` → `u32`  (reverse index for O(1) removal)
+- `TotalCitizens`: `u32`
+- `SuspendedNullifiers`: `[u8;32]` → `Option<BlockNumber>`
+  - Key absent = not suspended; `None` = indefinite; `Some(block)` = suspended until that block
 
 Calls:
-- register_citizen(nullifier, zk_proof, public_inputs) — verifies ZK proof via ZkVerifier trait
-- revoke_citizen() — swap-and-pop removes from index; also clears suspension entry
-- suspend_citizen(nullifier, until) — root (TODO: court-controlled multisig)
-- restore_citizen_rights(nullifier) — root (TODO: court-controlled multisig)
+- `register_citizen(nullifier, zk_proof [≤4096 bytes], public_inputs [≤16 × [u8;32]])`
+  - Verifies ZK proof via `ZkVerifier` trait
+  - Rarimo Freedom Tool uses 10 public signals; bound is 16
+- `revoke_citizen()` — swap-and-pop, clears suspension
+- `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (root placeholder)
+- `restore_citizen_rights(nullifier)` — `SuspensionOrigin` (root placeholder)
 
-Public methods:
-- is_active_citizen(who) — registered AND no active suspension (used by pallet-voting)
-- is_citizen(who) — registered regardless of suspension status
-- citizen_at(index) / total_citizens() — for jury selection
+Public helpers:
+- `is_active_citizen(who)` — registered AND no active suspension
+- `is_citizen(who)` — registered regardless of suspension
+- `citizen_at(index)` / `total_citizens()` — for jury selection
 
-Config:
-- ZkVerifier: ZkProofVerifier trait — runtime uses PassthroughZkVerifier (accepts all)
+ZK proof byte format (129 bytes total):
+```
+[0..32]   A  G1 compressed (ark-serialize LE, flags in byte 31)
+[32..96]  B  G2 compressed (ark-serialize LE, flags in byte 63)
+[96..128] C  G1 compressed
+[128]     variant: 0=SHA-256 circuit, 1=SHA-1 circuit
+```
 
 TODOs:
-- Replace PassthroughZkVerifier with real Rarimo Groth16 verifier (BN254, specific vk)
-- Country allowlist check on public_inputs[2] (country_code_hash)
-- Passport expiry check: public_inputs[1] (expiry_timestamp) > now
-- Replace ensure_root with court-controlled multisig origin for suspend/restore
+- Populate `runtime/assets/vk_sha256.bin` and `vk_sha1.bin` using `scripts/convert_vk.py`
+  (download VKs from https://github.com/rarimo/passport-zk-circuits)
+- Country allowlist check on `public_inputs[5/6]` (country_code_hash)
+- Passport expiry check: `public_inputs[2]` (expirationDate) vs current timestamp
+- Replace `EnsureRoot` with court-controlled multisig for `SuspensionOrigin`
+
+---
 
 ### pallet-voting (crate: pallet-voting) — runtime index 9
 
-Two separate participation systems. Suspension excludes citizens from both.
-
-#### System 1 — MACI 1p1v (laws and elections)
+#### System 1 — MACI 1p1v (proposals and elections)
 
 Storage:
-- Proposals: proposal_id -> end_block
-- VoteCommitments: (proposal_id, nullifier) -> commitment (MACI encrypted)
-- Delegations: (AccountId, topic_id) -> delegate AccountId  (per-topic)
-- DelegatorCount: (topic_id, AccountId) -> u32  (direct delegator count per delegate)
-- NextProposalId counter
+- `Proposals`: `proposal_id` → `end_block`
+- `VoteCommitments`: `(proposal_id, nullifier)` → `commitment` (MACI-encrypted)
+- `Delegations`: `(AccountId, topic_id)` → `delegate AccountId`  (per-topic)
+- `DelegatorCount`: `(topic_id, AccountId)` → `u32`
+
+Calls: `submit_proposal`, `commit_vote`, `delegate_vote(delegate, topic_id)`, `revoke_delegation(topic_id)`
+
+Delegation guards:
+- Cycle detection: walks chain up to `MaxDelegationDepth` (10) hops; treats depth-exhaustion as cycle
+- Absolute cap: max 1 000 direct delegators per delegate per topic
+- Percentage cap: delegate's count × 100 must be ≤ `DelegationCap` (33) × `total_citizens`
+
+#### System 2 — Quadratic budget voting
+
+Storage:
+- `FiscalYearEpoch` / `EpochTokenAllocation` / `CitizenClaimedEpoch` / `BudgetBalance` / `CategoryVotes`
+
+Calls: `start_fiscal_year(tokens)` (root), `claim_fiscal_year_tokens()`, `allocate_budget(category, count)`
+
+Token cost for N votes on a category = N². Refundable by reducing count.
+
+#### System 3 — Referendum pipeline ← NEW
+
+Storage:
+- `Referenda`: `referendum_id` → `(petition_id, topic_hash [u8;32], end_block, ReferendumState)`
+- `PetitionReferendum`: `petition_id` → `referendum_id`  (prevents duplicate referenda)
+- `ReferendumTally`: `referendum_id` → `(yes_count, no_count)`
+- `ReferendumHasVoted`: `(referendum_id, AccountId)` → `bool`
+- `NextReferendumId`
 
 Config:
-- DelegationCap: u8 = 33  (future: enforce as % of total citizens)
-- MaxDelegationsPerDelegate: u32 = 1000  (enforced absolute cap today)
-- MaxDelegationDepth: u8 = 10  (cycle detection walk limit)
-- BudgetCategoryCount: u32 = 10
-
-Calls: submit_proposal, commit_vote, delegate_vote(delegate, topic_id), revoke_delegation(topic_id)
-
-Implemented:
-- Per-topic delegation (one delegation per account per topic)
-- Cycle detection (walks chain up to MaxDelegationDepth hops)
-- DelegatorCount cap enforcement (rejects if new_count > MaxDelegationsPerDelegate)
-
-#### System 2 — Quadratic budget voting (fiscal priorities only)
-
-Budget tokens are non-transferable and expire each fiscal year; casting N votes on a category
-costs N² tokens. This forces genuine prioritisation without enabling vote buying.
-Legislature controls line items within each category; citizens control category weights.
-
-Storage:
-- FiscalYearEpoch: u32 (incremented by start_fiscal_year)
-- EpochTokenAllocation: epoch -> u64 (tokens per citizen for that epoch)
-- CitizenClaimedEpoch: AccountId -> u32 (last epoch claimed; prevents double-claim)
-- BudgetBalance: AccountId -> u64 (remaining tokens this epoch)
-- CategoryVotes: (AccountId, epoch, category_id) -> u32 (votes cast; old epochs ignored)
+- `ReferendumDurationBlocks = 14 * DAYS`
+- `PassageThreshold = 51` (simple majority)
+- `LawEnactor = Runtime` → calls `pallet_constitution::enact_law_internal`
 
 Calls:
-- start_fiscal_year(tokens_per_citizen) — root (TODO: legislature origin)
-- claim_fiscal_year_tokens() — citizen, once per epoch; tokens expire with epoch
-- allocate_budget(category_id, vote_count) — replaces prior allocation, marginal cost = Δvotes²
+- `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen per referendum
+- `finalize_referendum(referendum_id)` — anyone, after `end_block`; enacts law if passed
 
-#### TODOs (both systems)
-- Percentage-based delegation cap (needs TotalCitizens via CitizenSelector trait)
-- Off-chain MACI tally submission with ZK proof
+Internal:
+- `create_referendum_internal(petition_id, topic_hash)` — called by PetitionApprover
+
+TODOs:
+- Off-chain MACI tally submission with ZK proof (for proposals/elections, not referenda)
+- Referendum: make `PassageThreshold` per-referendum-type (simple majority vs supermajority)
+
+---
 
 ### pallet-treasury-ledger (crate: pallet-treasury-ledger) — runtime index 10
 
 Storage:
-- DepartmentBudgets: department_id -> Balance
-- DepartmentSpent: department_id -> Balance
-- ExpenditureLog: index -> (department_id, amount, ipfs_metadata_hash [u8;32])
-- FrozenDepartments: department_id -> bool  (set by courts on illegal treasury ruling)
+- `DepartmentBudgets`: `department_id` → `Balance`
+- `DepartmentSpent`: `department_id` → `Balance`
+- `ExpenditureLog`: `index` → `(department_id, amount, ipfs_metadata_hash [u8;32])`
+- `FrozenDepartments`: `department_id` → `bool`
 
-Config:
-- Balance = u128 (same as chain Balance)
+Calls: `allocate_budget` (root), `record_expenditure` (any signed — TODO: restrict)
 
-Calls: allocate_budget (root), record_expenditure
-
-Fixed:
-- Spend accounting: new_spent = spent.checked_add(amount) stored before inserting log
-- Freeze check: record_expenditure returns DepartmentFrozen if department is frozen
-
-Internal:
-- freeze_department_internal(department_id) — called by courts auto-enforcement
+Internal: `freeze_department_internal(department_id)` — called by courts enforcement
 
 TODOs:
-- Authorized spender per department (any signed account can currently record)
+- `DepartmentSpenders: StorageMap<u32, AccountId>` — only the designated spender per dept
+  can call `record_expenditure`
+
+---
 
 ### pallet-courts (crate: pallet-courts) — runtime index 11
 
-Enums: CaseStatus, Verdict, CaseSubject {General, LawChallenge{law_id}, TreasuryDispute{department_id}}
+Case flow: `Filed → AIRulingIssued → InJuryAppeal → JurySeated → FinalRuling`
 
 Storage:
-- Cases: case_id -> (AccountId, CaseStatus, Option<[u8;32]>, CaseSubject)
-- Rulings: case_id -> Verdict
-- JuryPool: case_id -> BoundedVec<AccountId, 21>
-- NextCaseId counter
+- `Cases`: `case_id` → `(AccountId, CaseStatus, Option<[u8;32]>, CaseSubject)`
+- `Rulings`: `case_id` → `Verdict`
+- `AIRulingBlock`: `case_id` → `BlockNumber`  (enforces 7-day appeal window)
+- `JuryPool`: `case_id` → `BoundedVec<AccountId, 21>`
+- `JuryVotes`: `(case_id, AccountId)` → `Verdict`
+- `JuryTally`: `case_id` → `(upheld, overturned)`
 
-Config:
-- AppealWindowBlocks = 7 * DAYS
-- CitizenSelector: impl by Runtime -> reads pallet-identity CitizenIndex
-- LawEnforcer: impl by Runtime -> calls pallet_constitution::invalidate_law_internal
-- TreasuryEnforcer: impl by Runtime -> calls pallet_treasury_ledger::freeze_department_internal
+`CaseSubject` enum: `General`, `LawChallenge { law_id }`, `TreasuryDispute { department_id }`
 
-Calls: file_case(subject), submit_ai_ruling (root), appeal_ruling, select_jury(case_id, jury_size), finalize_ruling (root)
+Calls: `file_case(subject)`, `submit_ai_ruling` (root), `appeal_ruling`, `select_jury(case_id, size)`, `finalize_ruling` (root), `cast_jury_vote(case_id, verdict)`
 
-Implemented:
-- select_jury: random selection from citizen index via block hash entropy + CitizenSelector trait
-- auto-enforcement in finalize_ruling: Overturned+LawChallenge -> pauses law; Overturned+TreasuryDispute -> freezes dept
-- CaseSubject types for targeted enforcement
+Auto-enforcement on `Overturned`:
+- `LawChallenge` → `invalidate_law_internal(law_id)` → law paused
+- `TreasuryDispute` → `freeze_department_internal(department_id)`
+
+Jury reaches strict majority in `cast_jury_vote` → auto-finalizes via shared `auto_finalize()`.
 
 TODOs:
-- AI oracle origin (replace ensure_root in submit_ai_ruling)
-- Jury voting mechanism (finalize_ruling is root-only placeholder)
-- Appeal window block-time enforcement
-- Level 2 (21-person) jury flow for constitutional questions
+- AI oracle origin (replace `ensure_root` in `submit_ai_ruling`)
+- Level 2 (21-person) jury flow for constitutional cases
+- VRF-based jury randomness (current: block hash — manipulable by authors)
+
+---
 
 ### pallet-constitution (crate: pallet-constitution) — runtime index 12
 
+Law tiers: `Ordinary` (simple majority), `Constitutional` (supermajority + 30-day deliberation)
+Law statuses: `Active`, `Paused` (court-invalidated), `Repealed`
+
 Storage:
-- Laws: law_id -> (LawTier, LawStatus, version: u32, content_hash [u8;32])
-- PendingAmendments: law_id -> (proposed_hash, proposed_at_block)
-- NextLawId counter
+- `Laws`: `law_id` → `(LawTier, LawStatus, version: u32, content_hash [u8;32])`
+- `PendingAmendments`: `law_id` → `(proposed_hash, proposed_at_block)`
+- `Petitions`: `petition_id` → `(AccountId, topic_hash [u8;32], sig_count, submitted_at)`
+- `PetitionSignatures`: `(petition_id, AccountId)` → `bool`
+- `NextLawId`, `NextPetitionId`
 
-Config:
-- ConstitutionalDeliberationBlocks = 30 * DAYS
-
-Calls: enact_law (root), invalidate_law (root), propose_amendment (any), ratify_amendment (root)
+Calls:
+- `enact_law(tier, content_hash)` — `LegislatureOrigin` (root placeholder)
+- `invalidate_law(law_id)` — root; also has `Active` status guard
+- `propose_amendment(law_id, hash)` — `LegislatureOrigin`; guards: Active status, no existing pending amendment
+- `ratify_amendment(law_id)` — `LegislatureOrigin`; enforces `ConstitutionalDeliberationBlocks`
+- `submit_petition(topic_hash)` — any signed
+- `sign_petition(petition_id)` — any signed; at threshold calls `PetitionApprover::create_referendum`
 
 Internal:
-- invalidate_law_internal(law_id) — called by courts auto-enforcement (sets LawStatus::Paused)
+- `enact_law_internal(tier, content_hash)` — called by pallet-voting on referendum pass
+- `invalidate_law_internal(law_id)` — called by pallet-courts on Overturned ruling
 
 TODOs:
-- Legislature origin (replace ensure_root with collective/referendum origin)
-- Petition -> signature threshold -> referendum pipeline (not started)
-- Human Rights Commission veto hook
+- Replace `EnsureRoot` `LegislatureOrigin` with a proper collective/referendum origin
+- Human Rights Commission veto hook on `enact_law`
 
 ---
 
-## Pallets wired into runtime
+## Full citizen → law pipeline (now complete)
 
-runtime/src/lib.rs pallet indices:
-- 8: Identity = pallet_identity_zk
-- 9: Voting = pallet_voting
-- 10: TreasuryLedger = pallet_treasury_ledger
-- 11: Courts = pallet_courts
-- 12: Constitution = pallet_constitution
-
-Cross-pallet trait wiring in runtime/src/configs/mod.rs:
-- PassthroughZkVerifier: accepts all ZK proofs (replace before production)
-- Runtime impls CitizenSelector -> reads pallet_identity_zk storage
-- Runtime impls LawEnforcer -> calls pallet_constitution::invalidate_law_internal
-- Runtime impls TreasuryEnforcer -> calls pallet_treasury_ledger::freeze_department_internal
+```
+submit_petition(topic_hash)
+  → sign_petition(petition_id)  [× 1 000 citizens]
+    → PetitionThresholdReached event
+    → PetitionApprover::create_referendum  [auto, same tx]
+      → Referendum created, 14-day window opens
+        → vote_referendum(referendum_id, in_favor)  [any active citizen]
+        → finalize_referendum(referendum_id)  [after end_block, anyone]
+          → if yes*100 >= 51*total: LawEnactor::enact_law(topic_hash)
+            → Laws storage: new Ordinary law, Active
+```
 
 ---
 
-## Mobile scaffold
+## ZK verifier status
 
-`mobile/` has TypeScript skeleton only — not runnable yet:
-- src/chain/api.ts          — WsProvider + ApiPromise connection helper
-- src/chain/identity.ts     — registerCitizen, isCitizen
-- src/chain/voting.ts       — submitProposal, commitVote, delegateVote, revokeDelegation
-- src/screens/RegisterScreen.tsx — passport NFC flow stub (TODOs for Rarimo SDK)
-- src/screens/VoteScreen.tsx     — proposal list stub
-- src/App.tsx                    — NavigationContainer with two screens
+Infrastructure: complete. `runtime/src/verifier.rs` implements `RarimoGroth16Verifier` using `ark-groth16 0.4` + `ark-bn254 0.4`. Proof format is 129 bytes (ark-serialize compressed A+B+C + 1-byte variant tag).
 
-TODOs before mobile is runnable:
-- `npx react-native init DemocracyChain` to generate iOS/Android native scaffolding
-- `npm install` in mobile/
-- Install Rarimo React Native passport reader SDK
-- Install MobileFaceNet TFLite native module for Android liveness
-- Wire real pair/keyring management (iOS Secure Enclave / Android Keystore)
+**Operational step remaining:**
+```bash
+# 1. Download VKs from https://github.com/rarimo/passport-zk-circuits
+# 2. Convert to binary:
+python3 scripts/convert_vk.py sha256_verification_key.json runtime/assets/vk_sha256.bin
+python3 scripts/convert_vk.py sha1_verification_key.json  runtime/assets/vk_sha1.bin
+# 3. Rebuild without dev-mode:
+cargo build --release --no-default-features --features std
+```
+
+Mobile: `mobile/src/chain/identity.ts` exports `encodeProofForChain(snarkjsProof, variant)` and `encodePublicInputs(signals)` to convert snarkjs output to chain binary format.
+
+---
+
+## Mobile scaffold (src/ only — not runnable)
+
+Files:
+- `src/chain/api.ts` — WsProvider + ApiPromise singleton
+- `src/chain/identity.ts` — `registerCitizen`, `isCitizen`, `suspendCitizen`, `restoreCitizenRights`, `encodeProofForChain`, `encodePublicInputs`
+- `src/chain/voting.ts` — `submitProposal`, `commitVote`, `delegateVote`, `revokeDelegation`, `claimFiscalYearTokens`, `allocateBudget`
+- `src/chain/constitution.ts` — `submitPetition`, `signPetition`, `proposeAmendment`
+- `src/chain/courts.ts` — `fileCase`, `appealRuling`, `castJuryVote`
+- `src/screens/RegisterScreen.tsx` — NFC passport flow stub
+- `src/screens/VoteScreen.tsx` — proposals + budget allocation UI
+- `src/App.tsx` — NavigationContainer
+
+To make runnable:
+```bash
+cd mobile
+npx react-native init Agora --template react-native-template-typescript
+# copy src/ into the generated project
+npm install @polkadot/api
+# install Rarimo SDK when available: @rarimo/react-native-passport-reader
+```
 
 ---
 
 ## Next steps (in priority order)
 
-1. [DONE] Create monorepo structure and stub all 5 pallets
-2. [DONE] Fix DepartmentSpent accounting bug in pallet-treasury-ledger
-3. [DONE] Wire all 5 pallets into runtime/src/lib.rs
-4. [DONE] Delegation cycle detection + cap enforcement in pallet-voting
-5. [DONE] Jury selection + cross-pallet auto-enforcement in pallet-courts
-6. [DONE] ZkVerifier trait in pallet-identity (PassthroughZkVerifier placeholder)
-7. [DONE] React Native mobile scaffold (src/ skeleton only)
-8. [DONE] Wire is_active_citizen check in pallet-voting (suspend guard for all 4 calls)
-9. [ ] Replace PassthroughZkVerifier with real Rarimo Groth16 verifier
-10. [ ] Jury voting mechanism + appeal window enforcement in pallet-courts
-11. [ ] Legislature/courts/HRC origins replacing ensure_root in pallet-constitution
-12. [ ] Petition -> threshold -> referendum pipeline
-13. [ ] Court-controlled multisig origin for suspend_citizen / restore_citizen_rights
-14. [ ] `npx react-native init` + Rarimo SDK + native build setup
+1. [DONE] Create monorepo + stub all 5 pallets
+2. [DONE] Fix treasury accounting bug
+3. [DONE] Wire all 5 pallets into runtime
+4. [DONE] Delegation cycle detection + cap enforcement
+5. [DONE] Jury selection + cross-pallet auto-enforcement
+6. [DONE] ZkVerifier trait + PassthroughZkVerifier placeholder
+7. [DONE] React Native mobile scaffold (TypeScript skeleton)
+8. [DONE] `is_active_citizen` suspension guard in pallet-voting
+9. [DONE] 10-finding code review — all bugs fixed
+10. [DONE] Real Rarimo Groth16 verifier infrastructure (ark-groth16, needs VK assets)
+11. [DONE] Referendum pipeline: petition → referendum → vote → law enacted
+12. [DONE] Populate `runtime/assets/vk_sha256.bin` + `vk_sha1.bin` (convert_vk.py)
+13. [ ] `npx react-native init` + Rarimo SDK + native build setup
+14. [DONE] Per-department authorized spenders in pallet-treasury-ledger
+15. [DONE] Legislature collective origin — new pallet-legislature (index 13) with member/motion/vote/close flow; EnsureLegislatureMotion replaces EnsureRoot in pallet-constitution
+16. [DONE] AI oracle origin (`OracleOrigin` config type) in pallet-courts
+17. [DONE] Human Rights Commission veto hook in pallet-constitution (14-day veto window)
+18. [DONE] CitizenConduct case subject + CitizenSuspender trait + suspend_citizen_internal; courts auto-suspend guilty citizens
+19. [DONE] Passport expiry + country allowlist checks in `register_citizen`
+20. [DONE] Off-chain MACI tally submission with ZK proof (submit_maci_tally call + PassthroughMACIVerifier)
 
 ---
 

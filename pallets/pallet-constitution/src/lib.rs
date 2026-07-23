@@ -29,6 +29,17 @@ pub mod pallet {
         Repealed,
     }
 
+    /// Called by pallet-constitution when a petition crosses PetitionThreshold.
+    /// Implemented by the runtime — delegates to pallet-voting's referendum storage.
+    pub trait PetitionApprover {
+        fn create_referendum(petition_id: u32, topic_hash: [u8; 32]) -> DispatchResult;
+    }
+
+    /// Gate: returns false if the account is not a registered active citizen.
+    pub trait CitizenChecker<AccountId> {
+        fn is_active_citizen(who: &AccountId) -> bool;
+    }
+
     #[pallet::config]
     pub trait Config: frame_system::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
@@ -36,12 +47,24 @@ pub mod pallet {
         #[pallet::constant]
         type ConstitutionalDeliberationBlocks: Get<u32>;
         /// The origin that represents the legislature (e.g. a referendum or collective).
-        /// Currently wired to EnsureRoot in the runtime; will be replaced with a
-        /// democratic collective once pallet-voting referendum pipeline is complete.
         type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// Minimum number of citizen signatures required for a petition to trigger a referendum.
         #[pallet::constant]
         type PetitionThreshold: Get<u32>;
+        /// Hook called when a petition hits PetitionThreshold — schedules a referendum.
+        type PetitionApprover: PetitionApprover;
+        /// Gate that checks whether an account is a registered active citizen.
+        /// Prevents Sybil attacks on petitions.
+        type CitizenChecker: CitizenChecker<Self::AccountId>;
+        /// Minimum blocks of deliberation before an Ordinary law amendment can be ratified.
+        /// Typically 0 (no wait) for ordinary laws.
+        #[pallet::constant]
+        type OrdinaryAmendmentDeliberationBlocks: Get<u32>;
+        /// Origin representing the Human Rights Commission. Can veto a newly enacted law within HRCVetoWindowBlocks.
+        type HumanRightsOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// Blocks after law enactment during which the HRC may veto. After this window only courts can invalidate.
+        #[pallet::constant]
+        type HRCVetoWindowBlocks: Get<u32>;
     }
 
     /// law_id -> (tier, status, version, ipfs_content_hash).
@@ -53,6 +76,10 @@ pub mod pallet {
     #[pallet::storage]
     pub type PendingAmendments<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, ([u8; 32], BlockNumberFor<T>)>;
+
+    /// Block at which each law was enacted. Used to enforce the HRC veto window.
+    #[pallet::storage]
+    pub type LawEnactedAt<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
 
     #[pallet::storage]
     pub type NextLawId<T: Config> = StorageValue<_, u32, ValueQuery>;
@@ -84,6 +111,7 @@ pub mod pallet {
         /// Emitted when a petition crosses PetitionThreshold — signals the legislature
         /// to schedule a referendum. Off-chain indexers and on-chain governance act on this.
         PetitionThresholdReached { petition_id: u32, topic_hash: [u8; 32] },
+        LawVetoed { law_id: u32 },
     }
 
     #[pallet::error]
@@ -97,6 +125,9 @@ pub mod pallet {
         PetitionNotFound,
         AlreadySigned,
         PetitionAlreadyPassed,
+        VetoWindowExpired,
+        CitizenNotActive,
+        LawAlreadyRepealed,
     }
 
     #[pallet::call]
@@ -113,6 +144,7 @@ pub mod pallet {
             T::LegislatureOrigin::ensure_origin(origin)?;
             let id = NextLawId::<T>::get();
             Laws::<T>::insert(id, (tier.clone(), LawStatus::Active, 1u32, content_hash));
+            LawEnactedAt::<T>::insert(id, frame_system::Pallet::<T>::block_number());
             NextLawId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::LawEnacted { law_id: id, tier, content_hash });
             Ok(())
@@ -163,7 +195,12 @@ pub mod pallet {
             T::LegislatureOrigin::ensure_origin(origin)?;
             let (new_hash, proposed_at) =
                 PendingAmendments::<T>::take(law_id).ok_or(Error::<T>::AmendmentNotFound)?;
-            let deliberation = BlockNumberFor::<T>::from(T::ConstitutionalDeliberationBlocks::get());
+            let law = Laws::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
+            let deliberation_blocks = match law.0 {
+                LawTier::Constitutional => T::ConstitutionalDeliberationBlocks::get(),
+                LawTier::Ordinary => T::OrdinaryAmendmentDeliberationBlocks::get(),
+            };
+            let deliberation = BlockNumberFor::<T>::from(deliberation_blocks);
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(now >= proposed_at + deliberation, Error::<T>::DeliberationPeriodActive);
             Laws::<T>::try_mutate(law_id, |maybe_law| {
@@ -184,6 +221,7 @@ pub mod pallet {
             topic_hash: [u8; 32],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             let id = NextPetitionId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
             Petitions::<T>::insert(id, (who.clone(), topic_hash, 0u32, now));
@@ -201,6 +239,7 @@ pub mod pallet {
             petition_id: u32,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             ensure!(
                 !PetitionSignatures::<T>::get((petition_id, &who)),
                 Error::<T>::AlreadySigned
@@ -221,12 +260,62 @@ pub mod pallet {
                     petition_id,
                     topic_hash: petition.1,
                 });
+                // Auto-create a referendum in pallet-voting. Failure here is non-fatal
+                // (e.g., duplicate petition) — we don't roll back the signature.
+                let _ = T::PetitionApprover::create_referendum(petition_id, petition.1);
             }
+            Ok(())
+        }
+
+        /// Veto a newly enacted law on human rights grounds. Only callable by HumanRightsOrigin
+        /// within HRCVetoWindowBlocks of the law's enactment. After the window, use pallet-courts.
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn veto_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
+            T::HumanRightsOrigin::ensure_origin(origin)?;
+            let enacted_at = LawEnactedAt::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
+            let veto_window = BlockNumberFor::<T>::from(T::HRCVetoWindowBlocks::get());
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now <= enacted_at + veto_window, Error::<T>::VetoWindowExpired);
+            Laws::<T>::try_mutate(law_id, |maybe_law| {
+                let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
+                ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
+                law.1 = LawStatus::Paused;
+                Ok::<(), DispatchError>(())
+            })?;
+            Self::deposit_event(Event::LawVetoed { law_id });
+            Ok(())
+        }
+
+        /// Repeal a law entirely. A repealed law is terminal: it cannot be amended or re-enacted
+        /// by the same id. Only Active or Paused laws may be repealed.
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn repeal_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
+            T::LegislatureOrigin::ensure_origin(origin)?;
+            Laws::<T>::try_mutate(law_id, |maybe_law| {
+                let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
+                ensure!(law.1 != LawStatus::Repealed, Error::<T>::LawAlreadyRepealed);
+                law.1 = LawStatus::Repealed;
+                Ok::<(), DispatchError>(())
+            })?;
+            Self::deposit_event(Event::LawRepealed { law_id });
             Ok(())
         }
     }
 
     impl<T: Config> Pallet<T> {
+        /// Called by pallet-voting (via LawEnactor trait in the runtime) when a referendum passes.
+        /// Enacts a new Ordinary law from the petition's IPFS content hash.
+        pub fn enact_law_internal(tier: LawTier, content_hash: [u8; 32]) -> DispatchResult {
+            let id = NextLawId::<T>::get();
+            Laws::<T>::insert(id, (tier.clone(), LawStatus::Active, 1u32, content_hash));
+            LawEnactedAt::<T>::insert(id, frame_system::Pallet::<T>::block_number());
+            NextLawId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::LawEnacted { law_id: id, tier, content_hash });
+            Ok(())
+        }
+
         /// Called by pallet-courts (via LawEnforcer trait in the runtime) when a ruling
         /// overturns a law. Pauses the law pending legislature review.
         /// Returns LawNotActive if the law is already Paused or Repealed — prevents

@@ -242,4 +242,7 @@ mod runtime {
 
 	#[runtime::pallet_index(12)]
 	pub type Constitution = pallet_constitution;
+
+	#[runtime::pallet_index(13)]
+	pub type Legislature = pallet_legislature;
 }

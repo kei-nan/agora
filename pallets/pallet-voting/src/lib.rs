@@ -12,6 +12,7 @@ pub use pallet::*;
 #[frame_support::pallet]
 pub mod pallet {
 
+    use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
 
@@ -24,6 +25,37 @@ pub mod pallet {
         fn is_active_citizen(who: &AccountId) -> bool;
         /// Total number of registered citizens. Used for percentage-based delegation cap.
         fn total_citizens() -> u32;
+    }
+
+    /// Returns the nullifier for a registered citizen, or None if not registered.
+    /// Implemented by the runtime by reading CitizenNullifier from pallet-identity.
+    pub trait NullifierProvider<AccountId> {
+        fn nullifier_of(who: &AccountId) -> Option<[u8; 32]>;
+    }
+
+    /// Called by pallet-voting when a referendum passes — enacts the law in pallet-constitution.
+    pub trait LawEnactor {
+        fn enact_law(content_hash: [u8; 32]) -> DispatchResult;
+    }
+
+    /// Verifies an off-chain MACI tally ZK proof. The proof attests that
+    /// (yes_votes, no_votes) is the correct decryption of all encrypted
+    /// vote commitments whose Merkle root is commitment_root.
+    pub trait MACITallyVerifier {
+        fn verify_tally(
+            proposal_id: u32,
+            yes_votes: u64,
+            no_votes: u64,
+            commitment_root: [u8; 32],
+            proof_bytes: &[u8],
+        ) -> bool;
+    }
+
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum ReferendumState {
+        Voting,
+        Passed,
+        Failed,
     }
 
     #[pallet::config]
@@ -41,8 +73,28 @@ pub mod pallet {
         /// Number of budget categories citizens can allocate tokens across.
         #[pallet::constant]
         type BudgetCategoryCount: Get<u32>;
+        /// Minimum proposal duration in blocks. Prevents instantly-expired proposals.
+        #[pallet::constant]
+        type MinProposalDurationBlocks: Get<u32>;
+        /// Maximum proposal duration in blocks. Prevents unbounded proposals.
+        #[pallet::constant]
+        type MaxProposalDurationBlocks: Get<u32>;
         /// Gate: returns false if the account is not a registered citizen or is suspended.
         type CitizenChecker: CitizenChecker<Self::AccountId>;
+        /// Looks up a citizen's nullifier from pallet-identity storage.
+        /// Returns None if the account has no registered nullifier.
+        type NullifierProvider: NullifierProvider<Self::AccountId>;
+        /// How long a referendum voting window stays open in blocks (e.g. 14 * DAYS).
+        #[pallet::constant]
+        type ReferendumDurationBlocks: Get<u32>;
+        /// Percentage of yes votes required for a referendum to pass (0-100). e.g. 50 = majority.
+        #[pallet::constant]
+        type PassageThreshold: Get<u8>;
+        /// Hook called when a referendum passes — enacts the law in pallet-constitution.
+        type LawEnactor: LawEnactor;
+        /// Verifier for MACI tally ZK proofs. Use PassthroughMACIVerifier in dev; wire in the
+        /// real MACI verifier once circuit trusted setup is complete.
+        type MACITallyVerifier: MACITallyVerifier;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -71,6 +123,12 @@ pub mod pallet {
     #[pallet::storage]
     pub type NextProposalId<T: Config> = StorageValue<_, u32, ValueQuery>;
 
+    /// Finalized MACI tally: proposal_id -> (yes_votes, no_votes, commitment_root).
+    /// Set once per proposal by submit_maci_tally after the voting window closes.
+    #[pallet::storage]
+    pub type ProposalResults<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, (u64, u64, [u8; 32])>;
+
     // ── Budget QV storage ────────────────────────────────────────────────────
 
     /// Current fiscal year epoch. Incremented by start_fiscal_year.
@@ -98,6 +156,31 @@ pub mod pallet {
     pub type CategoryVotes<T: Config> =
         StorageMap<_, Blake2_128Concat, (T::AccountId, u32, u32), u32, ValueQuery>;
 
+    // ── Referendum storage ───────────────────────────────────────────────────
+
+    /// referendum_id -> (petition_id, topic_hash, end_block, state).
+    #[pallet::storage]
+    pub type Referenda<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, (u32, [u8; 32], BlockNumberFor<T>, ReferendumState)>;
+
+    /// petition_id -> referendum_id. Prevents duplicate referenda for the same petition.
+    #[pallet::storage]
+    pub type PetitionReferendum<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, u32>;
+
+    /// Running yes/no tally: referendum_id -> (yes_count, no_count).
+    #[pallet::storage]
+    pub type ReferendumTally<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, (u32, u32), ValueQuery>;
+
+    /// Tracks which accounts have voted in which referendum (one vote per citizen).
+    #[pallet::storage]
+    pub type ReferendumHasVoted<T: Config> =
+        StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool, ValueQuery>;
+
+    #[pallet::storage]
+    pub type NextReferendumId<T: Config> = StorageValue<_, u32, ValueQuery>;
+
     // ── Events ───────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -114,6 +197,21 @@ pub mod pallet {
         /// A citizen updated their QV allocation for a budget category.
         /// vote_count is the new total; token cost for this slot = vote_count².
         BudgetAllocated { who: T::AccountId, epoch: u32, category_id: u32, vote_count: u32 },
+        /// A referendum was automatically created when a petition hit PetitionThreshold.
+        ReferendumCreated {
+            referendum_id: u32,
+            petition_id: u32,
+            topic_hash: [u8; 32],
+            ends_at: BlockNumberFor<T>,
+        },
+        /// A citizen cast a vote on a referendum.
+        ReferendumVoteCast { referendum_id: u32, voter: T::AccountId, in_favor: bool },
+        /// A referendum passed the passage threshold — law has been enacted.
+        ReferendumPassed { referendum_id: u32, topic_hash: [u8; 32] },
+        /// A referendum failed to reach the passage threshold.
+        ReferendumFailed { referendum_id: u32 },
+        /// Off-chain MACI tally submitted and verified for a proposal.
+        TallySubmitted { proposal_id: u32, yes_votes: u64, no_votes: u64, commitment_root: [u8; 32] },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────
@@ -134,6 +232,23 @@ pub mod pallet {
         BudgetNotClaimed,
         InsufficientBudgetTokens,
         InvalidCategoryId,
+        ReferendumNotFound,
+        /// The referendum is not in Voting state (already finalized or doesn't exist).
+        ReferendumNotActive,
+        /// Citizen has already voted in this referendum.
+        AlreadyVotedInReferendum,
+        /// Voting window has not yet closed; cannot finalize.
+        ReferendumStillActive,
+        /// A referendum for this petition already exists.
+        ReferendumAlreadyExists,
+        /// A tally has already been submitted for this proposal.
+        TallyAlreadySubmitted,
+        /// The MACI tally ZK proof did not verify.
+        InvalidTallyProof,
+        /// Voting window has not yet closed; cannot submit tally.
+        ProposalStillActive,
+        /// duration_blocks is outside [MinProposalDurationBlocks, MaxProposalDurationBlocks].
+        InvalidProposalDuration,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────
@@ -141,13 +256,21 @@ pub mod pallet {
     #[pallet::call]
     impl<T: Config> Pallet<T> {
         /// Submit a new proposal for the current voting epoch.
+        /// Caller must be an active citizen. `duration_blocks` must fall within
+        /// [MinProposalDurationBlocks, MaxProposalDurationBlocks].
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn submit_proposal(
             origin: OriginFor<T>,
             duration_blocks: u32,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
+            let who = ensure_signed(origin)?;
+            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
+            ensure!(
+                duration_blocks >= T::MinProposalDurationBlocks::get()
+                    && duration_blocks <= T::MaxProposalDurationBlocks::get(),
+                Error::<T>::InvalidProposalDuration
+            );
             let id = NextProposalId::<T>::get();
             let ends_at = frame_system::Pallet::<T>::block_number() +
                 BlockNumberFor::<T>::from(duration_blocks);
@@ -158,16 +281,19 @@ pub mod pallet {
         }
 
         /// Commit an encrypted vote (MACI commitment). Actual tally done off-chain with ZK proof.
+        /// The nullifier is derived from the caller's registered identity — callers cannot supply
+        /// an arbitrary nullifier, which enforces 1-person-1-vote.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn commit_vote(
             origin: OriginFor<T>,
             proposal_id: u32,
-            nullifier: [u8; 32],
             commitment: [u8; 32],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
+            let nullifier = T::NullifierProvider::nullifier_of(&who)
+                .ok_or(Error::<T>::NotRegisteredCitizen)?;
             let ends_at = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(frame_system::Pallet::<T>::block_number() < ends_at, Error::<T>::ProposalEnded);
             ensure!(!VoteCommitments::<T>::contains_key((proposal_id, nullifier)), Error::<T>::AlreadyVoted);
@@ -310,11 +436,127 @@ pub mod pallet {
             Self::deposit_event(Event::BudgetAllocated { who, epoch, category_id, vote_count });
             Ok(())
         }
+
+        /// Cast a yes/no vote on an active referendum.
+        /// One vote per active citizen. Voting closes at the referendum's end_block.
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        pub fn vote_referendum(
+            origin: OriginFor<T>,
+            referendum_id: u32,
+            in_favor: bool,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
+            let (petition_id, topic_hash, end_block, state) =
+                Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
+            ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
+            ensure!(
+                frame_system::Pallet::<T>::block_number() <= end_block,
+                Error::<T>::ReferendumNotActive
+            );
+            ensure!(
+                !ReferendumHasVoted::<T>::get((referendum_id, &who)),
+                Error::<T>::AlreadyVotedInReferendum
+            );
+            ReferendumHasVoted::<T>::insert((referendum_id, &who), true);
+            ReferendumTally::<T>::mutate(referendum_id, |(yes, no)| {
+                if in_favor { *yes = yes.saturating_add(1); } else { *no = no.saturating_add(1); }
+            });
+            // Re-insert unchanged fields to satisfy the borrow checker.
+            let _ = (petition_id, topic_hash, end_block);
+            Self::deposit_event(Event::ReferendumVoteCast { referendum_id, voter: who, in_favor });
+            Ok(())
+        }
+
+        /// Finalize a referendum once the voting window has closed.
+        /// Anyone may call this. Passes if yes_votes * 100 >= PassageThreshold * total_votes.
+        /// On pass, calls LawEnactor to enact the law in pallet-constitution.
+        #[pallet::call_index(8)]
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn finalize_referendum(origin: OriginFor<T>, referendum_id: u32) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+            let (petition_id, topic_hash, end_block, state) =
+                Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
+            ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
+            ensure!(
+                frame_system::Pallet::<T>::block_number() > end_block,
+                Error::<T>::ReferendumStillActive
+            );
+            let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
+            let total = yes_count.saturating_add(no_count);
+            let passed = total > 0
+                && yes_count.saturating_mul(100) >= T::PassageThreshold::get() as u32 * total;
+            let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
+            Referenda::<T>::insert(referendum_id, (petition_id, topic_hash, end_block, new_state));
+            if passed {
+                T::LawEnactor::enact_law(topic_hash)?;
+                Self::deposit_event(Event::ReferendumPassed { referendum_id, topic_hash });
+            } else {
+                Self::deposit_event(Event::ReferendumFailed { referendum_id });
+            }
+            Ok(())
+        }
+
+        /// Submit a verified MACI tally for a proposal whose voting window has closed.
+        /// The off-chain MACI coordinator calls this after decrypting all vote commitments
+        /// and generating a ZK proof of correct tallying.
+        #[pallet::call_index(9)]
+        #[pallet::weight(Weight::from_parts(50_000, 0))]
+        pub fn submit_maci_tally(
+            origin: OriginFor<T>,
+            proposal_id: u32,
+            yes_votes: u64,
+            no_votes: u64,
+            commitment_root: [u8; 32],
+            proof_bytes: BoundedVec<u8, ConstU32<4096>>,
+        ) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+            let end_block = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
+            ensure!(
+                frame_system::Pallet::<T>::block_number() > end_block,
+                Error::<T>::ProposalStillActive
+            );
+            ensure!(
+                !ProposalResults::<T>::contains_key(proposal_id),
+                Error::<T>::TallyAlreadySubmitted
+            );
+            ensure!(
+                T::MACITallyVerifier::verify_tally(
+                    proposal_id,
+                    yes_votes,
+                    no_votes,
+                    commitment_root,
+                    proof_bytes.as_slice(),
+                ),
+                Error::<T>::InvalidTallyProof
+            );
+            ProposalResults::<T>::insert(proposal_id, (yes_votes, no_votes, commitment_root));
+            Self::deposit_event(Event::TallySubmitted { proposal_id, yes_votes, no_votes, commitment_root });
+            Ok(())
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     impl<T: Config> Pallet<T> {
+        /// Called by pallet-constitution (via PetitionApprover trait in the runtime) when a
+        /// petition hits PetitionThreshold. Creates a timed referendum from the petition.
+        pub fn create_referendum_internal(petition_id: u32, topic_hash: [u8; 32]) -> DispatchResult {
+            ensure!(
+                !PetitionReferendum::<T>::contains_key(petition_id),
+                Error::<T>::ReferendumAlreadyExists
+            );
+            let id = NextReferendumId::<T>::get();
+            let now = frame_system::Pallet::<T>::block_number();
+            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
+            Referenda::<T>::insert(id, (petition_id, topic_hash, ends_at, ReferendumState::Voting));
+            PetitionReferendum::<T>::insert(petition_id, id);
+            NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::ReferendumCreated { referendum_id: id, petition_id, topic_hash, ends_at });
+            Ok(())
+        }
+
         /// Walk the delegation chain from `delegate` up to MaxDelegationDepth steps.
         /// Returns true if `who` appears in the chain, `who == delegate`, or the depth limit is
         /// reached without a clean termination (conservatively treats deep chains as cycles).

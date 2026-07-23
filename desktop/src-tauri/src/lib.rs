@@ -1,4 +1,5 @@
 mod commands;
+mod rpc;
 
 use commands::{agent, auth, chain};
 use auth::PendingSessions;

@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useState, ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { createContext, useCallback, useContext, useRef, useState, ReactNode } from "react";
+import { invoke } from "../lib/invoke";
 
 interface Session {
   nullifierHash: string;
@@ -29,8 +29,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [qrChallenge, setQrChallenge] = useState<string | null>(null);
   const [isGeneratingQr, setIsGeneratingQr] = useState(false);
   const [qrError, setQrError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPoll = useCallback(() => {
+    if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null; }
+    if (timeoutRef.current !== null) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
+  }, []);
 
   const requestQr = useCallback(async () => {
+    cancelPoll(); // clear any existing poll before starting a new one
     setIsGeneratingQr(true);
     setQrError(null);
     try {
@@ -39,13 +47,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setIsGeneratingQr(false);
 
       // Poll for session completion — mobile app deep-links back with signed token
-      const poll = setInterval(async () => {
+      pollRef.current = setInterval(async () => {
         try {
           const sess = await invoke<Session>("auth_poll_session", { challenge });
           if (sess) {
             setSession(sess);
             setQrChallenge(null);
-            clearInterval(poll);
+            cancelPoll();
           }
         } catch {
           // "pending" error is expected until mobile completes auth
@@ -53,15 +61,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }, 2000);
 
       // Stop polling after 5 minutes
-      setTimeout(() => {
-        clearInterval(poll);
+      timeoutRef.current = setTimeout(() => {
+        cancelPoll();
         setQrChallenge(null);
       }, 5 * 60 * 1000);
     } catch (err) {
       setQrError(String(err));
       setIsGeneratingQr(false);
     }
-  }, []);
+  }, [cancelPoll]);
 
   const logout = useCallback(() => {
     setSession(null);

@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
-use ark_groth16::{Groth16, Proof, VerifyingKey};
+use ark_groth16::{prepare_verifying_key, Groth16, Proof, VerifyingKey};
 use ark_serialize::CanonicalDeserialize;
 
 /// Serialized `VerifyingKey<Bn254>` (ark-serialize compressed) for the SHA-256 circuit.
@@ -71,7 +71,7 @@ fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<bool> 
     let vk = VerifyingKey::<Bn254>::deserialize_compressed(vk_bytes).ok()?;
 
     // Process into miller-loop form (computes precomputed pairing terms).
-    let pvk = Groth16::<Bn254>::process_vk(&vk).ok()?;
+    let pvk = prepare_verifying_key(&vk);
 
     // Deserialize the proof (A, B, C).
     let proof = Proof::<Bn254>::deserialize_compressed(&proof_bytes[..128]).ok()?;
@@ -83,5 +83,5 @@ fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<bool> 
         .collect();
 
     // Run the Groth16 pairing check.
-    Groth16::<Bn254>::verify_with_processed_vk(&pvk, &pub_signals, &proof).ok()
+    Groth16::<Bn254>::verify_proof(&pvk, &proof, &pub_signals).ok()
 }

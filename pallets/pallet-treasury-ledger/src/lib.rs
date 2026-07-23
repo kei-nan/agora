@@ -53,6 +53,11 @@ pub mod pallet {
     pub type FrozenDepartments<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, bool, ValueQuery>;
 
+    /// Per-department authorized spender. Only this account may call record_expenditure for that department.
+    #[pallet::storage]
+    pub type DepartmentSpenders<T: Config> =
+        StorageMap<_, Twox64Concat, u32, T::AccountId, OptionQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -60,6 +65,8 @@ pub mod pallet {
         FundsSpent { department_id: u32, amount: T::Balance, metadata_hash: [u8; 32] },
         DepartmentFrozen { department_id: u32 },
         DepartmentUnfrozen { department_id: u32 },
+        SpenderRegistered { department_id: u32, spender: T::AccountId },
+        SpenderRemoved { department_id: u32 },
     }
 
     #[pallet::error]
@@ -68,6 +75,8 @@ pub mod pallet {
         DepartmentNotFound,
         DepartmentFrozen,
         Overflow,
+        NotAuthorizedSpender,
+        DepartmentHasNoSpender,
     }
 
     #[pallet::call]
@@ -96,8 +105,10 @@ pub mod pallet {
             amount: T::Balance,
             metadata_hash: [u8; 32],
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
-            // TODO: enforce authorized spender per department
+            let who = ensure_signed(origin)?;
+            let authorized = DepartmentSpenders::<T>::get(department_id)
+                .ok_or(Error::<T>::DepartmentHasNoSpender)?;
+            ensure!(authorized == who, Error::<T>::NotAuthorizedSpender);
             ensure!(!FrozenDepartments::<T>::get(department_id), Error::<T>::DepartmentFrozen);
             let budget = DepartmentBudgets::<T>::get(department_id);
             let spent = DepartmentSpent::<T>::get(department_id);
@@ -108,6 +119,37 @@ pub mod pallet {
             ExpenditureLog::<T>::insert(idx, (department_id, amount, metadata_hash));
             NextExpenditureIndex::<T>::put(idx.saturating_add(1));
             Self::deposit_event(Event::FundsSpent { department_id, amount, metadata_hash });
+            Ok(())
+        }
+
+        /// Register (or replace) the authorized spender for a department.
+        #[pallet::call_index(2)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn register_department_spender(
+            origin: OriginFor<T>,
+            department_id: u32,
+            spender: T::AccountId,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            DepartmentSpenders::<T>::insert(department_id, &spender);
+            Self::deposit_event(Event::SpenderRegistered { department_id, spender });
+            Ok(())
+        }
+
+        /// Remove the authorized spender for a department.
+        #[pallet::call_index(3)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn remove_department_spender(
+            origin: OriginFor<T>,
+            department_id: u32,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(
+                DepartmentSpenders::<T>::contains_key(department_id),
+                Error::<T>::DepartmentHasNoSpender
+            );
+            DepartmentSpenders::<T>::remove(department_id);
+            Self::deposit_event(Event::SpenderRemoved { department_id });
             Ok(())
         }
     }

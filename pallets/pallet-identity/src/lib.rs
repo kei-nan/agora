@@ -68,6 +68,12 @@ pub mod pallet {
     pub type SuspendedNullifiers<T: Config> =
         StorageMap<_, Blake2_128Concat, [u8; 32], Option<BlockNumberFor<T>>>;
 
+    /// Trusted issuer Merkle roots (slaveMerkleRoot from Rarimo circuit, public_inputs[4]).
+    /// A proof is only accepted if its slaveMerkleRoot matches one of these roots.
+    /// Roots represent trusted sets of country certificate authorities.
+    #[pallet::storage]
+    pub type AllowedMerkleRoots<T: Config> = StorageMap<_, Identity, [u8; 32], bool, ValueQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -77,6 +83,8 @@ pub mod pallet {
         CitizenSuspended { nullifier: [u8; 32], until: Option<BlockNumberFor<T>> },
         /// Voting rights restored (sentence served or conviction overturned).
         CitizenRestored { nullifier: [u8; 32] },
+        MerkleRootAdded { merkle_root: [u8; 32] },
+        MerkleRootRemoved { merkle_root: [u8; 32] },
     }
 
     #[pallet::error]
@@ -84,36 +92,52 @@ pub mod pallet {
         AlreadyRegistered,
         NullifierAlreadyUsed,
         InvalidZKProof,
-        PassportExpired,
         NotRegistered,
         AlreadySuspended,
         NotSuspended,
+        /// The proof's slaveMerkleRoot is not in the on-chain allowlist of trusted issuers.
+        IssuerNotAllowed,
     }
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Register a new citizen using a ZK passport proof and nullifier.
-        /// zk_proof: serialized Groth16 proof bytes.
-        /// public_inputs: [nullifier_hash, passport_expiry_timestamp, country_code_hash].
+        /// Register a new citizen using a Rarimo ZK passport proof.
+        ///
+        /// Rarimo registerIdentity circuit public signals (nPublic = 5):
+        ///   [0] dg15PubKeyHash  — Poseidon hash of DG15 active-auth public key (0 if NA)
+        ///   [1] passportHash    — PoseidonHash(SHA-256(signedAttributes)[252:])
+        ///   [2] dg1Commitment   — PoseidonHash(DG1_chunks..., skIdentity)  ← used as nullifier
+        ///   [3] pkIdentityHash  — PoseidonHash(babyJubJub_pubkey.X, .Y)
+        ///   [4] slaveMerkleRoot — root of trusted issuer CA certificate tree (public INPUT)
+        ///
+        /// The nullifier is derived from public_inputs[2] (dg1Commitment). No need to pass it
+        /// separately — it binds the passport's MRZ data to the user's on-device identity key.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn register_citizen(
             origin: OriginFor<T>,
-            nullifier: [u8; 32],
             zk_proof: BoundedVec<u8, ConstU32<4096>>,
-            // Up to 16 public signals; Rarimo Freedom Tool registration circuit uses 10.
+            // Rarimo registerIdentity produces exactly 5 public signals.
             public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
+            // Require at least 5 public inputs before indexing or ZK verification.
+            ensure!(public_inputs.len() >= 5, Error::<T>::InvalidZKProof);
+            // Derive nullifier from dg1Commitment (public_inputs[2]).
+            let nullifier = public_inputs[2];
             ensure!(
                 !NullifierRegistry::<T>::contains_key(nullifier),
                 Error::<T>::NullifierAlreadyUsed
             );
+            // Verify the proof against all 5 public signals.
             ensure!(
                 T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
                 Error::<T>::InvalidZKProof
             );
+            // slaveMerkleRoot (public_inputs[4]) must match a root added by governance.
+            // This restricts registration to citizens whose country's CA cert is in the tree.
+            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[4]), Error::<T>::IssuerNotAllowed);
             let pos = TotalCitizens::<T>::get();
             CitizenIndex::<T>::insert(pos, &who);
             CitizenPosition::<T>::insert(&who, pos);
@@ -189,9 +213,52 @@ pub mod pallet {
             Self::deposit_event(Event::CitizenRestored { nullifier });
             Ok(())
         }
+
+        /// Add a trusted issuer Merkle root. Proofs with this slaveMerkleRoot will be accepted.
+        /// The root represents a specific snapshot of the trusted country CA certificate set.
+        #[pallet::call_index(4)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn add_allowed_merkle_root(
+            origin: OriginFor<T>,
+            merkle_root: [u8; 32],
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            AllowedMerkleRoots::<T>::insert(merkle_root, true);
+            Self::deposit_event(Event::MerkleRootAdded { merkle_root });
+            Ok(())
+        }
+
+        /// Remove a trusted issuer Merkle root (e.g. after a CA revocation event).
+        #[pallet::call_index(5)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn remove_allowed_merkle_root(
+            origin: OriginFor<T>,
+            merkle_root: [u8; 32],
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            AllowedMerkleRoots::<T>::remove(merkle_root);
+            Self::deposit_event(Event::MerkleRootRemoved { merkle_root });
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
+        /// Called by pallet-courts via CitizenSuspender runtime trait when a conduct ruling
+        /// is finalized. Bypasses the extrinsic origin check — courts are pre-authorized.
+        pub fn suspend_citizen_internal(
+            nullifier: [u8; 32],
+            until: Option<BlockNumberFor<T>>,
+        ) -> DispatchResult {
+            ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
+            ensure!(
+                !SuspendedNullifiers::<T>::contains_key(nullifier),
+                Error::<T>::AlreadySuspended
+            );
+            SuspendedNullifiers::<T>::insert(nullifier, until);
+            Self::deposit_event(Event::CitizenSuspended { nullifier, until });
+            Ok(())
+        }
+
         /// Used by pallet-courts (via a CitizenSelector trait impl in the runtime).
         pub fn citizen_at(index: u32) -> Option<T::AccountId> {
             CitizenIndex::<T>::get(index)

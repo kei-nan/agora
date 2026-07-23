@@ -196,6 +196,21 @@ impl pallet_identity_zk::Config for Runtime {
 	type SuspensionOrigin = EnsureRoot<AccountId>;
 }
 
+/// Passthrough MACI tally verifier — accepts all proofs.
+/// TODO: replace with the real MACI circuit verifier once trusted setup is complete.
+pub struct PassthroughMACIVerifier;
+impl pallet_voting::MACITallyVerifier for PassthroughMACIVerifier {
+	fn verify_tally(
+		_proposal_id: u32,
+		_yes_votes: u64,
+		_no_votes: u64,
+		_commitment_root: [u8; 32],
+		_proof_bytes: &[u8],
+	) -> bool {
+		true
+	}
+}
+
 /// Runtime implements CitizenChecker by calling pallet-identity's is_active_citizen.
 /// Returns false for both unregistered accounts and accounts with active suspensions.
 impl pallet_voting::CitizenChecker<AccountId> for Runtime {
@@ -208,17 +223,45 @@ impl pallet_voting::CitizenChecker<AccountId> for Runtime {
 	}
 }
 
+/// Runtime implements NullifierProvider by reading CitizenNullifier from pallet-identity.
+impl pallet_voting::NullifierProvider<AccountId> for Runtime {
+	fn nullifier_of(who: &AccountId) -> Option<[u8; 32]> {
+		pallet_identity_zk::CitizenNullifier::<Runtime>::get(who)
+	}
+}
+
+/// Runtime implements LawEnactor: when a referendum passes, enact an Ordinary law.
+impl pallet_voting::LawEnactor for Runtime {
+	fn enact_law(content_hash: [u8; 32]) -> sp_runtime::DispatchResult {
+		pallet_constitution::Pallet::<Runtime>::enact_law_internal(
+			pallet_constitution::LawTier::Ordinary,
+			content_hash,
+		)
+	}
+}
+
 impl pallet_voting::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// No single delegate may hold more than 33% of voting power (future: enforce by %).
+	/// No single delegate may hold more than 33% of voting power.
 	type DelegationCap = ConstU8<33>;
-	/// Absolute ceiling: at most 1 000 direct delegators per (topic, delegate) for now.
+	/// Absolute ceiling: at most 1 000 direct delegators per (topic, delegate).
 	type MaxDelegationsPerDelegate = ConstU32<1_000>;
 	/// Walk at most 10 hops when checking for delegation cycles.
 	type MaxDelegationDepth = ConstU8<10>;
 	/// Number of budget categories citizens can allocate QV tokens across.
 	type BudgetCategoryCount = ConstU32<10>;
 	type CitizenChecker = Runtime;
+	type NullifierProvider = Runtime;
+	/// Minimum 1-day voting window prevents spam proposals that expire instantly.
+	type MinProposalDurationBlocks = ConstU32<{ 1 * DAYS }>;
+	/// Maximum 90-day cap prevents proposals from lingering indefinitely.
+	type MaxProposalDurationBlocks = ConstU32<{ 90 * DAYS }>;
+	/// Referendum voting window: 14 days.
+	type ReferendumDurationBlocks = ConstU32<{ 14 * DAYS }>;
+	/// Simple majority required to pass.
+	type PassageThreshold = ConstU8<51>;
+	type LawEnactor = Runtime;
+	type MACITallyVerifier = PassthroughMACIVerifier;
 }
 
 impl pallet_treasury_ledger::Config for Runtime {
@@ -250,6 +293,16 @@ impl pallet_courts::TreasuryEnforcer for Runtime {
 	}
 }
 
+/// Runtime implements CitizenSuspender by calling pallet-identity's internal suspension function.
+impl pallet_courts::CitizenSuspender for Runtime {
+	fn suspend_citizen(nullifier: [u8; 32], until: Option<u32>) -> sp_runtime::DispatchResult {
+		pallet_identity_zk::Pallet::<Runtime>::suspend_citizen_internal(
+			nullifier,
+			until.map(|u| u.into()),
+		)
+	}
+}
+
 impl pallet_courts::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	/// Citizens have 7 days to appeal an AI ruling.
@@ -257,15 +310,48 @@ impl pallet_courts::Config for Runtime {
 	type CitizenSelector = Runtime;
 	type LawEnforcer = Runtime;
 	type TreasuryEnforcer = Runtime;
+	/// TODO: replace with a dedicated oracle account origin in production.
+	type OracleOrigin = EnsureRoot<AccountId>;
+	type CitizenSuspender = Runtime;
+}
+
+/// Runtime implements CitizenChecker for pallet-constitution (petition/sign gating).
+impl pallet_constitution::CitizenChecker<AccountId> for Runtime {
+	fn is_active_citizen(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+}
+
+/// Runtime implements PetitionApprover: when a petition hits threshold, create a referendum.
+impl pallet_constitution::PetitionApprover for Runtime {
+	fn create_referendum(petition_id: u32, topic_hash: [u8; 32]) -> sp_runtime::DispatchResult {
+		pallet_voting::Pallet::<Runtime>::create_referendum_internal(petition_id, topic_hash)
+	}
 }
 
 impl pallet_constitution::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	/// Constitutional amendments require 30 days of deliberation before ratification.
 	type ConstitutionalDeliberationBlocks = ConstU32<{ 30 * DAYS }>;
-	/// TODO: replace with a democratic collective / referendum origin once pallet-voting
-	/// referendum pipeline is complete.
-	type LegislatureOrigin = EnsureRoot<AccountId>;
+	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// 1 000 citizen signatures required to trigger a referendum.
 	type PetitionThreshold = ConstU32<1_000>;
+	type PetitionApprover = Runtime;
+	type CitizenChecker = Runtime;
+	/// Ordinary law amendments take effect immediately (no deliberation window).
+	type OrdinaryAmendmentDeliberationBlocks = ConstU32<0>;
+	/// TODO: replace with a proper HRC collective origin in production.
+	type HumanRightsOrigin = EnsureRoot<AccountId>;
+	/// HRC has 14 days to veto a newly enacted law on human rights grounds.
+	type HRCVetoWindowBlocks = ConstU32<{ 14 * DAYS }>;
+}
+
+impl pallet_legislature::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Legislature has at most 500 seats.
+	type MaxMembers = ConstU32<500>;
+	/// Members have 7 days to vote on a motion.
+	type MotionDurationBlocks = ConstU32<{ 7 * DAYS }>;
+	/// Simple majority (50%+1) required to pass a motion.
+	type PassageThreshold = ConstU8<50>;
 }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/invoke";
 import { useAgent } from "../context/AgentContext";
 import AgentPanel from "../components/AgentPanel";
 import "./Page.css";

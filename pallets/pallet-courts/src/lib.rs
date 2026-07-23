@@ -12,7 +12,7 @@ pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode};
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
-    use sp_runtime::traits::Hash as HashT;
+    use sp_runtime::traits::{Hash as HashT, Saturating};
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -33,6 +33,12 @@ pub mod pallet {
     /// Implemented by the runtime to call pallet-treasury-ledger's freeze_department_internal.
     pub trait TreasuryEnforcer {
         fn freeze_department(department_id: u32) -> DispatchResult;
+    }
+
+    /// Implemented by the runtime to call pallet-identity's suspend_citizen_internal.
+    /// Triggered when a CitizenConduct case is finalized with an Overturned verdict.
+    pub trait CitizenSuspender {
+        fn suspend_citizen(nullifier: [u8; 32], until: Option<u32>) -> DispatchResult;
     }
 
     // ── Enums ───────────────────────────────────────────────────────────────────
@@ -63,6 +69,9 @@ pub mod pallet {
         LawChallenge { law_id: u32 },
         /// Alleges illegal treasury activity; Overturned ruling freezes the department.
         TreasuryDispute { department_id: u32 },
+        /// Criminal/conduct case against a citizen identified by their nullifier.
+        /// Overturned verdict (i.e. guilty) suspends them; suspension_blocks = None means indefinite.
+        CitizenConduct { nullifier: [u8; 32], suspension_blocks: Option<u32> },
     }
 
     // ── Config ──────────────────────────────────────────────────────────────────
@@ -79,6 +88,11 @@ pub mod pallet {
         type LawEnforcer: LawEnforcer;
         /// Hook called to freeze a department when an Overturned treasury verdict is issued.
         type TreasuryEnforcer: TreasuryEnforcer;
+        /// The origin permitted to submit AI rulings and finalize un-appealed cases.
+        /// Configure as EnsureRoot for dev; wire to a dedicated oracle account in production.
+        type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
+        type CitizenSuspender: CitizenSuspender;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
@@ -169,7 +183,7 @@ pub mod pallet {
             case_id: u32,
             ruling_hash: [u8; 32],
         ) -> DispatchResult {
-            ensure_root(origin)?; // TODO: replace with AI oracle origin
+            T::OracleOrigin::ensure_origin(origin)?;
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let case = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
                 ensure!(case.1 == CaseStatus::Filed, Error::<T>::InvalidStatus);
@@ -236,9 +250,15 @@ pub mod pallet {
             case_id: u32,
             verdict: Verdict,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::OracleOrigin::ensure_origin(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::AIRulingIssued, Error::<T>::InvalidStatus);
+            let ruling_block = AIRulingBlock::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+            let appeal_deadline = ruling_block + BlockNumberFor::<T>::from(T::AppealWindowBlocks::get());
+            ensure!(
+                frame_system::Pallet::<T>::block_number() > appeal_deadline,
+                Error::<T>::AppealWindowClosed
+            );
             Self::auto_finalize(case_id, verdict)?;
             Ok(())
         }
@@ -311,6 +331,9 @@ pub mod pallet {
                     CaseSubject::TreasuryDispute { department_id } => {
                         T::TreasuryEnforcer::freeze_department(*department_id)?;
                     }
+                    CaseSubject::CitizenConduct { nullifier, suspension_blocks } => {
+                        T::CitizenSuspender::suspend_citizen(*nullifier, *suspension_blocks)?;
+                    }
                     CaseSubject::General => {}
                 }
             }
@@ -318,20 +341,30 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Pick `jury_size` unique citizens at random using the parent block hash as entropy.
-        /// NOTE: Block hash randomness is manipulable by block authors — production should use
-        /// VRF (Babe randomness) or a commit-reveal scheme.
+        /// Pick `jury_size` unique citizens at random.
+        /// Entropy is XOR of hashes from the 5 most recent blocks, making manipulation
+        /// require control of 5 consecutive authorship slots instead of just one.
+        /// NOTE: True unpredictability requires VRF (Babe/SASSAFRAS randomness) — a
+        /// commit-reveal scheme or on-chain VRF should replace this before mainnet.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
             total: u32,
         ) -> Result<BoundedVec<T::AccountId, ConstU32<21>>, DispatchError> {
-            let block_hash = frame_system::Pallet::<T>::parent_hash();
+            let current = frame_system::Pallet::<T>::block_number();
+            let mut entropy = [0u8; 32];
+            for lag in 0u32..5 {
+                let n = current.saturating_sub(BlockNumberFor::<T>::from(lag));
+                let h = frame_system::Pallet::<T>::block_hash(n);
+                for (i, b) in h.as_ref().iter().enumerate() {
+                    entropy[i % 32] ^= b;
+                }
+            }
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
             let max_attempts = total.saturating_add(jury_size as u32).saturating_mul(3);
             while (jurors.len() as u8) < jury_size && nonce < max_attempts {
-                let seed_input = (block_hash, case_id, nonce).encode();
+                let seed_input = (entropy, case_id, nonce).encode();
                 let hash = T::Hashing::hash(&seed_input);
                 let bytes = hash.as_ref();
                 let idx = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % total;
