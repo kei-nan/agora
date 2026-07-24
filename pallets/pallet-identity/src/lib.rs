@@ -25,6 +25,11 @@ pub mod pallet {
         /// Currently wired to EnsureRoot in the runtime.
         /// TODO: replace with a court-controlled multisig or collective origin.
         type SuspensionOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// The origin permitted to manage the trusted issuer Merkle root allowlist
+        /// (add/remove country CA certificate roots). Keeping this separate from
+        /// SuspensionOrigin lets governance rotate the allowlist without touching
+        /// the court-controlled suspension key. Use EnsureRoot for now.
+        type AdminOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -222,7 +227,7 @@ pub mod pallet {
             origin: OriginFor<T>,
             merkle_root: [u8; 32],
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AdminOrigin::ensure_origin(origin)?;
             AllowedMerkleRoots::<T>::insert(merkle_root, true);
             Self::deposit_event(Event::MerkleRootAdded { merkle_root });
             Ok(())
@@ -235,7 +240,7 @@ pub mod pallet {
             origin: OriginFor<T>,
             merkle_root: [u8; 32],
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AdminOrigin::ensure_origin(origin)?;
             AllowedMerkleRoots::<T>::remove(merkle_root);
             Self::deposit_event(Event::MerkleRootRemoved { merkle_root });
             Ok(())

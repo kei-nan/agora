@@ -33,6 +33,9 @@ pallet-treasury-ledger.workspace = true
 pallet-courts.workspace = true
 pallet-constitution.workspace = true
 pallet-legislature.workspace = true
+pallet-elections.workspace = true
+pallet-emergency-council.workspace = true
+pallet-audit.workspace = true
 ark-bn254.workspace = true
 ark-groth16.workspace = true
 ark-serialize.workspace = true
@@ -87,6 +90,9 @@ std = [
 	"pallet-courts/std",
 	"pallet-constitution/std",
 	"pallet-legislature/std",
+	"pallet-elections/std",
+	"pallet-emergency-council/std",
+	"pallet-audit/std",
 	"ark-bn254/std",
 	"ark-groth16/std",
 	"ark-serialize/std",
@@ -143,6 +149,9 @@ try-runtime = [
 	"pallet-courts/try-runtime",
 	"pallet-constitution/try-runtime",
 	"pallet-legislature/try-runtime",
+	"pallet-elections/try-runtime",
+	"pallet-emergency-council/try-runtime",
+	"pallet-audit/try-runtime",
 	"pallet-timestamp/try-runtime",
 	"pallet-transaction-payment/try-runtime",
 	"sp-runtime/try-runtime",

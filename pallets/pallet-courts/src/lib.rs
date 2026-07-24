@@ -257,17 +257,29 @@ pub mod pallet {
         }
 
         /// Select a jury from the citizen registry using block randomness.
-        /// jury_size: 7 for Level 1 appeal, 21 for Level 2 constitutional questions.
+        /// The jury size is determined by the case subject:
+        ///   - LawChallenge: 21 jurors (Level 2 constitutional review).
+        ///   - General / TreasuryDispute / CitizenConduct: 7 jurors (Level 1 appeal).
+        /// The caller-supplied `jury_size` is validated against this required size and
+        /// rejected with `InvalidJurySize` if it doesn't match, preventing callers from
+        /// accidentally (or maliciously) under- or over-seating a jury.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(100_000, 0))]
         pub fn select_jury(origin: OriginFor<T>, case_id: u32, jury_size: u8) -> DispatchResult {
             let _who = ensure_signed(origin)?;
-            ensure!(jury_size <= 21, Error::<T>::InvalidJurySize);
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::InJuryAppeal, Error::<T>::InvalidStatus);
+            // Derive the required jury size from the case subject so that the
+            // routing logic (Level 1 vs Level 2) is enforced on-chain rather than
+            // relying on the caller to pass the correct value.
+            let required_size: u8 = match &case.3 {
+                CaseSubject::LawChallenge { .. } => 21,
+                _ => 7,
+            };
+            ensure!(jury_size == required_size, Error::<T>::InvalidJurySize);
             let total = T::CitizenSelector::total_citizens();
-            ensure!(total >= jury_size as u32, Error::<T>::NotEnoughCitizens);
-            let jurors = Self::pick_random_jurors(case_id, jury_size, total)?;
+            ensure!(total >= required_size as u32, Error::<T>::NotEnoughCitizens);
+            let jurors = Self::pick_random_jurors(case_id, required_size, total)?;
             Self::deposit_event(Event::JurySelected { case_id, jurors: jurors.clone() });
             JuryPool::<T>::insert(case_id, jurors);
             // Advance status so a second select_jury call is rejected.

@@ -6,9 +6,21 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
+/// Called after every recorded expenditure. Implement to maintain an audit trail.
+pub trait AuditHook {
+    fn on_expenditure(index: u32, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]);
+}
+
+/// No-op implementation for tests or when audit is disabled.
+pub struct NoopAuditHook;
+impl AuditHook for NoopAuditHook {
+    fn on_expenditure(_index: u32, _dept_id: u32, _amount: u128, _ipfs_hash: [u8; 32]) {}
+}
+
 #[frame_support::pallet]
 pub mod pallet {
 
+    use crate::AuditHook as _;
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::CheckedAdd;
@@ -27,7 +39,10 @@ pub mod pallet {
             + PartialOrd
             + CheckedAdd
             + codec::HasCompact
-            + scale_info::TypeInfo;
+            + scale_info::TypeInfo
+            + Into<u128>;
+        /// Hook called after every expenditure is recorded.
+        type AuditHook: crate::AuditHook;
     }
 
     /// Department id -> allocated budget (in base units).
@@ -118,6 +133,13 @@ pub mod pallet {
             let idx = NextExpenditureIndex::<T>::get();
             ExpenditureLog::<T>::insert(idx, (department_id, amount, metadata_hash));
             NextExpenditureIndex::<T>::put(idx.saturating_add(1));
+            // Notify the audit pallet (or no-op if AuditHook = NoopAuditHook).
+            T::AuditHook::on_expenditure(
+                idx as u32,
+                department_id,
+                amount.into(),
+                metadata_hash,
+            );
             Self::deposit_event(Event::FundsSpent { department_id, amount, metadata_hash });
             Ok(())
         }

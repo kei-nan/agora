@@ -245,4 +245,13 @@ mod runtime {
 
 	#[runtime::pallet_index(13)]
 	pub type Legislature = pallet_legislature;
+
+	#[runtime::pallet_index(14)]
+	pub type PalletElections = pallet_elections;
+
+	#[runtime::pallet_index(15)]
+	pub type PalletEmergencyCouncil = pallet_emergency_council;
+
+	#[runtime::pallet_index(16)]
+	pub type PalletAudit = pallet_audit;
 }

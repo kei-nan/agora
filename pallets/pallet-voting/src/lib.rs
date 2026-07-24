@@ -95,6 +95,10 @@ pub mod pallet {
         /// Verifier for MACI tally ZK proofs. Use PassthroughMACIVerifier in dev; wire in the
         /// real MACI verifier once circuit trusted setup is complete.
         type MACITallyVerifier: MACITallyVerifier;
+        /// The origin permitted to start a new fiscal year (open a new budget epoch).
+        /// Wired to the legislature motion origin so only a passed legislature vote
+        /// can open a new fiscal year. Use EnsureRoot during development.
+        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -357,14 +361,14 @@ pub mod pallet {
 
         /// Open a new fiscal year, making budget tokens available for citizens to claim.
         /// Tokens from the previous epoch cannot be carried over (expire on the old epoch).
-        /// Origin: root (TODO: legislature origin).
+        /// Origin: legislature motion (T::LegislatureOrigin).
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
         pub fn start_fiscal_year(
             origin: OriginFor<T>,
             tokens_per_citizen: u64,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::LegislatureOrigin::ensure_origin(origin)?;
             let epoch = FiscalYearEpoch::<T>::get().saturating_add(1);
             FiscalYearEpoch::<T>::put(epoch);
             EpochTokenAllocation::<T>::insert(epoch, tokens_per_citizen);

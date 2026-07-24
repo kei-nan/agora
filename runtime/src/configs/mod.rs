@@ -217,6 +217,8 @@ impl pallet_identity_zk::Config for Runtime {
 	/// TODO: replace with a court-controlled multisig origin once pallet-courts has a dedicated
 	/// SuspensionOrigin council. Using root for now.
 	type SuspensionOrigin = EnsureRoot<AccountId>;
+	/// Merkle root allowlist management. Root for now; swap to a governance collective later.
+	type AdminOrigin = EnsureRoot<AccountId>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -226,6 +228,8 @@ impl pallet_identity_zk::Config for Runtime {
 	/// vk_sha1.bin to be populated (see scripts/convert_vk.py).
 	type ZkVerifier = crate::verifier::RarimoGroth16Verifier;
 	type SuspensionOrigin = EnsureRoot<AccountId>;
+	/// Merkle root allowlist management. Root for now; swap to a governance collective later.
+	type AdminOrigin = EnsureRoot<AccountId>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs.
@@ -294,11 +298,26 @@ impl pallet_voting::Config for Runtime {
 	type PassageThreshold = ConstU8<51>;
 	type LawEnactor = Runtime;
 	type MACITallyVerifier = PassthroughMACIVerifier;
+	/// Fiscal year start is a legislature motion — wired to the same origin as
+	/// pallet-constitution's law-enactment gate so budget epochs are on-chain governed.
+	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+}
+
+/// Type alias for the audit pallet used in cross-pallet trait wiring.
+/// The canonical `PalletAudit` alias for `construct_runtime!` lives in `runtime/src/lib.rs`.
+type PalletAuditImpl = pallet_audit::Pallet<Runtime>;
+
+impl pallet_audit::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// At most 10 registered auditors.
+	type MaxAuditors = ConstU32<10>;
 }
 
 impl pallet_treasury_ledger::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type Balance = Balance;
+	/// Wire the audit pallet as the expenditure hook.
+	type AuditHook = PalletAuditImpl;
 }
 
 /// Runtime implements CitizenSelector by reading pallet-identity's indexed storage.
@@ -399,6 +418,21 @@ impl pallet_constitution::Config for Runtime {
 	type HumanRightsOrigin = EnsureSignedBy<HrcCouncil, AccountId>;
 	/// HRC has 14 days to veto a newly enacted law on human rights grounds.
 	type HRCVetoWindowBlocks = ConstU32<{ 14 * DAYS }>;
+	/// Courts origin for invalidate_law. EnsureRoot for now; swap to a dedicated
+	/// pallet-courts origin once that pallet exposes a standalone origin type.
+	type CourtOrigin = EnsureRoot<AccountId>;
+}
+
+impl pallet_emergency_council::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// 30 days at 6s/block — constitutionally hard-coded ceiling on emergency duration.
+	type MaxEmergencyBlocks = ConstU32<432_000>;
+	/// Emergency Council may have at most 15 members.
+	type MaxCouncilSize = ConstU32<15>;
+	/// Supermajority numerator: 2 (for 2/3 majority).
+	type SupermajorityNumerator = ConstU32<2>;
+	/// Supermajority denominator: 3 (for 2/3 majority).
+	type SupermajorityDenominator = ConstU32<3>;
 }
 
 impl pallet_legislature::Config for Runtime {
@@ -409,4 +443,27 @@ impl pallet_legislature::Config for Runtime {
 	type MotionDurationBlocks = ConstU32<{ 7 * DAYS }>;
 	/// Simple majority (50%+1) required to pass a motion.
 	type PassageThreshold = ConstU8<50>;
+}
+
+// ── Elections Commission ─────────────────────────────────────────────────────
+
+/// Runtime implements pallet_elections::CitizenChecker by delegating to pallet-identity.
+impl pallet_elections::CitizenChecker<AccountId> for Runtime {
+	fn is_active_citizen(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+}
+
+impl pallet_elections::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Candidate deposit: 1 AGR token (1_000_000_000_000 planck). Refunded after election certified.
+	type CandidateDeposit = ConstU128<1_000_000_000_000>;
+	/// Up to 20 commissioners on the Elections Commission.
+	type MaxCommissioners = ConstU32<20>;
+	/// Up to 100 candidates per election.
+	type MaxCandidatesPerElection = ConstU32<100>;
+	/// Use the chain's native Balances pallet for deposits.
+	type Currency = Balances;
+	/// Citizen eligibility gated on active passport registration.
+	type CitizenChecker = Runtime;
 }

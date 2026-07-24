@@ -65,6 +65,10 @@ pub mod pallet {
         /// Blocks after law enactment during which the HRC may veto. After this window only courts can invalidate.
         #[pallet::constant]
         type HRCVetoWindowBlocks: Get<u32>;
+        /// The origin permitted to call `invalidate_law` (pause a law via courts ruling).
+        /// Wire to a dedicated courts origin type once pallet-courts exposes one.
+        /// Use EnsureRoot for now to preserve current behaviour while making it swappable.
+        type CourtOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
     }
 
     /// law_id -> (tier, status, version, ipfs_content_hash).
@@ -154,7 +158,7 @@ pub mod pallet {
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(6_000, 0))]
         pub fn invalidate_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            ensure_root(origin)?; // TODO: courts pallet origin
+            T::CourtOrigin::ensure_origin(origin)?;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
                 ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);

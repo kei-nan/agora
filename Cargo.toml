@@ -15,6 +15,9 @@ members = [
     "pallets/pallet-courts",
     "pallets/pallet-constitution",
     "pallets/pallet-legislature",
+    "pallets/pallet-elections",
+    "pallets/pallet-emergency-council",
+    "pallets/pallet-audit",
     "runtime",
 ]
 resolver = "2"
@@ -28,6 +31,9 @@ pallet-treasury-ledger = { path = "./pallets/pallet-treasury-ledger", default-fe
 pallet-courts = { path = "./pallets/pallet-courts", default-features = false }
 pallet-constitution = { path = "./pallets/pallet-constitution", default-features = false }
 pallet-legislature = { path = "./pallets/pallet-legislature", default-features = false }
+pallet-elections = { path = "./pallets/pallet-elections", default-features = false }
+pallet-emergency-council = { path = "./pallets/pallet-emergency-council", default-features = false }
+pallet-audit = { path = "./pallets/pallet-audit", default-features = false }
 ark-bn254 = { version = "0.4", default-features = false, features = ["curve"] }
 ark-groth16 = { version = "0.4", default-features = false }
 ark-serialize = { version = "0.4", default-features = false }
