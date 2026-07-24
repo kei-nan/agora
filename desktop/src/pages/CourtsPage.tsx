@@ -15,11 +15,14 @@ interface Ruling {
 }
 
 const LEVEL_LABELS = ["AI Judge", "Jury (7)", "Constitutional Jury (21)"];
+const ZERO_HASH = "0x" + "0".repeat(64);
 
 export default function CourtsPage() {
   const [rulings, setRulings] = useState<Ruling[]>([]);
   const [selected, setSelected] = useState<Ruling | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ipfsContent, setIpfsContent] = useState<string | null>(null);
+  const [ipfsLoading, setIpfsLoading] = useState(false);
   const { setActiveItem } = useAgent();
 
   useEffect(() => {
@@ -31,10 +34,24 @@ export default function CourtsPage() {
 
   function selectRuling(r: Ruling) {
     setSelected(r);
+    setIpfsContent(null);
     setActiveItem(
       r.id,
       `Court ruling: ${r.caseTitle}\nLevel: ${LEVEL_LABELS[r.level]}\nOutcome: ${r.outcome}\nSummary: ${r.summary}\nIPFS: ${r.ipfsHash}`
     );
+    if (r.ipfsHash && r.ipfsHash !== ZERO_HASH) {
+      setIpfsLoading(true);
+      invoke<string>("fetch_ipfs_content", { hashHex: r.ipfsHash })
+        .then((text) => {
+          setIpfsContent(text);
+          setActiveItem(
+            r.id,
+            `Court ruling: ${r.caseTitle}\nLevel: ${LEVEL_LABELS[r.level]}\nOutcome: ${r.outcome}\n\n${text}`
+          );
+        })
+        .catch(() => setIpfsContent(null))
+        .finally(() => setIpfsLoading(false));
+    }
   }
 
   return (
@@ -64,7 +81,12 @@ export default function CourtsPage() {
           <p className="detail-meta">
             {LEVEL_LABELS[selected.level]} · {selected.outcome}
           </p>
-          <p className="detail-summary">{selected.summary}</p>
+          {ipfsLoading && <p className="loading">Fetching ruling from IPFS…</p>}
+          {ipfsContent ? (
+            <pre className="ipfs-content">{ipfsContent}</pre>
+          ) : (
+            !ipfsLoading && <p className="detail-summary">{selected.summary}</p>
+          )}
           <a className="ipfs-link" href={`https://ipfs.io/ipfs/${selected.ipfsHash}`} target="_blank" rel="noreferrer">
             Full ruling on IPFS
           </a>

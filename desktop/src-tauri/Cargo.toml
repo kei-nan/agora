@@ -30,6 +30,7 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 twox-hash = "1.6"
 hex = "0.4"
+bs58 = "0.5"
 
 [profile.release]
 panic = "abort"

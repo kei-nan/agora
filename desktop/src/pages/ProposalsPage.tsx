@@ -14,12 +14,17 @@ interface Proposal {
   endsAt: number;
   ipfsHash: string;
   summary: string;
+  tier: "ordinary" | "constitutional";
 }
+
+const ZERO_HASH = "0x" + "0".repeat(64);
 
 export default function ProposalsPage() {
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [selected, setSelected] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ipfsContent, setIpfsContent] = useState<string | null>(null);
+  const [ipfsLoading, setIpfsLoading] = useState(false);
   const { setActiveItem } = useAgent();
 
   useEffect(() => {
@@ -31,7 +36,21 @@ export default function ProposalsPage() {
 
   function selectProposal(p: Proposal) {
     setSelected(p);
+    setIpfsContent(null);
     setActiveItem(p.id, `Proposal: ${p.title}\n\nSummary: ${p.summary}\nStatus: ${p.status}\nIPFS: ${p.ipfsHash}`);
+    if (p.ipfsHash && p.ipfsHash !== ZERO_HASH) {
+      setIpfsLoading(true);
+      invoke<string>("fetch_ipfs_content", { hashHex: p.ipfsHash })
+        .then((text) => {
+          setIpfsContent(text);
+          setActiveItem(
+            p.id,
+            `Proposal: ${p.title}\nStatus: ${p.status}\nProposed by: ${p.proposer}\n\n${text}`
+          );
+        })
+        .catch(() => setIpfsContent(null))
+        .finally(() => setIpfsLoading(false));
+    }
   }
 
   return (
@@ -48,6 +67,9 @@ export default function ProposalsPage() {
               onClick={() => selectProposal(p)}
             >
               <span className={`status-chip status-${p.status}`}>{p.status}</span>
+              {p.tier === "constitutional" && (
+                <span className="tier-chip tier-constitutional">const.</span>
+              )}
               <span className="item-title">{p.title}</span>
               <span className="item-meta">
                 {p.votesFor} for · {p.votesAgainst} against
@@ -61,7 +83,12 @@ export default function ProposalsPage() {
         <div className="detail-panel">
           <h2 className="detail-title">{selected.title}</h2>
           <p className="detail-meta">Proposed by {selected.proposer}</p>
-          <p className="detail-summary">{selected.summary}</p>
+          {ipfsLoading && <p className="loading">Fetching proposal text from IPFS…</p>}
+          {ipfsContent ? (
+            <pre className="ipfs-content">{ipfsContent}</pre>
+          ) : (
+            !ipfsLoading && <p className="detail-summary">{selected.summary}</p>
+          )}
           <a className="ipfs-link" href={`https://ipfs.io/ipfs/${selected.ipfsHash}`} target="_blank" rel="noreferrer">
             Full text on IPFS
           </a>

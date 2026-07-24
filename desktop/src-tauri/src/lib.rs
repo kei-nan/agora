@@ -3,13 +3,11 @@ mod rpc;
 
 use commands::{agent, auth, chain};
 use auth::PendingSessions;
-use std::collections::HashMap;
-use std::sync::Mutex;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(PendingSessions(Mutex::new(HashMap::new())))
+        .manage(PendingSessions::new())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -19,9 +17,13 @@ pub fn run() {
             chain::fetch_proposals,
             chain::fetch_laws,
             chain::fetch_treasury,
+            chain::fetch_department_budgets,
             chain::fetch_rulings,
+            chain::fetch_ipfs_content,
+            chain::auth_verify_nullifier,
             auth::auth_generate_challenge,
             auth::auth_poll_session,
+            auth::auth_start_callback_server,
             agent::agent_ask,
         ])
         .run(tauri::generate_context!())

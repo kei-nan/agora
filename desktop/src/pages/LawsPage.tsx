@@ -18,6 +18,8 @@ export default function LawsPage() {
   const [laws, setLaws] = useState<Law[]>([]);
   const [selected, setSelected] = useState<Law | null>(null);
   const [loading, setLoading] = useState(true);
+  const [ipfsContent, setIpfsContent] = useState<string | null>(null);
+  const [ipfsLoading, setIpfsLoading] = useState(false);
   const { setActiveItem } = useAgent();
 
   useEffect(() => {
@@ -29,10 +31,24 @@ export default function LawsPage() {
 
   function selectLaw(law: Law) {
     setSelected(law);
+    setIpfsContent(null);
     setActiveItem(
       law.id,
       `Law: ${law.title}\nTier: ${law.tier}\nVersion: ${law.version}\nSummary: ${law.summary}\nIPFS: ${law.ipfsHash}`
     );
+    if (law.ipfsHash && law.ipfsHash !== "0x" + "0".repeat(64)) {
+      setIpfsLoading(true);
+      invoke<string>("fetch_ipfs_content", { hashHex: law.ipfsHash })
+        .then((text) => {
+          setIpfsContent(text);
+          setActiveItem(
+            law.id,
+            `Law: ${law.title}\nTier: ${law.tier}\nVersion: ${law.version}\n\n${text}`
+          );
+        })
+        .catch(() => setIpfsContent(null))
+        .finally(() => setIpfsLoading(false));
+    }
   }
 
   return (
@@ -62,9 +78,19 @@ export default function LawsPage() {
           <p className="detail-meta">
             {selected.tier} law · version {selected.version}
           </p>
-          <p className="detail-summary">{selected.summary}</p>
-          <a className="ipfs-link" href={`https://ipfs.io/ipfs/${selected.ipfsHash}`} target="_blank" rel="noreferrer">
-            Full text on IPFS
+          {ipfsLoading && <p className="loading">Fetching law text from IPFS…</p>}
+          {ipfsContent ? (
+            <pre className="ipfs-content">{ipfsContent}</pre>
+          ) : (
+            !ipfsLoading && <p className="detail-summary">{selected.summary}</p>
+          )}
+          <a
+            className="ipfs-link"
+            href={`https://ipfs.io/ipfs/${selected.ipfsHash}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            View raw on IPFS
           </a>
           <AgentPanel itemTitle="law" />
         </div>
