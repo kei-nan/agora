@@ -41,6 +41,35 @@ pub mod pallet {
         fn suspend_citizen(nullifier: [u8; 32], until: Option<u32>) -> DispatchResult;
     }
 
+    // ── Oracle origin ────────────────────────────────────────────────────────────
+
+    /// Accepts a `Signed` origin only if the signer matches the stored `OracleAccount`.
+    /// Returns `Err(origin)` if no oracle account is set or the signer doesn't match.
+    /// Governance can rotate the oracle via `set_oracle_account` without a runtime upgrade.
+    pub struct EnsureOracle<T>(core::marker::PhantomData<T>);
+
+    impl<T: Config> frame_support::traits::EnsureOrigin<T::RuntimeOrigin> for EnsureOracle<T> {
+        type Success = T::AccountId;
+
+        fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
+            use frame_system::RawOrigin;
+            let oracle = match OracleAccount::<T>::get() {
+                Some(a) => a,
+                None => return Err(o),
+            };
+            match o.clone().into() {
+                Ok(RawOrigin::Signed(who)) if who == oracle => Ok(who),
+                _ => Err(o),
+            }
+        }
+
+        #[cfg(feature = "runtime-benchmarks")]
+        fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
+            let oracle = OracleAccount::<T>::get().ok_or(())?;
+            Ok(frame_system::RawOrigin::Signed(oracle).into())
+        }
+    }
+
     // ── Enums ───────────────────────────────────────────────────────────────────
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
@@ -132,6 +161,12 @@ pub mod pallet {
     pub type JuryTally<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, (u32, u32), ValueQuery>;
 
+    /// The designated AI oracle account. Only this account may call `submit_ai_ruling`
+    /// and `finalize_ruling`. Set by root via `set_oracle_account`; rotatable without
+    /// a runtime upgrade.
+    #[pallet::storage]
+    pub type OracleAccount<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
+
     // ── Events ──────────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -144,6 +179,7 @@ pub mod pallet {
         RulingFinalized { case_id: u32, verdict: Verdict },
         RulingEnforced { case_id: u32 },
         JuryVoteCast { case_id: u32, juror: T::AccountId, verdict: Verdict },
+        OracleAccountSet { account: T::AccountId },
     }
 
     // ── Errors ──────────────────────────────────────────────────────────────────
@@ -305,6 +341,17 @@ pub mod pallet {
             } else if overturned > majority_threshold {
                 Self::auto_finalize(case_id, Verdict::Overturned)?;
             }
+            Ok(())
+        }
+
+        /// Set the designated AI oracle account. Only root may call this.
+        /// After this call, `submit_ai_ruling` and `finalize_ruling` require the oracle's signature.
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn set_oracle_account(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
+            ensure_root(origin)?;
+            OracleAccount::<T>::put(account.clone());
+            Self::deposit_event(Event::OracleAccountSet { account });
             Ok(())
         }
     }

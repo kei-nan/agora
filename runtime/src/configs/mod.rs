@@ -32,10 +32,10 @@ use frame_support::{
 		IdentityFee, Weight,
 	},
 };
-use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot};
+use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot, EnsureSignedBy};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, Perbill};
+use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, AccountId32, Perbill};
 use sp_version::RuntimeVersion;
 
 // Local module imports
@@ -342,8 +342,8 @@ impl pallet_courts::Config for Runtime {
 	type CitizenSelector = Runtime;
 	type LawEnforcer = Runtime;
 	type TreasuryEnforcer = Runtime;
-	/// TODO: replace with a dedicated oracle account origin in production.
-	type OracleOrigin = EnsureRoot<AccountId>;
+	/// Oracle account stored in OracleAccount storage; set via set_oracle_account (root-only).
+	type OracleOrigin = pallet_courts::EnsureOracle<Runtime>;
 	type CitizenSuspender = Runtime;
 	/// TODO: replace with Babe/SASSAFRAS VRF randomness before mainnet.
 	type Randomness = BlockHashRandomness;
@@ -363,6 +363,26 @@ impl pallet_constitution::PetitionApprover for Runtime {
 	}
 }
 
+// ── HRC (Human Rights Commission) origin ────────────────────────────────────
+
+/// The Human Rights Commission seat — currently a single well-known dev account (//Eve),
+/// distinct from Alice/sudo. HRC may veto newly enacted laws within HRCVetoWindowBlocks.
+///
+/// TODO (mainnet): replace with a pallet-collective instance appointed by supermajority vote.
+pub struct HrcCouncil;
+
+impl frame_support::traits::SortedMembers<AccountId32> for HrcCouncil {
+	fn sorted_members() -> alloc::vec::Vec<AccountId32> {
+		// SR25519 "//Eve" public key (subkey inspect //Eve --scheme sr25519)
+		alloc::vec![AccountId32::from([
+			0xe6, 0x59, 0xa7, 0xa1, 0x62, 0x8c, 0xdd, 0x93,
+			0xfe, 0xbc, 0x04, 0xa4, 0xe0, 0x64, 0x6e, 0xa2,
+			0x0e, 0x9f, 0x5f, 0x0c, 0xe0, 0x97, 0xd9, 0xa0,
+			0x52, 0x90, 0xd4, 0xa9, 0xe0, 0x54, 0xdf, 0x4e,
+		])]
+	}
+}
+
 impl pallet_constitution::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	/// Constitutional amendments require 30 days of deliberation before ratification.
@@ -374,8 +394,9 @@ impl pallet_constitution::Config for Runtime {
 	type CitizenChecker = Runtime;
 	/// Ordinary law amendments take effect immediately (no deliberation window).
 	type OrdinaryAmendmentDeliberationBlocks = ConstU32<0>;
-	/// TODO: replace with a proper HRC collective origin in production.
-	type HumanRightsOrigin = EnsureRoot<AccountId>;
+	/// HRC veto: the //Eve dev account acts as the HRC seat.
+	/// TODO (mainnet): replace with a pallet-collective HRC instance.
+	type HumanRightsOrigin = EnsureSignedBy<HrcCouncil, AccountId>;
 	/// HRC has 14 days to veto a newly enacted law on human rights grounds.
 	type HRCVetoWindowBlocks = ConstU32<{ 14 * DAYS }>;
 }
