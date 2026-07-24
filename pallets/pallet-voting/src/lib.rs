@@ -34,8 +34,9 @@ pub mod pallet {
     }
 
     /// Called by pallet-voting when a referendum passes — enacts the law in pallet-constitution.
+    /// The tier is forwarded so pallet-constitution can record the correct law tier.
     pub trait LawEnactor {
-        fn enact_law(content_hash: [u8; 32]) -> DispatchResult;
+        fn enact_law(tier: ReferendumTier, content_hash: [u8; 32]) -> DispatchResult;
     }
 
     /// Verifies an off-chain MACI tally ZK proof. The proof attests that
@@ -56,6 +57,14 @@ pub mod pallet {
         Voting,
         Passed,
         Failed,
+    }
+
+    /// Whether a referendum would enact an ordinary or constitutional law.
+    /// Constitutional referenda require a supermajority (ConstitutionalPassageThreshold).
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum ReferendumTier {
+        Ordinary,
+        Constitutional,
     }
 
     #[pallet::config]
@@ -87,9 +96,13 @@ pub mod pallet {
         /// How long a referendum voting window stays open in blocks (e.g. 14 * DAYS).
         #[pallet::constant]
         type ReferendumDurationBlocks: Get<u32>;
-        /// Percentage of yes votes required for a referendum to pass (0-100). e.g. 50 = majority.
+        /// Percentage of yes votes required to pass an ordinary referendum (0–100).
         #[pallet::constant]
         type PassageThreshold: Get<u8>;
+        /// Percentage of yes votes required to pass a constitutional referendum (0–100).
+        /// Must be higher than PassageThreshold (e.g. 67 for 2/3 supermajority).
+        #[pallet::constant]
+        type ConstitutionalPassageThreshold: Get<u8>;
         /// Hook called when a referendum passes — enacts the law in pallet-constitution.
         type LawEnactor: LawEnactor;
         /// Verifier for MACI tally ZK proofs. Use PassthroughMACIVerifier in dev; wire in the
@@ -99,6 +112,12 @@ pub mod pallet {
         /// Wired to the legislature motion origin so only a passed legislature vote
         /// can open a new fiscal year. Use EnsureRoot during development.
         type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// Minimum duration of a voting epoch in blocks.
+        #[pallet::constant]
+        type MinEpochDurationBlocks: Get<u32>;
+        /// Maximum duration of a voting epoch in blocks (constitutional ceiling).
+        #[pallet::constant]
+        type MaxEpochDurationBlocks: Get<u32>;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -162,10 +181,10 @@ pub mod pallet {
 
     // ── Referendum storage ───────────────────────────────────────────────────
 
-    /// referendum_id -> (petition_id, topic_hash, end_block, state).
+    /// referendum_id -> (petition_id, topic_hash, end_block, state, tier).
     #[pallet::storage]
     pub type Referenda<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32, (u32, [u8; 32], BlockNumberFor<T>, ReferendumState)>;
+        StorageMap<_, Blake2_128Concat, u32, (u32, [u8; 32], BlockNumberFor<T>, ReferendumState, ReferendumTier)>;
 
     /// petition_id -> referendum_id. Prevents duplicate referenda for the same petition.
     #[pallet::storage]
@@ -184,6 +203,18 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type NextReferendumId<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    // ── Voting epoch storage ─────────────────────────────────────────────────
+
+    /// Current active voting epoch: (start_block, end_block). None = no epoch open.
+    /// Citizens may only cast referendum votes while this is Some and now is in [start, end].
+    #[pallet::storage]
+    pub type ActiveEpoch<T: Config> =
+        StorageValue<_, (BlockNumberFor<T>, BlockNumberFor<T>)>;
+
+    /// Monotonically increasing voting epoch counter. Incremented each time an epoch opens.
+    #[pallet::storage]
+    pub type EpochNumber<T: Config> = StorageValue<_, u32, ValueQuery>;
 
     // ── Events ───────────────────────────────────────────────────────────────
 
@@ -207,7 +238,12 @@ pub mod pallet {
             petition_id: u32,
             topic_hash: [u8; 32],
             ends_at: BlockNumberFor<T>,
+            tier: ReferendumTier,
         },
+        /// A periodic voting epoch opened — citizens may now vote on active referenda.
+        VotingEpochOpened { epoch: u32, start: BlockNumberFor<T>, end: BlockNumberFor<T> },
+        /// A voting epoch closed — no more votes accepted until the next epoch opens.
+        VotingEpochClosed { epoch: u32 },
         /// A citizen cast a vote on a referendum.
         ReferendumVoteCast { referendum_id: u32, voter: T::AccountId, in_favor: bool },
         /// A referendum passed the passage threshold — law has been enacted.
@@ -253,6 +289,14 @@ pub mod pallet {
         ProposalStillActive,
         /// duration_blocks is outside [MinProposalDurationBlocks, MaxProposalDurationBlocks].
         InvalidProposalDuration,
+        /// Voting is only permitted during an active voting epoch.
+        VotingEpochNotActive,
+        /// A voting epoch is already open; close it before opening a new one.
+        EpochAlreadyActive,
+        /// The voting epoch end block has not passed yet; cannot close early.
+        EpochStillActive,
+        /// duration_blocks is outside [MinEpochDurationBlocks, MaxEpochDurationBlocks].
+        InvalidEpochDuration,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────
@@ -452,13 +496,20 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
-            let (petition_id, topic_hash, end_block, state) =
+            let (petition_id, topic_hash, end_block, state, tier) =
                 Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
             ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
             ensure!(
                 frame_system::Pallet::<T>::block_number() <= end_block,
                 Error::<T>::ReferendumNotActive
             );
+            // Voting is only permitted during an active epoch (Swiss batched-voting model).
+            if let Some((epoch_start, epoch_end)) = ActiveEpoch::<T>::get() {
+                let now = frame_system::Pallet::<T>::block_number();
+                ensure!(now >= epoch_start && now <= epoch_end, Error::<T>::VotingEpochNotActive);
+            } else {
+                return Err(Error::<T>::VotingEpochNotActive.into());
+            }
             ensure!(
                 !ReferendumHasVoted::<T>::get((referendum_id, &who)),
                 Error::<T>::AlreadyVotedInReferendum
@@ -467,8 +518,7 @@ pub mod pallet {
             ReferendumTally::<T>::mutate(referendum_id, |(yes, no)| {
                 if in_favor { *yes = yes.saturating_add(1); } else { *no = no.saturating_add(1); }
             });
-            // Re-insert unchanged fields to satisfy the borrow checker.
-            let _ = (petition_id, topic_hash, end_block);
+            let _ = (petition_id, topic_hash, end_block, tier);
             Self::deposit_event(Event::ReferendumVoteCast { referendum_id, voter: who, in_favor });
             Ok(())
         }
@@ -480,7 +530,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn finalize_referendum(origin: OriginFor<T>, referendum_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
-            let (petition_id, topic_hash, end_block, state) =
+            let (petition_id, topic_hash, end_block, state, tier) =
                 Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
             ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
             ensure!(
@@ -489,12 +539,19 @@ pub mod pallet {
             );
             let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
             let total = yes_count.saturating_add(no_count);
-            let passed = total > 0
-                && yes_count.saturating_mul(100) >= T::PassageThreshold::get() as u32 * total;
+            // Constitutional referenda require a higher supermajority threshold.
+            let threshold = match tier {
+                ReferendumTier::Ordinary => T::PassageThreshold::get() as u32,
+                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u32,
+            };
+            let passed = total > 0 && yes_count.saturating_mul(100) >= threshold * total;
             let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
-            Referenda::<T>::insert(referendum_id, (petition_id, topic_hash, end_block, new_state));
+            Referenda::<T>::insert(
+                referendum_id,
+                (petition_id, topic_hash, end_block, new_state, tier.clone()),
+            );
             if passed {
-                T::LawEnactor::enact_law(topic_hash)?;
+                T::LawEnactor::enact_law(tier, topic_hash)?;
                 Self::deposit_event(Event::ReferendumPassed { referendum_id, topic_hash });
             } else {
                 Self::deposit_event(Event::ReferendumFailed { referendum_id });
@@ -539,6 +596,100 @@ pub mod pallet {
             Self::deposit_event(Event::TallySubmitted { proposal_id, yes_votes, no_votes, commitment_root });
             Ok(())
         }
+
+        /// Open a new Swiss-model voting epoch. Citizens may only vote on referenda during
+        /// an active epoch. The legislature controls when epochs open and how long they last.
+        /// Emits VotingEpochOpened. Fails if an epoch is already active.
+        #[pallet::call_index(10)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn open_voting_epoch(
+            origin: OriginFor<T>,
+            duration_blocks: u32,
+        ) -> DispatchResult {
+            T::LegislatureOrigin::ensure_origin(origin)?;
+            ensure!(ActiveEpoch::<T>::get().is_none(), Error::<T>::EpochAlreadyActive);
+            ensure!(
+                duration_blocks >= T::MinEpochDurationBlocks::get()
+                    && duration_blocks <= T::MaxEpochDurationBlocks::get(),
+                Error::<T>::InvalidEpochDuration
+            );
+            let now = frame_system::Pallet::<T>::block_number();
+            let end = now + BlockNumberFor::<T>::from(duration_blocks);
+            ActiveEpoch::<T>::put((now, end));
+            let epoch = EpochNumber::<T>::get().saturating_add(1);
+            EpochNumber::<T>::put(epoch);
+            Self::deposit_event(Event::VotingEpochOpened { epoch, start: now, end });
+            Ok(())
+        }
+
+        /// Create a Constitutional-tier referendum directly, without a citizen petition.
+        /// Only the legislature (via a passed motion) may call this.
+        /// Use for constitutional amendments and other matters requiring the
+        /// ConstitutionalPassageThreshold supermajority to pass.
+        /// petition_id is set to u32::MAX (sentinel — no backing petition).
+        #[pallet::call_index(11)]
+        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        pub fn create_constitutional_referendum(
+            origin: OriginFor<T>,
+            topic_hash: [u8; 32],
+        ) -> DispatchResult {
+            T::LegislatureOrigin::ensure_origin(origin)?;
+            let id = NextReferendumId::<T>::get();
+            let now = frame_system::Pallet::<T>::block_number();
+            let ends_at = if let Some((_, epoch_end)) = ActiveEpoch::<T>::get() {
+                epoch_end
+            } else {
+                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
+            };
+            Referenda::<T>::insert(
+                id,
+                (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Constitutional),
+            );
+            NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::ReferendumCreated {
+                referendum_id: id,
+                petition_id: u32::MAX,
+                topic_hash,
+                ends_at,
+                tier: ReferendumTier::Constitutional,
+            });
+            Ok(())
+        }
+
+        /// Manually close an expired voting epoch.
+        /// Anyone may call this after the epoch's end block has passed.
+        /// The on_initialize hook auto-closes epochs on the first block after expiry, so
+        /// this call is a fallback for explicit finalization.
+        #[pallet::call_index(12)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn close_voting_epoch(origin: OriginFor<T>) -> DispatchResult {
+            let _who = ensure_signed(origin)?;
+            let (_, end_block) = ActiveEpoch::<T>::get().ok_or(Error::<T>::VotingEpochNotActive)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now > end_block, Error::<T>::EpochStillActive);
+            ActiveEpoch::<T>::kill();
+            let epoch = EpochNumber::<T>::get();
+            Self::deposit_event(Event::VotingEpochClosed { epoch });
+            Ok(())
+        }
+    }
+
+    // ── Hooks ────────────────────────────────────────────────────────────────
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+        /// Auto-expire the active voting epoch on the first block after its end.
+        fn on_initialize(now: BlockNumberFor<T>) -> Weight {
+            if let Some((_, end_block)) = ActiveEpoch::<T>::get() {
+                if now > end_block {
+                    ActiveEpoch::<T>::kill();
+                    let epoch = EpochNumber::<T>::get();
+                    Self::deposit_event(Event::VotingEpochClosed { epoch });
+                    return Weight::from_parts(10_000, 0);
+                }
+            }
+            Weight::zero()
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -546,18 +697,38 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         /// Called by pallet-constitution (via PetitionApprover trait in the runtime) when a
         /// petition hits PetitionThreshold. Creates a timed referendum from the petition.
-        pub fn create_referendum_internal(petition_id: u32, topic_hash: [u8; 32]) -> DispatchResult {
+        /// `tier` controls whether simple majority or supermajority is required to pass.
+        pub fn create_referendum_internal(
+            petition_id: u32,
+            topic_hash: [u8; 32],
+            tier: ReferendumTier,
+        ) -> DispatchResult {
             ensure!(
                 !PetitionReferendum::<T>::contains_key(petition_id),
                 Error::<T>::ReferendumAlreadyExists
             );
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
-            Referenda::<T>::insert(id, (petition_id, topic_hash, ends_at, ReferendumState::Voting));
+            // If a voting epoch is active, the referendum closes at epoch end so citizens
+            // can vote in the same epoch it's announced. Otherwise, fall back to duration.
+            let ends_at = if let Some((_start, epoch_end)) = ActiveEpoch::<T>::get() {
+                epoch_end
+            } else {
+                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
+            };
+            Referenda::<T>::insert(
+                id,
+                (petition_id, topic_hash, ends_at, ReferendumState::Voting, tier.clone()),
+            );
             PetitionReferendum::<T>::insert(petition_id, id);
             NextReferendumId::<T>::put(id.saturating_add(1));
-            Self::deposit_event(Event::ReferendumCreated { referendum_id: id, petition_id, topic_hash, ends_at });
+            Self::deposit_event(Event::ReferendumCreated {
+                referendum_id: id,
+                petition_id,
+                topic_hash,
+                ends_at,
+                tier,
+            });
             Ok(())
         }
 

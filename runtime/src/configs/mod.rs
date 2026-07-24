@@ -32,7 +32,7 @@ use frame_support::{
 		IdentityFee, Weight,
 	},
 };
-use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot, EnsureSignedBy};
+use frame_system::{limits::{BlockLength, BlockWeights}, EnsureSignedBy};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, AccountId32, Perbill};
@@ -165,26 +165,25 @@ impl pallet_template::Config for Runtime {
 
 // ── Randomness ───────────────────────────────────────────────────────────────
 
-/// Block-hash-based randomness source wired into pallets via the `Randomness` trait.
-///
-/// Mixes the 5 most recent block hashes with the caller's subject bytes, making
-/// manipulation require control of 5 consecutive authorship slots rather than one.
-/// This is still NOT safe against a determined adversary with significant stake.
-/// TODO: Replace with Babe/SASSAFRAS VRF randomness before any real deployment.
+/// Block-hash-based randomness for jury selection.
+/// Mixes the last 81 block hashes (matching the official pallet_insecure_randomness_collective_flip
+/// history length) with the subject bytes for domain separation.
+/// Still vulnerable to block-author manipulation — replace with BABE/SASSAFRAS VRF before mainnet.
+/// (pallet-insecure-randomness-collective-flip cannot be added as a dep because it transitively
+/// requires an older sp-io version incompatible with our frame-support 40.x stack.)
 pub struct BlockHashRandomness;
 
 impl frame_support::traits::Randomness<[u8; 32], BlockNumber> for BlockHashRandomness {
 	fn random(subject: &[u8]) -> ([u8; 32], BlockNumber) {
 		let current = frame_system::Pallet::<Runtime>::block_number();
 		let mut entropy = [0u8; 32];
-		for lag in 0u32..5 {
+		for lag in 0u32..81 {
 			let n = current.saturating_sub(lag);
 			let h = frame_system::Pallet::<Runtime>::block_hash(n);
 			for (i, b) in h.as_ref().iter().enumerate() {
 				entropy[i % 32] ^= b;
 			}
 		}
-		// Mix in subject bytes for domain separation so different callers get different seeds.
 		for (i, b) in subject.iter().enumerate() {
 			entropy[i % 32] ^= b;
 		}
@@ -214,11 +213,11 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 impl pallet_identity_zk::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type ZkVerifier = PassthroughZkVerifier;
-	/// TODO: replace with a court-controlled multisig origin once pallet-courts has a dedicated
-	/// SuspensionOrigin council. Using root for now.
-	type SuspensionOrigin = EnsureRoot<AccountId>;
-	/// Merkle root allowlist management. Root for now; swap to a governance collective later.
-	type AdminOrigin = EnsureRoot<AccountId>;
+	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
+	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
+	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// Merkle root allowlist updates require a legislature vote.
+	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -227,9 +226,11 @@ impl pallet_identity_zk::Config for Runtime {
 	/// Real Rarimo Groth16 BN254 verifier. Requires runtime/assets/vk_sha256.bin and
 	/// vk_sha1.bin to be populated (see scripts/convert_vk.py).
 	type ZkVerifier = crate::verifier::RarimoGroth16Verifier;
-	type SuspensionOrigin = EnsureRoot<AccountId>;
-	/// Merkle root allowlist management. Root for now; swap to a governance collective later.
-	type AdminOrigin = EnsureRoot<AccountId>;
+	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
+	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
+	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// Merkle root allowlist updates require a legislature vote.
+	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs.
@@ -266,13 +267,18 @@ impl pallet_voting::NullifierProvider<AccountId> for Runtime {
 	}
 }
 
-/// Runtime implements LawEnactor: when a referendum passes, enact an Ordinary law.
+/// Runtime implements LawEnactor: when a referendum passes, enact the law at the correct tier.
+/// The referendum tier is forwarded so constitutional referenda enact constitutional laws.
 impl pallet_voting::LawEnactor for Runtime {
-	fn enact_law(content_hash: [u8; 32]) -> sp_runtime::DispatchResult {
-		pallet_constitution::Pallet::<Runtime>::enact_law_internal(
-			pallet_constitution::LawTier::Ordinary,
-			content_hash,
-		)
+	fn enact_law(
+		tier: pallet_voting::ReferendumTier,
+		content_hash: [u8; 32],
+	) -> sp_runtime::DispatchResult {
+		let law_tier = match tier {
+			pallet_voting::ReferendumTier::Ordinary => pallet_constitution::LawTier::Ordinary,
+			pallet_voting::ReferendumTier::Constitutional => pallet_constitution::LawTier::Constitutional,
+		};
+		pallet_constitution::Pallet::<Runtime>::enact_law_internal(law_tier, content_hash)
 	}
 }
 
@@ -294,13 +300,19 @@ impl pallet_voting::Config for Runtime {
 	type MaxProposalDurationBlocks = ConstU32<{ 90 * DAYS }>;
 	/// Referendum voting window: 14 days.
 	type ReferendumDurationBlocks = ConstU32<{ 14 * DAYS }>;
-	/// Simple majority required to pass.
+	/// Simple majority required to pass an ordinary referendum.
 	type PassageThreshold = ConstU8<51>;
+	/// 2/3 supermajority required to pass a constitutional referendum.
+	type ConstitutionalPassageThreshold = ConstU8<67>;
 	type LawEnactor = Runtime;
 	type MACITallyVerifier = PassthroughMACIVerifier;
 	/// Fiscal year start is a legislature motion — wired to the same origin as
 	/// pallet-constitution's law-enactment gate so budget epochs are on-chain governed.
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Voting epochs must be at least 7 days long.
+	type MinEpochDurationBlocks = ConstU32<{ 7 * DAYS }>;
+	/// Voting epochs may not exceed 30 days (constitutional ceiling).
+	type MaxEpochDurationBlocks = ConstU32<{ 30 * DAYS }>;
 }
 
 /// Type alias for the audit pallet used in cross-pallet trait wiring.
@@ -364,7 +376,8 @@ impl pallet_courts::Config for Runtime {
 	/// Oracle account stored in OracleAccount storage; set via set_oracle_account (root-only).
 	type OracleOrigin = pallet_courts::EnsureOracle<Runtime>;
 	type CitizenSuspender = Runtime;
-	/// TODO: replace with Babe/SASSAFRAS VRF randomness before mainnet.
+	/// Mixes 81 historical block hashes; still insecure against block-author manipulation.
+	/// Replace with BABE/SASSAFRAS VRF before mainnet.
 	type Randomness = BlockHashRandomness;
 }
 
@@ -375,10 +388,15 @@ impl pallet_constitution::CitizenChecker<AccountId> for Runtime {
 	}
 }
 
-/// Runtime implements PetitionApprover: when a petition hits threshold, create a referendum.
+/// Runtime implements PetitionApprover: when a petition hits threshold, create an Ordinary
+/// referendum. Constitutional referenda require a separate legislature motion.
 impl pallet_constitution::PetitionApprover for Runtime {
 	fn create_referendum(petition_id: u32, topic_hash: [u8; 32]) -> sp_runtime::DispatchResult {
-		pallet_voting::Pallet::<Runtime>::create_referendum_internal(petition_id, topic_hash)
+		pallet_voting::Pallet::<Runtime>::create_referendum_internal(
+			petition_id,
+			topic_hash,
+			pallet_voting::ReferendumTier::Ordinary,
+		)
 	}
 }
 
@@ -418,9 +436,10 @@ impl pallet_constitution::Config for Runtime {
 	type HumanRightsOrigin = EnsureSignedBy<HrcCouncil, AccountId>;
 	/// HRC has 14 days to veto a newly enacted law on human rights grounds.
 	type HRCVetoWindowBlocks = ConstU32<{ 14 * DAYS }>;
-	/// Courts origin for invalidate_law. EnsureRoot for now; swap to a dedicated
-	/// pallet-courts origin once that pallet exposes a standalone origin type.
-	type CourtOrigin = EnsureRoot<AccountId>;
+	/// Courts origin for invalidate_law (manual override). The auto-enforcement path
+	/// uses invalidate_law_internal via the LawEnforcer trait; this extrinsic requires
+	/// the court oracle's explicit signature.
+	type CourtOrigin = pallet_courts::EnsureOracle<Runtime>;
 }
 
 impl pallet_emergency_council::Config for Runtime {
@@ -466,4 +485,50 @@ impl pallet_elections::Config for Runtime {
 	type Currency = Balances;
 	/// Citizen eligibility gated on active passport registration.
 	type CitizenChecker = Runtime;
+}
+
+// ── Anti-Corruption module ───────────────────────────────────────────────────
+
+/// Passthrough ZK verifier for the anti-corruption pallet (dev mode only).
+/// In production, wire in the same Rarimo Groth16 verifier used by pallet-identity.
+#[cfg(feature = "dev-mode")]
+pub struct PassthroughAntiCorruptionZkVerifier;
+
+#[cfg(feature = "dev-mode")]
+impl pallet_anticorruption::ZkProofVerifier for PassthroughAntiCorruptionZkVerifier {
+	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		true
+	}
+}
+
+#[cfg(feature = "dev-mode")]
+impl pallet_anticorruption::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type ZkVerifier = PassthroughAntiCorruptionZkVerifier;
+	/// Up to 20 designated investigators.
+	type MaxInvestigators = ConstU32<20>;
+	/// Asset disclosures must be renewed every ~1 year (5_256_000 blocks at 6s/block).
+	type AssetDisclosureRenewalBlocks = ConstU32<5_256_000>;
+}
+
+#[cfg(not(feature = "dev-mode"))]
+pub struct RarimoAntiCorruptionZkVerifier;
+
+#[cfg(not(feature = "dev-mode"))]
+impl pallet_anticorruption::ZkProofVerifier for RarimoAntiCorruptionZkVerifier {
+	fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
+		// Reuse the same Rarimo Groth16 circuit that pallet-identity uses.
+		<crate::verifier::RarimoGroth16Verifier as pallet_identity_zk::ZkProofVerifier>::verify(
+			proof_bytes,
+			public_inputs,
+		)
+	}
+}
+
+#[cfg(not(feature = "dev-mode"))]
+impl pallet_anticorruption::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type ZkVerifier = RarimoAntiCorruptionZkVerifier;
+	type MaxInvestigators = ConstU32<20>;
+	type AssetDisclosureRenewalBlocks = ConstU32<5_256_000>;
 }

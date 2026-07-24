@@ -14,11 +14,12 @@
 //! Convert the Rarimo snarkjs JSON VKs to binary with `scripts/convert_vk.py`.
 //! Download from <https://github.com/rarimo/passport-zk-circuits>.
 //!
-//! # Public inputs (10 signals, each [u8; 32] big-endian Fr)
-//! Index 0: nullifier = Poseidon3(sk_identity, Poseidon1(sk_identity), eventID)
-//! Index 1: birthDate  (UTF-8 hex YYMMDD encoded as decimal)
-//! Index 2: expirationDate
-//! Indices 3-9: name/nationality/citizenship/documentNumber/eventID per circuit version
+//! # Public inputs — Rarimo registerIdentity circuit (nPublic = 5, each [u8; 32] big-endian Fr)
+//! Index 0: dg15PubKeyHash  — Poseidon hash of DG15 active-auth public key (0 if NA)
+//! Index 1: passportHash    — Poseidon(SHA-256(signedAttributes)[252:])
+//! Index 2: dg1Commitment   — Poseidon(DG1_chunks, skIdentity) — used as on-chain nullifier
+//! Index 3: pkIdentityHash  — Poseidon(babyJubJub pubkey X, Y)
+//! Index 4: slaveMerkleRoot — root of trusted issuer CA certificate tree (must be on allowlist)
 
 #![cfg(not(feature = "dev-mode"))]
 

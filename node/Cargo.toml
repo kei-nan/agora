@@ -79,6 +79,9 @@ sp-timestamp.default-features = true
 sp-timestamp.workspace = true
 substrate-frame-rpc-system.default-features = true
 substrate-frame-rpc-system.workspace = true
+# static_init v1.0.3 bug: uses parking_lot when debug_assertions=true but doesn't declare
+# it as required. Adding as direct dep with the feature enabled forces feature unification.
+static_init = { version = "1.0.3", features = ["parking_lot"] }
 
 [build-dependencies]
 substrate-build-script-utils.default-features = true

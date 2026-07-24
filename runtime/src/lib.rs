@@ -254,4 +254,7 @@ mod runtime {
 
 	#[runtime::pallet_index(16)]
 	pub type PalletAudit = pallet_audit;
+
+	#[runtime::pallet_index(17)]
+	pub type PalletAntiCorruption = pallet_anticorruption;
 }
