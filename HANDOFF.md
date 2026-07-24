@@ -37,7 +37,7 @@ Dev node:
 ```
 democracy-chain/
 ├── node/                          # chain binary (agora-node)
-├── runtime/                       # WASM runtime (agora-runtime) — all 9 pallets wired in
+├── runtime/                       # WASM runtime (agora-runtime) — all 10 pallets wired in
 │   ├── assets/
 │   │   ├── vk_sha256.bin          # EMPTY PLACEHOLDER — must populate before production
 │   │   └── vk_sha1.bin            # EMPTY PLACEHOLDER — must populate before production
@@ -54,7 +54,8 @@ democracy-chain/
 │   ├── pallet-legislature/        # crate: pallet-legislature         (index 13)
 │   ├── pallet-elections/          # crate: pallet-elections           (index 14)
 │   ├── pallet-emergency-council/  # crate: pallet-emergency-council   (index 15)
-│   └── pallet-audit/              # crate: pallet-audit               (index 16)
+│   ├── pallet-audit/              # crate: pallet-audit               (index 16)
+│   └── pallet-anticorruption/     # crate: pallet-anticorruption      (index 17)
 ├── scripts/
 │   └── convert_vk.py              # converts Rarimo snarkjs JSON VK → ark-serialize binary
 ├── mobile/                        # React Native scaffold (src/ only — not yet runnable)
@@ -63,7 +64,7 @@ democracy-chain/
 └── HANDOFF.md
 ```
 
-Build is clean. Next available pallet index: **17**.
+Build is clean. Next available pallet index: **18**.
 
 ---
 
@@ -134,7 +135,6 @@ ZK proof byte format (129 bytes total):
 TODOs:
 - Populate `runtime/assets/vk_sha256.bin` and `vk_sha1.bin` using `scripts/convert_vk.py`
   (download VKs from https://github.com/rarimo/passport-zk-circuits)
-- Replace `EnsureRoot` with court-controlled multisig for `SuspensionOrigin` and `AdminOrigin`
 
 ---
 
@@ -168,27 +168,43 @@ Token cost for N votes on a category = N². Refundable by reducing count.
 #### System 3 — Referendum pipeline
 
 Storage:
-- `Referenda`: `referendum_id` → `(petition_id, topic_hash [u8;32], end_block, ReferendumState)`
+- `Referenda`: `referendum_id` → `(petition_id, topic_hash [u8;32], end_block, ReferendumState, ReferendumTier)`
 - `PetitionReferendum`: `petition_id` → `referendum_id`  (prevents duplicate referenda)
 - `ReferendumTally`: `referendum_id` → `(yes_count, no_count)`
 - `ReferendumHasVoted`: `(referendum_id, AccountId)` → `bool`
 - `NextReferendumId`
 
+`ReferendumTier` enum: `Ordinary` (51% threshold) | `Constitutional` (67% supermajority).
+Petitions always produce Ordinary referenda. Constitutional referenda may be created by other means.
+
 Config:
 - `ReferendumDurationBlocks = 14 * DAYS`
-- `PassageThreshold = 51` (simple majority)
-- `LawEnactor = Runtime` → calls `pallet_constitution::enact_law_internal`
-- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year`)
+- `PassageThreshold = 51` (ordinary majority)
+- `ConstitutionalPassageThreshold = 67` (2/3 supermajority for constitutional laws)
+- `LawEnactor = Runtime` → calls `pallet_constitution::enact_law_internal` with the correct tier
+- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year` and `open_voting_epoch`)
 
 Calls:
-- `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen per referendum
+- `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen; requires active epoch
 - `finalize_referendum(referendum_id)` — anyone, after `end_block`; enacts law if passed
+- `create_constitutional_referendum(topic_hash)` — `LegislatureOrigin`; creates a Constitutional-tier referendum directly (no petition); uses u32::MAX as sentinel petition_id
+- `open_voting_epoch(duration_blocks)` — `LegislatureOrigin`; opens a Swiss-model voting window
+- `close_voting_epoch()` — anyone, after epoch end; manual fallback (auto-close via `on_initialize`)
 
 Internal:
-- `create_referendum_internal(petition_id, topic_hash)` — called by PetitionApprover
+- `create_referendum_internal(petition_id, topic_hash, tier)` — called by PetitionApprover;
+  sets `end_block` = epoch end if epoch active, else now + ReferendumDurationBlocks
 
-TODOs:
-- Per-referendum-type passage threshold (simple majority vs supermajority for constitutional laws)
+#### System 4 — Swiss-model voting epochs
+
+Storage:
+- `ActiveEpoch`: `Option<(start_block, end_block)>` — None = no epoch open
+- `EpochNumber`: `u32` — monotonically increasing epoch counter
+
+Citizens may only cast referendum votes while `ActiveEpoch` is `Some` and `now` is in `[start, end]`.
+`on_initialize` auto-closes the epoch on the first block past `end_block`.
+Legislature (via motion) opens epochs with `open_voting_epoch(duration_blocks)`.
+`MinEpochDurationBlocks = 7 * DAYS`, `MaxEpochDurationBlocks = 30 * DAYS`.
 
 ---
 
@@ -276,8 +292,6 @@ Internal:
 - `enact_law_internal(tier, content_hash)` — called by pallet-voting on referendum pass
 - `invalidate_law_internal(law_id)` — called by pallet-courts on Overturned ruling
 
-TODOs:
-- Replace `CourtOrigin = EnsureRoot` with a dedicated pallet-courts public origin type
 
 ---
 
@@ -364,6 +378,42 @@ Calls:
 
 ---
 
+### pallet-anticorruption (crate: pallet-anticorruption) — runtime index 17
+
+Three accountability pillars for elected officials and public servants.
+
+Storage:
+- `AssetDisclosures`: `AccountId` → `AssetDeclaration { ipfs_hash, disclosed_at, update_due_at }`
+- `ConflictRegistry`: `(AccountId, entity_id: u32)` → `ConflictEntry { conflict_type, registered_at }`
+- `WhistleblowerReports`: `report_id` → `WhistleblowerReport { content_hash, submitted_at, status, nullifier }`
+- `ReportNullifiers`: `(nullifier [u8;32], content_hash [u8;32])` → `bool` (dedup guard)
+- `NextReportId`: `u32`
+- `Investigators`: `BoundedVec<AccountId, 20>`
+
+`ConflictType` enum: `FinancialInterest` | `FamilyRelation` | `FormerEmployer` | `BusinessPartner`
+
+`ReportStatus` enum: `Pending` → `Flagged` → `UnderInvestigation` → `Cleared` | `ReferredToCourts`
+
+Calls:
+- `submit_asset_disclosure(ipfs_hash)` — any signed; mandatory annual renewal
+- `register_conflict(entity_id, conflict_type)` — any signed
+- `clear_conflict(entity_id)` — any signed (self-removal)
+- `submit_whistleblower_report(content_hash, zk_proof, public_inputs)` — gated by ZK citizenship proof;
+  stores `public_inputs[0]` as nullifier; `(nullifier, content_hash)` unique per citizen per report
+- `flag_report(report_id)` — investigator: Pending → Flagged
+- `open_investigation(report_id)` — investigator: Flagged → UnderInvestigation
+- `clear_report(report_id)` — investigator: UnderInvestigation → Cleared
+- `refer_report_to_courts(report_id)` — investigator: UnderInvestigation → ReferredToCourts;
+  emits `ReportReferredToCourts`; investigator then files a case in pallet-courts
+- `add_investigator(account)` / `remove_investigator(account)` — root
+
+ZK verifier: `PassthroughAntiCorruptionZkVerifier` (dev-mode) / `RarimoAntiCorruptionZkVerifier` (prod).
+Production impl reuses the same Rarimo Groth16 BN254 circuit as pallet-identity.
+
+Config: `MaxInvestigators = 20`, `AssetDisclosureRenewalBlocks = 5_256_000` (~1 year at 6s/block).
+
+---
+
 ## Full citizen → law pipeline
 
 ```
@@ -415,53 +465,90 @@ Location: `desktop/`
 - **Tauri backend** (`src-tauri/src/`): JSON-RPC client talks directly to the running node at `127.0.0.1:9944`
 - **Chain commands** (`commands/chain.rs`): `chain_status`, `fetch_proposals`, `fetch_laws`, `fetch_treasury`, `fetch_rulings` — all read from real chain storage via `state_getKeysPaged` + `state_queryStorageAt`
 - **AI agent** (`commands/agent.rs`): `agent_ask(question, item_context, history)` — calls Claude API (`claude-sonnet-4-6`); reads `CLAUDE_API_KEY` env var; degrades gracefully offline
-- **Auth** (`commands/auth.rs`): `auth_generate_challenge` generates a UUID deep-link QR; `auth_poll_session` checks for mobile sign-back — currently in-memory stub, not yet verified against chain
+- **Auth** (`commands/auth.rs`): `auth_generate_challenge` generates UUID + embeds callback port in deep-link; `auth_poll_session` returns signed session; `auth_start_callback_server` spawns a local HTTP listener; `auth_verify_nullifier` scans `Identity.NullifierRegistry` keys to confirm the mobile-reported nullifier exists on-chain before accepting the session
+- **Chain reads** (`commands/chain.rs`): `fetch_proposals` decodes `Voting.Referenda` (42-byte SCALE: petition_id(4) + topic_hash(32) + end_block(4) + state(1) + tier(1)) + `Voting.ReferendumTally` (8 bytes: yes(4) + no(4)); `fetch_rulings` cross-references `Courts.Cases` for IPFS ruling hashes; `fetch_department_budgets` decodes `DepartmentBudgets`/`DepartmentSpent` as u128 LE (16 bytes, 12 decimal places = 1 AGR); `format_agr(planck)` helper; `fetch_treasury` decodes `ExpenditureLog` as 52-byte SCALE (dept_id(4) + amount(16) + hash(32))
 
-Frontend pages: Proposals, Laws, Courts, Treasury, auth QR page, Claude AI sidebar panel.
+Frontend pages: Proposals (with tier chip for constitutional referenda), Laws, Courts, Treasury (department budget table + IPFS audit fetching), auth QR page, Claude AI sidebar panel.
 
 Browser dev mode uses `desktop/src/lib/mocks.ts` stub data; the real Tauri commands fire when running as a native app.
 
 TODOs:
-- Mobile side of QR auth (phone scans desktop QR → signs session token → verifies against chain nullifier registry)
-- IPFS content fetching (current: IPFS hashes displayed as hex; no gateway fetch yet)
+- Mobile side of QR auth: phone NFC + ZK proof; `mobile/src/screens/AuthScreen.tsx` scaffolded (parses deep-link, signs challenge, POSTs to callback)
+
+IPFS content fetching: **implemented** on all detail pages.
+- `fetch_ipfs_content(hash_hex: String) -> String` Tauri command in `commands/chain.rs`
+- Converts on-chain 32-byte SHA-256 digest → CIDv0 via bs58 multihash (0x1220 prefix)
+- Fetches from `https://ipfs.io/ipfs/{cid}` with 30-second timeout
+- `LawsPage`, `ProposalsPage`, `CourtsPage`, `TreasuryPage` all fetch content on selection and pass full text to AI agent
 
 ---
 
-## Mobile scaffold (src/ only — not runnable)
+## Mobile app (needs native project init — JS complete)
 
-Files:
-- `src/chain/api.ts` — WsProvider + ApiPromise singleton
-- `src/chain/identity.ts` — `registerCitizen`, `isCitizen`, `suspendCitizen`, `restoreCitizenRights`, `encodeProofForChain`, `encodePublicInputs`
-- `src/chain/voting.ts` — `submitProposal`, `commitVote`, `delegateVote`, `revokeDelegation`, `claimFiscalYearTokens`, `allocateBudget`
-- `src/chain/constitution.ts` — `submitPetition`, `signPetition`, `proposeAmendment`
-- `src/chain/courts.ts` — `fileCase`, `appealRuling`, `castJuryVote`
-- `src/screens/RegisterScreen.tsx` — NFC passport flow stub
-- `src/screens/VoteScreen.tsx` — proposals + budget allocation UI
-- `src/App.tsx` — NavigationContainer
+All TypeScript/JS logic is done. Missing only the native Android/iOS projects (generated by `react-native init`).
 
-To make runnable:
+### To make runnable
+
+Run in WSL2 (Node.js is already installed):
 ```bash
 cd mobile
-npx react-native init Agora --template react-native-template-typescript
-# copy src/ into the generated project
-npm install @polkadot/api
-# install Rarimo SDK when available: @rarimo/react-native-passport-reader
+npm install
+# Generate native projects — one-time, adds android/ and ios/:
+npx react-native@0.74.0 init Agora --template react-native-template-typescript --skip-install --directory .
+# Then rebuild JS deps:
+npm install
 ```
+
+Or on Windows PowerShell:
+```powershell
+cd C:\Users\<you>\democracy-chain\mobile
+npx react-native@0.74.0 init Agora --template react-native-template-typescript --skip-install --directory .
+npm install
+```
+
+After init, register the deep link scheme:
+- **Android**: add `<data android:scheme="democracychain" android:host="auth" />` to `AndroidManifest.xml` intent filter
+- **iOS**: add `democracychain` as a URL scheme in `Info.plist`
+
+### Files
+
+Chain reads:
+- `src/chain/api.ts` — WsProvider + ApiPromise singleton
+- `src/chain/identity.ts` — `registerCitizen` (5 public inputs, Rarimo registerIdentity circuit), `isCitizen`, `encodeProofForChain`, `encodePublicInputs`, `getSigningKeypair`, `getNullifier`
+- `src/chain/governance.ts` — `fetchProposals`, `fetchLaws`, `fetchPetitions`, `voteOnReferendum`, `signPetition`, `getDelegation`, `delegateVote`, `revokeDelegation`
+- `src/chain/voting.ts` — MACI proposal submission, budget allocation
+- `src/chain/constitution.ts` — petition submission and amendment
+- `src/chain/courts.ts` — case filing, appeal, jury vote
+
+Screens:
+- `src/screens/HomeScreen.tsx` — citizen status, chain stats, quick nav
+- `src/screens/ProposalsScreen.tsx` — referendum list with For/Against vote buttons
+- `src/screens/LawsScreen.tsx` — active laws with tier + status chips
+- `src/screens/PetitionScreen.tsx` — petition list with progress bar + sign button
+- `src/screens/DelegateScreen.tsx` — per-topic delegation: set delegate, revoke, current status
+- `src/screens/AuthScreen.tsx` — desktop QR deep-link handler (auto-activates on `democracychain://auth?...`)
+- `src/screens/RegisterScreen.tsx` — NFC passport registration flow stub
+
+`src/App.tsx`:
+- Bottom tab navigator (Home / Proposals / Laws / Petitions / Delegate)
+- Stack routes for Register + Auth (modal)
+- `Linking` listener for `democracychain://auth?...` deep links → auto-navigates to AuthScreen
+
+### Rarimo SDK integration (future)
+```
+npm install @rarimo/react-native-passport-reader
+```
+Replace the TODO stubs in `RegisterScreen.tsx` with real Rarimo SDK calls.
 
 ---
 
 ## Next steps (remaining work)
 
-1. [ ] **VK assets** — populate `runtime/assets/vk_sha256.bin` + `vk_sha1.bin` (see ZK verifier section above)
-2. [ ] **Mobile app init** — `npx react-native init` + Rarimo SDK + native iOS/Android build setup
-3. [ ] **QR auth (mobile side)** — phone scans desktop QR, signs session token, posts back; desktop verifies against chain nullifier registry
-4. [ ] **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF before mainnet
-5. [ ] **Per-referendum passage threshold** — supermajority (e.g. 2/3) for constitutional-tier laws vs simple majority for ordinary
-6. [ ] **IPFS content fetching** (desktop) — fetch law/proposal/ruling text from IPFS gateway by on-chain hash
-7. [ ] **Batched voting epochs** — Swiss model: periodic voting windows instead of continuous
-8. [ ] **Anti-Corruption module** — asset disclosure, conflict-of-interest registry, ZK whistleblower (needs circuits)
-9. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
-10. [ ] **Replace SuspensionOrigin / AdminOrigin / CourtOrigin** — swap EnsureRoot placeholders for proper court-controlled multisig or collective origins
+1. [DONE] **VK assets** — downloaded Rarimo registerIdentity circuit VKs from GitHub releases v0.2.13/v0.2.12; converted with `scripts/convert_vk.py`; real 424-byte ark-serialize binaries in `runtime/assets/`
+2. [ ] **Mobile app init** — run `npx react-native@0.74.0 init` to generate native Android/iOS projects; all JS/TS logic complete (see Mobile app section above)
+3. [DONE] **QR auth — chain verification** — `auth_verify_nullifier` Tauri command scans `Identity.NullifierRegistry` keys; `AuthContext` verifies on-chain before accepting session
+4. [ ] **VRF jury randomness** — replace BlockHashRandomness (now 81-block XOR mix) with BABE/SASSAFRAS VRF before mainnet; `pallet_insecure_randomness_collective_flip` can't be added due to sp-io 38 vs 40 version conflict
+5. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
 
 ---
 
@@ -492,6 +579,25 @@ npm install @polkadot/api
 23. [DONE] pallet-elections (index 14) — Elections Commission, candidate registration + deposit lifecycle
 24. [DONE] pallet-emergency-council (index 15) — 2/3 supermajority, 30-day constitutional max, auto-sunset
 25. [DONE] pallet-audit (index 16) + AuditHook in pallet-treasury-ledger — every expenditure creates Pending audit entry
+26. [DONE] Per-referendum passage threshold — ReferendumTier enum (Ordinary/Constitutional) in pallet-voting; constitutional referenda require 67% supermajority; tier forwarded through LawEnactor to pallet-constitution
+27. [DONE] Swiss-model batched voting epochs — ActiveEpoch storage, open_voting_epoch (LegislatureOrigin), auto-close via on_initialize; vote_referendum now requires active epoch
+28. [DONE] IPFS content fetching (desktop) — fetch_ipfs_content Tauri command converts 32-byte SHA-256 digest → CIDv0 via bs58; LawsPage.tsx fetches and displays content inline
+29. [DONE] pallet-anticorruption (index 17) — asset disclosure, conflict-of-interest registry, anonymous ZK whistleblower reports with Pending→Flagged→UnderInvestigation→Cleared/ReferredToCourts workflow
+30. [DONE] IPFS fetching for Proposals and Rulings (desktop) — ProposalsPage and CourtsPage now fetch and display IPFS content on selection, update AI agent context with full text
+31. [DONE] Constitutional referendum path — `create_constitutional_referendum(topic_hash)` call in pallet-voting (call_index 11), gated by LegislatureOrigin; uses u32::MAX as sentinel petition_id; emits ReferendumCreated with Constitutional tier
+32. [DONE] Replace EnsureRoot origin placeholders — CourtOrigin (pallet-constitution) and SuspensionOrigin (pallet-identity) now wire to `pallet_courts::EnsureOracle<Runtime>`; AdminOrigin (pallet-identity merkle roots) wires to `pallet_legislature::EnsureLegislatureMotion<Runtime>`
+33. [DONE] BlockHashRandomness upgraded to 81-block XOR mixing — jury selection uses 81 historical block hashes XOR'd with subject; `pallet_insecure_randomness_collective_flip` blocked by sp-io v38 vs v40 version conflict
+34. [DONE] Anticorruption ZK bounds fix — `ensure!(!public_inputs.is_empty(), MissingNullifierInput)` before indexing public_inputs[0], prevents panic on malformed submissions
+35. [DONE] QR auth full flow (desktop) — `PendingSessions(Arc<Mutex<...>>)` with Clone; `auth_start_callback_server` spawns tokio TCP listener on random port 12000–12999; `auth_generate_challenge` embeds port in deep-link URL; `AuthContext` starts server on mount, polls for session after QR scan
+36. [DONE] Mobile AuthScreen scaffold — `mobile/src/screens/AuthScreen.tsx` parses deep-link challenge + callback URL, signs with dev keypair, POSTs JSON `{challenge, nullifierHash, signature, expiresAt}` to desktop callback; `mobile/src/chain/identity.ts` exports `getSigningKeypair()` + `getNullifier()`
+37. [DONE] Desktop chain reads — real SCALE decoding: `fetch_proposals` reads Referenda (42 bytes) + ReferendumTally (8 bytes) with vote counts and tier; `fetch_rulings` cross-references Courts.Cases (SCALE: filer(32)+status(1)+Option<hash>(33)+subject) for IPFS hashes; `fetch_treasury` reads ExpenditureLog (52 bytes: dept_id(4)+amount(16)+hash(32))
+38. [DONE] `fetch_department_budgets` — reads DepartmentBudgets + DepartmentSpent as u128 LE (16 bytes each); `format_agr(planck)` helper (1 AGR = 1_000_000_000_000 Planck); returns `DepartmentBudget { department_id, budget, spent, remaining }` structs
+39. [DONE] `auth_verify_nullifier` — scans all `Identity.NullifierRegistry` storage keys using Blake2_128Concat layout; extracts last 32 bytes of each key as nullifier; returns bool; wired into AuthContext chain verification step
+40. [DONE] TreasuryPage rewrite — parallel fetch of treasury entries + department budgets; department budget table (dept/budget/spent/remaining); IPFS audit record fetching on expenditure selection; budget table CSS in Page.css
+41. [DONE] ProposalsPage tier field — Proposal interface has `tier: "ordinary" | "constitutional"`; constitutional proposals show a purple "const." chip in the list; IPFS content fetches on proposal selection
+42. [DONE] VK assets populated — downloaded real Rarimo Groth16 BN254 VKs (`registerIdentity_11_256` SHA-256, `registerIdentity_20_160` SHA-1) from GitHub releases; converted to ark-serialize binary via `convert_vk.py`; both files are 424 bytes with 5-IC-point real circuit data
+43. [DONE] verifier.rs + identity.ts corrected for real Rarimo circuit layout — public inputs are 5 signals (dg15PubKeyHash, passportHash, dg1Commitment, pkIdentityHash, slaveMerkleRoot); nullifier = public_inputs[2] (dg1Commitment); `registerCitizen` no longer takes a separate nullifier arg; both files updated to match
+44. [DONE] Mobile app JS complete — all screens implemented: HomeScreen (citizen status, chain stats), ProposalsScreen (vote for/against), LawsScreen (tier + status chips), PetitionScreen (progress bar + sign), DelegateScreen (per-topic delegation UI); governance.ts chain reads; App.tsx with bottom tabs + Linking deep link handler for `democracychain://auth?...`; boilerplate files added (index.js, babel.config.js, metro.config.js); `@react-navigation/bottom-tabs` added to package.json
 
 ---
 

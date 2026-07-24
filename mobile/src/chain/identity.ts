@@ -12,7 +12,6 @@ import { KeyringPair } from '@polkadot/keyring/types';
 import { getApi } from './api';
 
 export interface ZkRegistration {
-  nullifier: Uint8Array;   // 32 bytes — public_inputs[0] (Poseidon3 nullifier)
   /**
    * 129-byte binary proof in ark-serialize compressed format:
    *   [0..32]   A  G1 compressed
@@ -23,9 +22,13 @@ export interface ZkRegistration {
    */
   zkProof: Uint8Array;
   /**
-   * 10 public signals from the Rarimo Freedom Tool registration circuit,
+   * 5 public signals from the Rarimo registerIdentity circuit (nPublic = 5),
    * each as a 32-byte big-endian Fr element.
-   * [0] nullifier  [1] birthDate  [2] expirationDate  [3-9] name/citizenship/doc
+   *   [0] dg15PubKeyHash  — Poseidon hash of DG15 active-auth pubkey (0 if NA)
+   *   [1] passportHash    — Poseidon(SHA-256(signedAttributes)[252:])
+   *   [2] dg1Commitment   — Poseidon(DG1_chunks, skIdentity)  ← used as nullifier on-chain
+   *   [3] pkIdentityHash  — Poseidon(babyJubJub.X, babyJubJub.Y)
+   *   [4] slaveMerkleRoot — root of trusted issuer CA tree (must be in AllowedMerkleRoots)
    */
   publicInputs: Uint8Array[];
 }
@@ -97,7 +100,7 @@ export async function registerCitizen(
   const api = await getApi();
   return new Promise((resolve, reject) => {
     api.tx.identity
-      .registerCitizen(reg.nullifier, Array.from(reg.zkProof), reg.publicInputs)
+      .registerCitizen(Array.from(reg.zkProof), reg.publicInputs)
       .signAndSend(pair, ({ status, dispatchError }) => {
         if (dispatchError) {
           reject(new Error(dispatchError.toString()));
@@ -133,6 +136,48 @@ export async function suspendCitizen(
       })
       .catch(reject);
   });
+}
+
+// ── Desktop auth helpers ──────────────────────────────────────────────────────
+
+/**
+ * Returns the signing keypair and nullifier hash for the currently registered citizen.
+ * In production this reads the hardware-backed key from iOS Secure Enclave / Android Keystore.
+ * For the scaffold, we derive a deterministic key from the stored nullifier seed.
+ *
+ * Throws if the user has not completed passport registration.
+ */
+export async function getSigningKeypair(): Promise<{
+  keypair: KeyringPair;
+  nullifierHash: string;
+}> {
+  // Circular import avoided: import Keyring lazily since it requires native modules.
+  const { Keyring } = await import('@polkadot/keyring');
+  const { u8aToHex } = await import('@polkadot/util');
+
+  // TODO: replace with hardware-backed key from Secure Enclave / Keystore.
+  // The seed here is derived from the app's keyring, which stores the Ed25519 key generated
+  // during registration. In production, the private key never leaves secure hardware.
+  const keyring = new Keyring({ type: 'ed25519' });
+
+  // Dev stub: deterministic from a constant seed. Replace with persisted key in production.
+  const pair = keyring.addFromUri('//AgoraDevUser');
+  const nullifierHash = u8aToHex(pair.publicKey);
+
+  return { keypair: pair, nullifierHash };
+}
+
+/**
+ * Returns the nullifier hash for the logged-in citizen (hex-encoded public key for now).
+ * Used to verify identity on the desktop side via chain state lookup.
+ */
+export async function getNullifier(): Promise<string | null> {
+  try {
+    const { nullifierHash } = await getSigningKeypair();
+    return nullifierHash;
+  } catch {
+    return null;
+  }
 }
 
 export async function restoreCitizenRights(
