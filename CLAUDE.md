@@ -5,9 +5,11 @@ A blockchain-based distributed democracy platform for real government adoption.
 Full separation of powers (legislature, executive, judiciary) enforced by smart contracts.
 
 ## Current State
-- Substrate solochain template cloned and building at 
 - Ubuntu 24.04 (WSL2), Rust 1.96 stable
-- Chain runs successfully in dev mode
+- Chain builds and runs in dev mode
+- **9 pallets** implemented at runtime indices 8–16 (see HANDOFF.md for detail)
+- Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
+- Mobile: TypeScript scaffold exists but is not a runnable React Native project yet
 
 ## Critical Build Command
 Always build with:
@@ -125,33 +127,39 @@ Runs without a server — connects directly to the chain and optionally to a clo
 - Casting votes (requires hardware-backed key)
 - Signing any on-chain transaction
 
-## Monorepo Structure (to be created)
+## Monorepo Structure
 ```
-agora/
-├── node/              ← chain binary (from template)
-├── runtime/           ← WASM runtime (from template)
+democracy-chain/
+├── node/              ← chain binary (agora-node)
+├── runtime/           ← WASM runtime (agora-runtime)
 ├── pallets/
-│   ├── pallet-identity/        ← citizen registry, ZK proof verification
-│   ├── pallet-voting/          ← MACI integration, liquid democracy
-│   ├── pallet-treasury-ledger/ ← public budget ledger
-│   ├── pallet-courts/          ← AI judge, jury selection, ruling ledger
-│   └── pallet-constitution/    ← versioned law ledger, amendment process
-├── circuits/          ← Noir ZK circuits (separate toolchain)
-├── mobile/            ← React Native app (voting, passport auth, ZK proofs)
-├── desktop/           ← Tauri 2 app (browse, review, AI questions)
+│   ├── pallet-identity/          ← citizen registry, ZK proof verification     (index 8)
+│   ├── pallet-voting/            ← MACI, liquid democracy, referenda            (index 9)
+│   ├── pallet-treasury-ledger/   ← public budget ledger, audit hook             (index 10)
+│   ├── pallet-courts/            ← AI judge, jury selection, auto-enforcement   (index 11)
+│   ├── pallet-constitution/      ← law ledger, petitions, HRC veto              (index 12)
+│   ├── pallet-legislature/       ← collective origin for law/budget motions     (index 13)
+│   ├── pallet-elections/         ← Elections Commission, candidates             (index 14)
+│   ├── pallet-emergency-council/ ← time-locked emergency powers, auto-sunset   (index 15)
+│   └── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
+├── circuits/          ← Noir ZK circuits (not yet started)
+├── mobile/            ← React Native app (TypeScript scaffold — not runnable yet)
+├── desktop/           ← Tauri 2 app (functional: chain RPC + Claude AI agent)
 └── CLAUDE.md          ← this file
 ```
 
-## Next Steps (in order)
-1. Create monorepo directory structure and pallet stubs
-2. Integrate Rarimo Freedom Tool into pallet-identity
-3. Wire MACI into pallet-voting
-4. Build liquid democracy delegation on top of MACI
-5. Build pallet-treasury-ledger (OpenGov pattern)
-6. Build pallet-constitution (law ledger + amendment process)
-7. Build pallet-courts (AI judge + jury selection)
-8. Scaffold React Native mobile app with Rarimo SDK
-9. Scaffold Tauri desktop app with smoldot + Claude AI agent integration
+## Remaining Work (in priority order)
+1. **VK assets** — populate `runtime/assets/vk_sha256.bin` + `vk_sha1.bin` to enable real ZK proof verification (see `scripts/convert_vk.py`)
+2. **Mobile app** — `npx react-native init` + Rarimo SDK for NFC passport reading + ZK proof generation
+3. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
+4. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
+5. **Per-referendum threshold** — supermajority for constitutional-tier laws
+6. **IPFS content fetching** (desktop) — fetch law/proposal text from gateway by on-chain hash
+7. **Batched voting epochs** — Swiss model periodic windows instead of continuous voting
+8. **Anti-Corruption module** — asset disclosure, ZK whistleblower (needs Noir circuits)
+9. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
+
+See `HANDOFF.md` for full pallet-by-pallet status and completed work log.
 
 ## Key References
 - Rarimo Freedom Tool: https://docs.rarimo.com/freedom-tool/
