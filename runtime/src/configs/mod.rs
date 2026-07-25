@@ -32,7 +32,7 @@ use frame_support::{
 		IdentityFee, Weight,
 	},
 };
-use frame_system::{limits::{BlockLength, BlockWeights}, EnsureSignedBy};
+use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, AccountId32, Perbill};
@@ -40,9 +40,9 @@ use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
-	AccountId, Aura, Balance, Balances, Block, BlockNumber, Hash, Nonce, PalletInfo, Runtime,
-	RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin, RuntimeTask,
-	System, DAYS, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
+	AccountId, Aura, Balance, Balances, Block, BlockNumber, Hash, Legislature, Nonce, PalletInfo,
+	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
+	RuntimeTask, System, DAYS, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -276,7 +276,7 @@ impl pallet_voting::LawEnactor for Runtime {
 	) -> sp_runtime::DispatchResult {
 		let law_tier = match tier {
 			pallet_voting::ReferendumTier::Ordinary => pallet_constitution::LawTier::Ordinary,
-			pallet_voting::ReferendumTier::Constitutional => pallet_constitution::LawTier::Constitutional,
+			pallet_voting::ReferendumTier::Constitutional => pallet_constitution::LawTier::Structural,
 		};
 		pallet_constitution::Pallet::<Runtime>::enact_law_internal(law_tier, content_hash)
 	}
@@ -290,6 +290,10 @@ impl pallet_voting::Config for Runtime {
 	type MaxDelegationsPerDelegate = ConstU32<1_000>;
 	/// Walk at most 10 hops when checking for delegation cycles.
 	type MaxDelegationDepth = ConstU8<10>;
+	/// Minimum delegation duration: 1 voting epoch (~30 days). Prevents instant-expiry gaming.
+	type MinDelegationDurationBlocks = ConstU32<{ 30 * DAYS }>;
+	/// Maximum delegation duration: 2 years. Constitutional ceiling; prevents indefinite concentration.
+	type MaxDelegationDurationBlocks = ConstU32<{ 2 * 365 * DAYS }>;
 	/// Number of budget categories citizens can allocate QV tokens across.
 	type BudgetCategoryCount = ConstU32<10>;
 	type CitizenChecker = Runtime;
@@ -379,6 +383,8 @@ impl pallet_courts::Config for Runtime {
 	/// Mixes 81 historical block hashes; still insecure against block-author manipulation.
 	/// Replace with BABE/SASSAFRAS VRF before mainnet.
 	type Randomness = BlockHashRandomness;
+	/// Zero account used as filer for system-initiated LawChallenge cases.
+	type AutoChallengeAccount = AutoChallengeAccount;
 }
 
 /// Runtime implements CitizenChecker for pallet-constitution (petition/sign gating).
@@ -400,45 +406,50 @@ impl pallet_constitution::PetitionApprover for Runtime {
 	}
 }
 
-// ── HRC (Human Rights Commission) origin ────────────────────────────────────
+// ── Auto-challenge (replaces HRC) ───────────────────────────────────────────
 
-/// The Human Rights Commission seat — currently a single well-known dev account (//Eve),
-/// distinct from Alice/sudo. HRC may veto newly enacted laws within HRCVetoWindowBlocks.
-///
-/// TODO (mainnet): replace with a pallet-collective instance appointed by supermajority vote.
-pub struct HrcCouncil;
+parameter_types! {
+	/// Zero account used as the system filer for auto-initiated LawChallenge cases.
+	/// Structural and Foundational laws automatically open a court case on enactment.
+	pub const AutoChallengeAccount: AccountId = AccountId32::new([0u8; 32]);
+}
 
-impl frame_support::traits::SortedMembers<AccountId32> for HrcCouncil {
-	fn sorted_members() -> alloc::vec::Vec<AccountId32> {
-		// SR25519 "//Eve" public key (subkey inspect //Eve --scheme sr25519)
-		alloc::vec![AccountId32::from([
-			0xe6, 0x59, 0xa7, 0xa1, 0x62, 0x8c, 0xdd, 0x93,
-			0xfe, 0xbc, 0x04, 0xa4, 0xe0, 0x64, 0x6e, 0xa2,
-			0x0e, 0x9f, 0x5f, 0x0c, 0xe0, 0x97, 0xd9, 0xa0,
-			0x52, 0x90, 0xd4, 0xa9, 0xe0, 0x54, 0xdf, 0x4e,
-		])]
+/// Runtime implements AutoChallengeHook by calling pallet-courts::auto_file_case.
+impl pallet_constitution::AutoChallengeHook for Runtime {
+	fn auto_challenge_law(law_id: u32) -> sp_runtime::DispatchResult {
+		pallet_courts::Pallet::<Runtime>::auto_file_case(
+			pallet_courts::CaseSubject::LawChallenge { law_id },
+		)
+	}
+}
+
+/// Runtime implements FreshLegislatureChecker by reading LastElectionBlock from pallet-elections.
+impl pallet_constitution::FreshLegislatureChecker<BlockNumber> for Runtime {
+	fn has_election_occurred_since(proposed_at: BlockNumber) -> bool {
+		pallet_elections::LastElectionBlock::<Runtime>::get() > proposed_at
 	}
 }
 
 impl pallet_constitution::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// Constitutional amendments require 30 days of deliberation before ratification.
-	type ConstitutionalDeliberationBlocks = ConstU32<{ 30 * DAYS }>;
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Ordinary law amendments take effect immediately (no deliberation window).
+	type OrdinaryAmendmentDeliberationBlocks = ConstU32<0>;
+	/// Structural/Foundational amendments stay Provisional for ~2 years before reaffirmation opens.
+	type ProvisioningPeriodBlocks = ConstU32<{ 2 * 365 * DAYS }>;
+	/// After Confirmed, ~4 more years before Entrenched can be claimed (6 years total pipeline).
+	type ConfirmationPeriodBlocks = ConstU32<{ 4 * 365 * DAYS }>;
+	type FreshLegislatureChecker = Runtime;
+	/// Revocation origin: EnsureRoot for dev. Wire to a minority collective (30–40%) for mainnet.
+	type RevocationOrigin = EnsureRoot<AccountId>;
 	/// 1 000 citizen signatures required to trigger a referendum.
 	type PetitionThreshold = ConstU32<1_000>;
 	type PetitionApprover = Runtime;
 	type CitizenChecker = Runtime;
-	/// Ordinary law amendments take effect immediately (no deliberation window).
-	type OrdinaryAmendmentDeliberationBlocks = ConstU32<0>;
-	/// HRC veto: the //Eve dev account acts as the HRC seat.
-	/// TODO (mainnet): replace with a pallet-collective HRC instance.
-	type HumanRightsOrigin = EnsureSignedBy<HrcCouncil, AccountId>;
-	/// HRC has 14 days to veto a newly enacted law on human rights grounds.
-	type HRCVetoWindowBlocks = ConstU32<{ 14 * DAYS }>;
+	/// Structural/Foundational laws auto-open a court case on enactment for AI review.
+	type AutoChallengeHook = Runtime;
 	/// Courts origin for invalidate_law (manual override). The auto-enforcement path
-	/// uses invalidate_law_internal via the LawEnforcer trait; this extrinsic requires
-	/// the court oracle's explicit signature.
+	/// uses invalidate_law_internal via the LawEnforcer trait.
 	type CourtOrigin = pallet_courts::EnsureOracle<Runtime>;
 }
 
@@ -475,16 +486,25 @@ impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 
 impl pallet_elections::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// Candidate deposit: 1 AGR token (1_000_000_000_000 planck). Refunded after election certified.
 	type CandidateDeposit = ConstU128<1_000_000_000_000>;
-	/// Up to 20 commissioners on the Elections Commission.
 	type MaxCommissioners = ConstU32<20>;
-	/// Up to 100 candidates per election.
 	type MaxCandidatesPerElection = ConstU32<100>;
-	/// Use the chain's native Balances pallet for deposits.
+	/// Hard cap on registered delegates; bounds on_initialize iteration.
+	type MaxDelegates = ConstU32<10_000>;
 	type Currency = Balances;
-	/// Citizen eligibility gated on active passport registration.
 	type CitizenChecker = Runtime;
+	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.
+	type GovernanceOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Constitutional supermajority (via legislature) gates term-limit parameters and bounds.
+	type ConstitutionalOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Seats the top-N backed delegates into pallet-legislature at each election.
+	type LegislatureSeating = Legislature;
+	/// 100 legislature seats (constitutional, changeable via set_election_params).
+	type DefaultLegislatureSeats = ConstU32<100>;
+	/// 2-year election cycle: 2 * 365 * 7200 blocks at 12 s/block.
+	type DefaultElectionCycleBlocks = ConstU32<{ 2 * 365 * DAYS }>;
+	/// Each citizen may back at most 5 delegates simultaneously (constitutional).
+	type DefaultMaxBackingsPerCitizen = ConstU32<5>;
 }
 
 // ── Anti-Corruption module ───────────────────────────────────────────────────

@@ -9,6 +9,7 @@
 //! runtime should gate constitution calls behind a custom RuntimeOrigin variant set by
 //! `close_motion`.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[frame_support::pallet]
@@ -276,5 +277,21 @@ pub mod pallet {
 
             Ok(())
         }
+    }
+}
+
+/// Implement SeatLegislature so pallet-elections can install election winners.
+impl<T: pallet::Config> pallet_elections::pallet::SeatLegislature<T::AccountId>
+    for pallet::Pallet<T>
+{
+    fn replace_members(
+        winners: alloc::vec::Vec<T::AccountId>,
+    ) -> frame_support::pallet_prelude::DispatchResult {
+        let bounded = frame_support::BoundedVec::<T::AccountId, T::MaxMembers>::try_from(winners)
+            .map_err(|_| frame_support::pallet_prelude::DispatchError::Other(
+                "election winners exceed MaxMembers",
+            ))?;
+        pallet::Members::<T>::put(bounded);
+        Ok(())
     }
 }

@@ -80,14 +80,19 @@ export default function AuthScreen({ route, navigation }: Props) {
     <View style={styles.container}>
       <Text style={styles.title}>Desktop Sign-In</Text>
       <Text style={styles.subtitle}>
-        Scan the QR code on the desktop app with your phone's camera. The app will sign you in
-        automatically without revealing your identity.
+        Use your phone's camera to scan the QR code shown on the Agora desktop app. Your signing
+        key never leaves the phone.
       </Text>
 
       {status === "idle" && (
-        <Text style={styles.hint}>
-          Open your camera and point it at the QR code on the Agora desktop app.
-        </Text>
+        <View style={styles.flowBox}>
+          <FlowStep num="1" text="Open your phone's camera app" />
+          <FlowStep num="2" text="Point it at the QR code on the Agora desktop" />
+          <FlowStep num="3" text="Tap the notification — this screen will handle the rest" />
+          <Text style={styles.hint}>
+            The QR code expires in 5 minutes. Refresh it on the desktop if it times out.
+          </Text>
+        </View>
       )}
 
       {(status === "signing" || status === "posting") && (
@@ -117,6 +122,17 @@ export default function AuthScreen({ route, navigation }: Props) {
           </TouchableOpacity>
         </View>
       )}
+    </View>
+  );
+}
+
+function FlowStep({ num, text }: { num: string; text: string }) {
+  return (
+    <View style={styles.flowStep}>
+      <View style={styles.flowNum}>
+        <Text style={styles.flowNumText}>{num}</Text>
+      </View>
+      <Text style={styles.flowStepText}>{text}</Text>
     </View>
   );
 }
@@ -189,10 +205,43 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   hint: {
-    fontSize: 15,
-    color: "#9ca3af",
+    fontSize: 13,
+    color: "#6b7280",
     textAlign: "center",
-    marginTop: 8,
-    lineHeight: 22,
+    marginTop: 16,
+    lineHeight: 20,
+  },
+  flowBox: {
+    width: "100%",
+    backgroundColor: "#161b27",
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: "#1f2937",
+    gap: 16,
+  },
+  flowStep: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+  },
+  flowNum: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#6C63FF",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  flowNumText: {
+    color: "#ffffff",
+    fontWeight: "700",
+    fontSize: 14,
+  },
+  flowStepText: {
+    flex: 1,
+    fontSize: 14,
+    color: "#d1d5db",
+    lineHeight: 20,
   },
 });

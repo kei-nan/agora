@@ -1,15 +1,19 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useFocusEffect } from '@react-navigation/native';
 import { RootStackParamList } from '../App';
-import { isCitizen } from '../chain/identity';
-import { getApi } from '../chain/api';
+import { getRegistered, setRegistered } from '../chain/citizenState';
+// Chain imports stubbed until @polkadot/api polyfills are set up for React Native
+// import { isCitizen } from '../chain/identity';
+// import { getApi } from '../chain/api';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Main'>;
 
@@ -17,41 +21,32 @@ interface ChainStats {
   blockNumber: number;
   totalCitizens: number;
   activeProposals: number;
-  activeLaws: number;
 }
 
 export default function HomeScreen({ navigation }: Props) {
   const [citizenStatus, setCitizenStatus] = useState<'checking' | 'registered' | 'unregistered'>('checking');
   const [stats, setStats] = useState<ChainStats | null>(null);
 
-  useEffect(() => {
-    // Check citizenship with a stub address — in production this reads from the persisted keypair
-    isCitizen('5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY')
-      .then((is) => setCitizenStatus(is ? 'registered' : 'unregistered'))
-      .catch(() => setCitizenStatus('unregistered'));
-
-    getApi().then(async (api) => {
-      const [blockHash, citizenCount] = await Promise.all([
-        api.rpc.chain.getHeader(),
-        api.query.identity.totalCitizens(),
-      ]);
-      const proposals = await api.query.voting.referenda.entries();
-      const laws = await api.query.constitution.laws.entries();
-      setStats({
-        blockNumber: (blockHash as any).number.toNumber(),
-        totalCitizens: (citizenCount as any).toNumber(),
-        activeProposals: proposals.length,
-        activeLaws: laws.length,
-      });
-    }).catch(() => {});
-  }, []);
+  useFocusEffect(useCallback(() => {
+    setCitizenStatus(getRegistered() ? 'registered' : 'unregistered');
+  }, []));
 
   return (
     <View style={s.container}>
       <Text style={s.headline}>Agora</Text>
       <Text style={s.tagline}>Distributed democracy on-chain</Text>
 
-      <View style={s.statusCard}>
+      <TouchableOpacity
+        style={s.statusCard}
+        activeOpacity={1}
+        onLongPress={() => {
+          if (citizenStatus !== 'registered') return;
+          Alert.alert('Reset registration?', 'This will clear your citizen status for this session.', [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Reset', style: 'destructive', onPress: () => { setRegistered(false); setCitizenStatus('unregistered'); } },
+          ]);
+        }}
+      >
         {citizenStatus === 'checking' ? (
           <ActivityIndicator color="#6C63FF" />
         ) : citizenStatus === 'registered' ? (
@@ -71,23 +66,22 @@ export default function HomeScreen({ navigation }: Props) {
             </TouchableOpacity>
           </>
         )}
-      </View>
+      </TouchableOpacity>
 
       {stats && (
         <View style={s.statsRow}>
           <Stat label="Block" value={`#${stats.blockNumber.toLocaleString()}`} />
           <Stat label="Citizens" value={stats.totalCitizens.toString()} />
           <Stat label="Proposals" value={stats.activeProposals.toString()} />
-          <Stat label="Laws" value={stats.activeLaws.toString()} />
         </View>
       )}
 
       <Text style={s.sectionTitle}>Quick access</Text>
       <View style={s.quickGrid}>
-        <QuickCard emoji="🗳" label="Vote on proposals" onPress={() => {}} />
-        <QuickCard emoji="📜" label="Browse laws" onPress={() => {}} />
-        <QuickCard emoji="✍" label="Sign petitions" onPress={() => {}} />
-        <QuickCard emoji="💻" label="Sign in to desktop" onPress={() => navigation.navigate('Auth', {})} />
+        <QuickCard emoji="🗳" label="Vote on proposals" onPress={() => (navigation as any).navigate('Proposals')} disabled={citizenStatus !== 'registered'} />
+        <QuickCard emoji="📝" label="Sign petitions" onPress={() => (navigation as any).navigate('Petitions')} disabled={citizenStatus !== 'registered'} />
+        <QuickCard emoji="🤝" label="Manage delegation" onPress={() => (navigation as any).navigate('Delegate')} disabled={citizenStatus !== 'registered'} />
+        <QuickCard emoji="💻" label="Sign in to desktop" onPress={() => navigation.navigate('Auth', {})} disabled={citizenStatus !== 'registered'} />
       </View>
     </View>
   );
@@ -102,11 +96,16 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function QuickCard({ emoji, label, onPress }: { emoji: string; label: string; onPress: () => void }) {
+function QuickCard({ emoji, label, onPress, disabled }: { emoji: string; label: string; onPress: () => void; disabled?: boolean }) {
   return (
-    <TouchableOpacity style={s.card} onPress={onPress}>
-      <Text style={s.cardEmoji}>{emoji}</Text>
-      <Text style={s.cardLabel}>{label}</Text>
+    <TouchableOpacity
+      style={[s.card, disabled && s.cardDisabled]}
+      onPress={disabled ? undefined : onPress}
+      activeOpacity={disabled ? 1 : 0.7}
+    >
+      <Text style={[s.cardEmoji, disabled && s.cardEmojiDisabled]}>{emoji}</Text>
+      <Text style={[s.cardLabel, disabled && s.cardLabelDisabled]}>{label}</Text>
+      {disabled && <Text style={s.cardLock}>🔒</Text>}
     </TouchableOpacity>
   );
 }
@@ -155,4 +154,8 @@ const s = StyleSheet.create({
   },
   cardEmoji: { fontSize: 28, marginBottom: 8 },
   cardLabel: { fontSize: 13, fontWeight: '600', color: '#d1d5db' },
+  cardDisabled: { opacity: 0.4 },
+  cardEmojiDisabled: { opacity: 0.6 },
+  cardLabelDisabled: { color: '#6b7280' },
+  cardLock: { fontSize: 10, position: 'absolute', top: 8, right: 8 },
 });

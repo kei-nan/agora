@@ -1,176 +1,333 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
-  ScrollView,
+  Alert, FlatList, StyleSheet, Text,
+  TextInput, TouchableOpacity, View,
 } from 'react-native';
-import { delegateVote, getDelegation, revokeDelegation } from '../chain/governance';
-import { getSigningKeypair } from '../chain/identity';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { RootStackParamList } from '../App';
+import { fetchDelegateRegistry, DelegateProfile } from '../chain/governance';
+import { getAllDelegations, getRegistered, DelegationEntry } from '../chain/citizenState';
 
-const TOPICS = [
-  { id: 0, label: 'General' },
-  { id: 1, label: 'Budget' },
-  { id: 2, label: 'Constitutional' },
-  { id: 3, label: 'Foreign Affairs' },
-  { id: 4, label: 'Public Safety' },
-];
+const TOPICS = ['General', 'Budget', 'Constitutional', 'Foreign Affairs', 'Public Safety'];
+type StatusFilter = 'All' | 'Active' | 'Pending' | 'OnBreak';
+type Nav = NativeStackNavigationProp<RootStackParamList>;
+
+const HELP = {
+  myDelegations:
+    'When you delegate a topic, your vote on that subject is transferred to a representative of your choice. They vote on your behalf until the delegation expires or you revoke it. You can delegate each topic to a different person.',
+  registry:
+    'Delegates are citizens who have publicly registered with their verified passport name. They represent other citizens on specific topics. You choose which topics — and for how long — you trust each delegate.',
+  backing:
+    'Backing endorses a delegate as trustworthy. A delegate needs at least 50 backers to become Active and eligible to receive vote delegations. Backing is separate from delegation — you can back without delegating.',
+  termLimit:
+    'To prevent permanent concentration of power, delegates serve a maximum number of consecutive terms before a mandatory break. The progress bar shows how far through their current term they are.',
+  becomeDelegate:
+    'Registering as a delegate makes your verified name publicly visible. You start as Pending and need 50 backers to become Active. You can still vote privately as a citizen — your delegate identity is cryptographically separate.',
+};
+
+function help(title: string, message: string) {
+  Alert.alert(title, message);
+}
+
+function HelpIcon({ title, message }: { title: string; message: string }) {
+  return (
+    <TouchableOpacity
+      onPress={() => help(title, message)}
+      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      style={s.helpBtn}
+    >
+      <Text style={s.helpIcon}>?</Text>
+    </TouchableOpacity>
+  );
+}
 
 export default function DelegateScreen() {
-  const [selectedTopic, setSelectedTopic] = useState(0);
-  const [currentDelegate, setCurrentDelegate] = useState<string | null>(null);
-  const [delegateInput, setDelegateInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
-  const [myAddress, setMyAddress] = useState<string>('');
+  const navigation = useNavigation<Nav>();
+  const [delegates, setDelegates] = useState<DelegateProfile[]>([]);
+  const [delegations, setDelegations] = useState<Map<number, DelegationEntry>>(new Map());
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
+  const isRegistered = getRegistered();
 
-  const loadDelegation = useCallback(async (address: string, topicId: number) => {
-    setChecking(true);
-    try {
-      const d = await getDelegation(address, topicId);
-      setCurrentDelegate(d);
-    } finally {
-      setChecking(false);
-    }
-  }, []);
+  useFocusEffect(useCallback(() => {
+    fetchDelegateRegistry().then(d => { setDelegates(d); setLoading(false); });
+    setDelegations(getAllDelegations());
+  }, []));
 
-  useEffect(() => {
-    getSigningKeypair()
-      .then(({ keypair }) => {
-        const addr = keypair.address;
-        setMyAddress(addr);
-        loadDelegation(addr, selectedTopic);
-      })
-      .catch(() => setChecking(false));
-  }, [loadDelegation, selectedTopic]);
+  const activeDelegations = Array.from(delegations.entries());
 
-  async function handleDelegate() {
-    if (!delegateInput.trim()) {
-      Alert.alert('Missing address', 'Enter the delegate address.');
-      return;
-    }
-    setLoading(true);
-    try {
-      const { keypair } = await getSigningKeypair();
-      await delegateVote(keypair, delegateInput.trim(), selectedTopic);
-      Alert.alert('Delegated', `Votes for topic "${TOPICS[selectedTopic]?.label}" delegated.`);
-      loadDelegation(keypair.address, selectedTopic);
-      setDelegateInput('');
-    } catch (e: any) {
-      Alert.alert('Delegation failed', e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const warningDelegates = delegates.filter(
+    d => d.warningEmitted && activeDelegations.some(([, entry]) => entry.delegate === d.address),
+  );
 
-  async function handleRevoke() {
-    setLoading(true);
-    try {
-      const { keypair } = await getSigningKeypair();
-      await revokeDelegation(keypair, selectedTopic);
-      Alert.alert('Revoked', 'Delegation revoked. Your votes are now direct.');
-      setCurrentDelegate(null);
-    } catch (e: any) {
-      Alert.alert('Revoke failed', e.message);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const filteredDelegates = delegates.filter(d => {
+    const matchesSearch = d.displayName.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesStatus = statusFilter === 'All' || d.status === statusFilter;
+    return matchesSearch && matchesStatus;
+  });
+
+  const STATUS_FILTERS: { label: string; value: StatusFilter }[] = [
+    { label: 'All', value: 'All' },
+    { label: 'Active', value: 'Active' },
+    { label: 'Pending', value: 'Pending' },
+    { label: 'On Break', value: 'OnBreak' },
+  ];
 
   return (
-    <ScrollView style={s.container} contentContainerStyle={s.content}>
-      <Text style={s.title}>Vote Delegation</Text>
-      <Text style={s.sub}>
-        Delegate your votes per topic to a trusted citizen. You can revoke at any time.
-      </Text>
+    <FlatList
+      style={s.list}
+      data={filteredDelegates}
+      keyExtractor={d => d.address}
+      refreshing={loading}
+      onRefresh={() => {
+        setLoading(true);
+        fetchDelegateRegistry().then(d => { setDelegates(d); setLoading(false); });
+      }}
+      ListHeaderComponent={
+        <View>
+          {/* Term warning banner */}
+          {warningDelegates.map(d => (
+            <View key={d.address} style={s.warningBanner}>
+              <Text style={s.warningText}>
+                ⚠ {d.displayName}'s term is ending soon — consider re-delegating
+              </Text>
+            </View>
+          ))}
 
-      <Text style={s.sectionLabel}>Topic</Text>
-      <View style={s.topicRow}>
-        {TOPICS.map((t) => (
-          <TouchableOpacity
-            key={t.id}
-            style={[s.topicChip, selectedTopic === t.id && s.topicChipActive]}
-            onPress={() => setSelectedTopic(t.id)}
-          >
-            <Text style={[s.topicChipText, selectedTopic === t.id && s.topicChipTextActive]}>
-              {t.label}
-            </Text>
-          </TouchableOpacity>
-        ))}
+          {/* My Delegations */}
+          <View style={s.section}>
+            <View style={s.sectionHeading}>
+              <Text style={s.sectionLabel}>My Delegations</Text>
+              <HelpIcon title="Vote Delegation" message={HELP.myDelegations} />
+            </View>
+            {activeDelegations.length === 0 ? (
+              <View style={s.card}>
+                <Text style={s.emptyText}>You are voting directly on all topics.</Text>
+              </View>
+            ) : (
+              <View style={s.card}>
+                {activeDelegations.map(([topicId, entry]) => {
+                  const { delegate: addr, expiresAt } = entry;
+                  const profile = delegates.find(d => d.address === addr);
+                  const expiryStr = new Date(expiresAt).toLocaleDateString('en-US', {
+                    month: 'short', day: 'numeric', year: 'numeric',
+                  });
+                  return (
+                    <TouchableOpacity
+                      key={topicId}
+                      style={s.delegationRow}
+                      onPress={() => navigation.navigate('DelegateDetail', { address: addr })}
+                    >
+                      <View>
+                        <Text style={s.delegationTopic}>{TOPICS[topicId] ?? `Topic ${topicId}`}</Text>
+                        <Text style={s.delegationExpiry}>Until {expiryStr}</Text>
+                      </View>
+                      <View style={s.delegationRight}>
+                        <Text style={s.delegationName}>
+                          {profile?.displayName ?? addr.slice(0, 8) + '…'}
+                        </Text>
+                        {profile?.warningEmitted && <Text style={s.warningDot}>⚠</Text>}
+                        <Text style={s.chevron}>›</Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
+          </View>
+
+          {/* Become a Delegate */}
+          {isRegistered && (
+            <View style={s.becomeDelegateRow}>
+              <TouchableOpacity
+                style={s.becomeBtn}
+                onPress={() => navigation.navigate('RegisterDelegate')}
+              >
+                <Text style={s.becomeBtnText}>+ Become a delegate</Text>
+              </TouchableOpacity>
+              <HelpIcon title="Becoming a Delegate" message={HELP.becomeDelegate} />
+            </View>
+          )}
+
+          {/* Registry header with search */}
+          <View style={s.sectionHeading}>
+            <Text style={s.sectionLabel}>Delegate Registry</Text>
+            <HelpIcon title="Delegate Registry" message={HELP.registry} />
+          </View>
+
+          <View style={s.searchRow}>
+            <TextInput
+              style={s.searchInput}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholder="Search by name…"
+              placeholderTextColor="#4b5563"
+              clearButtonMode="while-editing"
+            />
+          </View>
+
+          <View style={s.filterRow}>
+            {STATUS_FILTERS.map(f => (
+              <TouchableOpacity
+                key={f.value}
+                style={[s.filterChip, statusFilter === f.value && s.filterChipActive]}
+                onPress={() => setStatusFilter(f.value)}
+              >
+                <Text style={[s.filterChipText, statusFilter === f.value && s.filterChipTextActive]}>
+                  {f.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      }
+      ListEmptyComponent={
+        loading ? null :
+        <Text style={s.emptyText}>
+          {searchQuery || statusFilter !== 'All' ? 'No delegates match your search.' : 'No delegates registered yet.'}
+        </Text>
+      }
+      renderItem={({ item }) => (
+        <DelegateRow
+          delegate={item}
+          onPress={() => navigation.navigate('DelegateDetail', { address: item.address })}
+        />
+      )}
+      contentContainerStyle={s.content}
+    />
+  );
+}
+
+function DelegateRow({ delegate: d, onPress }: { delegate: DelegateProfile; onPress: () => void }) {
+  const statusColor = d.status === 'Active' ? '#22c55e' : d.status === 'Pending' ? '#f59e0b' : '#6b7280';
+  return (
+    <TouchableOpacity style={s.delegateCard} onPress={onPress}>
+      <View style={s.delegateHeader}>
+        <View style={s.delegateNameRow}>
+          <Text style={s.delegateName}>{d.displayName}</Text>
+          {d.warningEmitted && <Text style={s.warningDotSmall}>⚠</Text>}
+        </View>
+        <View style={[s.statusBadge, { backgroundColor: statusColor + '22' }]}>
+          <Text style={[s.statusText, { color: statusColor }]}>{d.status === 'OnBreak' ? 'On Break' : d.status}</Text>
+        </View>
       </View>
 
-      <View style={s.statusCard}>
-        {checking ? (
-          <ActivityIndicator color="#6C63FF" />
-        ) : currentDelegate ? (
-          <>
-            <Text style={s.delegatedLabel}>Currently delegating to:</Text>
-            <Text style={s.delegateAddress}>{currentDelegate}</Text>
-            <TouchableOpacity style={s.revokeBtn} onPress={handleRevoke} disabled={loading}>
-              {loading
-                ? <ActivityIndicator color="#fff" size="small" />
-                : <Text style={s.revokeBtnText}>Revoke delegation</Text>}
-            </TouchableOpacity>
-          </>
-        ) : (
-          <Text style={s.noDelegation}>Voting directly — no delegation set.</Text>
+      <View style={s.delegateMeta}>
+        <View style={s.metaItem}>
+          <Text style={s.backingText}>{d.backingCount} backers</Text>
+          <HelpIcon title="Backing" message={HELP.backing} />
+        </View>
+        {d.status === 'Active' && (
+          <View style={s.metaItem}>
+            <Text style={s.termText}>Term {d.consecutiveTerms}/{d.maxConsecutiveTerms}</Text>
+            <HelpIcon title="Term Limits" message={HELP.termLimit} />
+          </View>
+        )}
+        {d.status === 'OnBreak' && d.breakEndsInBlocks !== undefined && (
+          <Text style={s.breakText}>Break: {Math.round(d.breakEndsInBlocks / 7200)}d remaining</Text>
         )}
       </View>
 
-      {!currentDelegate && (
-        <>
-          <Text style={s.sectionLabel}>Delegate to</Text>
-          <TextInput
-            style={s.input}
-            value={delegateInput}
-            onChangeText={setDelegateInput}
-            placeholder="5G... (Substrate address)"
-            placeholderTextColor="#4b5563"
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <TouchableOpacity style={s.delegateBtn} onPress={handleDelegate} disabled={loading}>
-            {loading
-              ? <ActivityIndicator color="#fff" />
-              : <Text style={s.delegateBtnText}>Delegate votes</Text>}
-          </TouchableOpacity>
-        </>
+      {d.status === 'Active' && (
+        <View style={s.progressBg}>
+          <View style={[s.progressFill, { width: `${d.termProgressPct}%` as any,
+            backgroundColor: d.warningEmitted ? '#f59e0b' : '#6C63FF' }]} />
+        </View>
       )}
 
-      <View style={s.infoBox}>
-        <Text style={s.infoText}>
-          Delegation is transitive (your delegate may re-delegate) and revocable at any time.
-          No single delegate may hold more than 33% of total votes.
+      {d.status === 'Pending' && (
+        <Text style={s.pendingHint}>
+          Needs {Math.max(0, 50 - d.backingCount)} more backers to activate
         </Text>
-      </View>
-    </ScrollView>
+      )}
+
+      <Text style={s.chevronRight}>›</Text>
+    </TouchableOpacity>
   );
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117' },
-  content: { padding: 20 },
-  title: { fontSize: 22, fontWeight: '700', color: '#ffffff', marginBottom: 6 },
-  sub: { fontSize: 14, color: '#6b7280', marginBottom: 24, lineHeight: 20 },
-  sectionLabel: { fontSize: 12, fontWeight: '600', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 10 },
-  topicRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 24 },
-  topicChip: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937' },
-  topicChipActive: { backgroundColor: '#6C63FF', borderColor: '#6C63FF' },
-  topicChipText: { fontSize: 13, color: '#9ca3af', fontWeight: '500' },
-  topicChipTextActive: { color: '#ffffff', fontWeight: '700' },
-  statusCard: { backgroundColor: '#161b27', borderRadius: 14, padding: 16, marginBottom: 24, borderWidth: 1, borderColor: '#1f2937', minHeight: 70, justifyContent: 'center' },
-  delegatedLabel: { fontSize: 12, color: '#9ca3af', marginBottom: 4 },
-  delegateAddress: { fontSize: 12, color: '#a78bfa', fontFamily: 'monospace', marginBottom: 14 },
-  revokeBtn: { backgroundColor: '#7f1d1d', paddingVertical: 10, borderRadius: 8, alignItems: 'center' },
-  revokeBtnText: { color: '#fca5a5', fontWeight: '600', fontSize: 13 },
-  noDelegation: { fontSize: 14, color: '#6b7280' },
-  input: { backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937', borderRadius: 12, padding: 14, color: '#ffffff', fontSize: 14, marginBottom: 14, fontFamily: 'monospace' },
-  delegateBtn: { backgroundColor: '#6C63FF', paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 24 },
-  delegateBtnText: { color: '#ffffff', fontWeight: '700', fontSize: 15 },
-  infoBox: { backgroundColor: '#161b27', borderRadius: 12, padding: 14, borderWidth: 1, borderColor: '#1f2937' },
-  infoText: { fontSize: 12, color: '#6b7280', lineHeight: 18 },
+  list: { flex: 1, backgroundColor: '#0f1117' },
+  content: { padding: 16, paddingBottom: 32 },
+
+  sectionHeading: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, marginTop: 4 },
+  sectionLabel: {
+    fontSize: 12, fontWeight: '600', color: '#9ca3af',
+    textTransform: 'uppercase', letterSpacing: 0.8,
+  },
+  helpBtn: {
+    width: 20, height: 20, borderRadius: 10,
+    backgroundColor: '#1e1b4b', borderWidth: 1, borderColor: '#6C63FF',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  helpIcon: { fontSize: 12, color: '#a5b4fc', fontWeight: '700', lineHeight: 14 },
+
+  section: { marginBottom: 16 },
+  card: {
+    backgroundColor: '#161b27', borderRadius: 14,
+    borderWidth: 1, borderColor: '#1f2937', overflow: 'hidden',
+  },
+  emptyText: { color: '#6b7280', padding: 16, textAlign: 'center' },
+
+  delegationRow: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingHorizontal: 16, paddingVertical: 12,
+    borderBottomWidth: 1, borderBottomColor: '#1f2937',
+  },
+  delegationTopic: { fontSize: 14, color: '#9ca3af', fontWeight: '500' },
+  delegationExpiry: { fontSize: 11, color: '#4b5563', marginTop: 2 },
+  delegationRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  delegationName: { fontSize: 14, fontWeight: '600', color: '#ffffff' },
+  warningDot: { fontSize: 14, color: '#f59e0b' },
+  warningDotSmall: { fontSize: 12, color: '#f59e0b' },
+  chevron: { fontSize: 18, color: '#6b7280', marginLeft: 4 },
+
+  warningBanner: {
+    backgroundColor: '#451a03', borderRadius: 10, padding: 12,
+    marginBottom: 12, borderWidth: 1, borderColor: '#92400e',
+  },
+  warningText: { color: '#fcd34d', fontSize: 13, lineHeight: 18 },
+
+  becomeDelegateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 20 },
+  becomeBtn: {
+    flex: 1, borderWidth: 1, borderColor: '#6C63FF', borderRadius: 12,
+    paddingVertical: 12, alignItems: 'center',
+  },
+  becomeBtnText: { color: '#6C63FF', fontWeight: '600', fontSize: 14 },
+
+  searchRow: { marginBottom: 10 },
+  searchInput: {
+    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+    borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,
+    color: '#ffffff', fontSize: 14,
+  },
+  filterRow: { flexDirection: 'row', gap: 8, marginBottom: 14, flexWrap: 'wrap' },
+  filterChip: {
+    paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8,
+    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+  },
+  filterChipActive: { backgroundColor: '#6C63FF', borderColor: '#6C63FF' },
+  filterChipText: { fontSize: 13, color: '#6b7280', fontWeight: '500' },
+  filterChipTextActive: { color: '#ffffff', fontWeight: '600' },
+
+  delegateCard: {
+    backgroundColor: '#161b27', borderRadius: 14, padding: 16,
+    marginBottom: 10, borderWidth: 1, borderColor: '#1f2937',
+  },
+  delegateHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  delegateNameRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  delegateName: { fontSize: 15, fontWeight: '700', color: '#ffffff' },
+  statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  statusText: { fontSize: 11, fontWeight: '600' },
+  delegateMeta: { flexDirection: 'row', gap: 16, marginBottom: 8, flexWrap: 'wrap' },
+  metaItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  backingText: { fontSize: 12, color: '#6b7280' },
+  termText: { fontSize: 12, color: '#6b7280' },
+  breakText: { fontSize: 12, color: '#6b7280' },
+  pendingHint: { fontSize: 12, color: '#6b7280', marginTop: 2 },
+  progressBg: { height: 4, backgroundColor: '#1f2937', borderRadius: 2, marginBottom: 4 },
+  progressFill: { height: 4, borderRadius: 2 },
+  chevronRight: { position: 'absolute', right: 16, top: '50%', fontSize: 20, color: '#4b5563' },
 });

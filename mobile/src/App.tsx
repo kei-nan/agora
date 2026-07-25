@@ -3,25 +3,31 @@ import { Linking } from 'react-native';
 import { NavigationContainer, NavigationContainerRef } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { enableScreens } from 'react-native-screens';
+
+enableScreens();
 
 import RegisterScreen from './screens/RegisterScreen';
 import HomeScreen from './screens/HomeScreen';
 import ProposalsScreen from './screens/ProposalsScreen';
-import LawsScreen from './screens/LawsScreen';
 import PetitionScreen from './screens/PetitionScreen';
 import DelegateScreen from './screens/DelegateScreen';
+import DelegateDetailScreen from './screens/DelegateDetailScreen';
+import RegisterDelegateScreen from './screens/RegisterDelegateScreen';
 import AuthScreen from './screens/AuthScreen';
 
 export type RootStackParamList = {
   Main: undefined;
   Register: undefined;
   Auth: { deepLink?: string };
+  DelegateDetail: { address: string };
+  RegisterDelegate: undefined;
 };
 
 export type TabParamList = {
   Home: undefined;
   Proposals: undefined;
-  Laws: undefined;
   Petitions: undefined;
   Delegate: undefined;
 };
@@ -40,9 +46,8 @@ function MainTabs() {
         headerTintColor: '#ffffff',
       }}
     >
-      <Tab.Screen name="Home" component={HomeScreen} options={{ title: 'Agora' }} />
+      <Tab.Screen name="Home" component={HomeScreen} options={{ title: 'Agora', headerShown: false }} />
       <Tab.Screen name="Proposals" component={ProposalsScreen} />
-      <Tab.Screen name="Laws" component={LawsScreen} />
       <Tab.Screen name="Petitions" component={PetitionScreen} />
       <Tab.Screen name="Delegate" component={DelegateScreen} />
     </Tab.Navigator>
@@ -70,6 +75,7 @@ export default function App() {
   }, []);
 
   return (
+    <SafeAreaProvider>
     <NavigationContainer ref={navRef}>
       <Stack.Navigator
         screenOptions={{
@@ -89,7 +95,18 @@ export default function App() {
           component={AuthScreen}
           options={{ title: 'Desktop Sign-In', presentation: 'modal' }}
         />
+        <Stack.Screen
+          name="DelegateDetail"
+          component={DelegateDetailScreen}
+          options={{ title: 'Delegate Profile' }}
+        />
+        <Stack.Screen
+          name="RegisterDelegate"
+          component={RegisterDelegateScreen}
+          options={{ title: 'Become a Delegate' }}
+        />
       </Stack.Navigator>
     </NavigationContainer>
+    </SafeAreaProvider>
   );
 }

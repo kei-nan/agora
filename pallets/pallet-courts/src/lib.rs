@@ -125,6 +125,9 @@ pub mod pallet {
         /// On-chain randomness source for jury selection. Wire to a VRF-backed source
         /// (Babe/SASSAFRAS) before mainnet.
         type Randomness: RandomnessTrait<[u8; 32], BlockNumberFor<Self>>;
+        /// AccountId used as the filer for system-initiated cases (e.g. auto law challenges).
+        /// Wire to a well-known zero account or a dedicated pallet account in the runtime.
+        type AutoChallengeAccount: Get<Self::AccountId>;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
@@ -400,6 +403,18 @@ pub mod pallet {
                 }
             }
             Self::deposit_event(Event::RulingEnforced { case_id });
+            Ok(())
+        }
+
+        /// System-initiated case filing — used by pallet-constitution when a Structural or
+        /// Foundational law is enacted, guaranteeing automatic AI review without requiring
+        /// a citizen to proactively file a challenge.
+        pub fn auto_file_case(subject: CaseSubject) -> DispatchResult {
+            let filer = T::AutoChallengeAccount::get();
+            let id = NextCaseId::<T>::get();
+            Cases::<T>::insert(id, (filer.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
+            NextCaseId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::CaseFiled { case_id: id, filer, subject });
             Ok(())
         }
 

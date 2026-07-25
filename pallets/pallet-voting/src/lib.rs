@@ -52,6 +52,15 @@ pub mod pallet {
         ) -> bool;
     }
 
+    /// Stored per (delegator, topic_id). The delegation is invalid once `expires_at` is past.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct DelegationRecord<AccountId, BlockNumber> {
+        pub delegate: AccountId,
+        /// Delegation is valid for referenda whose close block ≤ expires_at.
+        /// After this block the record is treated as absent and cleaned up lazily.
+        pub expires_at: BlockNumber,
+    }
+
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub enum ReferendumState {
         Voting,
@@ -82,6 +91,13 @@ pub mod pallet {
         /// Number of budget categories citizens can allocate tokens across.
         #[pallet::constant]
         type BudgetCategoryCount: Get<u32>;
+        /// Minimum delegation duration in blocks. Prevents instant-expiry gaming.
+        #[pallet::constant]
+        type MinDelegationDurationBlocks: Get<u32>;
+        /// Maximum delegation duration in blocks. Constitutional ceiling on how long
+        /// a single delegation can run without renewal (prevents indefinite concentration).
+        #[pallet::constant]
+        type MaxDelegationDurationBlocks: Get<u32>;
         /// Minimum proposal duration in blocks. Prevents instantly-expired proposals.
         #[pallet::constant]
         type MinProposalDurationBlocks: Get<u32>;
@@ -132,10 +148,15 @@ pub mod pallet {
     pub type VoteCommitments<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, [u8; 32]), [u8; 32]>;
 
-    /// Per-topic delegation: (delegator, topic_id) -> delegate AccountId.
+    /// Per-topic delegation: (delegator, topic_id) -> DelegationRecord.
+    /// Expired records (expires_at < now) are treated as absent and cleaned up lazily.
     #[pallet::storage]
-    pub type Delegations<T: Config> =
-        StorageMap<_, Blake2_128Concat, (T::AccountId, u32), T::AccountId>;
+    pub type Delegations<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        (T::AccountId, u32),
+        DelegationRecord<T::AccountId, BlockNumberFor<T>>,
+    >;
 
     /// Number of direct delegators per (topic_id, delegate).
     #[pallet::storage]
@@ -223,8 +244,15 @@ pub mod pallet {
     pub enum Event<T: Config> {
         ProposalCreated { id: u32, ends_at: BlockNumberFor<T> },
         VoteCommitted { proposal_id: u32, nullifier: [u8; 32] },
-        DelegationSet { delegator: T::AccountId, delegate: T::AccountId, topic_id: u32 },
+        DelegationSet {
+            delegator: T::AccountId,
+            delegate: T::AccountId,
+            topic_id: u32,
+            expires_at: BlockNumberFor<T>,
+        },
         DelegationRevoked { delegator: T::AccountId, topic_id: u32 },
+        /// Emitted lazily when an expired delegation is encountered and cleaned up.
+        DelegationExpired { delegator: T::AccountId, topic_id: u32 },
         /// New fiscal year opened; all registered citizens may now claim budget tokens.
         FiscalYearStarted { epoch: u32, tokens_per_citizen: u64 },
         /// A citizen claimed their budget tokens for this epoch.
@@ -264,6 +292,10 @@ pub mod pallet {
         DelegationCycleDetected,
         DelegationCapExceeded,
         NoDelegationOnTopic,
+        /// duration_blocks is outside [MinDelegationDurationBlocks, MaxDelegationDurationBlocks].
+        InvalidDelegationDuration,
+        /// The delegation has already expired; it will be cleaned up automatically.
+        DelegationExpired,
         NotRegisteredCitizen,
         /// Account is either not a registered citizen or has an active court-ordered suspension.
         CitizenNotActive,
@@ -350,34 +382,43 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Delegate voting power for a specific topic to another citizen.
-        /// Replaces any existing delegation for that topic.
+        /// Delegate voting power for a specific topic to another citizen for a fixed duration.
+        ///
+        /// `duration_blocks` must be within [MinDelegationDurationBlocks, MaxDelegationDurationBlocks].
+        /// Replaces any existing (including expired) delegation for that topic.
+        /// The delegation is valid for any referendum whose close block ≤ (now + duration_blocks).
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn delegate_vote(
             origin: OriginFor<T>,
             delegate: T::AccountId,
             topic_id: u32,
+            duration_blocks: u32,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             ensure!(
+                duration_blocks >= T::MinDelegationDurationBlocks::get()
+                    && duration_blocks <= T::MaxDelegationDurationBlocks::get(),
+                Error::<T>::InvalidDelegationDuration
+            );
+            ensure!(
                 !Self::has_delegation_cycle(&who, &delegate, topic_id),
                 Error::<T>::DelegationCycleDetected
             );
-            if let Some(old_delegate) = Delegations::<T>::get((who.clone(), topic_id)) {
-                DelegatorCount::<T>::mutate((topic_id, &old_delegate), |c| {
+
+            // Clean up any previous delegation (expired or active).
+            if let Some(old_record) = Delegations::<T>::get((who.clone(), topic_id)) {
+                DelegatorCount::<T>::mutate((topic_id, &old_record.delegate), |c| {
                     *c = c.saturating_sub(1)
                 });
             }
-            let new_count =
-                DelegatorCount::<T>::get((topic_id, &delegate)).saturating_add(1);
-            // Absolute delegator count ceiling.
+
+            let new_count = DelegatorCount::<T>::get((topic_id, &delegate)).saturating_add(1);
             ensure!(
                 new_count <= T::MaxDelegationsPerDelegate::get(),
                 Error::<T>::DelegationCapExceeded
             );
-            // Percentage cap: delegate may not hold more than DelegationCap% of all citizens.
             let total = T::CitizenChecker::total_citizens();
             if total > 0 {
                 ensure!(
@@ -385,20 +426,27 @@ pub mod pallet {
                     Error::<T>::DelegationCapExceeded
                 );
             }
+
+            let now = frame_system::Pallet::<T>::block_number();
+            let expires_at = now + BlockNumberFor::<T>::from(duration_blocks);
+
             DelegatorCount::<T>::insert((topic_id, &delegate), new_count);
-            Delegations::<T>::insert((who.clone(), topic_id), delegate.clone());
-            Self::deposit_event(Event::DelegationSet { delegator: who, delegate, topic_id });
+            Delegations::<T>::insert(
+                (who.clone(), topic_id),
+                DelegationRecord { delegate: delegate.clone(), expires_at },
+            );
+            Self::deposit_event(Event::DelegationSet { delegator: who, delegate, topic_id, expires_at });
             Ok(())
         }
 
-        /// Revoke an existing delegation for a specific topic.
+        /// Revoke an existing delegation for a specific topic (active or expired).
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn revoke_delegation(origin: OriginFor<T>, topic_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let delegate = Delegations::<T>::take((who.clone(), topic_id))
+            let record = Delegations::<T>::take((who.clone(), topic_id))
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
-            DelegatorCount::<T>::mutate((topic_id, &delegate), |c| *c = c.saturating_sub(1));
+            DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
             Self::deposit_event(Event::DelegationRevoked { delegator: who, topic_id });
             Ok(())
         }
@@ -733,25 +781,38 @@ pub mod pallet {
         }
 
         /// Walk the delegation chain from `delegate` up to MaxDelegationDepth steps.
+        /// Expired delegations are treated as absent (lazy cleanup: removes record + adjusts count).
         /// Returns true if `who` appears in the chain, `who == delegate`, or the depth limit is
-        /// reached without a clean termination (conservatively treats deep chains as cycles).
+        /// reached (conservatively treats deep chains as cycles to bound on-chain computation).
         fn has_delegation_cycle(who: &T::AccountId, delegate: &T::AccountId, topic_id: u32) -> bool {
             if who == delegate {
                 return true;
             }
+            let now = frame_system::Pallet::<T>::block_number();
             let mut current = delegate.clone();
             for _ in 0..T::MaxDelegationDepth::get() {
                 match Delegations::<T>::get((current.clone(), topic_id)) {
-                    Some(next) => {
-                        if next == *who {
+                    Some(record) if record.expires_at >= now => {
+                        if record.delegate == *who {
                             return true;
                         }
-                        current = next;
+                        current = record.delegate;
+                    }
+                    Some(record) => {
+                        // Expired — clean up lazily.
+                        DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| {
+                            *c = c.saturating_sub(1)
+                        });
+                        Delegations::<T>::remove((current.clone(), topic_id));
+                        Self::deposit_event(Event::DelegationExpired {
+                            delegator: current,
+                            topic_id,
+                        });
+                        return false;
                     }
                     None => return false,
                 }
             }
-            // Depth exhausted without finding a clean chain end — treat as potential cycle.
             true
         }
     }

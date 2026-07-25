@@ -1,17 +1,7 @@
-import { ApiPromise, WsProvider } from '@polkadot/api';
-
-const NODE_WS = process.env.NODE_WS ?? 'ws://127.0.0.1:9944';
-
-let _api: ApiPromise | null = null;
-
-export async function getApi(): Promise<ApiPromise> {
-  if (_api?.isConnected) return _api;
-  const provider = new WsProvider(NODE_WS);
-  _api = await ApiPromise.create({ provider });
-  return _api;
+// Stub: @polkadot/api requires Node.js polyfills not yet set up for React Native.
+// Replace with real implementation once polyfills are configured.
+export async function getApi(): Promise<any> {
+  throw new Error('Chain not connected — polyfills needed');
 }
 
-export async function disconnect() {
-  await _api?.disconnect();
-  _api = null;
-}
+export async function disconnect() {}

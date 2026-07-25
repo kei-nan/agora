@@ -6167,6 +6167,7 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-elections",
  "parity-scale-codec",
  "scale-info",
  "sp-core",

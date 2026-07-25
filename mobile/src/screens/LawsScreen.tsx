@@ -44,19 +44,26 @@ export default function LawsScreen() {
       ListEmptyComponent={<Text style={s.empty}>No laws enacted yet.</Text>}
       renderItem={({ item }) => (
         <View style={s.card}>
-          <View style={s.header}>
-            <Text style={[s.statusChip,
-              item.status === 'Active' ? s.active
-              : item.status === 'Paused' ? s.paused
-              : s.repealed
+          <View style={s.chips}>
+            <View style={[s.chip,
+              item.status === 'Active' ? s.chipActive
+              : item.status === 'Paused' ? s.chipPaused
+              : s.chipRepealed
             ]}>
-              {item.status}
-            </Text>
+              <Text style={[s.chipText,
+                item.status === 'Active' ? s.chipTextActive
+                : item.status === 'Paused' ? s.chipTextPaused
+                : s.chipTextRepealed
+              ]}>{item.status}</Text>
+            </View>
             {item.tier === 'Constitutional' && (
-              <Text style={[s.statusChip, s.constitutional]}>constitutional</Text>
+              <View style={[s.chip, s.chipConstitutional]}>
+                <Text style={[s.chipText, s.chipTextConstitutional]}>Constitutional</Text>
+              </View>
             )}
-            <Text style={s.idText}>Law #{item.id} · v{item.version}</Text>
+            <Text style={s.meta}>Law #{item.id} · v{item.version}</Text>
           </View>
+          <Text style={s.title}>{item.title}</Text>
           <Text style={s.hash} numberOfLines={1}>{item.contentHash}</Text>
         </View>
       )}
@@ -76,12 +83,18 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#1f2937',
   },
-  header: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' },
-  statusChip: { fontSize: 11, fontWeight: '600', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
-  active: { backgroundColor: '#1a3a1a', color: '#22c55e' },
-  paused: { backgroundColor: '#2a2a1a', color: '#f59e0b' },
-  repealed: { backgroundColor: '#3a1a1a', color: '#ef4444' },
-  constitutional: { backgroundColor: '#1e1040', color: '#a78bfa' },
-  idText: { fontSize: 12, color: '#6b7280', marginLeft: 'auto' },
-  hash: { fontSize: 11, color: '#4b5563', fontFamily: 'monospace' },
+  chips: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' },
+  chip: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  chipText: { fontSize: 11, fontWeight: '600' },
+  chipActive: { backgroundColor: '#052e16' },
+  chipTextActive: { color: '#22c55e' },
+  chipPaused: { backgroundColor: '#2a2a1a' },
+  chipTextPaused: { color: '#f59e0b' },
+  chipRepealed: { backgroundColor: '#2d1515' },
+  chipTextRepealed: { color: '#ef4444' },
+  chipConstitutional: { backgroundColor: '#1e1040' },
+  chipTextConstitutional: { color: '#a78bfa' },
+  meta: { fontSize: 11, color: '#4b5563', marginLeft: 'auto' },
+  title: { fontSize: 15, fontWeight: '600', color: '#ffffff', marginBottom: 8, lineHeight: 21 },
+  hash: { fontSize: 11, color: '#374151', fontFamily: 'monospace' },
 });
