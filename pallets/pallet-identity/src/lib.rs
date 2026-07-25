@@ -98,10 +98,13 @@ pub mod pallet {
         NullifierAlreadyUsed,
         InvalidZKProof,
         NotRegistered,
-        AlreadySuspended,
         NotSuspended,
         /// The proof's slaveMerkleRoot is not in the on-chain allowlist of trusted issuers.
         IssuerNotAllowed,
+        /// Citizen registry is full (u32::MAX citizens).
+        TotalCitizensOverflow,
+        /// A suspended citizen may not self-revoke to escape an active court ruling.
+        CannotRevokeWhileSuspended,
     }
 
     #[pallet::call]
@@ -127,26 +130,33 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
-            // Require at least 5 public inputs before indexing or ZK verification.
             ensure!(public_inputs.len() >= 5, Error::<T>::InvalidZKProof);
-            // Derive nullifier from dg1Commitment (public_inputs[2]).
+
+            // 1. Check allowlist first (cheap storage lookup, no proof work yet).
+            //    slaveMerkleRoot is public_inputs[4].
+            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[4]), Error::<T>::IssuerNotAllowed);
+
+            // 2. Verify the ZK proof (expensive BN254 pairing). Only after confirming the
+            //    issuer root is trusted to avoid wasting compute on untrusted roots.
+            ensure!(
+                T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
+                Error::<T>::InvalidZKProof
+            );
+
+            // 3. Only after the proof is authenticated, extract and check the nullifier.
+            //    Checking nullifier uniqueness before proof verification would let an attacker
+            //    learn whether a nullifier is registered without submitting a valid proof.
             let nullifier = public_inputs[2];
             ensure!(
                 !NullifierRegistry::<T>::contains_key(nullifier),
                 Error::<T>::NullifierAlreadyUsed
             );
-            // Verify the proof against all 5 public signals.
-            ensure!(
-                T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
-                Error::<T>::InvalidZKProof
-            );
-            // slaveMerkleRoot (public_inputs[4]) must match a root added by governance.
-            // This restricts registration to citizens whose country's CA cert is in the tree.
-            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[4]), Error::<T>::IssuerNotAllowed);
+
             let pos = TotalCitizens::<T>::get();
+            let new_total = pos.checked_add(1).ok_or(Error::<T>::TotalCitizensOverflow)?;
             CitizenIndex::<T>::insert(pos, &who);
             CitizenPosition::<T>::insert(&who, pos);
-            TotalCitizens::<T>::put(pos.saturating_add(1));
+            TotalCitizens::<T>::put(new_total);
             CitizenNullifier::<T>::insert(&who, nullifier);
             NullifierRegistry::<T>::insert(nullifier, &who);
             Self::deposit_event(Event::CitizenRegistered { who, nullifier });
@@ -154,11 +164,24 @@ pub mod pallet {
         }
 
         /// Revoke a citizen registration (e.g. country removed from allowlist).
+        /// Blocked while the citizen has an active or unexpired suspension — a suspended
+        /// citizen cannot self-revoke to escape an active court ruling.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(15_000, 0))]
         pub fn revoke_citizen(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let nullifier = CitizenNullifier::<T>::take(&who).ok_or(Error::<T>::NotRegistered)?;
+            let nullifier =
+                CitizenNullifier::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
+            // Block self-revocation if the citizen is currently suspended (including
+            // time-limited suspensions whose block hasn't passed yet).
+            if let Some(entry) = SuspendedNullifiers::<T>::get(nullifier) {
+                let is_active_suspension = match entry {
+                    None => true, // indefinite
+                    Some(until) => frame_system::Pallet::<T>::block_number() <= until,
+                };
+                ensure!(!is_active_suspension, Error::<T>::CannotRevokeWhileSuspended);
+            }
+            CitizenNullifier::<T>::remove(&who);
             NullifierRegistry::<T>::remove(nullifier);
             SuspendedNullifiers::<T>::remove(nullifier);
             // Swap-and-pop: fill the vacated slot with the last citizen to keep the index dense.
@@ -178,9 +201,9 @@ pub mod pallet {
 
         /// Suspend a citizen's voting and budget-allocation rights by court order.
         /// `until`: None = indefinite suspension; Some(block) = suspension lifts at that block.
+        /// If the citizen is already suspended, the existing record is replaced (allows courts
+        /// to extend or modify an active suspension).
         /// Origin: root (TODO: replace with court-controlled multisig origin).
-        /// Only for offences listed in the constitution — legislature cannot expand this list
-        /// without a constitutional amendment.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn suspend_citizen(
@@ -190,10 +213,7 @@ pub mod pallet {
         ) -> DispatchResult {
             T::SuspensionOrigin::ensure_origin(origin)?;
             ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
-            ensure!(
-                !SuspendedNullifiers::<T>::contains_key(nullifier),
-                Error::<T>::AlreadySuspended
-            );
+            // Upsert: courts may extend or modify an existing suspension.
             SuspendedNullifiers::<T>::insert(nullifier, until);
             Self::deposit_event(Event::CitizenSuspended { nullifier, until });
             Ok(())
@@ -201,7 +221,7 @@ pub mod pallet {
 
         /// Restore suspended voting rights.
         /// Called when a sentence is served, the waiting period passes, or a conviction is
-        /// overturned on appeal. Restoration is automatic via the same court contract.
+        /// overturned on appeal. Works on both active and expired-but-not-yet-cleaned-up records.
         /// Origin: root (TODO: replace with court-controlled multisig origin).
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
@@ -250,15 +270,13 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         /// Called by pallet-courts via CitizenSuspender runtime trait when a conduct ruling
         /// is finalized. Bypasses the extrinsic origin check — courts are pre-authorized.
+        /// Upserts: if a suspension record already exists it is replaced, allowing courts to
+        /// extend or modify a citizen's suspension without needing to restore first.
         pub fn suspend_citizen_internal(
             nullifier: [u8; 32],
             until: Option<BlockNumberFor<T>>,
         ) -> DispatchResult {
             ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
-            ensure!(
-                !SuspendedNullifiers::<T>::contains_key(nullifier),
-                Error::<T>::AlreadySuspended
-            );
             SuspendedNullifiers::<T>::insert(nullifier, until);
             Self::deposit_event(Event::CitizenSuspended { nullifier, until });
             Ok(())
@@ -274,13 +292,23 @@ pub mod pallet {
         }
 
         /// True if the account is a registered citizen with no active suspension.
-        /// Suspensions with a block expiry are lazily treated as lifted once that block passes.
+        /// Timed suspensions are lazily removed from storage once their block has passed,
+        /// so subsequent is_citizen / suspend calls do not see stale records.
         pub fn is_active_citizen(who: &T::AccountId) -> bool {
             let Some(nullifier) = CitizenNullifier::<T>::get(who) else { return false; };
             match SuspendedNullifiers::<T>::get(nullifier) {
                 None => true,
-                Some(None) => false,
-                Some(Some(until)) => frame_system::Pallet::<T>::block_number() > until,
+                Some(None) => false, // indefinite suspension
+                Some(Some(until)) => {
+                    if frame_system::Pallet::<T>::block_number() > until {
+                        // Lazily clean up the expired record so future suspend/restore
+                        // calls don't incorrectly see it as an active suspension.
+                        SuspendedNullifiers::<T>::remove(nullifier);
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
         }
 

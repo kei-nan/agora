@@ -136,7 +136,6 @@ dependencies = [
  "pallet-constitution",
  "pallet-courts",
  "pallet-elections",
- "pallet-emergency-council",
  "pallet-executive",
  "pallet-grandpa",
  "pallet-identity-zk",

@@ -337,6 +337,8 @@ impl pallet_treasury_ledger::Config for Runtime {
 	type Balance = Balance;
 	/// Wire the audit pallet as the expenditure hook.
 	type AuditHook = PalletAuditImpl;
+	/// Budget allocation requires a passed legislature motion, not just sudo.
+	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 }
 
 /// Runtime implements CitizenSelector by reading pallet-identity's indexed storage.
@@ -346,6 +348,13 @@ impl pallet_courts::CitizenSelector<AccountId> for Runtime {
 	}
 	fn total_citizens() -> u32 {
 		pallet_identity_zk::TotalCitizens::<Runtime>::get()
+	}
+}
+
+/// Runtime implements CitizenChecker for pallet-courts (file_case active-citizen gate).
+impl pallet_courts::CitizenChecker<AccountId> for Runtime {
+	fn is_active_citizen(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
 	}
 }
 
@@ -364,12 +373,13 @@ impl pallet_courts::TreasuryEnforcer for Runtime {
 }
 
 /// Runtime implements CitizenSuspender by calling pallet-identity's internal suspension function.
-impl pallet_courts::CitizenSuspender for Runtime {
-	fn suspend_citizen(nullifier: [u8; 32], until: Option<u32>) -> sp_runtime::DispatchResult {
-		pallet_identity_zk::Pallet::<Runtime>::suspend_citizen_internal(
-			nullifier,
-			until.map(|u| u.into()),
-		)
+/// `suspension_until` is an absolute block number computed by pallet-courts before this call.
+impl pallet_courts::CitizenSuspender<BlockNumber> for Runtime {
+	fn suspend_citizen(
+		nullifier: [u8; 32],
+		suspension_until: Option<BlockNumber>,
+	) -> sp_runtime::DispatchResult {
+		pallet_identity_zk::Pallet::<Runtime>::suspend_citizen_internal(nullifier, suspension_until)
 	}
 }
 
@@ -378,6 +388,7 @@ impl pallet_courts::Config for Runtime {
 	/// Citizens have 7 days to appeal an AI ruling.
 	type AppealWindowBlocks = ConstU32<{ 7 * DAYS }>;
 	type CitizenSelector = Runtime;
+	type CitizenChecker = Runtime;
 	type LawEnforcer = Runtime;
 	type TreasuryEnforcer = Runtime;
 	/// Oracle account stored in OracleAccount storage; set via set_oracle_account (root-only).
@@ -456,17 +467,6 @@ impl pallet_constitution::Config for Runtime {
 	type CourtOrigin = pallet_courts::EnsureOracle<Runtime>;
 }
 
-impl pallet_emergency_council::Config for Runtime {
-	type RuntimeEvent = RuntimeEvent;
-	/// 30 days at 6s/block — constitutionally hard-coded ceiling on emergency duration.
-	type MaxEmergencyBlocks = ConstU32<432_000>;
-	/// Emergency Council may have at most 15 members.
-	type MaxCouncilSize = ConstU32<15>;
-	/// Supermajority numerator: 2 (for 2/3 majority).
-	type SupermajorityNumerator = ConstU32<2>;
-	/// Supermajority denominator: 3 (for 2/3 majority).
-	type SupermajorityDenominator = ConstU32<3>;
-}
 
 impl pallet_legislature::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -484,10 +484,17 @@ impl pallet_legislature::Config for Runtime {
 
 impl pallet_executive::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// Only a passed legislature motion can appoint/dismiss ministers.
+	/// Only a passed legislature motion can appoint/dismiss ministers or ratify an emergency.
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// Maximum 20 cabinet portfolios.
 	type MaxPortfolios = ConstU32<20>;
+	/// 30 days at 6s/block — constitutional ceiling on emergency duration.
+	type MaxEmergencyBlocks = ConstU32<432_000>;
+	/// Legislature has 72 hours (at 6s/block) to ratify after cabinet declares emergency.
+	type RatificationWindowBlocks = ConstU32<{ 3 * DAYS }>;
+	/// 2/3 cabinet supermajority required to declare or end an emergency.
+	type SupermajorityNumerator = ConstU32<2>;
+	type SupermajorityDenominator = ConstU32<3>;
 }
 
 // ── Elections Commission ─────────────────────────────────────────────────────
@@ -520,6 +527,19 @@ impl pallet_elections::Config for Runtime {
 	type DefaultElectionCycleBlocks = ConstU32<{ 2 * 365 * DAYS }>;
 	/// Each citizen may back at most 5 delegates simultaneously (constitutional).
 	type DefaultMaxBackingsPerCitizen = ConstU32<5>;
+	/// Governance-controlled parameter defaults — stored in storage and changeable by governance,
+	/// but these values apply from genesis so the chain is functional without a governance vote.
+	type DefaultBackingThreshold = ConstU32<10>;
+	type DefaultBackingThresholdFloor = ConstU32<5>;
+	type DefaultBackingThresholdCeiling = ConstU32<500>;
+	/// 1-year term: 365 * 7200 blocks at 12 s/block.
+	type DefaultTermLengthBlocks = ConstU32<{ 365 * DAYS }>;
+	/// Delegates must take a break after 2 consecutive terms.
+	type DefaultMaxConsecutiveTerms = ConstU32<2>;
+	/// Mandatory break = 1 year.
+	type DefaultMandatoryBreakBlocks = ConstU32<{ 365 * DAYS }>;
+	/// Warn delegates when 10% of their term remains.
+	type DefaultWarningWindowPct = ConstU8<10>;
 }
 
 // ── Anti-Corruption module ───────────────────────────────────────────────────

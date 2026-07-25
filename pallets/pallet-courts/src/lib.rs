@@ -25,6 +25,11 @@ pub mod pallet {
         fn total_citizens() -> u32;
     }
 
+    /// Implemented by the runtime to check whether an account is an active citizen.
+    pub trait CitizenChecker<AccountId> {
+        fn is_active_citizen(who: &AccountId) -> bool;
+    }
+
     /// Implemented by the runtime to call pallet-constitution's invalidate_law_internal.
     pub trait LawEnforcer {
         fn invalidate_law(law_id: u32) -> DispatchResult;
@@ -36,9 +41,14 @@ pub mod pallet {
     }
 
     /// Implemented by the runtime to call pallet-identity's suspend_citizen_internal.
-    /// Triggered when a CitizenConduct case is finalized with an Overturned verdict.
-    pub trait CitizenSuspender {
-        fn suspend_citizen(nullifier: [u8; 32], until: Option<u32>) -> DispatchResult;
+    /// `suspension_until` is an **absolute block number** when the suspension lifts
+    /// (None = indefinite). The courts pallet computes this from `suspension_blocks` +
+    /// `now` before calling this trait — the implementor just passes it through.
+    pub trait CitizenSuspender<BlockNumber> {
+        fn suspend_citizen(
+            nullifier: [u8; 32],
+            suspension_until: Option<BlockNumber>,
+        ) -> DispatchResult;
     }
 
     // ── Oracle origin ────────────────────────────────────────────────────────────
@@ -100,6 +110,7 @@ pub mod pallet {
         TreasuryDispute { department_id: u32 },
         /// Criminal/conduct case against a citizen identified by their nullifier.
         /// Overturned verdict (i.e. guilty) suspends them; suspension_blocks = None means indefinite.
+        /// suspension_blocks is a DURATION in blocks; auto_finalize converts to an absolute block.
         CitizenConduct { nullifier: [u8; 32], suspension_blocks: Option<u32> },
     }
 
@@ -113,6 +124,9 @@ pub mod pallet {
         type AppealWindowBlocks: Get<u32>;
         /// Source of citizen accounts for jury selection.
         type CitizenSelector: CitizenSelector<Self::AccountId>;
+        /// Gate: checks whether an account is an active (non-suspended) citizen.
+        /// Used to require active citizenship before filing a case.
+        type CitizenChecker: CitizenChecker<Self::AccountId>;
         /// Hook called to pause a law when an Overturned verdict is issued.
         type LawEnforcer: LawEnforcer;
         /// Hook called to freeze a department when an Overturned treasury verdict is issued.
@@ -121,7 +135,7 @@ pub mod pallet {
         /// Configure as EnsureRoot for dev; wire to a dedicated oracle account in production.
         type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
-        type CitizenSuspender: CitizenSuspender;
+        type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// On-chain randomness source for jury selection. Wire to a VRF-backed source
         /// (Babe/SASSAFRAS) before mainnet.
         type Randomness: RandomnessTrait<[u8; 32], BlockNumberFor<Self>>;
@@ -180,6 +194,8 @@ pub mod pallet {
         JurySelected { case_id: u32, jurors: BoundedVec<T::AccountId, ConstU32<21>> },
         AppealFiled { case_id: u32, appellant: T::AccountId },
         RulingFinalized { case_id: u32, verdict: Verdict },
+        /// Emitted only when an Overturned verdict triggers actual on-chain enforcement
+        /// (law paused, department frozen, or citizen suspended).
         RulingEnforced { case_id: u32 },
         JuryVoteCast { case_id: u32, juror: T::AccountId, verdict: Verdict },
         OracleAccountSet { account: T::AccountId },
@@ -198,17 +214,24 @@ pub mod pallet {
         NotEnoughCitizens,
         InvalidJurySize,
         MajorityAlreadyReached,
+        /// Only active (non-suspended) citizens may file cases.
+        NotActiveCitizen,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// File a new case. subject determines what gets auto-enforced on ruling.
+        /// File a new case. Only active (non-suspended) citizens may file.
+        /// subject determines what gets auto-enforced on ruling.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn file_case(origin: OriginFor<T>, subject: CaseSubject) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(
+                T::CitizenChecker::is_active_citizen(&who),
+                Error::<T>::NotActiveCitizen
+            );
             let id = NextCaseId::<T>::get();
             Cases::<T>::insert(id, (who.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
             NextCaseId::<T>::put(id.saturating_add(1));
@@ -246,7 +269,8 @@ pub mod pallet {
             // Enforce the appeal window before changing any state.
             let ruling_block = AIRulingBlock::<T>::get(case_id)
                 .ok_or(Error::<T>::CaseNotFound)?;
-            let deadline = ruling_block + BlockNumberFor::<T>::from(T::AppealWindowBlocks::get());
+            let deadline = ruling_block
+                .saturating_add(BlockNumberFor::<T>::from(T::AppealWindowBlocks::get()));
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(now <= deadline, Error::<T>::AppealWindowClosed);
             Cases::<T>::try_mutate(case_id, |maybe_case| {
@@ -269,9 +293,13 @@ pub mod pallet {
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(100_000, 0))]
         pub fn select_jury(origin: OriginFor<T>, case_id: u32, jury_size: u8) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
+            let who = ensure_signed(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::InJuryAppeal, Error::<T>::InvalidStatus);
+            // Only the case filer or the oracle may trigger jury selection.
+            // Prevents any random account from timing the call to game block-hash randomness.
+            let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| o == who);
+            ensure!(who == case.0 || oracle_ok, Error::<T>::NotActiveCitizen);
             // Derive the required jury size from the case subject so that the
             // routing logic (Level 1 vs Level 2) is enforced on-chain rather than
             // relying on the caller to pass the correct value.
@@ -308,7 +336,8 @@ pub mod pallet {
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::AIRulingIssued, Error::<T>::InvalidStatus);
             let ruling_block = AIRulingBlock::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
-            let appeal_deadline = ruling_block + BlockNumberFor::<T>::from(T::AppealWindowBlocks::get());
+            let appeal_deadline = ruling_block
+                .saturating_add(BlockNumberFor::<T>::from(T::AppealWindowBlocks::get()));
             ensure!(
                 frame_system::Pallet::<T>::block_number() > appeal_deadline,
                 Error::<T>::AppealWindowClosed
@@ -317,7 +346,7 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Cast a jury vote for a case in InJuryAppeal status.
+        /// Cast a jury vote for a case in JurySeated status.
         /// Auto-finalizes the case when a strict majority is reached.
         #[pallet::call_index(5)]
         #[pallet::weight(Weight::from_parts(15_000, 0))]
@@ -387,22 +416,42 @@ pub mod pallet {
             })?;
             Rulings::<T>::insert(case_id, verdict.clone());
             Self::deposit_event(Event::RulingFinalized { case_id, verdict: verdict.clone() });
-            // Auto-enforce on Overturned verdicts.
+            // Auto-enforce only on Overturned verdicts — Upheld means "AI was right, no action".
+            // For General cases there is no automatic enforcement target by design.
             if verdict == Verdict::Overturned {
-                match &case.3 {
+                let enforced = match &case.3 {
                     CaseSubject::LawChallenge { law_id } => {
                         T::LawEnforcer::invalidate_law(*law_id)?;
+                        true
                     }
                     CaseSubject::TreasuryDispute { department_id } => {
                         T::TreasuryEnforcer::freeze_department(*department_id)?;
+                        true
                     }
                     CaseSubject::CitizenConduct { nullifier, suspension_blocks } => {
-                        T::CitizenSuspender::suspend_citizen(*nullifier, *suspension_blocks)?;
+                        // Convert the duration to an absolute block number here in the courts pallet.
+                        // The CitizenSuspender trait receives an absolute block, not a duration,
+                        // so the identity pallet can store it directly without knowing "now".
+                        let now = frame_system::Pallet::<T>::block_number();
+                        let until = suspension_blocks.map(|b| {
+                            now.saturating_add(BlockNumberFor::<T>::from(b))
+                        });
+                        T::CitizenSuspender::suspend_citizen(*nullifier, until)?;
+                        true
                     }
-                    CaseSubject::General => {}
+                    CaseSubject::General => false,
+                };
+                if enforced {
+                    // Advance status to Enforced so observers can distinguish
+                    // "finalized but not enforced" from "finalized and enforced".
+                    Cases::<T>::try_mutate(case_id, |maybe_case| {
+                        let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
+                        c.1 = CaseStatus::Enforced;
+                        Ok::<(), DispatchError>(())
+                    })?;
+                    Self::deposit_event(Event::RulingEnforced { case_id });
                 }
             }
-            Self::deposit_event(Event::RulingEnforced { case_id });
             Ok(())
         }
 

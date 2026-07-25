@@ -6,6 +6,16 @@
 //! which inserts a new `AuditEntry` with status `Pending`. Designated auditors can then clear,
 //! flag, or escalate entries to `Disputed`. Periodic audit reports are submitted on-chain as
 //! IPFS hashes.
+//!
+//! ## Audit lifecycle
+//! ```text
+//! Pending → Cleared   (auditor finds it compliant)
+//! Pending → Flagged   (auditor finds it irregular; reason stored)
+//! Flagged → Disputed  (escalated to formal dispute)
+//! ```
+//! Only these transitions are valid. Notably:
+//! - `Disputed` cannot be downgraded back to `Flagged`.
+//! - `Pending` cannot jump directly to `Disputed` (must go through `Flagged`).
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
@@ -27,7 +37,7 @@ pub mod pallet {
         Cleared,
         /// Flagged as potentially irregular; reason document stored on IPFS.
         Flagged,
-        /// Escalated to formal dispute.
+        /// Escalated to formal dispute. Cannot be downgraded back to Flagged.
         Disputed,
     }
 
@@ -59,19 +69,15 @@ pub mod pallet {
 
     // ── Storage ────────────────────────────────────────────────────────────────
 
-    /// Audit entries indexed by the treasury expenditure index.
+    /// Audit entries indexed by the treasury expenditure index (u64 matching the ledger counter).
     #[pallet::storage]
     pub type AuditLog<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32, AuditEntry<T::AccountId>>;
+        StorageMap<_, Blake2_128Concat, u64, AuditEntry<T::AccountId>>;
 
     /// The current set of registered auditors.
     #[pallet::storage]
     pub type Auditors<T: Config> =
         StorageValue<_, BoundedVec<T::AccountId, T::MaxAuditors>, ValueQuery>;
-
-    /// Monotonic counter for audit report submissions (informational).
-    #[pallet::storage]
-    pub type NextEntryId<T: Config> = StorageValue<_, u32, ValueQuery>;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -83,11 +89,11 @@ pub mod pallet {
         /// An auditor was removed.
         AuditorRemoved { who: T::AccountId },
         /// An expenditure entry was cleared as compliant.
-        EntryCleared { index: u32 },
+        EntryCleared { index: u64 },
         /// An expenditure entry was flagged as irregular.
-        EntryFlagged { index: u32, by: T::AccountId, reason: [u8; 32] },
+        EntryFlagged { index: u64, by: T::AccountId, reason: [u8; 32] },
         /// An expenditure entry was escalated to disputed status.
-        EntryDisputed { index: u32 },
+        EntryDisputed { index: u64 },
         /// An audit report covering a time period was submitted on-chain.
         AuditReportSubmitted { period_hash: [u8; 32] },
     }
@@ -106,6 +112,12 @@ pub mod pallet {
         TooManyAuditors,
         /// Account is already a registered auditor.
         AlreadyAuditor,
+        /// dispute_entry requires the entry to be Flagged first.
+        MustBeFlaggedFirst,
+        /// flag_entry cannot re-flag an already-flagged entry.
+        EntryAlreadyFlagged,
+        /// flag_entry cannot downgrade a Disputed entry.
+        EntryAlreadyDisputed,
     }
 
     // ── Calls ──────────────────────────────────────────────────────────────────
@@ -145,11 +157,13 @@ pub mod pallet {
         /// Mark an expenditure entry as Cleared. Auditor only.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
-        pub fn clear_entry(origin: OriginFor<T>, expenditure_index: u32) -> DispatchResult {
+        pub fn clear_entry(origin: OriginFor<T>, expenditure_index: u64) -> DispatchResult {
             let _who = Self::ensure_auditor(origin)?;
             AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
                 let entry = maybe_entry.as_mut().ok_or(Error::<T>::EntryNotFound)?;
-                ensure!(entry.status != AuditStatus::Cleared, Error::<T>::AlreadyCertified);
+                // Only Pending→Cleared is a valid transition. Flagged and Disputed entries
+                // are in active review and must not be silently cleared.
+                ensure!(entry.status == AuditStatus::Pending, Error::<T>::AlreadyCertified);
                 entry.status = AuditStatus::Cleared;
                 Ok::<_, DispatchError>(())
             })?;
@@ -158,17 +172,23 @@ pub mod pallet {
         }
 
         /// Flag an expenditure entry with a reason document (IPFS hash). Auditor only.
+        /// Only Pending entries may be flagged — Disputed entries cannot be downgraded.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
         pub fn flag_entry(
             origin: OriginFor<T>,
-            expenditure_index: u32,
+            expenditure_index: u64,
             reason_hash: [u8; 32],
         ) -> DispatchResult {
             let who = Self::ensure_auditor(origin)?;
             AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
                 let entry = maybe_entry.as_mut().ok_or(Error::<T>::EntryNotFound)?;
-                ensure!(entry.status != AuditStatus::Cleared, Error::<T>::AlreadyCertified);
+                match entry.status {
+                    AuditStatus::Pending => {}
+                    AuditStatus::Cleared => return Err(Error::<T>::AlreadyCertified.into()),
+                    AuditStatus::Flagged => return Err(Error::<T>::EntryAlreadyFlagged.into()),
+                    AuditStatus::Disputed => return Err(Error::<T>::EntryAlreadyDisputed.into()),
+                }
                 entry.status = AuditStatus::Flagged;
                 entry.flag_reason = Some(reason_hash);
                 entry.flagged_by = Some(who.clone());
@@ -182,14 +202,16 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Escalate an entry to Disputed status. Auditor only.
+        /// Escalate a Flagged entry to Disputed status. Auditor only.
+        /// Requires the entry to be in Flagged state — cannot skip from Pending to Disputed.
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
-        pub fn dispute_entry(origin: OriginFor<T>, expenditure_index: u32) -> DispatchResult {
+        pub fn dispute_entry(origin: OriginFor<T>, expenditure_index: u64) -> DispatchResult {
             let _who = Self::ensure_auditor(origin)?;
             AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
                 let entry = maybe_entry.as_mut().ok_or(Error::<T>::EntryNotFound)?;
                 ensure!(entry.status != AuditStatus::Cleared, Error::<T>::AlreadyCertified);
+                ensure!(entry.status == AuditStatus::Flagged, Error::<T>::MustBeFlaggedFirst);
                 entry.status = AuditStatus::Disputed;
                 Ok::<_, DispatchError>(())
             })?;
@@ -205,8 +227,6 @@ pub mod pallet {
             period_hash: [u8; 32],
         ) -> DispatchResult {
             let _who = Self::ensure_auditor(origin)?;
-            let id = NextEntryId::<T>::get();
-            NextEntryId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::AuditReportSubmitted { period_hash });
             Ok(())
         }
@@ -228,7 +248,7 @@ pub mod pallet {
 // ── AuditHook implementation ───────────────────────────────────────────────────
 
 impl<T: Config> pallet_treasury_ledger::AuditHook for Pallet<T> {
-    fn on_expenditure(index: u32, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]) {
+    fn on_expenditure(index: u64, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]) {
         let entry = pallet::AuditEntry {
             dept_id,
             amount,
@@ -238,7 +258,5 @@ impl<T: Config> pallet_treasury_ledger::AuditHook for Pallet<T> {
             flagged_by: None,
         };
         pallet::AuditLog::<T>::insert(index, entry);
-        // We intentionally do NOT increment NextEntryId here;
-        // audit entries are indexed by the treasury's own expenditure index directly.
     }
 }

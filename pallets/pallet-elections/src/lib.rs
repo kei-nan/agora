@@ -178,6 +178,36 @@ pub mod pallet {
         /// Default max number of delegates a citizen may back simultaneously (constitutional, default 5).
         #[pallet::constant]
         type DefaultMaxBackingsPerCitizen: Get<u32>;
+
+        // ── Governance parameter defaults (stored in storage, changeable by governance) ──
+
+        /// Genesis default for the minimum backer count required to hold Active status.
+        #[pallet::constant]
+        type DefaultBackingThreshold: Get<u32>;
+
+        /// Genesis default for the backing threshold floor (governance may not lower below this).
+        #[pallet::constant]
+        type DefaultBackingThresholdFloor: Get<u32>;
+
+        /// Genesis default for the backing threshold ceiling (governance may not raise above this).
+        #[pallet::constant]
+        type DefaultBackingThresholdCeiling: Get<u32>;
+
+        /// Genesis default for a single delegate term length in blocks.
+        #[pallet::constant]
+        type DefaultTermLengthBlocks: Get<u32>;
+
+        /// Genesis default for the maximum number of consecutive terms before a mandatory break.
+        #[pallet::constant]
+        type DefaultMaxConsecutiveTerms: Get<u32>;
+
+        /// Genesis default for the mandatory break length in blocks.
+        #[pallet::constant]
+        type DefaultMandatoryBreakBlocks: Get<u32>;
+
+        /// Genesis default for the warning window as a percentage of the term (1–50 %).
+        #[pallet::constant]
+        type DefaultWarningWindowPct: Get<u8>;
     }
 
     // ── Storage: Elections Commission ──────────────────────────────────────────
@@ -230,27 +260,52 @@ pub mod pallet {
 
     // ── Storage: Governance-controlled parameters ──────────────────────────────
 
+    #[pallet::type_value]
+    pub fn DefaultBackingThresholdFn<T: Config>() -> u32 { T::DefaultBackingThreshold::get() }
+
     /// Minimum citizen backers required to hold Active delegate status.
     #[pallet::storage]
-    pub type BackingThreshold<T: Config> = StorageValue<_, u32, ValueQuery>;
+    pub type BackingThreshold<T: Config> = StorageValue<_, u32, ValueQuery, DefaultBackingThresholdFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultBackingThresholdFloorFn<T: Config>() -> u32 { T::DefaultBackingThresholdFloor::get() }
 
     #[pallet::storage]
-    pub type BackingThresholdFloor<T: Config> = StorageValue<_, u32, ValueQuery>;
+    pub type BackingThresholdFloor<T: Config> = StorageValue<_, u32, ValueQuery, DefaultBackingThresholdFloorFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultBackingThresholdCeilingFn<T: Config>() -> u32 { T::DefaultBackingThresholdCeiling::get() }
 
     #[pallet::storage]
-    pub type BackingThresholdCeiling<T: Config> = StorageValue<_, u32, ValueQuery>;
+    pub type BackingThresholdCeiling<T: Config> = StorageValue<_, u32, ValueQuery, DefaultBackingThresholdCeilingFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultTermLengthBlocksFn<T: Config>() -> BlockNumberFor<T> {
+        T::DefaultTermLengthBlocks::get().into()
+    }
 
     #[pallet::storage]
-    pub type TermLengthBlocks<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+    pub type TermLengthBlocks<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery, DefaultTermLengthBlocksFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultMaxConsecutiveTermsFn<T: Config>() -> u32 { T::DefaultMaxConsecutiveTerms::get() }
 
     #[pallet::storage]
-    pub type MaxConsecutiveTerms<T: Config> = StorageValue<_, u32, ValueQuery>;
+    pub type MaxConsecutiveTerms<T: Config> = StorageValue<_, u32, ValueQuery, DefaultMaxConsecutiveTermsFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultMandatoryBreakBlocksFn<T: Config>() -> BlockNumberFor<T> {
+        T::DefaultMandatoryBreakBlocks::get().into()
+    }
 
     #[pallet::storage]
-    pub type MandatoryBreakBlocks<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+    pub type MandatoryBreakBlocks<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery, DefaultMandatoryBreakBlocksFn<T>>;
+
+    #[pallet::type_value]
+    pub fn DefaultWarningWindowPctFn<T: Config>() -> u8 { T::DefaultWarningWindowPct::get() }
 
     #[pallet::storage]
-    pub type WarningWindowPct<T: Config> = StorageValue<_, u8, ValueQuery>;
+    pub type WarningWindowPct<T: Config> = StorageValue<_, u8, ValueQuery, DefaultWarningWindowPctFn<T>>;
 
     // ── Storage: Legislature election parameters (constitutional) ──────────────
 
@@ -353,6 +408,10 @@ pub mod pallet {
         BackingLimitReached,
         /// Legislature seat count must be at least 1.
         ElectionSeatsZero,
+        /// Account is already a registered commissioner.
+        AlreadyCommissioner,
+        /// certify_results requires results to be submitted first.
+        ResultsNotSubmitted,
     }
 
     // ── on_initialize: term warnings, expirations, and legislature elections ───
@@ -375,6 +434,10 @@ pub mod pallet {
             let break_blocks = MandatoryBreakBlocks::<T>::get();
             let warning_pct = WarningWindowPct::<T>::get();
 
+            // warning_offset = term_length * (100 - warning_pct) / 100
+            // Divide-first avoids u32 overflow for large term lengths (saturating_mul at u32::MAX
+            // then dividing by 100 would fire the warning months too early for 9+ year terms).
+            // Precision loss is at most (complement - 1) blocks — negligible vs. million-block terms.
             let hundred: BlockNumberFor<T> = 100u32.into();
             let complement: BlockNumberFor<T> = (100u32.saturating_sub(warning_pct as u32)).into();
             let warning_offset: BlockNumberFor<T> = (term_length / hundred) * complement;
@@ -478,7 +541,7 @@ pub mod pallet {
         pub fn add_commissioner(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Commissioners::<T>::try_mutate(|commissioners| {
-                if commissioners.contains(&account) { return Ok(()); }
+                ensure!(!commissioners.contains(&account), Error::<T>::AlreadyCommissioner);
                 commissioners.try_push(account.clone()).map_err(|_| Error::<T>::TooManyCommissioners)?;
                 Self::deposit_event(Event::CommissionerAdded { account });
                 Ok(())
@@ -586,7 +649,11 @@ pub mod pallet {
             let winner = Elections::<T>::try_mutate(election_id, |maybe| {
                 let election = maybe.as_mut().ok_or(Error::<T>::ElectionNotFound)?;
                 ensure!(election.status != ElectionStatus::Certified, Error::<T>::AlreadyCertified);
-                ensure!(election.status == ElectionStatus::ResultsSubmitted, Error::<T>::ResultsAlreadySubmitted);
+                // Results must be submitted before certification is possible.
+                ensure!(
+                    election.status == ElectionStatus::ResultsSubmitted,
+                    Error::<T>::ResultsNotSubmitted
+                );
                 election.status = ElectionStatus::Certified;
                 Ok::<Option<T::AccountId>, DispatchError>(election.winner.clone())
             })?;

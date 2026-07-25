@@ -18,6 +18,7 @@ pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode};
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::Saturating;
 
     // ── Motion struct ────────────────────────────────────────────────────────────
 
@@ -45,28 +46,42 @@ pub mod pallet {
 
     // ── Origin ───────────────────────────────────────────────────────────────────
 
-    /// Origin that passes only when a majority of legislature members have voted aye
-    /// on a motion that has been closed (executed). Used as LegislatureOrigin.
+    /// Origin that passes only when `close_motion` has just passed a motion.
     ///
-    /// Current implementation: accepts any signed, currently-enrolled member.
-    /// Full motion gating is enforced by `close_motion`. In production, replace with a
-    /// custom RuntimeOrigin variant set by `close_motion` itself.
+    /// `close_motion` writes a `PendingLegislatureApproval` token (the passed call_hash) to
+    /// storage. `EnsureLegislatureMotion::try_origin` consumes that token exactly once, so
+    /// each passed motion can authorize exactly one subsequent legislature-gated extrinsic.
+    /// Any signed member origin without a pending approval is rejected.
     pub struct EnsureLegislatureMotion<T>(core::marker::PhantomData<T>);
 
     impl<T: Config> frame_support::traits::EnsureOrigin<T::RuntimeOrigin>
         for EnsureLegislatureMotion<T>
     {
-        type Success = ();
+        /// The call_hash of the consumed approval token, for off-chain auditability.
+        /// NOTE: the hash is caller-supplied at proposal time; it is not cryptographically
+        /// bound to the dispatched extrinsic — see PendingLegislatureApproval for the
+        /// known limitation and the path to a dispatch-via-motion redesign.
+        type Success = [u8; 32];
         fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
             use frame_system::RawOrigin;
             match o.clone().into() {
-                Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => Ok(()),
+                Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
+                    // Consume the pending approval token. If none exists, this member is
+                    // acting without a passed motion behind them — reject.
+                    if let Some(call_hash) = PendingLegislatureApproval::<T>::take() {
+                        Ok(call_hash)
+                    } else {
+                        Err(o)
+                    }
+                }
                 _ => Err(o),
             }
         }
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
+            // Plant a token so the benchmark-generated origin validates.
+            PendingLegislatureApproval::<T>::put([0u8; 32]);
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -118,6 +133,12 @@ pub mod pallet {
     pub type MotionVotes<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool>;
 
+    /// Set by `close_motion` when a motion passes; consumed by `EnsureLegislatureMotion`.
+    /// Stores the call_hash of the passed motion so the approval is auditable.
+    /// Cleared after it is consumed — each passed motion authorizes exactly one action.
+    #[pallet::storage]
+    pub type PendingLegislatureApproval<T: Config> = StorageValue<_, [u8; 32], OptionQuery>;
+
     // ── Events ───────────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -159,6 +180,11 @@ pub mod pallet {
         MemberNotFound,
         /// Active executive ministers may not vote on legislature motions (incompatibility rule).
         MinisterCannotVote,
+        /// The motion's voting window has already closed; votes are no longer accepted.
+        VotingWindowClosed,
+        /// A previously passed motion's approval token is still pending consumption.
+        /// The queued action must be executed before another passed motion can plant a new token.
+        ApprovalPending,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -195,15 +221,20 @@ pub mod pallet {
 
         /// Propose a motion. Only enrolled members may propose.
         /// The proposer's aye is recorded immediately (ayes starts at 1).
+        /// Active executive ministers may not propose motions (incompatibility rule).
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(15_000, 0))]
         pub fn propose_motion(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotAMember);
+            ensure!(
+                !T::MinisterChecker::is_active_minister(&who),
+                Error::<T>::MinisterCannotVote
+            );
 
             let motion_id = NextMotionId::<T>::get();
             let end_block = frame_system::Pallet::<T>::block_number()
-                + BlockNumberFor::<T>::from(T::MotionDurationBlocks::get());
+                .saturating_add(BlockNumberFor::<T>::from(T::MotionDurationBlocks::get()));
 
             let motion = Motion::<T> {
                 call_hash,
@@ -246,6 +277,8 @@ pub mod pallet {
             Motions::<T>::try_mutate(motion_id, |maybe_motion| {
                 let motion = maybe_motion.as_mut().ok_or(Error::<T>::MotionNotFound)?;
                 ensure!(!motion.executed, Error::<T>::MotionAlreadyExecuted);
+                let now = frame_system::Pallet::<T>::block_number();
+                ensure!(now < motion.end_block, Error::<T>::VotingWindowClosed);
 
                 if approve {
                     motion.ayes = motion.ayes.saturating_add(1);
@@ -272,12 +305,14 @@ pub mod pallet {
             ensure!(!motion.executed, Error::<T>::MotionAlreadyExecuted);
 
             let now = frame_system::Pallet::<T>::block_number();
-            ensure!(now > motion.end_block, Error::<T>::MotionStillOpen);
+            ensure!(now >= motion.end_block, Error::<T>::MotionStillOpen);
 
-            let total_members = Members::<T>::get().len() as u32;
-            let threshold = T::PassageThreshold::get() as u32;
-            // ayes * 100 >= threshold * total_members  →  majority met
-            let passed = motion.ayes.saturating_mul(100) >= threshold.saturating_mul(total_members);
+            let total_members = Members::<T>::get().len() as u64;
+            let threshold = T::PassageThreshold::get() as u64;
+            // Use u64 arithmetic to avoid overflow with large member sets (>42M members
+            // would overflow u32 when multiplied by 100).
+            let passed = (motion.ayes as u64).saturating_mul(100)
+                >= threshold.saturating_mul(total_members);
 
             Motions::<T>::try_mutate(motion_id, |maybe_motion| {
                 let m = maybe_motion.as_mut().ok_or(Error::<T>::MotionNotFound)?;
@@ -286,6 +321,13 @@ pub mod pallet {
             })?;
 
             if passed {
+                // Refuse to overwrite an unconsumed approval token: the pending action must be
+                // executed first, otherwise a second motion silently cancels the first.
+                ensure!(
+                    PendingLegislatureApproval::<T>::get().is_none(),
+                    Error::<T>::ApprovalPending
+                );
+                PendingLegislatureApproval::<T>::put(motion.call_hash);
                 Self::deposit_event(Event::MotionPassed { motion_id, call_hash: motion.call_hash });
             } else {
                 Self::deposit_event(Event::MotionFailed { motion_id });

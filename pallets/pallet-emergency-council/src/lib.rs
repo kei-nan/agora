@@ -24,6 +24,7 @@ pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode};
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::Saturating;
 
     // ── EmergencyInfo struct ─────────────────────────────────────────────────
 
@@ -101,15 +102,21 @@ pub mod pallet {
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
         /// Auto-expire an active emergency when `expires_at <= n`.
         fn on_initialize(n: BlockNumberFor<T>) -> Weight {
+            // Always charge at minimum for reading ActiveEmergency.
+            let mut weight = T::DbWeight::get().reads(1);
             if let Some(info) = ActiveEmergency::<T>::get() {
                 if info.expires_at <= n {
                     ActiveEmergency::<T>::kill();
-                    // Also clear end votes so they don't linger.
+                    // Clear both vote maps so they don't linger into the next emergency.
+                    // Without clearing DeclareVotes here, members who voted for the expired
+                    // emergency would receive AlreadyVotedToDeclare on the next declaration.
+                    let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                     let _ = EndVotes::<T>::clear(u32::MAX, None);
                     Self::deposit_event(Event::EmergencyExpired { at_block: n });
+                    weight = weight.saturating_add(T::DbWeight::get().writes(3));
                 }
             }
-            Weight::zero()
+            weight
         }
     }
 
@@ -144,9 +151,6 @@ pub mod pallet {
         NoActiveEmergency,
         /// Cannot declare a new emergency while one is already active.
         AlreadyActiveEmergency,
-        /// The requested duration exceeds the constitutional maximum.
-        /// This should not happen due to clamping, but is guarded defensively.
-        DurationExceedsMax,
         /// Cannot add member: council is at maximum capacity.
         CouncilAtCapacity,
         /// The account is not in the council list.
@@ -210,11 +214,9 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
-            // Clamp duration to constitutional ceiling.
-            let max = T::MaxEmergencyBlocks::get();
-            let clamped = duration_blocks.min(max);
-            // Defensive guard (clamping should prevent this, but be explicit).
-            ensure!(clamped <= max, Error::<T>::DurationExceedsMax);
+            // Clamp duration to constitutional ceiling. The clamp guarantees the value
+            // is within bounds, so no further ensure! check is needed.
+            let clamped = duration_blocks.min(T::MaxEmergencyBlocks::get());
 
             DeclareVotes::<T>::insert(&who, true);
 
@@ -227,7 +229,7 @@ pub mod pallet {
             if Self::supermajority_reached(vote_count, council.len() as u32) {
                 // Activate emergency.
                 let now = frame_system::Pallet::<T>::block_number();
-                let expires_at = now + BlockNumberFor::<T>::from(clamped);
+                let expires_at = now.saturating_add(BlockNumberFor::<T>::from(clamped));
 
                 let info = EmergencyInfo {
                     declared_at: now,

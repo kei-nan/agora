@@ -7,14 +7,16 @@
 pub use pallet::*;
 
 /// Called after every recorded expenditure. Implement to maintain an audit trail.
+/// `index` is the u64 expenditure counter — using u64 avoids truncation for chains
+/// that record billions of expenditures over their lifetime.
 pub trait AuditHook {
-    fn on_expenditure(index: u32, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]);
+    fn on_expenditure(index: u64, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]);
 }
 
 /// No-op implementation for tests or when audit is disabled.
 pub struct NoopAuditHook;
 impl AuditHook for NoopAuditHook {
-    fn on_expenditure(_index: u32, _dept_id: u32, _amount: u128, _ipfs_hash: [u8; 32]) {}
+    fn on_expenditure(_index: u64, _dept_id: u32, _amount: u128, _ipfs_hash: [u8; 32]) {}
 }
 
 #[frame_support::pallet]
@@ -43,6 +45,10 @@ pub mod pallet {
             + Into<u128>;
         /// Hook called after every expenditure is recorded.
         type AuditHook: crate::AuditHook;
+        /// Origin permitted to allocate department budgets and reset spend counters.
+        /// Must be wired to the legislature motion origin so that budget grants require
+        /// a passed legislature vote — enforcing the executive/legislature separation.
+        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
     }
 
     /// Department id -> allocated budget (in base units).
@@ -89,6 +95,7 @@ pub mod pallet {
         InsufficientBudget,
         DepartmentNotFound,
         DepartmentFrozen,
+        DepartmentNotFrozen,
         Overflow,
         NotAuthorizedSpender,
         DepartmentHasNoSpender,
@@ -97,6 +104,10 @@ pub mod pallet {
     #[pallet::call]
     impl<T: Config> Pallet<T> {
         /// Allocate a budget to a department (legislature-approved).
+        /// Note: calling this twice for the same department replaces the prior allocation.
+        /// A supplemental appropriation should pass the new total, not an addend.
+        /// `DepartmentSpent` is NOT reset on re-allocation — call reset_department_spent
+        /// explicitly at the start of a new fiscal period.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn allocate_budget(
@@ -104,9 +115,22 @@ pub mod pallet {
             department_id: u32,
             amount: T::Balance,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::LegislatureOrigin::ensure_origin(origin)?;
             DepartmentBudgets::<T>::insert(department_id, amount);
             Self::deposit_event(Event::BudgetAllocated { department_id, amount });
+            Ok(())
+        }
+
+        /// Reset the accumulated spend counter for a department to zero.
+        /// Call at the start of each fiscal period after allocating the new budget.
+        #[pallet::call_index(4)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn reset_department_spent(
+            origin: OriginFor<T>,
+            department_id: u32,
+        ) -> DispatchResult {
+            T::LegislatureOrigin::ensure_origin(origin)?;
+            DepartmentSpent::<T>::remove(department_id);
             Ok(())
         }
 
@@ -134,8 +158,9 @@ pub mod pallet {
             ExpenditureLog::<T>::insert(idx, (department_id, amount, metadata_hash));
             NextExpenditureIndex::<T>::put(idx.saturating_add(1));
             // Notify the audit pallet (or no-op if AuditHook = NoopAuditHook).
+            // idx is u64 — the AuditHook trait accepts u64 to avoid truncation.
             T::AuditHook::on_expenditure(
-                idx as u32,
+                idx,
                 department_id,
                 amount.into(),
                 metadata_hash,
@@ -174,10 +199,29 @@ pub mod pallet {
             Self::deposit_event(Event::SpenderRemoved { department_id });
             Ok(())
         }
+
+        /// Unfreeze a previously frozen department. Root only.
+        /// Called after an appeal overturns a treasury court ruling, or after remediation.
+        #[pallet::call_index(5)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn unfreeze_department(
+            origin: OriginFor<T>,
+            department_id: u32,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(
+                FrozenDepartments::<T>::get(department_id),
+                Error::<T>::DepartmentNotFrozen
+            );
+            FrozenDepartments::<T>::remove(department_id);
+            Self::deposit_event(Event::DepartmentUnfrozen { department_id });
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
         /// Called by pallet-courts when a ruling finds illegal treasury activity.
+        /// Cross-pallet internal call — no origin check needed here; courts are pre-authorized.
         pub fn freeze_department_internal(department_id: u32) -> DispatchResult {
             FrozenDepartments::<T>::insert(department_id, true);
             Self::deposit_event(Event::DepartmentFrozen { department_id });

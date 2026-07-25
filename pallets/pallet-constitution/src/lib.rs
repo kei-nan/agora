@@ -15,7 +15,6 @@
 //!      The required revocation threshold (30 / 35 / 40 %) grows by stage and is
 //!      enforced externally by the RevocationOrigin collective configuration.
 //!
-//! HRC may veto any newly enacted law within HRCVetoWindowBlocks.
 //! Courts may pause any Active law via CourtOrigin.
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
@@ -25,6 +24,7 @@ pub mod pallet {
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::Saturating;
 
     // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ pub mod pallet {
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub enum LawStatus {
         Active,
-        Paused,   // court-invalidated or HRC-vetoed, pending review
+        Paused,   // court-invalidated, pending review
         Repealed,
     }
 
@@ -62,6 +62,8 @@ pub mod pallet {
     pub struct ConstitutionalAmendmentRecord<T: Config> {
         /// Content hash before this amendment — restored on revocation.
         pub previous_hash: [u8; 32],
+        /// Law version before this amendment — restored on revocation.
+        pub previous_version: u32,
         /// Content hash applied at proposal time.
         pub new_hash: [u8; 32],
         /// Block at which the amendment was proposed.
@@ -261,6 +263,7 @@ pub mod pallet {
             NextLawId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::LawEnacted { law_id: id, tier: tier.clone(), content_hash });
             if tier == LawTier::Structural || tier == LawTier::Foundational {
+                // Best-effort: a courts pallet error must not prevent law enactment.
                 let _ = T::AutoChallengeHook::auto_challenge_law(id);
             }
             Ok(())
@@ -314,10 +317,17 @@ pub mod pallet {
             let deliberation =
                 BlockNumberFor::<T>::from(T::OrdinaryAmendmentDeliberationBlocks::get());
             let now = frame_system::Pallet::<T>::block_number();
-            ensure!(now >= proposed_at + deliberation, Error::<T>::DeliberationPeriodActive);
+            ensure!(
+                now >= proposed_at.saturating_add(deliberation),
+                Error::<T>::DeliberationPeriodActive
+            );
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
                 ensure!(law.0 == LawTier::Ordinary, Error::<T>::UseConstitutionalAmendmentCall);
+                // Guard: law must still be Active. A court ruling may have paused it between
+                // propose_amendment and ratify_amendment; ratifying a Paused law would silently
+                // update content while the law is suspended, corrupting the law ledger state.
+                ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
                 law.2 = law.2.saturating_add(1);
                 law.3 = new_hash;
                 Ok::<(), DispatchError>(())
@@ -327,6 +337,7 @@ pub mod pallet {
         }
 
         /// Submit a new petition. topic_hash is the IPFS CID of the petition text.
+        /// The proposer is automatically recorded as the first signer (count starts at 1).
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn submit_petition(origin: OriginFor<T>, topic_hash: [u8; 32]) -> DispatchResult {
@@ -334,9 +345,18 @@ pub mod pallet {
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             let id = NextPetitionId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            Petitions::<T>::insert(id, (who.clone(), topic_hash, 0u32, now));
+            // Proposer is counted as the first signature — prevents a petition from existing
+            // with 0 signatures and requiring a separate sign_petition call from the same proposer.
+            Petitions::<T>::insert(id, (who.clone(), topic_hash, 1u32, now));
+            PetitionSignatures::<T>::insert((id, &who), true);
             NextPetitionId::<T>::put(id.saturating_add(1));
-            Self::deposit_event(Event::PetitionSubmitted { petition_id: id, proposer: who, topic_hash });
+            Self::deposit_event(Event::PetitionSubmitted { petition_id: id, proposer: who.clone(), topic_hash });
+            Self::deposit_event(Event::PetitionSigned { petition_id: id, signer: who, signature_count: 1 });
+            // When threshold is 1, the proposer's signature already satisfies it.
+            if 1u32 == T::PetitionThreshold::get() {
+                Self::deposit_event(Event::PetitionThresholdReached { petition_id: id, topic_hash });
+                T::PetitionApprover::create_referendum(id, topic_hash)?;
+            }
             Ok(())
         }
 
@@ -367,13 +387,14 @@ pub mod pallet {
                     petition_id,
                     topic_hash: petition.1,
                 });
-                let _ = T::PetitionApprover::create_referendum(petition_id, petition.1);
+                T::PetitionApprover::create_referendum(petition_id, petition.1)?;
             }
             Ok(())
         }
 
         /// Repeal a law entirely. Terminal — cannot be re-enacted under the same id.
-        #[pallet::call_index(7)]
+        /// Cleans up any pending Ordinary or Constitutional amendments for this law.
+        #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn repeal_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(origin)?;
@@ -383,6 +404,10 @@ pub mod pallet {
                 law.1 = LawStatus::Repealed;
                 Ok::<(), DispatchError>(())
             })?;
+            // Clean up any in-flight amendments so their storage is reclaimed and
+            // a future propose_amendment call doesn't see stale pending records.
+            PendingAmendments::<T>::remove(law_id);
+            ConstitutionalAmendments::<T>::remove(law_id);
             Self::deposit_event(Event::LawRepealed { law_id });
             Ok(())
         }
@@ -393,7 +418,7 @@ pub mod pallet {
         /// It can be revoked at any stage via RevocationOrigin; the required revocation threshold
         /// grows as the amendment matures (30% Provisional / 35% Confirmed / 40% Entrenched),
         /// enforced externally by the RevocationOrigin's collective configuration.
-        #[pallet::call_index(8)]
+        #[pallet::call_index(7)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
         pub fn propose_constitutional_amendment(
             origin: OriginFor<T>,
@@ -413,6 +438,7 @@ pub mod pallet {
             );
 
             let previous_hash = law.3;
+            let previous_version = law.2;
             let now = frame_system::Pallet::<T>::block_number();
 
             // Apply the amendment immediately; the Provisional stage allows revocation.
@@ -427,6 +453,7 @@ pub mod pallet {
                 law_id,
                 ConstitutionalAmendmentRecord::<T> {
                     previous_hash,
+                    previous_version,
                     new_hash,
                     proposed_at: now,
                     stage: MaturityStage::Provisional,
@@ -446,7 +473,7 @@ pub mod pallet {
         ///
         /// Must be called by a legislature that held at least one election after the proposal block.
         /// Advances the amendment from Provisional → Confirmed.
-        #[pallet::call_index(9)]
+        #[pallet::call_index(8)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn reaffirm_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(origin)?;
@@ -463,7 +490,7 @@ pub mod pallet {
                 let provisioning =
                     BlockNumberFor::<T>::from(T::ProvisioningPeriodBlocks::get());
                 ensure!(
-                    now >= record.proposed_at + provisioning,
+                    now >= record.proposed_at.saturating_add(provisioning),
                     Error::<T>::ProvisioningPeriodNotElapsed
                 );
                 ensure!(
@@ -483,7 +510,7 @@ pub mod pallet {
         ///
         /// Permissionless — anyone may call once
         /// now >= proposed_at + ProvisioningPeriodBlocks + ConfirmationPeriodBlocks.
-        #[pallet::call_index(10)]
+        #[pallet::call_index(9)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn advance_to_entrenched(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
@@ -501,7 +528,7 @@ pub mod pallet {
                         .saturating_add(T::ConfirmationPeriodBlocks::get()),
                 );
                 ensure!(
-                    now >= record.proposed_at + total,
+                    now >= record.proposed_at.saturating_add(total),
                     Error::<T>::ConfirmationPeriodNotElapsed
                 );
 
@@ -518,7 +545,7 @@ pub mod pallet {
         ///   Provisional → 30% of legislature
         ///   Confirmed   → 35% of legislature
         ///   Entrenched  → 40% of legislature + citizen referendum
-        #[pallet::call_index(11)]
+        #[pallet::call_index(10)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
         pub fn revoke_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::RevocationOrigin::ensure_origin(origin)?;
@@ -528,7 +555,8 @@ pub mod pallet {
             let restored_hash = record.previous_hash;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
-                law.2 = law.2.saturating_add(1);
+                // Restore the version from before the amendment was proposed, not increment.
+                law.2 = record.previous_version;
                 law.3 = restored_hash;
                 Ok::<(), DispatchError>(())
             })?;
@@ -548,6 +576,7 @@ pub mod pallet {
             NextLawId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::LawEnacted { law_id: id, tier: tier.clone(), content_hash });
             if tier == LawTier::Structural || tier == LawTier::Foundational {
+                // Best-effort: a courts pallet error must not prevent law enactment.
                 let _ = T::AutoChallengeHook::auto_challenge_law(id);
             }
             Ok(())

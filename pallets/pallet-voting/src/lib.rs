@@ -15,6 +15,7 @@ pub mod pallet {
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::Saturating;
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -416,30 +417,55 @@ pub mod pallet {
                 Error::<T>::DelegationCycleDetected
             );
 
-            // Clean up any previous delegation (expired or active).
-            if let Some(old_record) = Delegations::<T>::get((who.clone(), topic_id)) {
-                DelegatorCount::<T>::mutate((topic_id, &old_record.delegate), |c| {
-                    *c = c.saturating_sub(1)
-                });
-            }
+            // Read the old delegation record without mutating yet.
+            // We must do all cap checks before touching any storage, otherwise a failed cap
+            // check would leave DelegatorCount decremented while the old Delegations record
+            // still exists — an inconsistency.
+            let maybe_old = Delegations::<T>::get((who.clone(), topic_id));
+            let replacing_same_delegate =
+                maybe_old.as_ref().map_or(false, |r| r.delegate == delegate);
 
-            let new_count = DelegatorCount::<T>::get((topic_id, &delegate)).saturating_add(1);
+            // Compute the new count for `delegate`. If we're re-delegating to the same
+            // delegate we decrement then increment, so the net count is unchanged.
+            let base_count = DelegatorCount::<T>::get((topic_id, &delegate));
+            let new_count = if replacing_same_delegate {
+                base_count
+            } else {
+                base_count.saturating_add(1)
+            };
+
             ensure!(
                 new_count <= T::MaxDelegationsPerDelegate::get(),
                 Error::<T>::DelegationCapExceeded
             );
             let total = T::CitizenChecker::total_citizens();
             if total > 0 {
+                // Use u64 to avoid overflow: DelegationCap * total can exceed u32::MAX
+                // for large citizenries (e.g. cap=50, total=100M → 5B overflows u32).
                 ensure!(
-                    new_count.saturating_mul(100) <= T::DelegationCap::get() as u32 * total,
+                    (new_count as u64).saturating_mul(100)
+                        <= (T::DelegationCap::get() as u64).saturating_mul(total as u64),
                     Error::<T>::DelegationCapExceeded
                 );
             }
 
-            let now = frame_system::Pallet::<T>::block_number();
-            let expires_at = now + BlockNumberFor::<T>::from(duration_blocks);
+            // All checks passed. Now perform state mutations atomically.
+            // When replacing_same_delegate is true the net count is unchanged, so we must
+            // skip BOTH the decrement (old) and the insert (new) to avoid a -1 drift.
+            if let Some(old_record) = maybe_old {
+                if old_record.delegate != delegate {
+                    DelegatorCount::<T>::mutate((topic_id, &old_record.delegate), |c| {
+                        *c = c.saturating_sub(1)
+                    });
+                }
+            }
+            if !replacing_same_delegate {
+                DelegatorCount::<T>::insert((topic_id, &delegate), new_count);
+            }
 
-            DelegatorCount::<T>::insert((topic_id, &delegate), new_count);
+            let now = frame_system::Pallet::<T>::block_number();
+            let expires_at = now.saturating_add(BlockNumberFor::<T>::from(duration_blocks));
+
             Delegations::<T>::insert(
                 (who.clone(), topic_id),
                 DelegationRecord { delegate: delegate.clone(), expires_at },
@@ -597,11 +623,14 @@ pub mod pallet {
             let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
             let total = yes_count.saturating_add(no_count);
             let threshold = match tier {
-                ReferendumTier::Ordinary => T::PassageThreshold::get() as u32,
-                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u32,
-                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u32,
+                ReferendumTier::Ordinary => T::PassageThreshold::get() as u64,
+                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u64,
+                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u64,
             };
-            let passed = total > 0 && yes_count.saturating_mul(100) >= threshold * total;
+            // Use u64 arithmetic to avoid overflow with large citizenries (yes_count * 100 would
+            // saturate a u32 above ~42 million votes, causing the check to always pass).
+            let passed = total > 0
+                && (yes_count as u64).saturating_mul(100) >= threshold * (total as u64);
             let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
             Referenda::<T>::insert(
                 referendum_id,
@@ -617,8 +646,9 @@ pub mod pallet {
         }
 
         /// Submit a verified MACI tally for a proposal whose voting window has closed.
-        /// The off-chain MACI coordinator calls this after decrypting all vote commitments
-        /// and generating a ZK proof of correct tallying.
+        /// Only callable by the legislature origin (same authority that opens voting epochs).
+        /// In production wire this to a dedicated MACI coordinator origin; using legislature
+        /// origin here ensures at minimum a governance-controlled account submits tallies.
         #[pallet::call_index(9)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn submit_maci_tally(
@@ -629,7 +659,7 @@ pub mod pallet {
             commitment_root: [u8; 32],
             proof_bytes: BoundedVec<u8, ConstU32<4096>>,
         ) -> DispatchResult {
-            let _who = ensure_signed(origin)?;
+            T::LegislatureOrigin::ensure_origin(origin)?;
             let end_block = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(
                 frame_system::Pallet::<T>::block_number() > end_block,
