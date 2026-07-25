@@ -257,4 +257,7 @@ mod runtime {
 
 	#[runtime::pallet_index(17)]
 	pub type PalletAntiCorruption = pallet_anticorruption;
+
+	#[runtime::pallet_index(18)]
+	pub type Cabinet = pallet_executive;
 }

@@ -19,6 +19,7 @@ members = [
     "pallets/pallet-emergency-council",
     "pallets/pallet-audit",
     "pallets/pallet-anticorruption",
+    "pallets/pallet-executive",
     "runtime",
 ]
 resolver = "2"
@@ -36,6 +37,7 @@ pallet-elections = { path = "./pallets/pallet-elections", default-features = fal
 pallet-emergency-council = { path = "./pallets/pallet-emergency-council", default-features = false }
 pallet-audit = { path = "./pallets/pallet-audit", default-features = false }
 pallet-anticorruption = { path = "./pallets/pallet-anticorruption", default-features = false }
+pallet-executive = { path = "./pallets/pallet-executive", default-features = false }
 ark-bn254 = { version = "0.4", default-features = false, features = ["curve"] }
 ark-groth16 = { version = "0.4", default-features = false }
 ark-serialize = { version = "0.4", default-features = false }

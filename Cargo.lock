@@ -137,6 +137,7 @@ dependencies = [
  "pallet-courts",
  "pallet-elections",
  "pallet-emergency-council",
+ "pallet-executive",
  "pallet-grandpa",
  "pallet-identity-zk",
  "pallet-legislature",
@@ -6118,6 +6119,20 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-core",
+ "sp-io",
+ "sp-runtime",
+]
+
+[[package]]
+name = "pallet-executive"
+version = "0.1.0"
+dependencies = [
+ "frame-support",
+ "frame-system",
+ "pallet-legislature",
  "parity-scale-codec",
  "scale-info",
  "sp-core",

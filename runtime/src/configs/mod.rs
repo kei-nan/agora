@@ -40,7 +40,7 @@ use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
-	AccountId, Aura, Balance, Balances, Block, BlockNumber, Hash, Legislature, Nonce, PalletInfo,
+	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce, PalletInfo,
 	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
 	RuntimeTask, System, DAYS, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
 };
@@ -473,6 +473,18 @@ impl pallet_legislature::Config for Runtime {
 	type MotionDurationBlocks = ConstU32<{ 7 * DAYS }>;
 	/// Simple majority (50%+1) required to pass a motion.
 	type PassageThreshold = ConstU8<50>;
+	/// Active ministers are blocked from legislature votes (incompatibility rule).
+	type MinisterChecker = Cabinet;
+}
+
+// ── Parliamentary Executive ──────────────────────────────────────────────────
+
+impl pallet_executive::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// Only a passed legislature motion can appoint/dismiss ministers.
+	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Maximum 20 cabinet portfolios.
+	type MaxPortfolios = ConstU32<20>;
 }
 
 // ── Elections Commission ─────────────────────────────────────────────────────

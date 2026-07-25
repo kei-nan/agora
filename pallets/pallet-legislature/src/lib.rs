@@ -71,6 +71,13 @@ pub mod pallet {
         }
     }
 
+    /// Checks whether an account is currently an active executive minister.
+    /// Implemented by pallet-executive; called by pallet-legislature to enforce
+    /// the incompatibility rule (ministers cannot vote on legislature motions).
+    pub trait MinisterChecker<AccountId> {
+        fn is_active_minister(who: &AccountId) -> bool;
+    }
+
     // ── Config ───────────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -86,6 +93,9 @@ pub mod pallet {
         /// Evaluated at close time: ayes * 100 >= PassageThreshold * total_members.
         #[pallet::constant]
         type PassageThreshold: Get<u8>;
+        /// Checks whether a member is an active executive minister.
+        /// Ministers are blocked from voting on motions (incompatibility rule).
+        type MinisterChecker: MinisterChecker<Self::AccountId>;
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────────
@@ -147,6 +157,8 @@ pub mod pallet {
         MembersAtCapacity,
         /// The account was not found in the member list.
         MemberNotFound,
+        /// Active executive ministers may not vote on legislature motions (incompatibility rule).
+        MinisterCannotVote,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -222,6 +234,10 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotAMember);
+            ensure!(
+                !T::MinisterChecker::is_active_minister(&who),
+                Error::<T>::MinisterCannotVote
+            );
             ensure!(
                 !MotionVotes::<T>::contains_key((motion_id, who.clone())),
                 Error::<T>::AlreadyVoted
