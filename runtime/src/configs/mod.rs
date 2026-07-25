@@ -277,6 +277,7 @@ impl pallet_voting::LawEnactor for Runtime {
 		let law_tier = match tier {
 			pallet_voting::ReferendumTier::Ordinary => pallet_constitution::LawTier::Ordinary,
 			pallet_voting::ReferendumTier::Constitutional => pallet_constitution::LawTier::Structural,
+			pallet_voting::ReferendumTier::Foundational => pallet_constitution::LawTier::Foundational,
 		};
 		pallet_constitution::Pallet::<Runtime>::enact_law_internal(law_tier, content_hash)
 	}
@@ -306,8 +307,10 @@ impl pallet_voting::Config for Runtime {
 	type ReferendumDurationBlocks = ConstU32<{ 14 * DAYS }>;
 	/// Simple majority required to pass an ordinary referendum.
 	type PassageThreshold = ConstU8<51>;
-	/// 2/3 supermajority required to pass a constitutional referendum.
+	/// 2/3 supermajority required to pass a constitutional (Structural-tier) referendum.
 	type ConstitutionalPassageThreshold = ConstU8<67>;
+	/// 3/4 supermajority required to pass a foundational referendum.
+	type FoundationalPassageThreshold = ConstU8<75>;
 	type LawEnactor = Runtime;
 	type MACITallyVerifier = PassthroughMACIVerifier;
 	/// Fiscal year start is a legislature motion — wired to the same origin as

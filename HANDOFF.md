@@ -37,10 +37,10 @@ Dev node:
 ```
 democracy-chain/
 ├── node/                          # chain binary (agora-node)
-├── runtime/                       # WASM runtime (agora-runtime) — all 10 pallets wired in
+├── runtime/                       # WASM runtime (agora-runtime) — all 11 pallets wired in
 │   ├── assets/
-│   │   ├── vk_sha256.bin          # EMPTY PLACEHOLDER — must populate before production
-│   │   └── vk_sha1.bin            # EMPTY PLACEHOLDER — must populate before production
+│   │   ├── vk_sha256.bin          # REAL VK — Rarimo registerIdentity_11_256 (424 bytes)
+│   │   └── vk_sha1.bin            # REAL VK — Rarimo registerIdentity_20_160 (424 bytes)
 │   └── src/
 │       ├── configs/mod.rs         # all pallet Config impls + cross-pallet trait wiring
 │       ├── lib.rs                 # runtime construction (construct_runtime!)
@@ -55,16 +55,17 @@ democracy-chain/
 │   ├── pallet-elections/          # crate: pallet-elections           (index 14)
 │   ├── pallet-emergency-council/  # crate: pallet-emergency-council   (index 15)
 │   ├── pallet-audit/              # crate: pallet-audit               (index 16)
-│   └── pallet-anticorruption/     # crate: pallet-anticorruption      (index 17)
+│   ├── pallet-anticorruption/     # crate: pallet-anticorruption      (index 17)
+│   └── pallet-executive/          # crate: pallet-executive  Cabinet  (index 18)
 ├── scripts/
 │   └── convert_vk.py              # converts Rarimo snarkjs JSON VK → ark-serialize binary
-├── mobile/                        # React Native scaffold (src/ only — not yet runnable)
+├── mobile/                        # React Native + Android native project (android/ generated)
 ├── desktop/                       # Tauri 2 app — wired to real chain RPC + Claude AI agent
 ├── CLAUDE.md
 └── HANDOFF.md
 ```
 
-Build is clean. Next available pallet index: **18**.
+Build is clean. Next available pallet index: **19**.
 
 ---
 
@@ -87,10 +88,13 @@ Build is clean. Next available pallet index: **18**.
 | `LawEnforcer` | `Runtime` | `pallet_constitution::invalidate_law_internal` |
 | `TreasuryEnforcer` | `Runtime` | `pallet_treasury_ledger::freeze_department_internal` |
 | `PetitionApprover` | `Runtime` | `pallet_voting::create_referendum_internal` |
-| `LawEnactor` | `Runtime` | `pallet_constitution::enact_law_internal(Ordinary, hash)` |
+| `LawEnactor` | `Runtime` | `pallet_constitution::enact_law_internal(tier, hash)` |
 | `CitizenSuspender` | `Runtime` | `pallet_identity_zk::suspend_citizen_internal` |
 | `AuditHook` | `pallet_audit::Pallet<Runtime>` | `AuditLog::insert(index, Pending entry)` |
 | `pallet_elections::CitizenChecker<AccountId>` | `Runtime` | `pallet_identity_zk::is_active_citizen` |
+| `MinisterChecker<AccountId>` | `Cabinet` (`pallet_executive::Pallet<Runtime>`) | `MinisterPortfolio::contains_key` + `PrimeMinister` check |
+| `FreshLegislatureChecker<BlockNumber>` | `Runtime` | reads `pallet_elections::LastElectionBlock` |
+| `AutoChallengeHook` | `Runtime` | `pallet_courts::Pallet::<Runtime>::auto_file_case(LawChallenge)` |
 
 ---
 
@@ -174,20 +178,22 @@ Storage:
 - `ReferendumHasVoted`: `(referendum_id, AccountId)` → `bool`
 - `NextReferendumId`
 
-`ReferendumTier` enum: `Ordinary` (51% threshold) | `Constitutional` (67% supermajority).
-Petitions always produce Ordinary referenda. Constitutional referenda may be created by other means.
+`ReferendumTier` enum: `Ordinary` (51%) | `Constitutional` (67%) | `Foundational` (75%).
+Petitions always produce Ordinary referenda. Constitutional and Foundational referenda require a passed legislature motion.
 
 Config:
 - `ReferendumDurationBlocks = 14 * DAYS`
 - `PassageThreshold = 51` (ordinary majority)
-- `ConstitutionalPassageThreshold = 67` (2/3 supermajority for constitutional laws)
+- `ConstitutionalPassageThreshold = 67` (2/3 supermajority for Structural laws)
+- `FoundationalPassageThreshold = 75` (3/4 supermajority for Foundational laws)
 - `LawEnactor = Runtime` → calls `pallet_constitution::enact_law_internal` with the correct tier
-- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year` and `open_voting_epoch`)
+- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year`, `open_voting_epoch`, `create_constitutional_referendum`, `create_foundational_referendum`)
 
 Calls:
 - `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen; requires active epoch
 - `finalize_referendum(referendum_id)` — anyone, after `end_block`; enacts law if passed
-- `create_constitutional_referendum(topic_hash)` — `LegislatureOrigin`; creates a Constitutional-tier referendum directly (no petition); uses u32::MAX as sentinel petition_id
+- `create_constitutional_referendum(topic_hash)` — `LegislatureOrigin`; Constitutional-tier (67%); no petition path
+- `create_foundational_referendum(topic_hash)` — `LegislatureOrigin`; Foundational-tier (75%); no petition path
 - `open_voting_epoch(duration_blocks)` — `LegislatureOrigin`; opens a Swiss-model voting window
 - `close_voting_epoch()` — anyone, after epoch end; manual fallback (auto-close via `on_initialize`)
 
@@ -268,29 +274,45 @@ TODOs:
 
 ### pallet-constitution (crate: pallet-constitution) — runtime index 12
 
-Law tiers: `Ordinary` (simple majority), `Constitutional` (supermajority + 30-day deliberation)
+Three-tier law system — no HRC (removed; opposition uses court challenges instead):
+
+| Tier | Description | Amendment pipeline |
+|---|---|---|
+| `Ordinary` | Legislature simple-majority; standard laws | Propose + ratify after `OrdinaryAmendmentDeliberationBlocks` |
+| `Structural` | High-threshold; separation-of-powers, electoral rules | Provisional (0–2yr) → Confirmed (2–6yr, fresh legislature reaffirmation required) → Entrenched (6yr+) |
+| `Foundational` | Highest protection; basic rights, democratic principles | Same pipeline as Structural; higher passage threshold enforced by referendum |
+
 Law statuses: `Active`, `Paused` (court-invalidated), `Repealed`
 
 Storage:
 - `Laws`: `law_id` → `(LawTier, LawStatus, version: u32, content_hash [u8;32])`
-- `PendingAmendments`: `law_id` → `(proposed_hash, proposed_at_block)`
+- `PendingAmendments`: `law_id` → `(proposed_hash, proposed_at_block)` (Ordinary tier)
+- `ConstitutionalAmendments`: `law_id` → `ConstitutionalAmendmentRecord { previous_hash, new_hash, proposed_at, stage, legislature_reaffirmed }` (Structural/Foundational)
 - `Petitions`: `petition_id` → `(AccountId, topic_hash [u8;32], sig_count, submitted_at)`
 - `PetitionSignatures`: `(petition_id, AccountId)` → `bool`
-- `HRCVetoes`: `law_id` → `enacted_at_block` (within 14-day window, HRC can veto)
 - `NextLawId`, `NextPetitionId`
 
+Config constants: `ProvisioningPeriodBlocks = 2 * 365 * DAYS`, `ConfirmationPeriodBlocks = 4 * 365 * DAYS`
+
 Calls:
-- `enact_law(tier, content_hash)` — `LegislatureOrigin` (EnsureLegislatureMotion)
-- `invalidate_law(law_id)` — `CourtOrigin` (EnsureRoot placeholder; swap to courts origin)
-- `veto_law(law_id)` — `HumanRightsOrigin` (EnsureSignedBy HRC seat); within 14-day window
-- `propose_amendment(law_id, hash)` — `LegislatureOrigin`
-- `ratify_amendment(law_id)` — `LegislatureOrigin`; enforces `ConstitutionalDeliberationBlocks`
+- `enact_law(tier, content_hash)` — `LegislatureOrigin`; Structural/Foundational auto-opens a court case via `AutoChallengeHook`
+- `invalidate_law(law_id)` — `CourtOrigin` (wired to `pallet_courts::EnsureOracle`)
+- `propose_amendment(law_id, hash)` — `LegislatureOrigin`; Ordinary tier only
+- `ratify_amendment(law_id)` — `LegislatureOrigin`; Ordinary tier only; enforces deliberation window
+- `propose_constitutional_amendment(law_id, new_hash)` — `LegislatureOrigin`; Structural/Foundational; enters Provisional stage
+- `reaffirm_amendment(law_id)` — `LegislatureOrigin`; advances Provisional → Confirmed; requires fresh electoral mandate (FreshLegislatureChecker)
+- `advance_to_entrenched(law_id)` — anyone; advances Confirmed → Entrenched once ConfirmationPeriod elapsed
+- `revoke_amendment(law_id)` — `RevocationOrigin` (EnsureRoot placeholder); 30–40% growing threshold by stage
 - `submit_petition(topic_hash)` — any signed
 - `sign_petition(petition_id)` — any signed; at 1 000 threshold calls `PetitionApprover::create_referendum`
 
 Internal:
 - `enact_law_internal(tier, content_hash)` — called by pallet-voting on referendum pass
 - `invalidate_law_internal(law_id)` — called by pallet-courts on Overturned ruling
+
+Auto-challenge: when `enact_law` or `enact_law_internal` enacts a Structural or Foundational law,
+`AutoChallengeHook::auto_challenge_law(law_id)` fires → `pallet-courts` opens a `LawChallenge` case
+filed by the zero account (`AccountId32::new([0u8; 32])`) → AI judge immediately reviews it.
 
 
 ---
@@ -299,18 +321,18 @@ Internal:
 
 Storage:
 - `Members`: `BoundedVec<AccountId, 500>`
-- `Motions`: `motion_id` → `(proposer, call_hash, end_block, MotionStatus)`
-- `Votes`: `(motion_id, AccountId)` → `bool`
-- `MotionTally`: `motion_id` → `(ayes, nays)`
+- `Motions`: `motion_id` → `Motion { call_hash, proposer, ayes, nays, end_block, executed }`
+- `MotionVotes`: `(motion_id, AccountId)` → `bool`
 - `NextMotionId`
 
 Calls:
 - `add_member(account)` / `remove_member(account)` — root
-- `propose_motion(encoded_call, duration_blocks)` — member only
-- `vote_motion(motion_id, approve: bool)` — member only
-- `close_motion(motion_id)` — anyone, after `end_block`; passes if ayes > 50%
+- `propose_motion(call_hash)` — member only; proposer's aye recorded immediately
+- `vote_motion(motion_id, approve: bool)` — member only; **active ministers blocked** (incompatibility rule via `MinisterChecker`)
+- `close_motion(motion_id)` — anyone, after `end_block`; passes if ayes * 100 >= 50 * total_members
 
-`EnsureLegislatureMotion<Runtime>` origin type — used by pallet-constitution and pallet-voting to gate law enactment and fiscal year starts behind a legislature vote.
+`EnsureLegislatureMotion<Runtime>` origin — gates law enactment, budget epochs, minister appointments.
+`MinisterChecker` trait — implemented by `Cabinet` (pallet-executive); blocks PM + portfolio ministers from voting.
 
 ---
 
@@ -414,28 +436,74 @@ Config: `MaxInvestigators = 20`, `AssetDisclosureRenewalBlocks = 5_256_000` (~1 
 
 ---
 
+### pallet-executive (crate: pallet-executive) — runtime index 18, alias `Cabinet`
+
+Parliamentary executive. The legislature appoints ministers to named portfolios via passed motions.
+Active ministers are **blocked from casting legislature votes** (incompatibility rule — separation of
+executive and legislative power). One account holds at most one portfolio at a time.
+
+Storage:
+- `PrimeMinister`: `Option<AccountId>`
+- `Portfolios`: `portfolio_id` → `Portfolio { name_hash: [u8;32] }` (name_hash = IPFS CID of terms of reference)
+- `PortfolioMinister`: `portfolio_id` → `AccountId`
+- `MinisterPortfolio`: `AccountId` → `portfolio_id` (enables O(1) is_active_minister)
+- `NextPortfolioId`: `u32`
+
+Config: `LegislatureOrigin = EnsureLegislatureMotion<Runtime>`, `MaxPortfolios = 20`
+
+Calls (all `LegislatureOrigin` except `resign`):
+- `define_portfolio(name_hash)` — creates a new named cabinet portfolio
+- `appoint_prime_minister(who)` — installs PM; auto-dismisses old PM if any
+- `dismiss_prime_minister()` — removes current PM
+- `appoint_minister(portfolio_id, who)` — installs minister; auto-vacates old holder + old portfolio of incoming
+- `dismiss_minister(portfolio_id)` — removes minister from a portfolio
+- `resign()` — any active minister may self-vacate
+
+`EnsureExecutiveMinister<T>` origin — passes if signer is PM or holds a portfolio; returns `AccountId`.
+
+Implements `MinisterChecker<AccountId>` from pallet-legislature: `is_active_minister(who)` returns true
+if the account holds a portfolio OR is the PM. This is the cross-pallet trait that enforces the
+incompatibility rule without circular dependencies.
+
+---
+
 ## Full citizen → law pipeline
 
+**Ordinary law via citizen petition:**
 ```
 submit_petition(topic_hash)
   → sign_petition(petition_id)  [× 1 000 citizens]
-    → PetitionThresholdReached event
     → PetitionApprover::create_referendum  [auto, same tx]
-      → Referendum created, 14-day window opens
-        → vote_referendum(referendum_id, in_favor)  [any active citizen]
+      → Ordinary referendum, 14-day window (or epoch end if epoch active)
+        → vote_referendum(referendum_id, in_favor)  [any active citizen, during active epoch]
         → finalize_referendum(referendum_id)  [after end_block, anyone]
-          → if yes*100 >= 51*total: LawEnactor::enact_law(topic_hash)
-            → Laws storage: new Ordinary law, Active
-            → HRC has 14-day veto window
+          → if yes*100 >= 51*total: LawEnactor::enact_law(Ordinary, topic_hash)
+            → Laws storage: Ordinary law, Active
 ```
 
-Legislature direct path:
+**Structural law via legislature:**
+```
+propose_motion(create_constitutional_referendum call)  [legislature member]
+  → vote_motion / close_motion  [passes at >50%]
+    → create_constitutional_referendum(topic_hash) → Constitutional referendum (67% threshold)
+      → finalize_referendum → enact_law(Structural, hash)
+        → Law enters Provisional stage + auto court review (AI judge Level 2)
+```
+
+**Foundational law via legislature:**
+```
+propose_motion(create_foundational_referendum call)  [legislature member]
+  → vote_motion / close_motion  [passes at >50%]
+    → create_foundational_referendum(topic_hash) → Foundational referendum (75% threshold)
+      → finalize_referendum → enact_law(Foundational, hash)
+        → Law enters Provisional stage + auto court review (AI judge Level 2)
+```
+
+**Ordinary law enacted directly by legislature:**
 ```
 propose_motion(encoded enact_law call)  [legislature member]
-  → vote_motion  [members vote, 7-day window]
-  → close_motion  [passes at >50%]
-    → EnsureLegislatureMotion origin satisfied
-    → enact_law(tier, content_hash) executes
+  → vote_motion / close_motion  [passes at >50%]
+    → enact_law(Ordinary, content_hash) executes
 ```
 
 ---
@@ -544,11 +612,14 @@ Replace the TODO stubs in `RegisterScreen.tsx` with real Rarimo SDK calls.
 
 ## Next steps (remaining work)
 
-1. [DONE] **VK assets** — downloaded Rarimo registerIdentity circuit VKs from GitHub releases v0.2.13/v0.2.12; converted with `scripts/convert_vk.py`; real 424-byte ark-serialize binaries in `runtime/assets/`
-2. [ ] **Mobile app init** — run `npx react-native@0.74.0 init` to generate native Android/iOS projects; all JS/TS logic complete (see Mobile app section above)
-3. [DONE] **QR auth — chain verification** — `auth_verify_nullifier` Tauri command scans `Identity.NullifierRegistry` keys; `AuthContext` verifies on-chain before accepting session
-4. [ ] **VRF jury randomness** — replace BlockHashRandomness (now 81-block XOR mix) with BABE/SASSAFRAS VRF before mainnet; `pallet_insecure_randomness_collective_flip` can't be added due to sp-io 38 vs 40 version conflict
-5. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
+1. [DONE] **VK assets** — real 424-byte Rarimo Groth16 BN254 VKs in `runtime/assets/`
+2. [DONE] **Mobile app native init** — `android/` generated; JS/TS complete; iOS deferred (WSL2)
+3. [DONE] **QR auth — chain verification** — `auth_verify_nullifier` scans NullifierRegistry on-chain
+4. [DONE] **pallet-executive (Cabinet)** — parliamentary executive, incompatibility rule, `EnsureExecutiveMinister`
+5. [DONE] **ReferendumTier::Foundational** — 75% threshold, `create_foundational_referendum` call, maps to `LawTier::Foundational` in pallet-constitution
+6. [ ] **VRF jury randomness** — replace 81-block XOR hash with BABE/SASSAFRAS VRF before mainnet; blocked by sp-io 38 vs 40 version conflict while on Aura consensus
+7. [ ] **Rarimo SDK (mobile)** — replace `RegisterScreen.tsx` TODO stubs with real `@rarimo/react-native-passport-reader` SDK calls
+8. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
 
 ---
 
@@ -598,6 +669,9 @@ Replace the TODO stubs in `RegisterScreen.tsx` with real Rarimo SDK calls.
 42. [DONE] VK assets populated — downloaded real Rarimo Groth16 BN254 VKs (`registerIdentity_11_256` SHA-256, `registerIdentity_20_160` SHA-1) from GitHub releases; converted to ark-serialize binary via `convert_vk.py`; both files are 424 bytes with 5-IC-point real circuit data
 43. [DONE] verifier.rs + identity.ts corrected for real Rarimo circuit layout — public inputs are 5 signals (dg15PubKeyHash, passportHash, dg1Commitment, pkIdentityHash, slaveMerkleRoot); nullifier = public_inputs[2] (dg1Commitment); `registerCitizen` no longer takes a separate nullifier arg; both files updated to match
 44. [DONE] Mobile app JS complete — all screens implemented: HomeScreen (citizen status, chain stats), ProposalsScreen (vote for/against), LawsScreen (tier + status chips), PetitionScreen (progress bar + sign), DelegateScreen (per-topic delegation UI); governance.ts chain reads; App.tsx with bottom tabs + Linking deep link handler for `democracychain://auth?...`; boilerplate files added (index.js, babel.config.js, metro.config.js); `@react-navigation/bottom-tabs` added to package.json
+45. [DONE] Three-tier constitutional law system — `LawTier::Ordinary/Structural/Foundational` in pallet-constitution; Structural/Foundational enter Provisional→Confirmed→Entrenched maturing pipeline (2yr + 4yr stages); FreshLegislatureChecker trait enforces Belgian-model fresh electoral mandate before Confirmed; AutoChallengeHook auto-opens court review for Structural/Foundational laws; HRC removed (replaced by court challenges)
+46. [DONE] pallet-executive (`Cabinet`, index 18) — parliamentary executive with PM + named portfolios; legislature appoints/dismisses; `MinisterChecker` cross-pallet trait blocks active ministers from legislature votes (incompatibility rule); `EnsureExecutiveMinister` origin for future executive-gated calls
+47. [DONE] `ReferendumTier::Foundational` — 75% supermajority threshold; `create_foundational_referendum` call (call_index 13) in pallet-voting; `FoundationalPassageThreshold = 75` in runtime; `LawEnactor` maps `Foundational → LawTier::Foundational`; desktop Proposal tier chip handles foundational display
 
 ---
 

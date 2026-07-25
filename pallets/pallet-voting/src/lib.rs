@@ -68,12 +68,17 @@ pub mod pallet {
         Failed,
     }
 
-    /// Whether a referendum would enact an ordinary or constitutional law.
-    /// Constitutional referenda require a supermajority (ConstitutionalPassageThreshold).
+    /// Which tier of law a referendum would enact.
+    /// Each tier requires a higher passage threshold than the one before it.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub enum ReferendumTier {
+        /// Simple majority (PassageThreshold %).
         Ordinary,
+        /// Structural supermajority (ConstitutionalPassageThreshold %, e.g. 67%).
         Constitutional,
+        /// Foundational supermajority (FoundationalPassageThreshold %, e.g. 75%).
+        /// Only the legislature can open a Foundational referendum; no petition path.
+        Foundational,
     }
 
     #[pallet::config]
@@ -115,10 +120,14 @@ pub mod pallet {
         /// Percentage of yes votes required to pass an ordinary referendum (0–100).
         #[pallet::constant]
         type PassageThreshold: Get<u8>;
-        /// Percentage of yes votes required to pass a constitutional referendum (0–100).
+        /// Percentage of yes votes required to pass a constitutional (Structural-tier) referendum.
         /// Must be higher than PassageThreshold (e.g. 67 for 2/3 supermajority).
         #[pallet::constant]
         type ConstitutionalPassageThreshold: Get<u8>;
+        /// Percentage of yes votes required to pass a foundational referendum (0–100).
+        /// Must be higher than ConstitutionalPassageThreshold (e.g. 75 for 3/4 supermajority).
+        #[pallet::constant]
+        type FoundationalPassageThreshold: Get<u8>;
         /// Hook called when a referendum passes — enacts the law in pallet-constitution.
         type LawEnactor: LawEnactor;
         /// Verifier for MACI tally ZK proofs. Use PassthroughMACIVerifier in dev; wire in the
@@ -587,10 +596,10 @@ pub mod pallet {
             );
             let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
             let total = yes_count.saturating_add(no_count);
-            // Constitutional referenda require a higher supermajority threshold.
             let threshold = match tier {
                 ReferendumTier::Ordinary => T::PassageThreshold::get() as u32,
                 ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u32,
+                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u32,
             };
             let passed = total > 0 && yes_count.saturating_mul(100) >= threshold * total;
             let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
@@ -700,6 +709,42 @@ pub mod pallet {
                 topic_hash,
                 ends_at,
                 tier: ReferendumTier::Constitutional,
+            });
+            Ok(())
+        }
+
+        /// Create a Foundational-tier referendum directly. Legislature only.
+        ///
+        /// Foundational referenda enact `LawTier::Foundational` laws and require
+        /// `FoundationalPassageThreshold` (e.g. 75%) of votes cast to pass. They may only
+        /// be created by a passed legislature motion — there is no citizen petition path to
+        /// Foundational laws. This mirrors the German Basic Law eternity-clause model: the
+        /// highest democratic bar, but still changeable through genuine democratic consensus.
+        #[pallet::call_index(13)]
+        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        pub fn create_foundational_referendum(
+            origin: OriginFor<T>,
+            topic_hash: [u8; 32],
+        ) -> DispatchResult {
+            T::LegislatureOrigin::ensure_origin(origin)?;
+            let id = NextReferendumId::<T>::get();
+            let now = frame_system::Pallet::<T>::block_number();
+            let ends_at = if let Some((_, epoch_end)) = ActiveEpoch::<T>::get() {
+                epoch_end
+            } else {
+                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
+            };
+            Referenda::<T>::insert(
+                id,
+                (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Foundational),
+            );
+            NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::ReferendumCreated {
+                referendum_id: id,
+                petition_id: u32::MAX,
+                topic_hash,
+                ends_at,
+                tier: ReferendumTier::Foundational,
             });
             Ok(())
         }
