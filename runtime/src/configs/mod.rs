@@ -517,8 +517,9 @@ impl pallet_elections::Config for Runtime {
 	type CitizenChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.
 	type GovernanceOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
-	/// Constitutional supermajority (via legislature) gates term-limit parameters and bounds.
-	type ConstitutionalOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Constitutional parameters require EnsureRoot for now. Production should wire this to
+	/// a dedicated constitutional collective with a 2/3 supermajority threshold.
+	type ConstitutionalOrigin = EnsureRoot<AccountId>;
 	/// Seats the top-N backed delegates into pallet-legislature at each election.
 	type LegislatureSeating = Legislature;
 	/// 100 legislature seats (constitutional, changeable via set_election_params).

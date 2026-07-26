@@ -66,13 +66,16 @@ pub mod pallet {
             use frame_system::RawOrigin;
             match o.clone().into() {
                 Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
-                    // Consume the pending approval token. If none exists, this member is
-                    // acting without a passed motion behind them — reject.
-                    if let Some(call_hash) = PendingLegislatureApproval::<T>::take() {
-                        Ok(call_hash)
-                    } else {
-                        Err(o)
+                    // Consume the pending approval token only if this member is the
+                    // motion's proposer. Any other member is rejected, preventing a
+                    // hostile member from hijacking the queued action.
+                    if let Some((call_hash, authorized)) = PendingLegislatureApproval::<T>::get() {
+                        if authorized == who {
+                            PendingLegislatureApproval::<T>::kill();
+                            return Ok(call_hash);
+                        }
                     }
+                    Err(o)
                 }
                 _ => Err(o),
             }
@@ -81,7 +84,7 @@ pub mod pallet {
         fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
             // Plant a token so the benchmark-generated origin validates.
-            PendingLegislatureApproval::<T>::put([0u8; 32]);
+            PendingLegislatureApproval::<T>::put(([0u8; 32], member.clone()));
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -134,10 +137,12 @@ pub mod pallet {
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool>;
 
     /// Set by `close_motion` when a motion passes; consumed by `EnsureLegislatureMotion`.
-    /// Stores the call_hash of the passed motion so the approval is auditable.
+    /// Stores `(call_hash, proposer)` — only the motion's proposer can consume the token,
+    /// preventing any other member from hijacking a passed motion's approval.
     /// Cleared after it is consumed — each passed motion authorizes exactly one action.
     #[pallet::storage]
-    pub type PendingLegislatureApproval<T: Config> = StorageValue<_, [u8; 32], OptionQuery>;
+    pub type PendingLegislatureApproval<T: Config> =
+        StorageValue<_, ([u8; 32], T::AccountId), OptionQuery>;
 
     // ── Events ───────────────────────────────────────────────────────────────────
 
@@ -327,7 +332,7 @@ pub mod pallet {
                     PendingLegislatureApproval::<T>::get().is_none(),
                     Error::<T>::ApprovalPending
                 );
-                PendingLegislatureApproval::<T>::put(motion.call_hash);
+                PendingLegislatureApproval::<T>::put((motion.call_hash, motion.proposer.clone()));
                 Self::deposit_event(Event::MotionPassed { motion_id, call_hash: motion.call_hash });
             } else {
                 Self::deposit_event(Event::MotionFailed { motion_id });

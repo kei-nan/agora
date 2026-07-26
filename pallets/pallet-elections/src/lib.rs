@@ -123,8 +123,6 @@ pub mod pallet {
         pub consecutive_terms: u32,
         /// Block at which the current term started. None when Pending or OnBreak.
         pub term_start_block: Option<BlockNumber>,
-        /// Total blocks spent Active in the current term (for the >50% rule).
-        pub active_blocks_this_term: BlockNumber,
         /// Block after which this delegate may return from a mandatory break.
         pub break_until_block: Option<BlockNumber>,
         /// Whether the warning event for the current term has already been emitted.
@@ -412,6 +410,8 @@ pub mod pallet {
         AlreadyCommissioner,
         /// certify_results requires results to be submitted first.
         ResultsNotSubmitted,
+        /// Election cycle length cannot be zero — elections would never run.
+        ElectionCycleBlocksZero,
     }
 
     // ── on_initialize: term warnings, expirations, and legislature elections ───
@@ -466,9 +466,10 @@ pub mod pallet {
                         }
 
                         if blocks_elapsed >= term_length {
+                            // Active delegates stay Active for the full term — no interruptions
+                            // — so blocks_elapsed equals active time. Always count as full.
                             let half: BlockNumberFor<T> = 2u32.into();
-                            let counts_as_full =
-                                info.active_blocks_this_term >= term_length / half;
+                            let counts_as_full = blocks_elapsed >= term_length / half;
 
                             if counts_as_full {
                                 info.consecutive_terms =
@@ -481,7 +482,6 @@ pub mod pallet {
                                     Some(now.saturating_add(break_blocks));
                             } else {
                                 info.term_start_block = Some(now);
-                                info.active_blocks_this_term = 0u32.into();
                                 info.warning_emitted = false;
                             }
 
@@ -490,13 +490,9 @@ pub mod pallet {
                             });
                             Delegates::<T>::insert(&account, &info);
                             weight = weight.saturating_add(T::DbWeight::get().writes(1));
-                        } else {
-                            let one: BlockNumberFor<T> = 1u32.into();
-                            info.active_blocks_this_term =
-                                info.active_blocks_this_term.saturating_add(one);
-                            Delegates::<T>::insert(&account, &info);
-                            weight = weight.saturating_add(T::DbWeight::get().writes(1));
                         }
+                        // No write in the steady-state case: elapsed blocks are derived
+                        // from (now - term_start_block) on demand, no counter needed.
                     }
                     DelegateStatus::OnBreak => {
                         if let Some(until) = info.break_until_block {
@@ -504,7 +500,6 @@ pub mod pallet {
                                 info.status = DelegateStatus::Pending;
                                 info.consecutive_terms = 0;
                                 info.term_start_block = None;
-                                info.active_blocks_this_term = 0u32.into();
                                 info.break_until_block = None;
                                 info.warning_emitted = false;
                                 Delegates::<T>::insert(&account, &info);
@@ -685,7 +680,6 @@ pub mod pallet {
                 status: DelegateStatus::Pending,
                 consecutive_terms: 0,
                 term_start_block: None,
-                active_blocks_this_term: Zero::zero(),
                 break_until_block: None,
                 warning_emitted: false,
             });
@@ -816,6 +810,7 @@ pub mod pallet {
                 LegislatureSeats::<T>::put(s);
             }
             if let Some(c) = cycle_blocks {
+                ensure!(c > 0, Error::<T>::ElectionCycleBlocksZero);
                 ElectionCycleBlocks::<T>::put(c);
             }
             if let Some(m) = max_backings_per_citizen {
@@ -845,7 +840,6 @@ pub mod pallet {
                 if let Some(d) = maybe {
                     d.status = DelegateStatus::Active;
                     d.term_start_block = Some(now);
-                    d.active_blocks_this_term = 0u32.into();
                     d.warning_emitted = false;
                 }
             });
@@ -856,7 +850,12 @@ pub mod pallet {
         fn run_election(now: BlockNumberFor<T>) -> Weight {
             let seats = LegislatureSeats::<T>::get() as usize;
 
-            let mut candidates: alloc::vec::Vec<(T::AccountId, u32)> = Delegates::<T>::iter()
+            // Collect all delegates first so we can report exact read counts in the weight.
+            let all_delegates: alloc::vec::Vec<_> = Delegates::<T>::iter().collect();
+            let total_delegates = all_delegates.len() as u64;
+
+            let mut candidates: alloc::vec::Vec<(T::AccountId, u32)> = all_delegates
+                .into_iter()
                 .filter_map(|(addr, info)| {
                     if info.status == DelegateStatus::Active {
                         Some((addr.clone(), BackingCount::<T>::get(&addr)))
@@ -865,6 +864,8 @@ pub mod pallet {
                     }
                 })
                 .collect();
+
+            let active_count = candidates.len() as u64;
 
             // Stable sort by backing count descending — ties broken by storage order.
             candidates.sort_by(|a, b| b.1.cmp(&a.1));
@@ -881,7 +882,13 @@ pub mod pallet {
 
             Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated });
 
-            T::DbWeight::get().reads_writes(3, 2)
+            // Reads: all delegate entries + BackingCount per active delegate + 3 overhead
+            //        (LegislatureSeats, ElectionCycleBlocks, LastElectionBlock).
+            // Writes: Members (replace_members) + LastElectionBlock.
+            T::DbWeight::get().reads_writes(
+                total_delegates.saturating_add(active_count).saturating_add(3),
+                (seated as u64).saturating_add(2),
+            )
         }
     }
 }

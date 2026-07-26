@@ -148,10 +148,11 @@ pub mod pallet {
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
 
-    /// Active proposals: proposal_id -> end block.
+    /// Active proposals: proposal_id -> (end_block, topic_hash, tier).
+    /// topic_hash and tier are needed by submit_maci_tally to enact the law on pass.
     #[pallet::storage]
     pub type Proposals<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
+        StorageMap<_, Blake2_128Concat, u32, (BlockNumberFor<T>, [u8; 32], ReferendumTier)>;
 
     /// Per-proposal vote commitments (MACI-style): (proposal_id, nullifier) -> commitment.
     #[pallet::storage]
@@ -252,7 +253,7 @@ pub mod pallet {
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
-        ProposalCreated { id: u32, ends_at: BlockNumberFor<T> },
+        ProposalCreated { id: u32, ends_at: BlockNumberFor<T>, topic_hash: [u8; 32], tier: ReferendumTier },
         VoteCommitted { proposal_id: u32, nullifier: [u8; 32] },
         DelegationSet {
             delegator: T::AccountId,
@@ -345,13 +346,15 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Submit a new proposal for the current voting epoch.
-        /// Caller must be an active citizen. `duration_blocks` must fall within
-        /// [MinProposalDurationBlocks, MaxProposalDurationBlocks].
+        /// Submit a new MACI proposal. Caller must be an active citizen.
+        /// `duration_blocks` must fall within [MinProposalDurationBlocks, MaxProposalDurationBlocks].
+        /// `topic_hash` and `tier` are stored so that submit_maci_tally can enact the law on pass.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn submit_proposal(
             origin: OriginFor<T>,
+            topic_hash: [u8; 32],
+            tier: ReferendumTier,
             duration_blocks: u32,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
@@ -364,9 +367,9 @@ pub mod pallet {
             let id = NextProposalId::<T>::get();
             let ends_at = frame_system::Pallet::<T>::block_number() +
                 BlockNumberFor::<T>::from(duration_blocks);
-            Proposals::<T>::insert(id, ends_at);
+            Proposals::<T>::insert(id, (ends_at, topic_hash, tier.clone()));
             NextProposalId::<T>::put(id.saturating_add(1));
-            Self::deposit_event(Event::ProposalCreated { id, ends_at });
+            Self::deposit_event(Event::ProposalCreated { id, ends_at, topic_hash, tier });
             Ok(())
         }
 
@@ -384,7 +387,7 @@ pub mod pallet {
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             let nullifier = T::NullifierProvider::nullifier_of(&who)
                 .ok_or(Error::<T>::NotRegisteredCitizen)?;
-            let ends_at = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
+            let (ends_at, _, _) = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(frame_system::Pallet::<T>::block_number() < ends_at, Error::<T>::ProposalEnded);
             ensure!(!VoteCommitments::<T>::contains_key((proposal_id, nullifier)), Error::<T>::AlreadyVoted);
             VoteCommitments::<T>::insert((proposal_id, nullifier), commitment);
@@ -660,7 +663,8 @@ pub mod pallet {
             proof_bytes: BoundedVec<u8, ConstU32<4096>>,
         ) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(origin)?;
-            let end_block = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
+            let (end_block, topic_hash, tier) =
+                Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(
                 frame_system::Pallet::<T>::block_number() > end_block,
                 Error::<T>::ProposalStillActive
@@ -681,6 +685,17 @@ pub mod pallet {
             );
             ProposalResults::<T>::insert(proposal_id, (yes_votes, no_votes, commitment_root));
             Self::deposit_event(Event::TallySubmitted { proposal_id, yes_votes, no_votes, commitment_root });
+
+            // Enact the law if the tally meets the applicable passage threshold.
+            let total = yes_votes.saturating_add(no_votes);
+            let threshold = match &tier {
+                ReferendumTier::Ordinary => T::PassageThreshold::get() as u64,
+                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u64,
+                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u64,
+            };
+            if total > 0 && yes_votes.saturating_mul(100) >= threshold.saturating_mul(total) {
+                T::LawEnactor::enact_law(tier, topic_hash)?;
+            }
             Ok(())
         }
 
@@ -723,11 +738,7 @@ pub mod pallet {
             T::LegislatureOrigin::ensure_origin(origin)?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            let ends_at = if let Some((_, epoch_end)) = ActiveEpoch::<T>::get() {
-                epoch_end
-            } else {
-                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
-            };
+            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Constitutional),
@@ -759,11 +770,7 @@ pub mod pallet {
             T::LegislatureOrigin::ensure_origin(origin)?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            let ends_at = if let Some((_, epoch_end)) = ActiveEpoch::<T>::get() {
-                epoch_end
-            } else {
-                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
-            };
+            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Foundational),
@@ -832,13 +839,10 @@ pub mod pallet {
             );
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            // If a voting epoch is active, the referendum closes at epoch end so citizens
-            // can vote in the same epoch it's announced. Otherwise, fall back to duration.
-            let ends_at = if let Some((_start, epoch_end)) = ActiveEpoch::<T>::get() {
-                epoch_end
-            } else {
-                now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get())
-            };
+            // Always give the referendum a full ReferendumDurationBlocks window so that
+            // a referendum created near the end of an epoch still has adequate voting time.
+            // Citizens may vote in any overlapping future epoch within the window.
+            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
             Referenda::<T>::insert(
                 id,
                 (petition_id, topic_hash, ends_at, ReferendumState::Voting, tier.clone()),

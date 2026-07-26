@@ -96,6 +96,11 @@ pub mod pallet {
     pub type EndVotes<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, bool, ValueQuery>;
 
+    /// Proposal terms locked in by the first council member to vote for an emergency.
+    /// Prevents a decisive late voter from overriding the agreed-upon reason or duration.
+    #[pallet::storage]
+    pub type PendingEmergencyProposal<T: Config> = StorageValue<_, ([u8; 32], u32), OptionQuery>;
+
     // ── Hooks ────────────────────────────────────────────────────────────────
 
     #[pallet::hooks]
@@ -112,6 +117,7 @@ pub mod pallet {
                     // emergency would receive AlreadyVotedToDeclare on the next declaration.
                     let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                     let _ = EndVotes::<T>::clear(u32::MAX, None);
+                    PendingEmergencyProposal::<T>::kill();
                     Self::deposit_event(Event::EmergencyExpired { at_block: n });
                     weight = weight.saturating_add(T::DbWeight::get().writes(3));
                 }
@@ -214,9 +220,14 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
-            // Clamp duration to constitutional ceiling. The clamp guarantees the value
-            // is within bounds, so no further ensure! check is needed.
-            let clamped = duration_blocks.min(T::MaxEmergencyBlocks::get());
+            // Lock in the proposal terms from the first vote. Subsequent voters' args are
+            // ignored so a decisive late voter cannot override the agreed-upon reason or duration.
+            if PendingEmergencyProposal::<T>::get().is_none() {
+                PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
+            }
+            let (agreed_reason, agreed_duration) =
+                PendingEmergencyProposal::<T>::get().unwrap_or((reason_hash, duration_blocks));
+            let clamped = agreed_duration.min(T::MaxEmergencyBlocks::get());
 
             DeclareVotes::<T>::insert(&who, true);
 
@@ -227,25 +238,26 @@ pub mod pallet {
                 .count() as u32;
 
             if Self::supermajority_reached(vote_count, council.len() as u32) {
-                // Activate emergency.
+                // Activate emergency using the agreed-upon (first-voter's) terms.
                 let now = frame_system::Pallet::<T>::block_number();
                 let expires_at = now.saturating_add(BlockNumberFor::<T>::from(clamped));
 
                 let info = EmergencyInfo {
                     declared_at: now,
                     expires_at,
-                    reason_hash,
+                    reason_hash: agreed_reason,
                     votes_to_declare: vote_count,
                     votes_to_end: 0,
                     _phantom: core::marker::PhantomData,
                 };
                 ActiveEmergency::<T>::put(info);
 
-                // Reset both vote maps.
+                // Proposal consumed; clear it. Reset both vote maps.
+                PendingEmergencyProposal::<T>::kill();
                 let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                 let _ = EndVotes::<T>::clear(u32::MAX, None);
 
-                Self::deposit_event(Event::EmergencyDeclared { expires_at, reason_hash });
+                Self::deposit_event(Event::EmergencyDeclared { expires_at, reason_hash: agreed_reason });
             }
             Ok(())
         }
@@ -272,6 +284,7 @@ pub mod pallet {
             if Self::supermajority_reached(vote_count, council.len() as u32) {
                 ActiveEmergency::<T>::kill();
                 let _ = EndVotes::<T>::clear(u32::MAX, None);
+                PendingEmergencyProposal::<T>::kill();
                 Self::deposit_event(Event::EmergencyLifted);
             }
             Ok(())

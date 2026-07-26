@@ -216,6 +216,8 @@ pub mod pallet {
         MajorityAlreadyReached,
         /// Only active (non-suspended) citizens may file cases.
         NotActiveCitizen,
+        /// Caller is not authorized to perform this action.
+        NotAuthorized,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -296,10 +298,16 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::InJuryAppeal, Error::<T>::InvalidStatus);
-            // Only the case filer or the oracle may trigger jury selection.
-            // Prevents any random account from timing the call to game block-hash randomness.
+            // For system-filed cases (filer == AutoChallengeAccount, an unsignable zero account),
+            // allow any active citizen to trigger jury selection — otherwise the case is permanently
+            // stuck when no oracle is configured. For citizen-filed cases, only the filer or the
+            // designated oracle may call, to prevent timing the block-hash randomness selection.
             let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| o == who);
-            ensure!(who == case.0 || oracle_ok, Error::<T>::NotActiveCitizen);
+            let system_case = case.0 == T::AutoChallengeAccount::get();
+            let authorized = who == case.0
+                || oracle_ok
+                || (system_case && T::CitizenChecker::is_active_citizen(&who));
+            ensure!(authorized, Error::<T>::NotAuthorized);
             // Derive the required jury size from the case subject so that the
             // routing logic (Level 1 vs Level 2) is enforced on-chain rather than
             // relying on the caller to pass the correct value.

@@ -161,6 +161,13 @@ pub mod pallet {
     pub type EndVotes<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, bool, ValueQuery>;
 
+    /// Proposal terms locked in by the first cabinet member to vote for an emergency.
+    /// Subsequent voters' `reason_hash` and `duration_blocks` args are ignored; these
+    /// stored terms are used when the supermajority is reached. Cleared on activation,
+    /// and on retract when no votes remain.
+    #[pallet::storage]
+    pub type PendingEmergencyProposal<T: Config> = StorageValue<_, ([u8; 32], u32), OptionQuery>;
+
     // ── Hooks ────────────────────────────────────────────────────────────────────
 
     #[pallet::hooks]
@@ -386,7 +393,15 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
-            let clamped = duration_blocks.min(T::MaxEmergencyBlocks::get());
+            // Lock in the proposal terms from the first vote. Subsequent voters' args are
+            // ignored so a decisive late voter cannot override the agreed-upon reason or duration.
+            if PendingEmergencyProposal::<T>::get().is_none() {
+                PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
+            }
+            let (agreed_reason, agreed_duration) =
+                PendingEmergencyProposal::<T>::get().unwrap_or((reason_hash, duration_blocks));
+            let clamped = agreed_duration.min(T::MaxEmergencyBlocks::get());
+
             DeclareVotes::<T>::insert(&who, true);
 
             let cabinet_size = Self::cabinet_size();
@@ -405,14 +420,16 @@ pub mod pallet {
                     declared_at: now,
                     expires_at,
                     ratify_by,
-                    reason_hash,
+                    reason_hash: agreed_reason,
                     ratified: false,
                 });
 
+                // Proposal has been consumed; clear it.
                 // DeclareVotes are intentionally kept so the same member can't re-vote
                 // if the emergency lapses and a new one is started immediately.
                 // They are cleared on lapse/expire/lift.
-                Self::deposit_event(Event::EmergencyDeclared { expires_at, ratify_by, reason_hash });
+                PendingEmergencyProposal::<T>::kill();
+                Self::deposit_event(Event::EmergencyDeclared { expires_at, ratify_by, reason_hash: agreed_reason });
             }
 
             Ok(())
@@ -458,6 +475,7 @@ pub mod pallet {
                 ActiveEmergency::<T>::kill();
                 let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                 let _ = EndVotes::<T>::clear(u32::MAX, None);
+                PendingEmergencyProposal::<T>::kill();
                 Self::deposit_event(Event::EmergencyLifted);
             }
 
@@ -476,6 +494,11 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             ensure!(DeclareVotes::<T>::get(&who), Error::<T>::NotYetVoted);
             DeclareVotes::<T>::remove(&who);
+            // If no cabinet votes remain, reset the proposal terms so the next first voter
+            // can establish fresh ones rather than inheriting the retracted voter's params.
+            if DeclareVotes::<T>::iter().filter(|(_, v)| *v).count() == 0 {
+                PendingEmergencyProposal::<T>::kill();
+            }
             Ok(())
         }
     }
