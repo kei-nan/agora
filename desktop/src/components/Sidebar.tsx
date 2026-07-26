@@ -5,7 +5,9 @@ import "./Sidebar.css";
 const NAV_ITEMS = [
   { to: "/proposals", label: "Proposals", icon: "📋" },
   { to: "/laws", label: "Laws", icon: "⚖️" },
-  { to: "/treasury", label: "Treasury", icon: "🏛️" },
+  { to: "/legislature", label: "Legislature", icon: "🏛️" },
+  { to: "/elections", label: "Elections", icon: "🗳️" },
+  { to: "/treasury", label: "Treasury", icon: "💰" },
   { to: "/courts", label: "Courts", icon: "🔨" },
 ];
 

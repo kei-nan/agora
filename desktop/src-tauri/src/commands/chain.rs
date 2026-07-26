@@ -430,6 +430,271 @@ pub async fn fetch_ipfs_content(hash_hex: String) -> Result<String, String> {
     resp.text().await.map_err(|e| e.to_string())
 }
 
+// ── Legislature + Elections commands ─────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct LegislatureMotion {
+    pub id: u32,
+    #[serde(rename = "callHash")]
+    pub call_hash: String,
+    pub proposer: String,
+    pub ayes: u32,
+    pub nays: u32,
+    #[serde(rename = "endBlock")]
+    pub end_block: u64,
+    pub executed: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LegislatureData {
+    pub members: Vec<String>,
+    pub motions: Vec<LegislatureMotion>,
+}
+
+/// Fetches Legislature.Members (StorageValue<BoundedVec<AccountId,500>>) and
+/// Legislature.Motions (StorageMap<u32, Motion>).
+///
+/// Motion SCALE layout (77 bytes):
+///   call_hash: [u8;32]
+///   proposer:  [u8;32]
+///   ayes:      u32 LE
+///   nays:      u32 LE
+///   end_block: u32 LE
+///   executed:  bool (1 byte)
+#[tauri::command]
+pub async fn fetch_legislature_data() -> Result<LegislatureData, String> {
+    let client = RpcClient::new(NODE_URL);
+
+    // ── Members (single StorageValue — key IS the prefix) ────────────────────
+    let members_key = storage_prefix("Legislature", "Members");
+    let members_bytes = client.get_storage(&members_key).await.unwrap_or_default();
+    let mut members: Vec<String> = Vec::new();
+    if let Some(bytes) = members_bytes {
+        let (count, offset) = decode_compact(&bytes);
+        let mut pos = offset;
+        for _ in 0..(count as usize) {
+            if pos + 32 <= bytes.len() {
+                members.push(format!("0x{}", hex::encode(&bytes[pos..pos + 32])));
+                pos += 32;
+            }
+        }
+    }
+
+    // ── Motions (StorageMap<Blake2_128Concat, u32, Motion>) ──────────────────
+    let motions_prefix = storage_prefix("Legislature", "Motions");
+    let motion_keys = client.get_keys_paged(&motions_prefix).await.unwrap_or_default();
+    let mut motions: Vec<LegislatureMotion> = Vec::new();
+    if !motion_keys.is_empty() {
+        let values = client.query_storage_at(&motion_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in motion_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                if bytes.len() < 77 {
+                    continue;
+                }
+                let call_hash = format!("0x{}", hex::encode(&bytes[0..32]));
+                let proposer   = format!("0x{}", hex::encode(&bytes[32..64]));
+                let ayes       = u32::from_le_bytes([bytes[64], bytes[65], bytes[66], bytes[67]]);
+                let nays       = u32::from_le_bytes([bytes[68], bytes[69], bytes[70], bytes[71]]);
+                let end_block  = u32::from_le_bytes([bytes[72], bytes[73], bytes[74], bytes[75]]);
+                let executed   = bytes[76] != 0;
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let id = extract_u32_key_suffix(&kbytes);
+                motions.push(LegislatureMotion { id, call_hash, proposer, ayes, nays, end_block: end_block as u64, executed });
+            }
+        }
+    }
+
+    Ok(LegislatureData { members, motions })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct Delegate {
+    pub account: String,
+    #[serde(rename = "displayName")]
+    pub display_name: String,
+    #[serde(rename = "backingCount")]
+    pub backing_count: u32,
+    pub status: String,
+    #[serde(rename = "consecutiveTerms")]
+    pub consecutive_terms: u32,
+    #[serde(rename = "profileIpfsHash")]
+    pub profile_ipfs_hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ElectionEntry {
+    pub id: u32,
+    pub office: String,
+    #[serde(rename = "startBlock")]
+    pub start_block: u64,
+    #[serde(rename = "endBlock")]
+    pub end_block: u64,
+    pub status: String,
+    pub winner: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ElectionsData {
+    pub delegates: Vec<Delegate>,
+    pub elections: Vec<ElectionEntry>,
+}
+
+/// Fetches PalletElections.Delegates, PalletElections.BackingCount, and
+/// PalletElections.Elections.
+///
+/// DelegateInfo SCALE (variable — display_name is a compact-prefixed BoundedVec<u8,64>):
+///   display_name:       compact_len + utf8_bytes
+///   profile_ipfs_hash:  [u8;32]
+///   status:             u8  (0=Pending, 1=Active, 2=OnBreak)
+///   consecutive_terms:  u32 LE
+///   term_start_block:   Option<u32>  (0x00 | 0x01 + 4 bytes)
+///   break_until_block:  Option<u32>  (0x00 | 0x01 + 4 bytes)
+///   warning_emitted:    bool
+///
+/// ElectionInfo SCALE (variable — office is a compact-prefixed BoundedVec<u8,64>):
+///   office:             compact_len + utf8_bytes
+///   start_block:        u32 LE
+///   end_block:          u32 LE
+///   status:             u8  (0=Scheduled, 1=Active, 2=ResultsSubmitted, 3=Certified)
+///   winner:             Option<AccountId>  (0x00 | 0x01 + 32 bytes)
+///   results_ipfs_hash:  Option<[u8;32]>    (0x00 | 0x01 + 32 bytes)
+#[tauri::command]
+pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
+    let client = RpcClient::new(NODE_URL);
+
+    // ── Backing counts keyed by AccountId ─────────────────────────────────────
+    let backing_prefix = storage_prefix("PalletElections", "BackingCount");
+    let backing_keys = client.get_keys_paged(&backing_prefix).await.unwrap_or_default();
+    let backing_values = client.query_storage_at(&backing_keys).await.unwrap_or_default();
+    let mut backing_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for (key_hex, val_opt) in backing_keys.iter().zip(backing_values.iter()) {
+        if let Some(val_hex) = val_opt {
+            let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+            if bytes.len() >= 4 {
+                let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                // AccountId occupies the last 32 bytes of the Blake2_128Concat key
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                if kbytes.len() >= 32 {
+                    let account = format!("0x{}", hex::encode(&kbytes[kbytes.len() - 32..]));
+                    backing_map.insert(account, count);
+                }
+            }
+        }
+    }
+
+    // ── Delegates ─────────────────────────────────────────────────────────────
+    let delegates_prefix = storage_prefix("PalletElections", "Delegates");
+    let delegate_keys = client.get_keys_paged(&delegates_prefix).await.unwrap_or_default();
+    let mut delegates: Vec<Delegate> = Vec::new();
+    if !delegate_keys.is_empty() {
+        let values = client.query_storage_at(&delegate_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in delegate_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                let mut pos = 0usize;
+                // display_name: compact len + utf8 bytes
+                let (name_len, consumed) = decode_compact(&bytes[pos..]);
+                pos += consumed;
+                let display_name = if pos + name_len as usize <= bytes.len() {
+                    let s = String::from_utf8_lossy(&bytes[pos..pos + name_len as usize]).to_string();
+                    pos += name_len as usize;
+                    s
+                } else {
+                    String::new()
+                };
+                // profile_ipfs_hash: [u8;32]
+                let profile_ipfs_hash = if pos + 32 <= bytes.len() {
+                    let h = format!("0x{}", hex::encode(&bytes[pos..pos + 32]));
+                    pos += 32;
+                    h
+                } else {
+                    String::new()
+                };
+                // status: u8
+                let status_str = if pos < bytes.len() {
+                    let s = match bytes[pos] { 1 => "active", 2 => "on_break", _ => "pending" };
+                    pos += 1;
+                    s
+                } else {
+                    "pending"
+                };
+                // consecutive_terms: u32 (pos not advanced — nothing further is parsed)
+                let consecutive_terms = if pos + 4 <= bytes.len() {
+                    u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]])
+                } else {
+                    0
+                };
+                // Extract account from key (last 32 bytes of Blake2_128Concat key)
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let account = if kbytes.len() >= 32 {
+                    format!("0x{}", hex::encode(&kbytes[kbytes.len() - 32..]))
+                } else {
+                    String::new()
+                };
+                let backing_count = backing_map.get(&account).copied().unwrap_or(0);
+                delegates.push(Delegate {
+                    account,
+                    display_name,
+                    backing_count,
+                    status: status_str.to_string(),
+                    consecutive_terms,
+                    profile_ipfs_hash,
+                });
+            }
+        }
+    }
+    // Sort delegates by backing_count descending
+    delegates.sort_by(|a, b| b.backing_count.cmp(&a.backing_count));
+
+    // ── Elections ─────────────────────────────────────────────────────────────
+    let elections_prefix = storage_prefix("PalletElections", "Elections");
+    let election_keys = client.get_keys_paged(&elections_prefix).await.unwrap_or_default();
+    let mut elections: Vec<ElectionEntry> = Vec::new();
+    if !election_keys.is_empty() {
+        let values = client.query_storage_at(&election_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in election_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                let mut pos = 0usize;
+                // office: compact len + utf8 bytes
+                let (office_len, consumed) = decode_compact(&bytes[pos..]);
+                pos += consumed;
+                let office = if pos + office_len as usize <= bytes.len() {
+                    let s = String::from_utf8_lossy(&bytes[pos..pos + office_len as usize]).to_string();
+                    pos += office_len as usize;
+                    s
+                } else {
+                    String::new()
+                };
+                if pos + 9 > bytes.len() {
+                    continue;
+                }
+                let start_block = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as u64;
+                pos += 4;
+                let end_block = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as u64;
+                pos += 4;
+                let status_str = match bytes[pos] { 1 => "active", 2 => "results_submitted", 3 => "certified", _ => "scheduled" };
+                pos += 1;
+                // winner: Option<AccountId>
+                let winner = if pos < bytes.len() && bytes[pos] == 1 && pos + 33 <= bytes.len() {
+                    let w = format!("0x{}", hex::encode(&bytes[pos+1..pos+33]));
+                    w
+                } else {
+                    String::new()
+                };
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let id = extract_u32_key_suffix(&kbytes);
+                elections.push(ElectionEntry { id, office, start_block, end_block, status: status_str.to_string(), winner });
+            }
+        }
+    }
+
+    Ok(ElectionsData { delegates, elections })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Converts a raw 32-byte SHA-256 digest to an IPFS CIDv0 string.
@@ -442,6 +707,26 @@ fn hash_to_cid(hash_bytes: &[u8]) -> Option<String> {
     multihash.push(0x20u8); // digest length = 32
     multihash.extend_from_slice(hash_bytes);
     Some(bs58::encode(multihash).into_string())
+}
+
+/// Decode a SCALE compact-encoded integer from the start of `bytes`.
+/// Returns (value, bytes_consumed).
+fn decode_compact(bytes: &[u8]) -> (u32, usize) {
+    if bytes.is_empty() {
+        return (0, 0);
+    }
+    match bytes[0] & 0b11 {
+        0 => ((bytes[0] >> 2) as u32, 1),
+        1 => {
+            if bytes.len() < 2 { return (0, 2); }
+            ((u16::from_le_bytes([bytes[0], bytes[1]]) >> 2) as u32, 2)
+        }
+        2 => {
+            if bytes.len() < 4 { return (0, 4); }
+            (u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) >> 2, 4)
+        }
+        _ => (0, 1), // big-integer mode — not used by these pallets
+    }
 }
 
 /// Extracts a u32 key from the last 4 bytes of a Blake2_128Concat storage key.

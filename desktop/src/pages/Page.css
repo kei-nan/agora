@@ -81,3 +81,35 @@
 .budget-table th { color: var(--text-muted); text-align: left; padding: 4px 6px; font-weight: 500; }
 .budget-table td { padding: 5px 6px; border-top: 1px solid var(--border); color: var(--text); }
 .budget-table td.remaining { color: var(--green); font-weight: 600; }
+
+/* Legislature + Elections shared */
+.page-subtitle { font-size: 13px; color: var(--text-muted); margin-top: -6px; }
+.section-heading { font-size: 12px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 4px; }
+.item-row.muted { opacity: 0.55; }
+.detail-empty { display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 8px; color: var(--text-muted); font-size: 13px; }
+.hint { font-size: 12px; color: var(--text-muted); }
+
+/* Legislature vote chips */
+.vote-chips { display: flex; gap: 4px; }
+.vote-chip { font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
+.vote-chip.aye { background: #1a3a1a; color: var(--green); }
+.vote-chip.nay { background: #3a1a1a; color: var(--red); }
+.detail-vote-row { display: flex; gap: 12px; margin: 4px 0; }
+.detail-vote { font-size: 15px; font-weight: 700; padding: 6px 16px; border-radius: 6px; }
+.detail-vote.aye { background: #1a3a1a; color: var(--green); }
+.detail-vote.nay { background: #3a1a1a; color: var(--red); }
+.detail-fields { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 13px; margin-top: 8px; }
+.detail-fields dt { color: var(--text-muted); white-space: nowrap; }
+.detail-fields dd { margin: 0; overflow: hidden; text-overflow: ellipsis; }
+.detail-fields dd.mono { font-family: monospace; font-size: 12px; }
+
+/* Elections */
+.status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.status-dot.status-active   { background: var(--green); }
+.status-dot.status-pending  { background: var(--yellow); }
+.status-dot.status-on_break { background: var(--text-muted); }
+.backing-badge { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 10px; background: var(--bg-hover); color: var(--text-muted); white-space: nowrap; }
+.member-list { max-height: 200px; overflow-y: auto; }
+.member-row { padding: 6px 10px; cursor: default; }
+.member-addr { font-family: monospace; font-size: 12px; color: var(--text-muted); }
+.tier-pending { background: #2a2a1a; color: var(--yellow); }
