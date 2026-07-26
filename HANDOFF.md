@@ -620,6 +620,7 @@ Replace the TODO stubs in `RegisterScreen.tsx` with real Rarimo SDK calls.
 6. [ ] **VRF jury randomness** — replace 81-block XOR hash with BABE/SASSAFRAS VRF before mainnet; blocked by sp-io 38 vs 40 version conflict while on Aura consensus
 7. [ ] **Rarimo SDK (mobile)** — replace `RegisterScreen.tsx` TODO stubs with real `@rarimo/react-native-passport-reader` SDK calls
 8. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
+9. [ ] **Anti-corruption desktop page** — asset disclosures, conflict registry, whistleblower report list (pallet-anticorruption all implemented; desktop page not yet built)
 
 ---
 
@@ -672,6 +673,9 @@ Replace the TODO stubs in `RegisterScreen.tsx` with real Rarimo SDK calls.
 45. [DONE] Three-tier constitutional law system — `LawTier::Ordinary/Structural/Foundational` in pallet-constitution; Structural/Foundational enter Provisional→Confirmed→Entrenched maturing pipeline (2yr + 4yr stages); FreshLegislatureChecker trait enforces Belgian-model fresh electoral mandate before Confirmed; AutoChallengeHook auto-opens court review for Structural/Foundational laws; HRC removed (replaced by court challenges)
 46. [DONE] pallet-executive (`Cabinet`, index 18) — parliamentary executive with PM + named portfolios; legislature appoints/dismisses; `MinisterChecker` cross-pallet trait blocks active ministers from legislature votes (incompatibility rule); `EnsureExecutiveMinister` origin for future executive-gated calls
 47. [DONE] `ReferendumTier::Foundational` — 75% supermajority threshold; `create_foundational_referendum` call (call_index 13) in pallet-voting; `FoundationalPassageThreshold = 75` in runtime; `LawEnactor` maps `Foundational → LawTier::Foundational`; desktop Proposal tier chip handles foundational display
+48. [DONE] Second batch pallet bug fixes — courts: any active citizen can trigger jury selection for system-filed (zero-account) cases; voting: Proposals stores (end_block, topic_hash, tier) so MACI tally can enact laws, referendum end time always uses full ReferendumDurationBlocks; elections: remove active_blocks_this_term counter (derive from term_start_block on demand), guard ElectionCycleBlocks != 0, fix run_election weight; emergency-council + executive: PendingEmergencyProposal locks in first-voter's terms; legislature: PendingLegislatureApproval stores (call_hash, proposer) to prevent token hijacking
+49. [DONE] Legislature desktop page — `fetch_legislature_data` Tauri command reads Legislature.Members (StorageValue, compact BoundedVec) + Legislature.Motions (77-byte SCALE); LegislaturePage shows pending/executed motions with aye/nay chips, detail panel with proposer + call hash, scrollable member list
+50. [DONE] Elections desktop page — `fetch_elections_data` Tauri command reads PalletElections.Delegates (variable SCALE, compact display_name) + BackingCount + Elections; ElectionsPage shows delegate leaderboard by backing count with status dots, active/past election list, detail panel with consecutive-term counter and IPFS profile link
 
 ---
 
