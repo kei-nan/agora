@@ -35,14 +35,14 @@ use frame_support::{
 use frame_system::{limits::{BlockLength, BlockWeights}, EnsureRoot};
 use pallet_transaction_payment::{ConstFeeMultiplier, FungibleAdapter, Multiplier};
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
-use sp_runtime::{traits::{BlakeTwo256, Hash as HashT, One}, AccountId32, Perbill};
+use sp_runtime::{traits::One, AccountId32, Perbill};
 use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
 	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce, PalletInfo,
 	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
-	RuntimeTask, System, DAYS, EXISTENTIAL_DEPOSIT, SLOT_DURATION, VERSION,
+	RuntimeTask, System, DAYS, EXISTENTIAL_DEPOSIT, MINUTES, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -164,35 +164,37 @@ impl pallet_template::Config for Runtime {
 }
 
 // ── Randomness ───────────────────────────────────────────────────────────────
-
-/// Block-hash-based randomness for jury selection.
-/// Mixes the last 81 block hashes (matching the official pallet_insecure_randomness_collective_flip
-/// history length) with the subject bytes for domain separation.
-/// Still vulnerable to block-author manipulation — replace with BABE/SASSAFRAS VRF before mainnet.
-/// (pallet-insecure-randomness-collective-flip cannot be added as a dep because it transitively
-/// requires an older sp-io version incompatible with our frame-support 40.x stack.)
-pub struct BlockHashRandomness;
-
-impl frame_support::traits::Randomness<[u8; 32], BlockNumber> for BlockHashRandomness {
-	fn random(subject: &[u8]) -> ([u8; 32], BlockNumber) {
-		let current = frame_system::Pallet::<Runtime>::block_number();
-		let mut entropy = [0u8; 32];
-		for lag in 0u32..81 {
-			let n = current.saturating_sub(lag);
-			let h = frame_system::Pallet::<Runtime>::block_hash(n);
-			for (i, b) in h.as_ref().iter().enumerate() {
-				entropy[i % 32] ^= b;
-			}
-		}
-		for (i, b) in subject.iter().enumerate() {
-			entropy[i % 32] ^= b;
-		}
-		let out_hash = BlakeTwo256::hash(&entropy);
-		let mut out = [0u8; 32];
-		out.copy_from_slice(out_hash.as_ref());
-		(out, current)
-	}
-}
+//
+// Jury-selection randomness for pallet-courts no longer goes through a generic
+// `frame_support::traits::Randomness` implementation. It previously did (mixing the last 81
+// block hashes as of the block `select_jury` was submitted in), but that scheme's output was
+// fully computable from already-mined history at the moment it was called — so any authorized
+// caller (the appellant, the oracle) could grind for a favorable jury just by delaying
+// submission across candidate blocks and checking each one's (already knowable) result. That
+// is *not* meaningfully different from what `pallet_insecure_randomness_collective_flip` would
+// have provided even if it built here (it doesn't — see below), since collective-flip has the
+// same "mix N already-known past blocks" shape.
+//
+// Instead, pallet-courts now implements a commit-then-delayed-reveal scheme internally: filing
+// an appeal (`appeal_ruling`) timestamps the case in `JuryRequestBlock`, and `select_jury` may
+// only be called — and only derives its seed from — a fixed window of `JurySeedDelayBlocks`
+// blocks starting immediately after that timestamp. None of those blocks exist (and their
+// hashes are therefore unknowable to anyone) at appeal time, which removes the grind-by-delay
+// hole. It does not remove all manipulation risk: a validator scheduled to author a block
+// inside that window can still nudge that block's hash within the space of valid blocks they
+// could produce (the same residual "last revealer" risk class as RANDAO). See the
+// `JurySeedDelayBlocks` doc comment on `pallet_courts::Config` for the full writeup, and
+// HANDOFF.md item 7.
+//
+// `pallet_insecure_randomness_collective_flip` (37.0.0, latest on crates.io) was re-checked
+// against the dependency set pinned below and still cannot be added: it depends on
+// `polkadot-sdk-frame` 0.18.0, which pulls in a parallel frame-support/frame-system/sp-io
+// 48.0.0 stack alongside our pinned 40.x/40.0.1 one. `cargo tree -i sp-io --duplicates`
+// confirms two resolved `sp-io` versions (40.0.1 and 48.0.0) once it's added, and the build
+// hard-fails compiling the old `sp-runtime-interface` v29.0.1 pulled in transitively
+// (`assert_eq_size!(usize, u32)` fails on a 64-bit host). This is the same conflict recorded
+// in HANDOFF.md item 33/7, just reconfirmed against current versions — not something worth
+// spending further effort on since, per above, it wouldn't have bought real security anyway.
 
 // ── Agora pallets ────────────────────────────────────────────────────────────
 
@@ -394,9 +396,10 @@ impl pallet_courts::Config for Runtime {
 	/// Oracle account stored in OracleAccount storage; set via set_oracle_account (root-only).
 	type OracleOrigin = pallet_courts::EnsureOracle<Runtime>;
 	type CitizenSuspender = Runtime;
-	/// Mixes 81 historical block hashes; still insecure against block-author manipulation.
-	/// Replace with BABE/SASSAFRAS VRF before mainnet.
-	type Randomness = BlockHashRandomness;
+	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
+	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`
+	/// for what this buys and its residual risk — it is not VRF-grade.
+	type JurySeedDelayBlocks = ConstU32<{ 10 * MINUTES }>;
 	/// Zero account used as filer for system-initiated LawChallenge cases.
 	type AutoChallengeAccount = AutoChallengeAccount;
 }

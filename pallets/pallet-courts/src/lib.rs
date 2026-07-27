@@ -6,11 +6,16 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 #[frame_support::pallet]
 pub mod pallet {
 
     use codec::{Decode, DecodeWithMemTracking, Encode};
-    use frame_support::{pallet_prelude::*, traits::Randomness as RandomnessTrait};
+    use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Hash as HashT, Saturating};
 
@@ -136,9 +141,38 @@ pub mod pallet {
         type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
-        /// On-chain randomness source for jury selection. Wire to a VRF-backed source
-        /// (Babe/SASSAFRAS) before mainnet.
-        type Randomness: RandomnessTrait<[u8; 32], BlockNumberFor<Self>>;
+        /// Number of blocks, starting the block *after* a case enters jury appeal, whose
+        /// hashes are mixed into the jury-selection seed. Jury selection is blocked until
+        /// this whole window has elapsed.
+        ///
+        /// This is a commit-then-delayed-reveal scheme: `appeal_ruling` is the implicit
+        /// "commit" (it timestamps the case via `JuryRequestBlock`), and the "reveal" is
+        /// the fixed window of `JurySeedDelayBlocks` blocks immediately following it. None
+        /// of those blocks exist yet — and their hashes are therefore unknowable to anyone,
+        /// including the appellant, the oracle, or whoever ends up calling `select_jury` —
+        /// at the moment the appeal is filed.
+        ///
+        /// This closes the dominant, cheap attack in a naive "mix the last N blocks as of
+        /// call time" scheme (what this pallet used before): since that scheme's output is
+        /// fully computable from already-mined history, *any* authorized caller could grind
+        /// for a favorable jury simply by delaying submission of `select_jury` block by
+        /// block until the (already-known) result looked good, with no need to author blocks
+        /// or hold any special role.
+        ///
+        /// It does **not** eliminate all manipulation risk. A validator who happens to be
+        /// scheduled (Aura round-robin, publicly known in advance) to author one of the
+        /// blocks inside the seed window can still nudge that block's hash — by choosing
+        /// which transactions to include and in what order — within the bounded space of
+        /// valid blocks they could produce, and someone author-ing the *last* block in the
+        /// window has a slight edge since they see the accumulated entropy from the earlier
+        /// blocks before finalizing their own. This is the same residual "last revealer"
+        /// class of risk inherent to RANDAO-style schemes generally, and is materially
+        /// narrower than the pre-existing hole (requires being a scheduled block author,
+        /// not just any authorized caller). Closing it fully requires either genuine
+        /// multi-party commit-reveal or consensus-native VRF (BABE/SASSAFRAS) — neither is
+        /// implemented here; see HANDOFF.md item 7.
+        #[pallet::constant]
+        type JurySeedDelayBlocks: Get<u32>;
         /// AccountId used as the filer for system-initiated cases (e.g. auto law challenges).
         /// Wire to a well-known zero account or a dedicated pallet account in the runtime.
         type AutoChallengeAccount: Get<Self::AccountId>;
@@ -167,6 +201,13 @@ pub mod pallet {
     /// Block number when the AI ruling was issued. Used to enforce the appeal window.
     #[pallet::storage]
     pub type AIRulingBlock<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
+
+    /// Block number when the case entered jury appeal (set by `appeal_ruling`). This is the
+    /// "commit" point for the delayed-reveal jury seed: `select_jury` may only be called once
+    /// `JurySeedDelayBlocks` blocks have elapsed after this point, and the seed is derived
+    /// solely from the hashes of blocks in that window — see `JurySeedDelayBlocks` doc comment.
+    #[pallet::storage]
+    pub type JuryRequestBlock<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
 
     /// Each juror's vote for a case. Only accounts in JuryPool[case_id] may vote.
     #[pallet::storage]
@@ -218,6 +259,9 @@ pub mod pallet {
         NotActiveCitizen,
         /// Caller is not authorized to perform this action.
         NotAuthorized,
+        /// The jury seed window hasn't fully elapsed yet (or was never requested), so
+        /// jury selection can't happen — see `JurySeedDelayBlocks`.
+        JurySeedNotReady,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -281,11 +325,16 @@ pub mod pallet {
                 case.1 = CaseStatus::InJuryAppeal;
                 Ok::<(), DispatchError>(())
             })?;
+            // Commit point for the delayed-reveal jury seed: jury selection can't use any
+            // block hash from at or before `now`, only ones produced after it.
+            JuryRequestBlock::<T>::insert(case_id, now);
             Self::deposit_event(Event::AppealFiled { case_id, appellant: who });
             Ok(())
         }
 
-        /// Select a jury from the citizen registry using block randomness.
+        /// Select a jury from the citizen registry using the delayed-reveal seed derived
+        /// from `JuryRequestBlock`. Only callable once `JurySeedDelayBlocks` blocks have
+        /// elapsed since the appeal — see that constant's doc comment.
         /// The jury size is determined by the case subject:
         ///   - LawChallenge: 21 jurors (Level 2 constitutional review).
         ///   - General / TreasuryDispute / CitizenConduct: 7 jurors (Level 1 appeal).
@@ -301,7 +350,11 @@ pub mod pallet {
             // For system-filed cases (filer == AutoChallengeAccount, an unsignable zero account),
             // allow any active citizen to trigger jury selection — otherwise the case is permanently
             // stuck when no oracle is configured. For citizen-filed cases, only the filer or the
-            // designated oracle may call, to prevent timing the block-hash randomness selection.
+            // designated oracle may call. Note this authorization check no longer needs to defend
+            // against "timing" the randomness the way it once did: the seed is anchored to the
+            // fixed post-appeal window (see `JurySeedDelayBlocks`), not to whichever block the
+            // caller of `select_jury` happens to submit in, so delaying this call doesn't let the
+            // caller pick a favorable outcome the way it could under the old scheme.
             let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| o == who);
             let system_case = case.0 == T::AutoChallengeAccount::get();
             let authorized = who == case.0
@@ -318,7 +371,18 @@ pub mod pallet {
             ensure!(jury_size == required_size, Error::<T>::InvalidJurySize);
             let total = T::CitizenSelector::total_citizens();
             ensure!(total >= required_size as u32, Error::<T>::NotEnoughCitizens);
-            let jurors = Self::pick_random_jurors(case_id, required_size, total)?;
+            // Delayed-reveal seed window: must be fully elapsed (all its block hashes fixed
+            // in history) before we can derive the jury seed from it. See
+            // `JurySeedDelayBlocks` doc comment for why this window is anchored to the
+            // appeal block rather than "now".
+            let request_block =
+                JuryRequestBlock::<T>::get(case_id).ok_or(Error::<T>::JurySeedNotReady)?;
+            let window_start = request_block.saturating_add(BlockNumberFor::<T>::from(1u32));
+            let delay = T::JurySeedDelayBlocks::get();
+            let window_end = request_block.saturating_add(BlockNumberFor::<T>::from(delay));
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now > window_end, Error::<T>::JurySeedNotReady);
+            let jurors = Self::pick_random_jurors(case_id, required_size, total, window_start, delay)?;
             Self::deposit_event(Event::JurySelected { case_id, jurors: jurors.clone() });
             JuryPool::<T>::insert(case_id, jurors);
             // Advance status so a second select_jury call is rejected.
@@ -475,14 +539,45 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Pick `jury_size` unique citizens at random.
-        /// Entropy comes from `T::Randomness`; for mainnet wire Babe/SASSAFRAS VRF here.
+        /// Mix the hashes of `window_len` blocks starting at `window_start` into a single
+        /// 32-byte seed, domain-separated by `case_id`. Every block in the window was
+        /// produced strictly after the case's `JuryRequestBlock` (the appeal), so none of
+        /// their hashes were computable at commit time — see `JurySeedDelayBlocks`.
+        fn anchored_entropy(
+            case_id: u32,
+            window_start: BlockNumberFor<T>,
+            window_len: u32,
+        ) -> [u8; 32] {
+            let mut entropy = [0u8; 32];
+            for offset in 0u32..window_len {
+                let n = window_start.saturating_add(BlockNumberFor::<T>::from(offset));
+                let h = frame_system::Pallet::<T>::block_hash(n);
+                for (i, b) in h.as_ref().iter().enumerate() {
+                    entropy[i % 32] ^= b;
+                }
+            }
+            for (i, b) in case_id.to_le_bytes().iter().enumerate() {
+                entropy[i % 32] ^= b;
+            }
+            for (i, b) in b"AGORA_JURY_SEED_V2".iter().enumerate() {
+                entropy[(i + 7) % 32] ^= b;
+            }
+            let out_hash = T::Hashing::hash(&entropy);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(out_hash.as_ref());
+            out
+        }
+
+        /// Pick `jury_size` unique citizens at random, using the delayed-reveal seed
+        /// derived from `[window_start, window_start + window_len)`.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
             total: u32,
+            window_start: BlockNumberFor<T>,
+            window_len: u32,
         ) -> Result<BoundedVec<T::AccountId, ConstU32<21>>, DispatchError> {
-            let (raw, _) = T::Randomness::random(&case_id.to_le_bytes());
+            let raw = Self::anchored_entropy(case_id, window_start, window_len);
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
             let max_attempts = total.saturating_add(jury_size as u32).saturating_mul(3);
