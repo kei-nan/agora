@@ -23,6 +23,7 @@ pub fn run() {
             chain::auth_verify_nullifier,
             chain::fetch_legislature_data,
             chain::fetch_elections_data,
+            chain::fetch_anticorruption_data,
             auth::auth_generate_challenge,
             auth::auth_poll_session,
             auth::auth_start_callback_server,

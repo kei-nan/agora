@@ -695,6 +695,180 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
     Ok(ElectionsData { delegates, elections })
 }
 
+// ── Anti-Corruption commands ──────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct AssetDisclosure {
+    pub account: String,
+    #[serde(rename = "ipfsHash")]
+    pub ipfs_hash: String,
+    #[serde(rename = "disclosedAt")]
+    pub disclosed_at: u64,
+    #[serde(rename = "updateDueAt")]
+    pub update_due_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ConflictEntry {
+    pub account: String,
+    #[serde(rename = "entityId")]
+    pub entity_id: u32,
+    #[serde(rename = "conflictType")]
+    pub conflict_type: String,
+    #[serde(rename = "registeredAt")]
+    pub registered_at: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WhistleblowerReport {
+    pub id: u32,
+    #[serde(rename = "contentHash")]
+    pub content_hash: String,
+    #[serde(rename = "submittedAt")]
+    pub submitted_at: u64,
+    pub status: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AntiCorruptionData {
+    #[serde(rename = "assetDisclosures")]
+    pub asset_disclosures: Vec<AssetDisclosure>,
+    pub conflicts: Vec<ConflictEntry>,
+    pub reports: Vec<WhistleblowerReport>,
+    #[serde(rename = "investigatorCount")]
+    pub investigator_count: u32,
+}
+
+/// Fetches PalletAntiCorruption.AssetDisclosures, ConflictRegistry, WhistleblowerReports,
+/// and the Investigators count.
+///
+/// AssetDeclaration SCALE (40 bytes): ipfs_hash[32] + disclosed_at:u32 LE + update_due_at:u32 LE
+/// Key suffix (Blake2_128Concat<AccountId>): last 32 bytes = account.
+///
+/// ConflictEntry SCALE (5 bytes): conflict_type:u8 (0=Financial,1=Family,2=FormerEmployer,3=BusinessPartner)
+///   + registered_at:u32 LE
+/// Key suffix (Blake2_128Concat<(AccountId,u32)>): last 36 bytes = account(32) + entity_id:u32 LE(4).
+///
+/// WhistleblowerReport SCALE (69 bytes): content_hash[32] + submitted_at:u32 LE + status:u8
+///   (0=Pending,1=Flagged,2=UnderInvestigation,3=Cleared,4=ReferredToCourts) + nullifier[32]
+/// Key suffix (Blake2_128Concat<u32>): last 4 bytes = report id.
+#[tauri::command]
+pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
+    let client = RpcClient::new(NODE_URL);
+
+    // ── Asset disclosures ─────────────────────────────────────────────────────
+    let disclosures_prefix = storage_prefix("PalletAntiCorruption", "AssetDisclosures");
+    let disclosure_keys = client.get_keys_paged(&disclosures_prefix).await.unwrap_or_default();
+    let mut asset_disclosures: Vec<AssetDisclosure> = Vec::new();
+    if !disclosure_keys.is_empty() {
+        let values = client.query_storage_at(&disclosure_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in disclosure_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                if bytes.len() < 40 {
+                    continue;
+                }
+                let ipfs_hash = format!("0x{}", hex::encode(&bytes[0..32]));
+                let disclosed_at =
+                    u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as u64;
+                let update_due_at =
+                    u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) as u64;
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let account = if kbytes.len() >= 32 {
+                    format!("0x{}", hex::encode(&kbytes[kbytes.len() - 32..]))
+                } else {
+                    String::new()
+                };
+                asset_disclosures.push(AssetDisclosure { account, ipfs_hash, disclosed_at, update_due_at });
+            }
+        }
+    }
+
+    // ── Conflict-of-interest registry ────────────────────────────────────────
+    let conflicts_prefix = storage_prefix("PalletAntiCorruption", "ConflictRegistry");
+    let conflict_keys = client.get_keys_paged(&conflicts_prefix).await.unwrap_or_default();
+    let mut conflicts: Vec<ConflictEntry> = Vec::new();
+    if !conflict_keys.is_empty() {
+        let values = client.query_storage_at(&conflict_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in conflict_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                if bytes.len() < 5 {
+                    continue;
+                }
+                let conflict_type = match bytes[0] {
+                    0 => "financial_interest",
+                    1 => "family_relation",
+                    2 => "former_employer",
+                    3 => "business_partner",
+                    _ => "unknown",
+                };
+                let registered_at = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64;
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let (account, entity_id) = if kbytes.len() >= 36 {
+                    let s = kbytes.len();
+                    let account = format!("0x{}", hex::encode(&kbytes[s - 36..s - 4]));
+                    let entity_id =
+                        u32::from_le_bytes([kbytes[s - 4], kbytes[s - 3], kbytes[s - 2], kbytes[s - 1]]);
+                    (account, entity_id)
+                } else {
+                    (String::new(), 0)
+                };
+                conflicts.push(ConflictEntry {
+                    account,
+                    entity_id,
+                    conflict_type: conflict_type.to_string(),
+                    registered_at,
+                });
+            }
+        }
+    }
+
+    // ── Whistleblower reports ────────────────────────────────────────────────
+    let reports_prefix = storage_prefix("PalletAntiCorruption", "WhistleblowerReports");
+    let report_keys = client.get_keys_paged(&reports_prefix).await.unwrap_or_default();
+    let mut reports: Vec<WhistleblowerReport> = Vec::new();
+    if !report_keys.is_empty() {
+        let values = client.query_storage_at(&report_keys).await.unwrap_or_default();
+        for (key_hex, val_opt) in report_keys.iter().zip(values.iter()) {
+            if let Some(val_hex) = val_opt {
+                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
+                if bytes.len() < 37 {
+                    continue;
+                }
+                let content_hash = format!("0x{}", hex::encode(&bytes[0..32]));
+                let submitted_at = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as u64;
+                let status = match bytes[36] {
+                    0 => "pending",
+                    1 => "flagged",
+                    2 => "under_investigation",
+                    3 => "cleared",
+                    4 => "referred_to_courts",
+                    _ => "unknown",
+                };
+                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+                let id = extract_u32_key_suffix(&kbytes);
+                reports.push(WhistleblowerReport {
+                    id,
+                    content_hash,
+                    submitted_at,
+                    status: status.to_string(),
+                });
+            }
+        }
+    }
+    reports.sort_by(|a, b| b.id.cmp(&a.id));
+
+    // ── Investigator count (StorageValue<BoundedVec<AccountId, MaxInvestigators>>) ──
+    let investigators_key = storage_prefix("PalletAntiCorruption", "Investigators");
+    let investigators_bytes = client.get_storage(&investigators_key).await.unwrap_or_default();
+    let investigator_count = investigators_bytes
+        .map(|bytes| decode_compact(&bytes).0)
+        .unwrap_or(0);
+
+    Ok(AntiCorruptionData { asset_disclosures, conflicts, reports, investigator_count })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Converts a raw 32-byte SHA-256 digest to an IPFS CIDv0 string.

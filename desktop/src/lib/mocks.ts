@@ -88,6 +88,34 @@ export const MOCKS: Record<string, (...args: unknown[]) => unknown> = {
     },
   ],
 
+  fetch_anticorruption_data: () => ({
+    assetDisclosures: [
+      {
+        account: "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+        ipfsHash: "QmStubDisclosure1",
+        disclosedAt: 12000,
+        updateDueAt: 12000 + 60 * 60 * 24 * 365,
+      },
+    ],
+    conflicts: [
+      {
+        account: "0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+        entityId: 7,
+        conflictType: "former_employer",
+        registeredAt: 12100,
+      },
+    ],
+    reports: [
+      {
+        id: 0,
+        contentHash: "0x" + "ab".repeat(32),
+        submittedAt: 12200,
+        status: "under_investigation",
+      },
+    ],
+    investigatorCount: 3,
+  }),
+
   auth_generate_challenge: () =>
     `agora://auth?challenge=mock-${Math.random().toString(36).slice(2)}`,
 

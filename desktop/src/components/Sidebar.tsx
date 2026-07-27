@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { to: "/elections", label: "Elections", icon: "🗳️" },
   { to: "/treasury", label: "Treasury", icon: "💰" },
   { to: "/courts", label: "Courts", icon: "🔨" },
+  { to: "/anti-corruption", label: "Anti-Corruption", icon: "🛡️" },
 ];
 
 export default function Sidebar() {

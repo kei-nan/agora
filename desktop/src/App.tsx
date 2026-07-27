@@ -10,6 +10,7 @@ import LegislaturePage from "./pages/LegislaturePage";
 import ElectionsPage from "./pages/ElectionsPage";
 import TreasuryPage from "./pages/TreasuryPage";
 import CourtsPage from "./pages/CourtsPage";
+import AntiCorruptionPage from "./pages/AntiCorruptionPage";
 import AuthPage from "./pages/AuthPage";
 import "./styles/app.css";
 
@@ -31,6 +32,7 @@ export default function App() {
                   <Route path="/elections" element={<ElectionsPage />} />
                   <Route path="/treasury" element={<TreasuryPage />} />
                   <Route path="/courts" element={<CourtsPage />} />
+                  <Route path="/anti-corruption" element={<AntiCorruptionPage />} />
                   <Route path="/auth" element={<AuthPage />} />
                 </Routes>
               </div>
