@@ -5,9 +5,18 @@
 //! 2. Budget QV — quadratic budget token allocation for fiscal priorities.
 //!
 //! Liquid democracy delegation applies to system 1 only.
-//! Suspended citizens are excluded from both systems (TODO: wire cross-pallet check).
+//! Suspended citizens are excluded from both systems via `Config::CitizenChecker::is_active_citizen`,
+//! checked at the start of every citizen-facing call. Delegations also carry a bounded
+//! `expires_at` ceiling (`MaxDelegationDurationBlocks`), so a suspended citizen's existing
+//! delegation lapses on its own rather than persisting indefinitely.
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
+
+#[cfg(test)]
+mod mock;
+
+#[cfg(test)]
+mod tests;
 
 #[frame_support::pallet]
 pub mod pallet {
@@ -482,6 +491,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn revoke_delegation(origin: OriginFor<T>, topic_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
             let record = Delegations::<T>::take((who.clone(), topic_id))
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
             DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));

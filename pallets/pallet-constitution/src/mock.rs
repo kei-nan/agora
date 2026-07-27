@@ -1,0 +1,150 @@
+use crate as pallet_constitution;
+use crate::{AutoChallengeHook, CitizenChecker, FreshLegislatureChecker, PetitionApprover};
+use frame_support::derive_impl;
+use frame_system::EnsureRoot;
+use sp_runtime::{BuildStorage, DispatchResult};
+use std::cell::RefCell;
+
+type Block = frame_system::mocking::MockBlock<Test>;
+
+// ── Test-controllable mocks for cross-pallet Config traits ─────────────────────
+//
+// These use thread-locals rather than pallet storage because the traits they mock
+// (CitizenChecker, FreshLegislatureChecker, AutoChallengeHook, PetitionApprover) are
+// implemented outside pallet-constitution in production (by pallet-identity,
+// pallet-elections, pallet-courts, pallet-voting respectively) and are here modeled as
+// plain Rust state the tests can set up/inspect directly.
+
+thread_local! {
+	static ACTIVE_CITIZENS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+	static FRESH_LEGISLATURE: RefCell<bool> = const { RefCell::new(false) };
+	static AUTO_CHALLENGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+	static REFERENDA_CREATED: RefCell<Vec<(u32, [u8; 32])>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Test helper: set the set of accounts considered active citizens by `TestCitizenChecker`.
+pub fn set_active_citizens(citizens: Vec<u64>) {
+	ACTIVE_CITIZENS.with(|c| *c.borrow_mut() = citizens);
+}
+
+/// Test helper: control whether `TestFreshLegislatureChecker::has_election_occurred_since`
+/// returns true.
+pub fn set_fresh_legislature(fresh: bool) {
+	FRESH_LEGISLATURE.with(|f| *f.borrow_mut() = fresh);
+}
+
+/// Test helper: law_ids that `TestAutoChallengeHook::auto_challenge_law` has been called with,
+/// in call order.
+pub fn auto_challenges() -> Vec<u32> {
+	AUTO_CHALLENGES.with(|v| v.borrow().clone())
+}
+
+/// Test helper: clears recorded auto-challenge calls (useful between sub-cases in one test).
+pub fn clear_auto_challenges() {
+	AUTO_CHALLENGES.with(|v| v.borrow_mut().clear());
+}
+
+/// Test helper: (petition_id, topic_hash) pairs that `TestPetitionApprover::create_referendum`
+/// has been called with, in call order.
+pub fn referenda_created() -> Vec<(u32, [u8; 32])> {
+	REFERENDA_CREATED.with(|v| v.borrow().clone())
+}
+
+pub struct TestCitizenChecker;
+impl CitizenChecker<u64> for TestCitizenChecker {
+	fn is_active_citizen(who: &u64) -> bool {
+		ACTIVE_CITIZENS.with(|c| c.borrow().contains(who))
+	}
+}
+
+pub struct TestFreshLegislatureChecker;
+impl FreshLegislatureChecker<u64> for TestFreshLegislatureChecker {
+	fn has_election_occurred_since(_proposed_at: u64) -> bool {
+		FRESH_LEGISLATURE.with(|f| *f.borrow())
+	}
+}
+
+pub struct TestAutoChallengeHook;
+impl AutoChallengeHook for TestAutoChallengeHook {
+	fn auto_challenge_law(law_id: u32) -> DispatchResult {
+		AUTO_CHALLENGES.with(|v| v.borrow_mut().push(law_id));
+		Ok(())
+	}
+}
+
+pub struct TestPetitionApprover;
+impl PetitionApprover for TestPetitionApprover {
+	fn create_referendum(petition_id: u32, topic_hash: [u8; 32]) -> DispatchResult {
+		REFERENDA_CREATED.with(|v| v.borrow_mut().push((petition_id, topic_hash)));
+		Ok(())
+	}
+}
+
+// ── Config constants (small values for fast, deterministic tests) ──────────────
+
+pub const ORDINARY_DELIBERATION_BLOCKS: u32 = 5;
+pub const PROVISIONING_PERIOD_BLOCKS: u32 = 10;
+pub const CONFIRMATION_PERIOD_BLOCKS: u32 = 6;
+pub const PETITION_THRESHOLD: u32 = 3;
+
+#[frame_support::runtime]
+mod runtime {
+	// The main runtime
+	#[runtime::runtime]
+	// Runtime Types to be generated
+	#[runtime::derive(
+		RuntimeCall,
+		RuntimeEvent,
+		RuntimeError,
+		RuntimeOrigin,
+		RuntimeFreezeReason,
+		RuntimeHoldReason,
+		RuntimeSlashReason,
+		RuntimeLockId,
+		RuntimeTask,
+		RuntimeViewFunction
+	)]
+	pub struct Test;
+
+	#[runtime::pallet_index(0)]
+	pub type System = frame_system::Pallet<Test>;
+
+	#[runtime::pallet_index(1)]
+	pub type Constitution = pallet_constitution::Pallet<Test>;
+}
+
+#[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
+impl frame_system::Config for Test {
+	type Block = Block;
+}
+
+impl pallet_constitution::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+
+	// Root is authorized; any signed origin is not — lets tests drive both the
+	// authorized and unauthorized-origin paths for every privileged call.
+	type LegislatureOrigin = EnsureRoot<u64>;
+	type RevocationOrigin = EnsureRoot<u64>;
+	type CourtOrigin = EnsureRoot<u64>;
+
+	type OrdinaryAmendmentDeliberationBlocks = frame_support::traits::ConstU32<ORDINARY_DELIBERATION_BLOCKS>;
+	type ProvisioningPeriodBlocks = frame_support::traits::ConstU32<PROVISIONING_PERIOD_BLOCKS>;
+	type ConfirmationPeriodBlocks = frame_support::traits::ConstU32<CONFIRMATION_PERIOD_BLOCKS>;
+	type FreshLegislatureChecker = TestFreshLegislatureChecker;
+
+	type PetitionThreshold = frame_support::traits::ConstU32<PETITION_THRESHOLD>;
+	type PetitionApprover = TestPetitionApprover;
+	type CitizenChecker = TestCitizenChecker;
+
+	type AutoChallengeHook = TestAutoChallengeHook;
+}
+
+// Build genesis storage according to the mock runtime, resetting all thread-local
+// test-mock state so tests don't leak state into one another.
+pub fn new_test_ext() -> sp_io::TestExternalities {
+	set_active_citizens(Vec::new());
+	set_fresh_legislature(false);
+	clear_auto_challenges();
+	REFERENDA_CREATED.with(|v| v.borrow_mut().clear());
+	frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into()
+}

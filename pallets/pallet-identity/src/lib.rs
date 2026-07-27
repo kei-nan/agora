@@ -6,6 +6,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 #[frame_support::pallet]
 pub mod pallet {
 
@@ -22,13 +27,14 @@ pub mod pallet {
         /// Use a no-op impl for testing.
         type ZkVerifier: ZkProofVerifier;
         /// The origin permitted to suspend and restore citizen voting rights.
-        /// Currently wired to EnsureRoot in the runtime.
-        /// TODO: replace with a court-controlled multisig or collective origin.
+        /// Wired to `pallet_courts::EnsureOracle` in the runtime — only a court ruling
+        /// (AI judge or jury) can suspend or restore a citizen.
         type SuspensionOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// The origin permitted to manage the trusted issuer Merkle root allowlist
         /// (add/remove country CA certificate roots). Keeping this separate from
         /// SuspensionOrigin lets governance rotate the allowlist without touching
-        /// the court-controlled suspension key. Use EnsureRoot for now.
+        /// the court-controlled suspension key. Wired to
+        /// `pallet_legislature::EnsureLegislatureMotion` in the runtime.
         type AdminOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
     }
 
@@ -203,7 +209,7 @@ pub mod pallet {
         /// `until`: None = indefinite suspension; Some(block) = suspension lifts at that block.
         /// If the citizen is already suspended, the existing record is replaced (allows courts
         /// to extend or modify an active suspension).
-        /// Origin: root (TODO: replace with court-controlled multisig origin).
+        /// Origin: `SuspensionOrigin` (court ruling — see `Config::SuspensionOrigin`).
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn suspend_citizen(
@@ -222,7 +228,7 @@ pub mod pallet {
         /// Restore suspended voting rights.
         /// Called when a sentence is served, the waiting period passes, or a conviction is
         /// overturned on appeal. Works on both active and expired-but-not-yet-cleaned-up records.
-        /// Origin: root (TODO: replace with court-controlled multisig origin).
+        /// Origin: `SuspensionOrigin` (court ruling — see `Config::SuspensionOrigin`).
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn restore_citizen_rights(

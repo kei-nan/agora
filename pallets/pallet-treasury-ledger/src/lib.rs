@@ -6,6 +6,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 /// Called after every recorded expenditure. Implement to maintain an audit trail.
 /// `index` is the u64 expenditure counter — using u64 avoids truncation for chains
 /// that record billions of expenditures over their lifetime.
