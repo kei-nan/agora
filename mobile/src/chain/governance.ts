@@ -1,24 +1,50 @@
-// Stub implementations — real chain calls need @polkadot/api polyfills for React Native
-import {
-  getDelegationFor, setDelegation, removeDelegation,
-  getDelegateRegistry, getDelegateProfile, updateDelegateBackingCount,
-  addBacking, removeBacking, isBacking,
-  DelegateProfile,
-} from './citizenState';
+/**
+ * Cross-pallet governance reads/writes for the mobile UI.
+ *
+ * Wraps pallet-voting / pallet-constitution calls that already have wrappers
+ * in voting.ts / constitution.ts, and adds the storage-reading list views
+ * (referenda, laws, petitions, the delegate registry) plus the
+ * pallet-elections delegate-registry calls (register/back/remove-backing),
+ * which didn't have a home in any of the other chain/*.ts files yet.
+ *
+ * Runtime pallet → @polkadot/api section names (see runtime/src/lib.rs
+ * construct_runtime! for the canonical list):
+ *   Voting          -> api.query.voting / api.tx.voting
+ *   Constitution    -> api.query.constitution / api.tx.constitution
+ *   PalletElections -> api.query.palletElections / api.tx.palletElections
+ */
+import { ApiPromise } from '@polkadot/api';
+import { KeyringPair } from '@polkadot/keyring/types';
+import { stringToU8a } from '@polkadot/util';
+import { sha256AsU8a } from '@polkadot/util-crypto';
+import { getApi } from './api';
+import * as votingChain from './voting';
+import * as constitutionChain from './constitution';
+import { removeDelegation, setDelegation } from './citizenState';
 
-export type { DelegateProfile };
+// 12s block time (see runtime/src/lib.rs MILLI_SECS_PER_BLOCK) => 7200
+// blocks/day. Matches the same constant already assumed for term-limit
+// display math elsewhere in the UI (DelegateScreen/DelegateDetailScreen).
+export const BLOCKS_PER_DAY = 7200;
 
 export interface Proposal {
   id: number;
-  title: string;
-  description: string;
+  state: 'Voting' | 'Passed' | 'Failed';
+  tier: 'Ordinary' | 'Constitutional' | 'Foundational';
+  topicHash: string;
   votesFor: number;
   votesAgainst: number;
-  status: 'active' | 'passed' | 'rejected';
 }
 
 export interface Law {
   id: number;
+  /**
+   * pallet-constitution's Laws storage only holds (tier, status, version,
+   * content_hash) — there is no on-chain title. Real content (including a
+   * title) lives on IPFS at contentHash and isn't fetched yet (see
+   * CLAUDE.md's "IPFS content fetching" remaining-work item). This is a
+   * placeholder until that's wired in.
+   */
   title: string;
   tier: 'Constitutional' | 'Ordinary';
   status: 'Active' | 'Paused' | 'Repealed';
@@ -28,6 +54,7 @@ export interface Law {
 
 export interface Petition {
   id: number;
+  /** Placeholder — see Law.title doc; petitions only store a topic_hash on-chain. */
   title: string;
   description: string;
   topicHash: string;
@@ -35,117 +62,284 @@ export interface Petition {
   threshold: number;
 }
 
-const MOCK_LAWS: Law[] = [
-  {
-    id: 1,
-    title: 'Public Transport Accessibility Act',
-    tier: 'Constitutional',
-    status: 'Active',
-    version: 2,
-    contentHash: 'bafybeiemxf5abjwjbikoz4mc3a3dla6ual3jsgpdr4cjr3oz3evfyavhwq',
-  },
-  {
-    id: 2,
-    title: 'Clean Air Standards Regulation',
-    tier: 'Ordinary',
-    status: 'Active',
-    version: 1,
-    contentHash: 'bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi',
-  },
-  {
-    id: 3,
-    title: 'Digital Privacy & Data Sovereignty Act',
-    tier: 'Constitutional',
-    status: 'Paused',
-    version: 1,
-    contentHash: 'bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku',
-  },
-  {
-    id: 4,
-    title: 'Municipal Budget Transparency Law',
-    tier: 'Ordinary',
-    status: 'Active',
-    version: 3,
-    contentHash: 'bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf4ch',
-  },
-  {
-    id: 5,
-    title: 'Electoral Reform (Proportional Representation) Act',
-    tier: 'Constitutional',
-    status: 'Repealed',
-    version: 1,
-    contentHash: 'bafybeif2fdfijc7xhf7dvulzftedr35zpjcvudhyjrgbln77kzodkf3dca',
-  },
-];
-
-const MOCK_PETITIONS: Petition[] = [
-  {
-    id: 1,
-    title: 'Universal Basic Income Pilot Program',
-    description: 'A 2-year UBI pilot of 800 AGR/month for citizens in the lowest two income quintiles, funded by a wealth tax surcharge.',
-    topicHash: '0x3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a',
-    sigCount: 847,
-    threshold: 1000,
-  },
-  {
-    id: 2,
-    title: 'Expand Renewable Energy Subsidies',
-    description: 'Triple the existing solar and wind installation grants, with priority for rural communities currently reliant on imported fossil fuels.',
-    topicHash: '0x1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
-    sigCount: 1243,
-    threshold: 1000,
-  },
-  {
-    id: 3,
-    title: 'Free Public Transit for Under-18s',
-    description: 'Zero-fare access to all bus and metro routes for citizens under 18, offset by a modest increase in peak-hour adult fares.',
-    topicHash: '0x9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c',
-    sigCount: 234,
-    threshold: 1000,
-  },
-  {
-    id: 4,
-    title: 'Open Source Government Software Mandate',
-    description: 'Require all government-commissioned software to be open-source by default, with exceptions subject to legislature approval.',
-    topicHash: '0x5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d',
-    sigCount: 678,
-    threshold: 1000,
-  },
-];
-
-export async function fetchProposals(): Promise<Proposal[]> { return []; }
-export async function fetchLaws(): Promise<Law[]> { return MOCK_LAWS; }
-export async function fetchPetitions(): Promise<Petition[]> { return MOCK_PETITIONS; }
-export async function voteOnReferendum(_id: number, _vote: boolean, _keypair: any): Promise<void> {}
-export async function signPetition(_id: number, _keypair: any): Promise<void> {}
-export async function getDelegation(_address: string, topicId: number): Promise<string | null> {
-  return getDelegationFor(topicId)?.delegate ?? null;
+export interface DelegateProfile {
+  address: string;
+  displayName: string;
+  status: 'Active' | 'Pending' | 'OnBreak';
+  backingCount: number;
+  consecutiveTerms: number;
+  maxConsecutiveTerms: number;
+  termProgressPct: number; // 0-100, only meaningful when Active
+  warningEmitted: boolean;
+  breakEndsInBlocks?: number;
 }
-export async function delegateVote(_keypair: any, delegate: string, topicId: number, durationDays: number): Promise<void> {
-  const expiresAt = Date.now() + durationDays * 86_400_000;
-  setDelegation(topicId, delegate, expiresAt);
+
+async function currentBlockNumber(api: ApiPromise): Promise<number> {
+  const header = await api.rpc.chain.getHeader();
+  return header.number.toNumber();
 }
-export async function revokeDelegation(_keypair: any, topicId: number): Promise<void> {
+
+// ── Referenda (pallet-voting) ────────────────────────────────────────────
+
+export async function fetchProposals(): Promise<Proposal[]> {
+  const api = await getApi();
+  const entries = await api.query.voting.referenda.entries();
+  const proposals = await Promise.all(
+    entries.map(async ([key, value]) => {
+      if ((value as any).isNone) return null;
+      const id = (key.args[0] as any).toNumber();
+      const [, topicHash, , state, tier] = (value as any).unwrap();
+      const [yes, no] = (await api.query.voting.referendumTally(id)) as any;
+      const proposal: Proposal = {
+        id,
+        state: state.type,
+        tier: tier.type,
+        topicHash: topicHash.toHex(),
+        votesFor: yes.toNumber(),
+        votesAgainst: no.toNumber(),
+      };
+      return proposal;
+    }),
+  );
+  return proposals
+    .filter((p): p is Proposal => p !== null)
+    .sort((a, b) => a.id - b.id);
+}
+
+export async function voteOnReferendum(
+  keypair: KeyringPair,
+  id: number,
+  inFavor: boolean,
+): Promise<void> {
+  await votingChain.voteReferendum(keypair, id, inFavor);
+}
+
+// ── Laws (pallet-constitution) ───────────────────────────────────────────
+
+export async function fetchLaws(): Promise<Law[]> {
+  const api = await getApi();
+  const entries = await api.query.constitution.laws.entries();
+  const laws: Law[] = [];
+  for (const [key, value] of entries) {
+    if ((value as any).isNone) continue;
+    const id = (key.args[0] as any).toNumber();
+    const [tier, status, version, contentHash] = (value as any).unwrap();
+    laws.push({
+      id,
+      title: `Law #${id}`,
+      // LawTier has three variants (Ordinary/Structural/Foundational); this
+      // UI only distinguishes two, so Structural and Foundational both
+      // surface as "Constitutional".
+      tier: tier.type === 'Ordinary' ? 'Ordinary' : 'Constitutional',
+      status: status.type,
+      version: version.toNumber(),
+      contentHash: contentHash.toHex(),
+    });
+  }
+  return laws.sort((a, b) => a.id - b.id);
+}
+
+// ── Petitions (pallet-constitution) ──────────────────────────────────────
+
+export async function fetchPetitions(): Promise<Petition[]> {
+  const api = await getApi();
+  const threshold = (api.consts.constitution.petitionThreshold as any).toNumber();
+  const entries = await api.query.constitution.petitions.entries();
+  const petitions: Petition[] = [];
+  for (const [key, value] of entries) {
+    if ((value as any).isNone) continue;
+    const id = (key.args[0] as any).toNumber();
+    const [, topicHash, sigCount] = (value as any).unwrap();
+    petitions.push({
+      id,
+      title: `Petition #${id}`,
+      description: '',
+      topicHash: topicHash.toHex(),
+      sigCount: sigCount.toNumber(),
+      threshold,
+    });
+  }
+  return petitions.sort((a, b) => a.id - b.id);
+}
+
+export async function signPetition(keypair: KeyringPair, petitionId: number): Promise<void> {
+  await constitutionChain.signPetition(keypair, petitionId);
+}
+
+// ── Topic delegation (pallet-voting liquid democracy) ────────────────────
+
+export async function getDelegation(address: string, topicId: number): Promise<string | null> {
+  const api = await getApi();
+  const record = await api.query.voting.delegations([address, topicId]);
+  if ((record as any).isNone) return null;
+  return (record as any).unwrap().delegate.toString();
+}
+
+export async function delegateVote(
+  keypair: KeyringPair,
+  delegate: string,
+  topicId: number,
+  durationDays: number,
+): Promise<void> {
+  const durationBlocks = Math.max(1, Math.round(durationDays * BLOCKS_PER_DAY));
+  await votingChain.delegateVote(keypair, delegate, topicId, durationBlocks);
+  // Mirror into the local cache so DelegateScreen's synchronous "My
+  // Delegations" list (reads citizenState directly, not the chain) reflects
+  // this without waiting for a refetch. The chain is the real source of
+  // truth; this is a UI-convenience mirror only.
+  setDelegation(topicId, delegate, Date.now() + durationDays * 86_400_000);
+}
+
+export async function revokeDelegation(keypair: KeyringPair, topicId: number): Promise<void> {
+  await votingChain.revokeDelegation(keypair, topicId);
   removeDelegation(topicId);
 }
+
+// ── Delegate registry (pallet-elections) ─────────────────────────────────
+
+function decodeDelegateInfo(
+  address: string,
+  info: any,
+  backingCount: number,
+  maxConsecutiveTerms: number,
+  termLengthBlocks: number,
+  now: number,
+): DelegateProfile {
+  const status: DelegateProfile['status'] = info.status.type;
+  const consecutiveTerms = info.consecutiveTerms.toNumber();
+  const warningEmitted = Boolean(info.warningEmitted.toJSON());
+
+  let termProgressPct = 0;
+  if (status === 'Active' && info.termStartBlock.isSome && termLengthBlocks > 0) {
+    const start = info.termStartBlock.unwrap().toNumber();
+    termProgressPct = Math.max(0, Math.min(100, Math.round(((now - start) / termLengthBlocks) * 100)));
+  }
+
+  let breakEndsInBlocks: number | undefined;
+  if (status === 'OnBreak' && info.breakUntilBlock.isSome) {
+    breakEndsInBlocks = Math.max(0, info.breakUntilBlock.unwrap().toNumber() - now);
+  }
+
+  return {
+    address,
+    displayName: info.displayName.toUtf8(),
+    status,
+    backingCount,
+    consecutiveTerms,
+    maxConsecutiveTerms,
+    termProgressPct,
+    warningEmitted,
+    breakEndsInBlocks,
+  };
+}
+
 export async function fetchDelegateRegistry(): Promise<DelegateProfile[]> {
-  return getDelegateRegistry();
+  const api = await getApi();
+  const [entries, maxTermsRaw, termLengthRaw, now] = await Promise.all([
+    api.query.palletElections.delegates.entries(),
+    api.query.palletElections.maxConsecutiveTerms(),
+    api.query.palletElections.termLengthBlocks(),
+    currentBlockNumber(api),
+  ]);
+  const maxConsecutiveTerms = (maxTermsRaw as any).toNumber();
+  const termLengthBlocks = (termLengthRaw as any).toNumber();
+
+  const profiles = await Promise.all(
+    entries.map(async ([key, value]) => {
+      if ((value as any).isNone) return null;
+      const address = (key.args[0] as any).toString();
+      const backing = await api.query.palletElections.backingCount(address);
+      return decodeDelegateInfo(
+        address,
+        (value as any).unwrap(),
+        (backing as any).toNumber(),
+        maxConsecutiveTerms,
+        termLengthBlocks,
+        now,
+      );
+    }),
+  );
+  return profiles.filter((p): p is DelegateProfile => p !== null);
 }
+
 export async function fetchDelegateProfile(address: string): Promise<DelegateProfile | null> {
-  return getDelegateProfile(address);
+  const api = await getApi();
+  const [infoOpt, backing, maxTermsRaw, termLengthRaw, now] = await Promise.all([
+    api.query.palletElections.delegates(address),
+    api.query.palletElections.backingCount(address),
+    api.query.palletElections.maxConsecutiveTerms(),
+    api.query.palletElections.termLengthBlocks(),
+    currentBlockNumber(api),
+  ]);
+  if ((infoOpt as any).isNone) return null;
+  return decodeDelegateInfo(
+    address,
+    (infoOpt as any).unwrap(),
+    (backing as any).toNumber(),
+    (maxTermsRaw as any).toNumber(),
+    (termLengthRaw as any).toNumber(),
+    now,
+  );
 }
-export async function backDelegate(_keypair: any, address: string): Promise<void> {
-  addBacking(address);
-  updateDelegateBackingCount(address, 1);
+
+export async function backDelegate(keypair: KeyringPair, address: string): Promise<void> {
+  const api = await getApi();
+  return new Promise((resolve, reject) => {
+    api.tx.palletElections
+      .backDelegate(address)
+      .signAndSend(keypair, ({ status, dispatchError }) => {
+        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
+        if (status.isFinalized) resolve();
+      })
+      .catch(reject);
+  });
 }
-export async function removeBackingFromDelegate(_keypair: any, address: string): Promise<void> {
-  removeBacking(address);
-  updateDelegateBackingCount(address, -1);
+
+export async function removeBackingFromDelegate(keypair: KeyringPair, address: string): Promise<void> {
+  const api = await getApi();
+  return new Promise((resolve, reject) => {
+    api.tx.palletElections
+      .removeBacking(address)
+      .signAndSend(keypair, ({ status, dispatchError }) => {
+        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
+        if (status.isFinalized) resolve();
+      })
+      .catch(reject);
+  });
 }
-export async function isBackingDelegate(_address: string, delegate: string): Promise<boolean> {
-  return isBacking(delegate);
+
+/**
+ * `address` is the checking citizen's own address, not the delegate's — pass
+ * ''/undefined-ish values are treated as "not signed in yet" and short-circuit
+ * to false rather than issuing an invalid storage query.
+ */
+export async function isBackingDelegate(address: string, delegate: string): Promise<boolean> {
+  if (!address) return false;
+  const api = await getApi();
+  const entry = await api.query.palletElections.backingOf(address, delegate);
+  return (entry as any).isSome;
 }
-export async function registerAsDelegate(_keypair: any, displayName: string, _profileHash: string): Promise<void> {
-  // Stub: in real impl posts register_as_delegate extrinsic
-  void displayName;
+
+export async function registerAsDelegate(
+  keypair: KeyringPair,
+  displayName: string,
+  bio: string,
+): Promise<void> {
+  const api = await getApi();
+  // register_as_delegate requires a real 32-byte profile_ipfs_hash. No IPFS
+  // upload client exists yet in this app (see CLAUDE.md's P1 remaining-work
+  // item / constitution.ts's TODO for the same gap on proposeAmendment). This
+  // hashes the bio text locally as a placeholder purely so the call is
+  // well-typed — it is NOT a real IPFS content hash and nothing is actually
+  // pinned anywhere.
+  const profileHash = sha256AsU8a(stringToU8a(bio || displayName));
+  return new Promise((resolve, reject) => {
+    api.tx.palletElections
+      .registerAsDelegate(displayName, profileHash)
+      .signAndSend(keypair, ({ status, dispatchError }) => {
+        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
+        if (status.isFinalized) resolve();
+      })
+      .catch(reject);
+  });
 }

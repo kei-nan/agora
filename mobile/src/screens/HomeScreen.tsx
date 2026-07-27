@@ -7,15 +7,21 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { useFocusEffect } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { RootStackParamList } from '../App';
 import { getRegistered, setRegistered } from '../chain/citizenState';
 // Chain imports stubbed until @polkadot/api polyfills are set up for React Native
 // import { isCitizen } from '../chain/identity';
 // import { getApi } from '../chain/api';
 
-type Props = NativeStackScreenProps<RootStackParamList, 'Main'>;
+// HomeScreen is registered as a Tab.Screen (see App.tsx's MainTabs), not a
+// Stack.Screen, so — matching the pattern already used in DelegateScreen —
+// its navigation is obtained via useNavigation() rather than a typed
+// `navigation` prop. It still needs RootStackParamList (not just
+// TabParamList) because it navigates to stack-only routes like 'Register'
+// and 'Auth'.
+type Nav = NativeStackNavigationProp<RootStackParamList>;
 
 interface ChainStats {
   blockNumber: number;
@@ -23,7 +29,8 @@ interface ChainStats {
   activeProposals: number;
 }
 
-export default function HomeScreen({ navigation }: Props) {
+export default function HomeScreen() {
+  const navigation = useNavigation<Nav>();
   const [citizenStatus, setCitizenStatus] = useState<'checking' | 'registered' | 'unregistered'>('checking');
   const [stats, setStats] = useState<ChainStats | null>(null);
 

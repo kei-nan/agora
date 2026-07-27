@@ -16,6 +16,7 @@ import DelegateScreen from './screens/DelegateScreen';
 import DelegateDetailScreen from './screens/DelegateDetailScreen';
 import RegisterDelegateScreen from './screens/RegisterDelegateScreen';
 import AuthScreen from './screens/AuthScreen';
+import VoteScreen from './screens/VoteScreen';
 
 export type RootStackParamList = {
   Main: undefined;
@@ -30,6 +31,7 @@ export type TabParamList = {
   Proposals: undefined;
   Petitions: undefined;
   Delegate: undefined;
+  Budget: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -50,6 +52,7 @@ function MainTabs() {
       <Tab.Screen name="Proposals" component={ProposalsScreen} />
       <Tab.Screen name="Petitions" component={PetitionScreen} />
       <Tab.Screen name="Delegate" component={DelegateScreen} />
+      <Tab.Screen name="Budget" component={VoteScreen} />
     </Tab.Navigator>
   );
 }
