@@ -38,6 +38,11 @@
 extern crate alloc;
 pub use pallet::*;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 #[frame_support::pallet]
 pub mod pallet {
     use codec::DecodeWithMemTracking;
@@ -229,6 +234,13 @@ pub mod pallet {
     #[pallet::storage]
     pub type NextElectionId<T: Config> = StorageValue<_, u32, ValueQuery>;
 
+    /// Number of candidates registered per election. Enforced against
+    /// MaxCandidatesPerElection on every register_candidate call — bounds the
+    /// unbounded iteration in certify_results over Candidates::iter_prefix.
+    #[pallet::storage]
+    pub type CandidateCount<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, u32, ValueQuery>;
+
     // ── Storage: Delegate registry ─────────────────────────────────────────────
 
     /// All registered delegates.
@@ -412,6 +424,8 @@ pub mod pallet {
         ResultsNotSubmitted,
         /// Election cycle length cannot be zero — elections would never run.
         ElectionCycleBlocksZero,
+        /// Election has reached MaxCandidatesPerElection and cannot accept more registrations.
+        TooManyCandidates,
     }
 
     // ── on_initialize: term warnings, expirations, and legislature elections ───
@@ -590,11 +604,14 @@ pub mod pallet {
             let election = Elections::<T>::get(election_id).ok_or(Error::<T>::ElectionNotFound)?;
             ensure!(election.status == ElectionStatus::Open, Error::<T>::ElectionNotOpen);
             ensure!(!Candidates::<T>::contains_key(election_id, &who), Error::<T>::CandidateAlreadyRegistered);
+            let count = CandidateCount::<T>::get(election_id);
+            ensure!(count < T::MaxCandidatesPerElection::get(), Error::<T>::TooManyCandidates);
             let deposit = T::CandidateDeposit::get();
             T::Currency::reserve(&who, deposit).map_err(|_| Error::<T>::InsufficientBalance)?;
             Candidates::<T>::insert(election_id, &who, CandidateInfo {
                 profile_ipfs_hash, status: CandidateStatus::Registered, deposit, account: who.clone(),
             });
+            CandidateCount::<T>::insert(election_id, count.saturating_add(1));
             Self::deposit_event(Event::CandidateRegistered { election_id, candidate: who });
             Ok(())
         }
