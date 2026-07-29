@@ -27,10 +27,16 @@ To run the dev chain:
 ## Architecture Decisions (Locked In)
 
 ### What We Integrate (don't build from scratch)
-- **Rarimo Freedom Tool** — passport NFC ZK proof + nullifier system (open source, Halborn-audited)
-  - Repo: https://github.com/rarimo/passport-zk-circuits
-  - Docs: https://docs.rarimo.com/freedom-tool/
-  - Saves ~18 months of ZK circuit work
+- **ZKPassport** — passport NFC ZK proof circuits, Noir/UltraHonk (open source, actively maintained)
+  - Repo: https://github.com/zkpassport/circuits
+  - SDK: https://github.com/zkpassport/zkpassport-sdk
+  - Replaces the earlier Rarimo integration — dropped 2026-07-30 (see HANDOFF.md log #65 for why:
+    Rarimo's own mobile SDK never actually shipped Noir proving, and ZKPassport is the more
+    actively maintained, more complete non-Rarimo stack covering the same problem)
+  - Saves the equivalent circuit-engineering work vs. building ICAO passport verification from scratch;
+    NOTE — the previously-built Rarimo-specific integration (VK assets, `verifier.rs`, `sodParser.ts`,
+    `certificateTree.ts`, mobile proving code) all need rework against ZKPassport's actual circuit
+    shape, none of that rework has started yet
 - **MACI** (Minimal Anti-Collusion Infrastructure) — receipt-free anonymous voting
   - Docs: https://maci.pse.dev/
   - Plug Rarimo nullifier as eligibility gate
@@ -44,7 +50,7 @@ To run the dev chain:
 - Smart-contract separation of powers (legislature/executive/judiciary domains)
 
 ## Identity System
-- Biometric passport NFC scan on mobile (Rarimo SDK)
+- Biometric passport NFC scan on mobile (custom JMRTD/NFCPassportReader native modules; ZKPassport Noir circuits for the ZK proof, see HANDOFF.md log #65)
 - On-device face match (Apple Vision iOS / MobileFaceNet Android)
 - Liveness detection (blink/turn)
 - ZK proof generated on device — nothing leaves the phone
@@ -88,7 +94,7 @@ All enforced by smart contract boundaries:
 
 ## Mobile App
 - React Native (iOS + Android)
-- Rarimo SDK for NFC passport reading + ZK proof generation
+- Custom native modules (JMRTD/Android, NFCPassportReader/iOS) for NFC passport reading; ZKPassport Noir/UltraHonk circuits for ZK proof generation (see HANDOFF.md log #65 — replaces the earlier Rarimo/circom integration)
 - On-device face match (Apple Vision / MobileFaceNet via TFLite)
 - @polkadot/api for Substrate chain interaction
 - Wallet stored in iOS Secure Enclave / Android Keystore
@@ -150,7 +156,7 @@ democracy-chain/
 
 ## Remaining Work (in priority order)
 1. **VK assets** — populate `runtime/assets/vk_sha256.bin` + `vk_sha1.bin` to enable real ZK proof verification (see `scripts/convert_vk.py`)
-2. **Mobile app** — `npx react-native init` + Rarimo SDK for NFC passport reading + ZK proof generation
+2. **Mobile app** — `npx react-native init` + custom NFC native modules + ZKPassport Noir circuits for ZK proof generation
 3. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
 4. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
 5. **Per-referendum threshold** — supermajority for constitutional-tier laws
@@ -162,10 +168,10 @@ democracy-chain/
 See `HANDOFF.md` for full pallet-by-pallet status and completed work log.
 
 ## Key References
-- Rarimo Freedom Tool: https://docs.rarimo.com/freedom-tool/
+- ZKPassport circuits: https://github.com/zkpassport/circuits
+- ZKPassport SDK: https://github.com/zkpassport/zkpassport-sdk
 - MACI: https://maci.pse.dev/
 - Kleros Court V2 (court architecture reference): https://kleros.io/
 - Polkadot OpenGov treasury: https://wiki.polkadot.com/learn/learn-polkadot-opengov-treasury/
 - polkadot-sdk-solochain-template: https://github.com/paritytech/polkadot-sdk-solochain-template
-- Rarimo passport-zk-circuits: https://github.com/rarimo/passport-zk-circuits
 - Semaphore v4: https://docs.semaphore.pse.dev/
