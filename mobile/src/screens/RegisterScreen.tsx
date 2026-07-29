@@ -3,6 +3,7 @@ import { Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, A
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { readPassport, RawPassportData } from '../native/nfcPassportReader';
+import { buildCircuitInputs } from '../chain/sodParser';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
 // imported here anymore — this screen can no longer honestly claim
@@ -61,25 +62,36 @@ export default function RegisterScreen({ navigation }: Props) {
       setStep('liveness');
       // TODO: await FaceMatch.verify(scan.faceImage);
       setStep('proving');
-      // Still blocked on two things this screen doesn't solve:
-      // (1) assembling the circuit's inputs.json from raw DG1/DG15/SOD bytes
-      //     (parsing the SOD's certificate chain, computing the Merkle proof
-      //     against the on-chain AllowedMerkleRoots allowlist, the Poseidon
-      //     hashes the circuit expects — genuinely new work, not yet started;
-      //     passport-zk-circuits' own test/inputs pipeline is the reference
-      //     for the exact schema, see HANDOFF item 8) and (2) obtaining a
-      //     .wcd witness graph + the ~515MB proving key for this circuit
-      //     (see ../chain/zkProving.ts's module doc + HANDOFF item 8/log #56).
-      // Once both exist, this step becomes roughly:
-      //   const graphPath = await fetchZkAsset(WCD_GRAPH_HASH);
-      //   const zkeyPath = await fetchZkAsset(PROVING_KEY_HASH);
-      //   const witness = await computeWitness(JSON.stringify(circuitInputs), graphPath);
+      // Real as of this session (../chain/sodParser.ts) — parses the SOD's
+      // CMS SignedData structure and assembles the RegisterIdentityBuilder
+      // circuit's dg1/dg15/encapsulatedContent/signedAttributes/pubkey/
+      // signature inputs, and identifies which circuit variant this
+      // passport needs. Still stops here, though, blocked on two things
+      // buildCircuitInputs deliberately does NOT produce (see its module
+      // doc comment for why both are real, unresolved blockers, not
+      // oversights):
+      //  (1) `skIdentity` — must be a genuine locally-generated secret, not
+      //      derived from public passport bytes.
+      //  (2) `slaveMerkleRoot` / `slaveMerkleInclusionBranches` — an
+      //      inclusion proof against Rarimo's live `CertificatesSMT`
+      //      registry; no documented client API for that was found yet.
+      // ...plus obtaining a `.wcd` witness graph + the ~515MB proving key
+      // for the specific variant identified below (see ../chain/
+      // zkProving.ts's module doc + HANDOFF item 8/log #56).
+      // Once all of that exists, this step becomes roughly:
+      //   const graphPath = await fetchZkAsset(WCD_GRAPH_HASH_FOR[variant.name]);
+      //   const zkeyPath = await fetchZkAsset(PROVING_KEY_HASH_FOR[variant.name]);
+      //   const fullInputs = { ...inputs, skIdentity, slaveMerkleRoot, slaveMerkleInclusionBranches };
+      //   const witness = await computeWitness(JSON.stringify(fullInputs), graphPath);
       //   const { proof, pub_signals } = await generateProof(zkeyPath, toBase64(witness));
       //   const zkProof = encodeGroth16Proof(proof as SnarkjsGroth16Proof, 0);
+      const { variant } = buildCircuitInputs(raw.dg1, raw.dg15, raw.sod);
       throw new NotImplementedError(
         `Passport chip read succeeded (DG1: ${raw.dg1.length}B, DG15: ${raw.dg15.length}B, ` +
-          `SOD: ${raw.sod.length}B) — but ZK proof generation isn't wired up yet ` +
-          '(circuit input assembly + proving key are still missing). See RegisterScreen.tsx TODOs.',
+          `SOD: ${raw.sod.length}B) and circuit inputs were assembled for variant "${variant.name}" — ` +
+          'but proof generation still needs a real identity secret, a Merkle inclusion proof from ' +
+          "Rarimo's certificate registry, and this variant's proving key/witness graph, none of which " +
+          'exist yet. See RegisterScreen.tsx TODOs.',
       );
     } catch (e: any) {
       if (e instanceof NotImplementedError) {
