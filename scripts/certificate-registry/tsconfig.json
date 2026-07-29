@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "allowJs": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["*.ts", "../../mobile/src/chain/certificateTree.ts", "../../mobile/src/chain/sodParser.ts", "../../mobile/src/chain/poseidon.js", "../../mobile/src/chain/poseidon.d.ts", "../../mobile/src/chain/asn1.js", "../../mobile/src/chain/asn1.d.ts"]
+}
