@@ -20,6 +20,7 @@ members = [
     "pallets/pallet-audit",
     "pallets/pallet-anticorruption",
     "pallets/pallet-executive",
+    "pallets/poseidon2-bn254",
     "runtime",
 ]
 resolver = "2"
@@ -38,6 +39,7 @@ pallet-emergency-council = { path = "./pallets/pallet-emergency-council", defaul
 pallet-audit = { path = "./pallets/pallet-audit", default-features = false }
 pallet-anticorruption = { path = "./pallets/pallet-anticorruption", default-features = false }
 pallet-executive = { path = "./pallets/pallet-executive", default-features = false }
+poseidon2-bn254 = { path = "./pallets/poseidon2-bn254", default-features = false }
 clap = { version = "4.5.13" }
 frame-benchmarking-cli = { version = "47.0.0", default-features = false }
 frame-metadata-hash-extension = { version = "0.8.0", default-features = false }
@@ -100,6 +102,13 @@ substrate-wasm-builder = { version = "26.0.1", default-features = false }
 # branch, not a rev, while the port is actively in progress; switch to a pinned `rev` once
 # it stabilizes.
 ultrahonk-no-std = { git = "https://github.com/kei-nan/ultrahonk_verifier", branch = "bb-5.0.0-port", default-features = false }
+# Pinned to the same 0.5.0 line ultrahonk-no-std itself depends on (see its Cargo.toml), so
+# the resolver doesn't end up with two ark-bn254/ark-ff major versions in the same runtime
+# build — that duplicate-version failure mode is exactly what bit
+# pallet_insecure_randomness_collective_flip (see the "Randomness" comment in
+# runtime/src/configs/mod.rs).
+ark-bn254 = { version = "0.5.0", default-features = false, features = ["curve"] }
+ark-ff = { version = "0.5.0", default-features = false }
 
 [profile.release]
 opt-level = 3

@@ -1,14 +1,15 @@
 //! Agora identity-anchor **migration** (dual-evaluation) circuit.
 //!
-//! Implements changelog entry 67's scheduled OPRF-scheme rotation: the citizen evaluates the
-//! *same* personal-number-derived identity input under both the outgoing committee and the
-//! incoming one, and proves both anchors came from that one input without revealing it.
+//! Implements changelog entry 67's scheduled OPRF-scheme rotation, over changelog entry 73's
+//! 5-committee topology: the citizen evaluates the *same* personal-number-derived identity
+//! input under both the 5 outgoing committees and the 5 incoming committees, and proves both
+//! combined anchors came from that one input without revealing it.
 //! `pallet-identity::migrate_oprf_scheme` then matches `old_anchor` against the citizen's
 //! existing `CitizenAnchor` entry and claims `new_anchor` under the next scheme version.
 //!
 //! Consistency is enforced structurally rather than by an extra constraint: there is exactly
-//! one `identity_input` binding in this circuit and both `verified_oprf` calls consume it, so
-//! there is no way for the two anchors to have come from different inputs.
+//! one `identity_input` binding in this circuit and all 10 `verified_oprf` calls consume it,
+//! so there is no way for the two combined anchors to have come from different inputs.
 //!
 //! This is the proof `AnchorProofVerifier::verify_migration` must ultimately verify.
 //!
@@ -20,14 +21,18 @@
 
 use common::hash_salt_dg1_dg2_hash_private_nullifier;
 use identity_anchor::{
-    assert_dg1_clear_value, derive_anchor, derive_identity_input, DS_ANCHOR_OUT, DS_DLOG,
+    assert_dg1_clear_value, combine_committee_anchors, derive_committee_anchor_term,
+    derive_identity_input, DS_ANCHOR_OUT, DS_DLOG, NUM_COMMITTEES,
 };
 use oprf::oprf_output::verified_oprf;
 use poseidon::poseidon2::Poseidon2;
 use utils::types::{DG1Data, MRZExpiryDate, OPRFProof, SaltedValue};
 
 /// Public inputs:  `comm_in`, `old_scheme_version`, `new_scheme_version`
-/// Public outputs: `(old_anchor, new_anchor, old_oprf_pk_hash, new_oprf_pk_hash)`
+/// Public outputs: `(old_anchor, new_anchor, old_oprf_pk_hashes, new_oprf_pk_hashes)`
+///
+/// Evaluates the same identity input under both the 5 outgoing committees and the 5 incoming
+/// committees (changelog entry 73's topology applies identically on both sides of a rotation).
 fn main(
     comm_in: pub Field,
     old_scheme_version: pub Field,
@@ -37,9 +42,9 @@ fn main(
     salted_dg2_hash: SaltedValue<Field>,
     salted_dg2_hash_type: SaltedValue<u32>,
     salted_private_nullifier: SaltedValue<Field>,
-    old_oprf_proof: OPRFProof,
-    new_oprf_proof: OPRFProof,
-) -> pub (Field, Field, Field, Field) {
+    old_oprf_proofs: [OPRFProof; NUM_COMMITTEES],
+    new_oprf_proofs: [OPRFProof; NUM_COMMITTEES],
+) -> pub (Field, Field, [Field; NUM_COMMITTEES], [Field; NUM_COMMITTEES]) {
     assert(
         comm_in
             == hash_salt_dg1_dg2_hash_private_nullifier(
@@ -58,37 +63,52 @@ fn main(
         "Migration must move between two different OPRF scheme versions",
     );
 
-    // Single binding, consumed twice — this is what makes the two anchors provably
-    // same-input without an explicit equality constraint.
+    // Single binding, consumed by all 10 evaluations below — this is what makes the old and
+    // new anchors provably same-input without an explicit equality constraint.
     let identity_input = derive_identity_input(salted_dg1.value);
 
-    let old_oprf_output = verified_oprf(
-        old_oprf_proof.beta,
-        old_oprf_proof.pk,
-        old_oprf_proof.dlog_e,
-        old_oprf_proof.dlog_s,
-        old_oprf_proof.response_blinded,
-        old_oprf_proof.response,
-        identity_input,
-        DS_DLOG,
-        DS_ANCHOR_OUT,
-    );
-    let new_oprf_output = verified_oprf(
-        new_oprf_proof.beta,
-        new_oprf_proof.pk,
-        new_oprf_proof.dlog_e,
-        new_oprf_proof.dlog_s,
-        new_oprf_proof.response_blinded,
-        new_oprf_proof.response,
-        identity_input,
-        DS_DLOG,
-        DS_ANCHOR_OUT,
-    );
+    let mut old_terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    let mut old_oprf_pk_hashes: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    for i in 0..NUM_COMMITTEES {
+        let old_oprf_proof = old_oprf_proofs[i];
+        let old_oprf_output = verified_oprf(
+            old_oprf_proof.beta,
+            old_oprf_proof.pk,
+            old_oprf_proof.dlog_e,
+            old_oprf_proof.dlog_s,
+            old_oprf_proof.response_blinded,
+            old_oprf_proof.response,
+            identity_input,
+            DS_DLOG,
+            DS_ANCHOR_OUT,
+        );
+        old_terms[i] = derive_committee_anchor_term(i, old_oprf_output, old_scheme_version);
+        old_oprf_pk_hashes[i] = Poseidon2::hash([old_oprf_proof.pk.x, old_oprf_proof.pk.y], 2);
+    }
+
+    let mut new_terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    let mut new_oprf_pk_hashes: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    for i in 0..NUM_COMMITTEES {
+        let new_oprf_proof = new_oprf_proofs[i];
+        let new_oprf_output = verified_oprf(
+            new_oprf_proof.beta,
+            new_oprf_proof.pk,
+            new_oprf_proof.dlog_e,
+            new_oprf_proof.dlog_s,
+            new_oprf_proof.response_blinded,
+            new_oprf_proof.response,
+            identity_input,
+            DS_DLOG,
+            DS_ANCHOR_OUT,
+        );
+        new_terms[i] = derive_committee_anchor_term(i, new_oprf_output, new_scheme_version);
+        new_oprf_pk_hashes[i] = Poseidon2::hash([new_oprf_proof.pk.x, new_oprf_proof.pk.y], 2);
+    }
 
     (
-        derive_anchor(old_oprf_output, old_scheme_version),
-        derive_anchor(new_oprf_output, new_scheme_version),
-        Poseidon2::hash([old_oprf_proof.pk.x, old_oprf_proof.pk.y], 2),
-        Poseidon2::hash([new_oprf_proof.pk.x, new_oprf_proof.pk.y], 2),
+        combine_committee_anchors(old_terms),
+        combine_committee_anchors(new_terms),
+        old_oprf_pk_hashes,
+        new_oprf_pk_hashes,
     )
 }

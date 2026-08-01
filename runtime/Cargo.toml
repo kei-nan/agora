@@ -38,6 +38,7 @@ pallet-audit.workspace = true
 pallet-anticorruption.workspace = true
 pallet-executive.workspace = true
 pallet-timestamp.workspace = true
+poseidon2-bn254.workspace = true
 pallet-transaction-payment-rpc-runtime-api.workspace = true
 pallet-transaction-payment.workspace = true
 scale-info = { features = ["derive", "serde"], workspace = true }
@@ -94,6 +95,7 @@ std = [
 	"pallet-anticorruption/std",
 	"pallet-executive/std",
 	"pallet-timestamp/std",
+	"poseidon2-bn254/std",
 	"pallet-transaction-payment-rpc-runtime-api/std",
 	"pallet-transaction-payment/std",
 	"scale-info/std",

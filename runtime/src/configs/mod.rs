@@ -42,10 +42,14 @@ use sp_version::RuntimeVersion;
 use super::{
 	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce, PalletInfo,
 	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
-	RuntimeTask, System, DAYS, EXISTENTIAL_DEPOSIT, MINUTES, SLOT_DURATION, VERSION,
+	RuntimeTask, System, Timestamp, DAYS, EXISTENTIAL_DEPOSIT, MINUTES, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
+
+/// Seconds per day — `pallet_identity_zk::Config::MaxAnchorProofAge` is denominated in
+/// (wall-clock) seconds, unlike `DAYS` above which counts blocks.
+const DAYS_IN_SECONDS: u64 = 24 * 60 * 60;
 
 parameter_types! {
 	pub const BlockHashCount: BlockNumber = 2400;
@@ -221,7 +225,12 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 pub struct PassthroughAnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
-	fn verify_registration_anchor(_proof_bytes: &[u8], _anchor: [u8; 32], _scheme_version: u32) -> bool {
+	fn verify_registration_anchor(
+		_outer_public_inputs: &[[u8; 32]],
+		_anchor: [u8; 32],
+		_scheme_version: u32,
+		_oprf_pk_hashes: [[u8; 32]; 5],
+	) -> bool {
 		true
 	}
 
@@ -255,6 +264,12 @@ impl pallet_identity_zk::Config for Runtime {
 	/// placeholder here, same pattern as `pallet_constitution::Config::RevocationOrigin`
 	/// below: replace with a real emergency-council-backed origin once one exists.
 	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
+	type Now = Timestamp;
+	/// 1 day: generous relative to how long a real registration flow (mobile proving, then
+	/// submitting) should ever take, while still bounding replay of a stale-but-not-yet-
+	/// passport-expired proof (HANDOFF log #75). Placeholder pending real-world timing data,
+	/// same governance-tunable-not-hardcoded spirit as `ReverificationPeriod` above.
+	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -271,13 +286,19 @@ impl pallet_identity_zk::Config for Runtime {
 	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
-	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet, so
-	/// even this "real verifier" build path uses the passthrough for the anchor check only.
-	type AnchorVerifier = PassthroughAnchorVerifier;
+	/// Real for `verify_registration_anchor` (Poseidon2 `param_commitment` recomputation
+	/// against the already-verified outer proof, HANDOFF log #75); `verify_reverification`/
+	/// `verify_migration` remain unconditionally permissive, matching
+	/// `PassthroughAnchorVerifier` — see `crate::anchor_verifier::Poseidon2AnchorVerifier`'s
+	/// doc comment for exactly why those two are not yet real.
+	type AnchorVerifier = crate::anchor_verifier::Poseidon2AnchorVerifier;
 	/// See the `dev-mode` impl above for the placeholder-cadence rationale.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
 	/// See the `dev-mode` impl above for why this is `EnsureRoot` for now.
 	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
+	type Now = Timestamp;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs.

@@ -21,14 +21,25 @@ pub const VALID_PROOF_MARKER: u8 = 1;
 /// Byte marker used by `TestZkVerifier` to signal a proof that should fail verification.
 pub const INVALID_PROOF_MARKER: u8 = 0;
 
-/// Test anchor-proof verifier. Same deterministic-by-proof-bytes convention as
-/// `TestZkVerifier`, reused across all three `AnchorProofVerifier` methods so tests stay
-/// simple: a proof whose first byte is `VALID_PROOF_MARKER` passes, anything else fails.
+/// Test anchor-proof verifier. `verify_reverification`/`verify_migration` keep the original
+/// deterministic-by-proof-bytes convention (a proof whose first byte is `VALID_PROOF_MARKER`
+/// passes). `verify_registration_anchor` no longer takes proof bytes at all (HANDOFF log #75
+/// — the disclosure subproof rides inside the already-verified outer proof, so there is no
+/// separate anchor SNARK); this mock instead treats registration as valid whenever
+/// `outer_public_inputs` contains a `param_commitments[i]` equal to `anchor` itself. That is
+/// not how the real `Poseidon2AnchorVerifier` computes a match (see
+/// `runtime/src/anchor_verifier.rs`), but it is deterministic and lets pallet-level tests
+/// drive both the accept and reject paths without depending on the crypto crate.
 pub struct TestAnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
-    fn verify_registration_anchor(proof_bytes: &[u8], _anchor: [u8; 32], _scheme_version: u32) -> bool {
-        matches!(proof_bytes.first(), Some(1))
+    fn verify_registration_anchor(
+        outer_public_inputs: &[[u8; 32]],
+        anchor: [u8; 32],
+        _scheme_version: u32,
+        _oprf_pk_hashes: [[u8; 32]; 5],
+    ) -> bool {
+        outer_public_inputs.contains(&anchor)
     }
 
     fn verify_reverification(proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
@@ -37,6 +48,20 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
 
     fn verify_migration(proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
         matches!(proof_bytes.first(), Some(1))
+    }
+}
+
+/// Fixed test clock for `pallet_identity_zk::Config::Now` — always reports
+/// `TEST_NOW_UNIX_SECS`, so freshness checks in tests are driven entirely by the
+/// `current_date` each test puts in its `public_inputs` fixture rather than by wall-clock
+/// time.
+pub const TEST_NOW_UNIX_SECS: u64 = 1_000_000;
+
+pub struct TestNow;
+
+impl frame_support::traits::UnixTime for TestNow {
+    fn now() -> core::time::Duration {
+        core::time::Duration::from_secs(TEST_NOW_UNIX_SECS)
     }
 }
 
@@ -83,6 +108,11 @@ impl pallet_identity_zk::Config for Test {
     type ReverificationPeriod = frame_support::traits::ConstU32<10>;
     // Same convention as SuspensionOrigin/AdminOrigin above.
     type EmergencyRotationOrigin = frame_system::EnsureRoot<u64>;
+    type Now = TestNow;
+    // 1 hour — generous enough that every fixture using the default fresh `current_date`
+    // (see `tests.rs::public_inputs`) stays comfortably inside the window, while still
+    // leaving room for a dedicated staleness test to use an obviously-expired one.
+    type MaxAnchorProofAge = frame_support::traits::ConstU64<3600>;
 }
 
 // Build genesis storage according to the mock runtime.

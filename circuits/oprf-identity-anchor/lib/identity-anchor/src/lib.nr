@@ -60,6 +60,14 @@ pub global DS_DLOG: Field = 1523098184080632582082867317389990410064981862;
 /// Domain separator for the published anchor itself, ASCII "AGORA_ANCHOR_V1".
 pub global DS_ANCHOR: Field = 338945631368262504456167009336383025;
 
+/// Number of independent OPRF committees a registration/reverification/migration proof must
+/// evaluate against. Fixed at 5 per changelog entry 73's governance design: every registration
+/// query is sent to all 5 committees symmetrically (not routed by hash, which would leak a
+/// low-entropy per-citizen signal), and the final anchor is a hashed-summation combination of
+/// all 5 responses. This is `n`-of-`n` combination, not threshold — see entry 73 for the
+/// disclosed 48h-SLA availability tradeoff that follows from that.
+pub global NUM_COMMITTEES: u32 = 5;
+
 /// The raw TD3 personal-number field, as 14 ASCII characters (right-padded with `<`).
 pub type PersonalNumber = [u8; PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH];
 
@@ -153,16 +161,50 @@ pub fn derive_identity_input(dg1: DG1Data) -> Field {
     )
 }
 
-/// Derives the published identity anchor from a verified OPRF output.
+/// Derives one committee's contribution to the published identity anchor.
 ///
-/// `Poseidon2(DS_ANCHOR, oprf_output, scheme_version)`
+/// `Poseidon2(DS_ANCHOR, committee_index, oprf_output, scheme_version)`
+///
+/// `committee_index` (0..`NUM_COMMITTEES`) is a circuit constant supplied by the caller's loop
+/// position, not prover-controlled data — it exists purely for domain separation between the
+/// 5 committees' terms before they are summed by `combine_committee_anchors`. Changelog entry
+/// 73 requires each term be hashed before combination rather than summed as raw OPRF output:
+/// real hybrid-cryptography combiners never sum raw group elements directly, since they carry
+/// algebraic structure a combiner attack can exploit (RFC 9497's vOPRF spec has a dedicated
+/// `Finalize`-hash step for exactly this reason). Hashing per-committee first, with a distinct
+/// separator per committee, is what gives the combined anchor its security property: it stays
+/// unpredictable as long as even one of the 5 committees is honest, even if the other 4 are
+/// fully compromised (a standard one-time-pad argument, sound in the random-oracle model).
 ///
 /// `scheme_version` is mixed in so that the same personal number under two different
-/// committee generations yields two unrelated anchors, matching `pallet-identity`'s
+/// committee generations yields unrelated terms, matching `pallet-identity`'s
 /// `IdentityAnchorRegistry` key of `(scheme_version, anchor)`. It does not, on its own, prove
 /// which committee key produced `oprf_output` — that is what the separately exposed
 /// `oprf_pk_hash` public output is for, and the on-chain verifier must check the
-/// `scheme_version -> oprf_pk_hash` binding itself.
-pub fn derive_anchor(oprf_output: Field, scheme_version: Field) -> Field {
-    Poseidon2::hash([DS_ANCHOR, oprf_output, scheme_version], 3)
+/// `scheme_version -> oprf_pk_hash` binding itself, once per committee slot.
+pub fn derive_committee_anchor_term(
+    committee_index: u32,
+    oprf_output: Field,
+    scheme_version: Field,
+) -> Field {
+    Poseidon2::hash([DS_ANCHOR, committee_index as Field, oprf_output, scheme_version], 4)
+}
+
+/// Combines all 5 committees' hashed terms into the final published anchor by field addition.
+///
+/// `final_anchor = term_0 + term_1 + ... + term_4` (BN254 scalar field addition).
+///
+/// This is the "hashed summation" combiner from changelog entry 73: addition, not another
+/// hash, because addition is what makes the one-time-pad security argument go through
+/// (an adversary holding 4 of the 5 committees' secret terms can compute their sum and
+/// subtract it from any observed `final_anchor`, but that only recovers the 5th, honest
+/// committee's term — which is exactly as unpredictable to them as before, since it was
+/// produced by a PRF they don't hold the key for). Combining by another hash instead would
+/// not preserve this property.
+pub fn combine_committee_anchors(terms: [Field; NUM_COMMITTEES]) -> Field {
+    let mut sum: Field = 0;
+    for i in 0..NUM_COMMITTEES {
+        sum += terms[i];
+    }
+    sum
 }

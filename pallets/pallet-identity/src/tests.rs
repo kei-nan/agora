@@ -1,6 +1,6 @@
 use crate::{
     mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex, CitizenNullifier, CitizenPosition,
-    Error, Event, IdentityAnchorRegistry, NullifierRegistry, OprfSchemeVersion,
+    Error, Event, IdentityAnchorRegistry, NullifierRegistry, OprfCommitteeKeys, OprfSchemeVersion,
     ReverificationDeadline, SelfDeclaredSingleDocument, SuspendedNullifiers, TotalCitizens,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
@@ -14,13 +14,30 @@ fn invalid_proof() -> BoundedVec<u8, ConstU32<4096>> {
     BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap()
 }
 
+/// Field-encodes a unix-seconds timestamp the way the outer circuit's `current_date: pub
+/// u64` public input is encoded: the low 8 bytes of a 32-byte big-endian field element.
+fn current_date_field(secs: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[24..32].copy_from_slice(&secs.to_be_bytes());
+    b
+}
+
 /// Builds a well-formed count_4 public_inputs vector (ZKPassport's outer-circuit layout,
-/// 9 fields: 8 fixed + 1 disclosure subproof — see `runtime/src/verifier.rs`) with the
-/// given nullifier (index 7 = `6 + D`, `scoped_nullifier`) and merkle root (index 0,
-/// `certificate_registry_root`); the other slots are left zeroed.
-fn public_inputs(nullifier: [u8; 32], merkle_root: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<18>> {
+/// 9 fields: 8 fixed + 1 disclosure subproof — see `runtime/src/verifier.rs`) with the given
+/// nullifier (index 7 = `6 + D`, `scoped_nullifier`), merkle root (index 0,
+/// `certificate_registry_root`), a fresh `current_date` (index 2, matching
+/// `mock::TEST_NOW_UNIX_SECS`), and `anchor` in the sole `param_commitments` slot (index 5)
+/// — `TestAnchorVerifier` (see `mock.rs`) treats registration as valid whenever the outer
+/// public inputs contain the submitted anchor there. The other slots are left zeroed.
+fn public_inputs(
+    nullifier: [u8; 32],
+    merkle_root: [u8; 32],
+    anchor: [u8; 32],
+) -> BoundedVec<[u8; 32], ConstU32<18>> {
     let mut v = vec![[0u8; 32]; 9];
     v[0] = merkle_root;
+    v[2] = current_date_field(TEST_NOW_UNIX_SECS);
+    v[5] = anchor;
     v[7] = nullifier;
     BoundedVec::try_from(v).unwrap()
 }
@@ -32,17 +49,36 @@ const ANCHOR_A: [u8; 32] = [11u8; 32];
 const ANCHOR_B: [u8; 32] = [12u8; 32];
 const ANCHOR_C: [u8; 32] = [13u8; 32];
 
+/// Fixed test committee-key hashes, one per slot. Arbitrary but distinct, so a test that
+/// mutates a single slot is unambiguous about which one it changed.
+const OPRF_PK_HASHES: [[u8; 32]; 5] =
+    [[101u8; 32], [102u8; 32], [103u8; 32], [104u8; 32], [105u8; 32]];
+
 fn allow_root() {
     assert_ok!(Identity::add_allowed_merkle_root(RuntimeOrigin::root(), ROOT));
 }
 
+/// Governance-approves `OPRF_PK_HASHES` for all 5 committee slots under `scheme_version`.
+/// Idempotent (upsert), so tests can call it freely.
+fn approve_committee_keys(scheme_version: u32) {
+    for (slot, hash) in OPRF_PK_HASHES.iter().enumerate() {
+        assert_ok!(Identity::set_oprf_committee_key(
+            RuntimeOrigin::root(),
+            scheme_version,
+            slot as u8,
+            *hash,
+        ));
+    }
+}
+
 fn register(who: u64, nullifier: [u8; 32], anchor: [u8; 32]) {
+    approve_committee_keys(OprfSchemeVersion::<Test>::get());
     assert_ok!(Identity::register_citizen(
         RuntimeOrigin::signed(who),
         valid_proof(),
-        public_inputs(nullifier, ROOT),
+        public_inputs(nullifier, ROOT, anchor),
         anchor,
-        valid_proof(),
+        OPRF_PK_HASHES,
     ));
 }
 
@@ -53,13 +89,14 @@ fn register_citizen_works() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();
+        approve_committee_keys(0);
 
         assert_ok!(Identity::register_citizen(
             RuntimeOrigin::signed(1),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
             ANCHOR_A,
-            valid_proof(),
+            OPRF_PK_HASHES,
         ));
 
         assert_eq!(CitizenNullifier::<Test>::get(1), Some(NULLIFIER_A));
@@ -98,9 +135,9 @@ fn register_citizen_fails_when_already_registered() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_B, ROOT),
+                public_inputs(NULLIFIER_B, ROOT, ANCHOR_B),
                 ANCHOR_B,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::AlreadyRegistered
         );
@@ -122,7 +159,7 @@ fn register_citizen_fails_with_too_few_public_inputs() {
                 valid_proof(),
                 short_inputs,
                 ANCHOR_A,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -138,9 +175,9 @@ fn register_citizen_fails_when_issuer_not_allowed() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
                 ANCHOR_A,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::IssuerNotAllowed
         );
@@ -157,9 +194,9 @@ fn register_citizen_fails_when_proof_invalid() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 invalid_proof(),
-                public_inputs(NULLIFIER_A, ROOT),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
                 ANCHOR_A,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -179,9 +216,9 @@ fn register_citizen_fails_when_nullifier_already_used() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
                 ANCHOR_B,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::NullifierAlreadyUsed
         );
@@ -203,9 +240,9 @@ fn register_citizen_fails_when_anchor_already_used() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_B, ROOT),
+                public_inputs(NULLIFIER_B, ROOT, ANCHOR_A),
                 ANCHOR_A,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::AnchorAlreadyUsed
         );
@@ -213,20 +250,116 @@ fn register_citizen_fails_when_anchor_already_used() {
 }
 
 #[test]
-fn register_citizen_fails_when_anchor_proof_invalid() {
+fn register_citizen_fails_when_committee_key_not_approved() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();
+        // No `approve_committee_keys` call — OprfCommitteeKeys is empty for every slot.
 
         assert_noop!(
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
                 ANCHOR_A,
-                invalid_proof(),
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::CommitteeKeyMismatch
+        );
+    });
+}
+
+#[test]
+fn register_citizen_fails_when_a_single_committee_key_is_wrong() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+        let mut wrong_hashes = OPRF_PK_HASHES;
+        wrong_hashes[2][0] ^= 1; // slot 2 doesn't match what governance approved.
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                wrong_hashes,
+            ),
+            Error::<Test>::CommitteeKeyMismatch
+        );
+    });
+}
+
+#[test]
+fn register_citizen_fails_when_anchor_verification_fails() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+        // public_inputs carries a *different* anchor in its param_commitments slot than the
+        // one submitted — TestAnchorVerifier (mock.rs) only accepts when the outer public
+        // inputs contain the submitted anchor.
+        let mismatched_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_B);
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                mismatched_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::InvalidAnchorProof
+        );
+    });
+}
+
+#[test]
+fn register_citizen_fails_when_proof_is_stale() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+
+        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        // MaxAnchorProofAge is 3600 in the mock (see mock.rs); this is far older than that.
+        stale_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS - 999_999);
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                stale_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorProofStale
+        );
+    });
+}
+
+#[test]
+fn register_citizen_fails_with_malformed_proof_date() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+
+        let mut malformed_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        // A genuine u64 current_date can never set byte 0 of its 32-byte field encoding —
+        // only the low 8 bytes are ever populated.
+        malformed_inputs[2][0] = 1;
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                malformed_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::MalformedProofDate
         );
     });
 }
@@ -236,15 +369,16 @@ fn register_citizen_fails_on_total_citizens_overflow() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();
+        approve_committee_keys(0);
         TotalCitizens::<Test>::put(u32::MAX);
 
         assert_noop!(
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
                 ANCHOR_A,
-                valid_proof(),
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::TotalCitizensOverflow
         );
@@ -522,6 +656,82 @@ fn remove_allowed_merkle_root_fails_for_unauthorized_origin() {
 
         assert_noop!(
             Identity::remove_allowed_merkle_root(RuntimeOrigin::signed(1), ROOT),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+// ─── OPRF committee key allowlist ───────────────────────────────────────────
+
+#[test]
+fn set_oprf_committee_key_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 2, [9u8; 32]));
+
+        assert_eq!(OprfCommitteeKeys::<Test>::get((0, 2)), Some([9u8; 32]));
+        System::assert_last_event(
+            Event::OprfCommitteeKeySet { scheme_version: 0, slot: 2 }.into(),
+        );
+    });
+}
+
+#[test]
+fn set_oprf_committee_key_upserts_existing_key() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 2, [9u8; 32]));
+        assert_ok!(Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 2, [10u8; 32]));
+
+        assert_eq!(OprfCommitteeKeys::<Test>::get((0, 2)), Some([10u8; 32]));
+    });
+}
+
+#[test]
+fn set_oprf_committee_key_fails_for_unauthorized_origin() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Identity::set_oprf_committee_key(RuntimeOrigin::signed(1), 0, 2, [9u8; 32]),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn set_oprf_committee_key_fails_for_out_of_range_slot() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 5, [9u8; 32]),
+            Error::<Test>::InvalidCommitteeSlot
+        );
+    });
+}
+
+#[test]
+fn remove_oprf_committee_key_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 2, [9u8; 32]));
+
+        assert_ok!(Identity::remove_oprf_committee_key(RuntimeOrigin::root(), 0, 2));
+
+        assert_eq!(OprfCommitteeKeys::<Test>::get((0, 2)), None);
+        System::assert_last_event(
+            Event::OprfCommitteeKeyRemoved { scheme_version: 0, slot: 2 }.into(),
+        );
+    });
+}
+
+#[test]
+fn remove_oprf_committee_key_fails_for_unauthorized_origin() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Identity::set_oprf_committee_key(RuntimeOrigin::root(), 0, 2, [9u8; 32]));
+
+        assert_noop!(
+            Identity::remove_oprf_committee_key(RuntimeOrigin::signed(1), 0, 2),
             DispatchError::BadOrigin
         );
     });

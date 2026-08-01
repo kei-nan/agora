@@ -33,7 +33,8 @@
 use common::hash_salt_dg1_dg2_hash_private_nullifier;
 use data_check_expiry::check_expiry_from_date;
 use identity_anchor::{
-    assert_dg1_clear_value, derive_anchor, derive_identity_input, DS_ANCHOR_OUT, DS_DLOG,
+    assert_dg1_clear_value, combine_committee_anchors, derive_committee_anchor_term,
+    derive_identity_input, DS_ANCHOR_OUT, DS_DLOG, NUM_COMMITTEES,
 };
 use oprf::oprf_output::verified_oprf;
 use poseidon::poseidon2::Poseidon2;
@@ -47,23 +48,39 @@ use utils::types::{DG1Data, MRZExpiryDate, OPRFProof, SaltedValue};
 global PROOF_TYPE_AGORA_IDENTITY_ANCHOR: Field = 200;
 
 /// `param_commitment = Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR, anchor, scheme_version,
-/// oprf_pk_hash)`
+/// oprf_pk_hashes[0], ..., oprf_pk_hashes[4])`
 ///
 /// Follows the same shape as `bind::calculate_param_commitment` and
 /// `compare_age::calculate_param_commitment`: a proof-type tag followed by the disclosed
 /// parameters. The on-chain verifier recomputes this from the (anchor, scheme_version,
-/// oprf_pk_hash) triple submitted alongside the extrinsic and checks it against the outer
-/// proof's `param_commitments[i]`.
+/// 5×oprf_pk_hash) tuple submitted alongside the extrinsic and checks it against the outer
+/// proof's `param_commitments[i]`. There is no room to carry the 5 committee-key hashes as
+/// separate disclosure-subproof outputs (the fixed 8-field outer layout only has one
+/// `oprf_pk_hash` slot, and that slot belongs to a different OPRF entirely — see below), so
+/// all 5 are folded into this single field instead.
 ///
-/// The anchor committee's `oprf_pk_hash` is carried *here* rather than in the subproof's
+/// The anchor committees' `oprf_pk_hashes` are carried *here* rather than in the subproof's
 /// dedicated `oprf_pk_hash` output because that output belongs to ZKPassport's own
 /// salted-*nullifier* OPRF, which is a different key for a different purpose. This circuit
 /// emits 0 there — the "non-participating" mode the outer circuit already supports for
 /// facematch subproofs.
-fn calculate_param_commitment(anchor: Field, scheme_version: Field, oprf_pk_hash: Field) -> Field {
+fn calculate_param_commitment(
+    anchor: Field,
+    scheme_version: Field,
+    oprf_pk_hashes: [Field; NUM_COMMITTEES],
+) -> Field {
     Poseidon2::hash(
-        [PROOF_TYPE_AGORA_IDENTITY_ANCHOR, anchor, scheme_version, oprf_pk_hash],
-        4,
+        [
+            PROOF_TYPE_AGORA_IDENTITY_ANCHOR,
+            anchor,
+            scheme_version,
+            oprf_pk_hashes[0],
+            oprf_pk_hashes[1],
+            oprf_pk_hashes[2],
+            oprf_pk_hashes[3],
+            oprf_pk_hashes[4],
+        ],
+        8,
     )
 }
 
@@ -82,7 +99,7 @@ fn main(
     salted_dg2_hash: SaltedValue<Field>,
     salted_dg2_hash_type: SaltedValue<u32>,
     salted_private_nullifier: SaltedValue<Field>,
-    oprf_proof: OPRFProof,
+    oprf_proofs: [OPRFProof; NUM_COMMITTEES],
     service_scope: pub Field,
     service_subscope: pub Field,
 ) -> pub (Field, Field, Field, Field) {
@@ -105,23 +122,31 @@ fn main(
     // sufficient for `AnchorProofVerifier::verify_reverification`.
     check_expiry_from_date(salted_expiry_date.value, current_date);
 
+    // Single binding, consumed by all 5 committee evaluations — see `anchor/src/main.nr` for
+    // why this is what proves the 5 committees answered the same identity input.
     let identity_input = derive_identity_input(salted_dg1.value);
-    let oprf_output = verified_oprf(
-        oprf_proof.beta,
-        oprf_proof.pk,
-        oprf_proof.dlog_e,
-        oprf_proof.dlog_s,
-        oprf_proof.response_blinded,
-        oprf_proof.response,
-        identity_input,
-        DS_DLOG,
-        DS_ANCHOR_OUT,
-    );
 
-    let anchor = derive_anchor(oprf_output, scheme_version);
-    let anchor_oprf_pk_hash = Poseidon2::hash([oprf_proof.pk.x, oprf_proof.pk.y], 2);
-    let param_commitment =
-        calculate_param_commitment(anchor, scheme_version, anchor_oprf_pk_hash);
+    let mut terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    let mut oprf_pk_hashes: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    for i in 0..NUM_COMMITTEES {
+        let oprf_proof = oprf_proofs[i];
+        let oprf_output = verified_oprf(
+            oprf_proof.beta,
+            oprf_proof.pk,
+            oprf_proof.dlog_e,
+            oprf_proof.dlog_s,
+            oprf_proof.response_blinded,
+            oprf_proof.response,
+            identity_input,
+            DS_DLOG,
+            DS_ANCHOR_OUT,
+        );
+        terms[i] = derive_committee_anchor_term(i, oprf_output, scheme_version);
+        oprf_pk_hashes[i] = Poseidon2::hash([oprf_proof.pk.x, oprf_proof.pk.y], 2);
+    }
+
+    let anchor = combine_committee_anchors(terms);
+    let param_commitment = calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes);
 
     // Silence unused-parameter warnings without changing the constrained system: these two
     // exist purely to occupy their slots in the outer circuit's fixed public-input layout.

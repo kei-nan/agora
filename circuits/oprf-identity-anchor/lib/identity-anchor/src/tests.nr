@@ -8,8 +8,8 @@
 
 use super::{
     ASCII_CODE_FOR_LESS_THAN, assert_dg1_clear_value, assert_personal_number_populated,
-    derive_anchor, derive_identity_input, get_personal_number_from_dg1,
-    PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
+    combine_committee_anchors, derive_committee_anchor_term, derive_identity_input,
+    get_personal_number_from_dg1, NUM_COMMITTEES, PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
 };
 use utils::constants::{DG1_LENGTH, ID_CARD_SAMPLE_DG1, SAMPLE_DG1};
 use utils::types::{DG1Data, SaltedValue};
@@ -147,10 +147,50 @@ fn accepts_salted_clear_dg1() {
 /// Scheme version must actually separate anchor generations, or the 4-year OPRF rotation in
 /// changelog entry 67 would be a no-op.
 #[test]
-fn anchor_is_separated_by_scheme_version() {
+fn committee_term_is_separated_by_scheme_version() {
     let oprf_output = 424242;
     assert(
-        derive_anchor(oprf_output, 1) != derive_anchor(oprf_output, 2),
-        "Anchors under different scheme versions must differ",
+        derive_committee_anchor_term(0, oprf_output, 1)
+            != derive_committee_anchor_term(0, oprf_output, 2),
+        "Committee terms under different scheme versions must differ",
     );
+}
+
+/// The whole point of hashing before summing (changelog entry 73): two committees producing
+/// the numerically identical OPRF output must still contribute different terms, or the
+/// combiner would leak equality between committees' secrets.
+#[test]
+fn committee_term_is_separated_by_committee_index() {
+    let oprf_output = 424242;
+    let scheme_version = 1;
+    assert(
+        derive_committee_anchor_term(0, oprf_output, scheme_version)
+            != derive_committee_anchor_term(1, oprf_output, scheme_version),
+        "Committee terms must differ by committee index alone",
+    );
+}
+
+/// The combined anchor must actually depend on every one of the 5 terms — a combiner that
+/// silently dropped a committee would defeat entry 73's "unpredictable if even one of 5 is
+/// honest" property.
+#[test]
+fn combined_anchor_depends_on_every_committee_term() {
+    let terms: [Field; NUM_COMMITTEES] = [1, 2, 3, 4, 5];
+    let before = combine_committee_anchors(terms);
+    for i in 0..NUM_COMMITTEES {
+        let mut mutated = terms;
+        mutated[i] += 1;
+        assert(
+            combine_committee_anchors(mutated) != before,
+            "Combined anchor must change when any single committee's term changes",
+        );
+    }
+}
+
+/// Combination is plain field addition, checked explicitly rather than only indirectly via
+/// the "depends on every term" test above.
+#[test]
+fn combined_anchor_is_the_field_sum_of_terms() {
+    let terms: [Field; NUM_COMMITTEES] = [10, 20, 30, 40, 50];
+    assert_eq(combine_committee_anchors(terms), 150, "Combination must be plain field addition");
 }
