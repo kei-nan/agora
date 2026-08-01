@@ -1,68 +1,52 @@
 /**
  * Builds our own Document Signer Certificate (DSC) Merkle tree — the thing
- * that becomes `slaveMerkleRoot` (registered via
- * `pallet_identity::add_allowed_merkle_root`) and, per certificate, a
- * `slaveMerkleInclusionBranches` proof mobile fetches at proving time. See
+ * that becomes `certificate_registry_root` (registered via
+ * `pallet_identity::add_allowed_merkle_root`) and, per certificate, a leaf +
+ * inclusion proof mobile fetches at proving time. See
  * mobile/src/chain/certificateTree.ts's doc comment for the full "why our
- * own tree instead of Rarimo's hosted CertificatesSMT" rationale and the
- * exact tree spec (depth-80 Poseidon SMT, iden3-style).
+ * own tree instead of a vendor-hosted registry" rationale (carries over
+ * unchanged from the Rarimo era, per HANDOFF.md logs #63/#65/#66) and the
+ * exact tree spec (depth-16, index-addressed, Poseidon2, per ZKPassport's
+ * `common/src/lib.nr`).
  *
- * Uses `@iden3/js-merkletree` (iden3's own production SMT implementation —
- * the same tree design used across Polygon ID, verified byte-for-byte
- * against the circuit's SMTHash1/SMTHash2 formulas — see this repo's own
- * `leafKey`/`NodeMiddle.getKey` source) rather than a hand-rolled tree
- * engine. It genuinely does branch per-bit along a shared key prefix (a
- * real `NodeMiddle` can have one Empty side, hashed as literal 0, while
- * the two keys routed there haven't diverged yet) — an earlier hand-rolled
- * version of this tool assumed that was wrong and tried to "path-compress"
- * away those levels, which produced a *different*, incompatible root. The
- * actual fix needed was on the *reading* side, not the tree structure:
- * `mobile/src/chain/certificateTree.ts`'s `verifyInclusion` must find the
- * real/padding boundary as "one past the deepest nonzero sibling," not
- * "first zero seen" — a real per-bit tree can have a legitimate,
- * non-padding zero sibling partway down. Multi-certificate trees exposed
- * this; a single-certificate tree (the realistic near-term case — see
- * below) happened to work under either (wrong or right) assumption, which
- * is why it's worth recording rather than re-discovering.
+ * REPLACES the previous Rarimo-era version of this file (`@iden3/js-merkletree`,
+ * depth-80 Poseidon1 SMT). Nothing about the old tree design carries over —
+ * see certificateTree.ts's doc comment for why.
+ *
+ * Leaf/tree math (hashing, Merkle combine, inclusion verification) all
+ * comes from `mobile/src/chain/certificateTree.ts` — this file does NOT
+ * reimplement that logic a second time. What this file adds on top:
+ * (1) parsing real DER/PEM X.509 certificates into the fields a
+ * `CertificateTreeLeaf` needs (country, public key bytes, expiry,
+ * fingerprint), using `@zkpassport/utils`' own first-party ASN.1 helpers
+ * (the same ones ZKPassport's own `src/ts/test-helper.ts#convertPemToPackagedCertificateV1`
+ * uses — this is a from-scratch reimplementation against those same public
+ * exports, not a copy of that file, since it isn't published), and
+ * (2) actually assembling a depth-16 indexed tree from N leaves (sorting,
+ * building levels bottom-up, extracting a proof per leaf) — logic
+ * `certificateTree.ts` deliberately doesn't need on a phone, which only
+ * ever verifies one already-built proof, never constructs a tree.
+ *
+ * A real API gotcha this surfaced, worth recording so it isn't
+ * rediscovered: `@zkpassport/utils/registry`'s own `getCertificateLeafHash`
+ * reads the certificate type (CSCA=1 vs DSC=2) from its *options* argument,
+ * not the certificate object, and its `buildMerkleTreeFromCerts` helper
+ * never forwards a type at all (always defaults to CSCA) — see
+ * `mobile/src/chain/certificateTree.test.ts`'s doc comment for the full
+ * story. This file sidesteps both by using only the low-level ASN.1
+ * extraction exports (`getCertificateIssuerCountry`, `getRSAInfo`, etc.)
+ * plus this project's own `calculateCertificateLeafHash`/tree-building,
+ * rather than either of those two higher-level entry points.
  *
  * ---
  *
- * Sourcing DSC certificates — the part of this that isn't just code:
- *
- * The tree's leaves are Document Signer Certificates (DSCs) — the
- * certificate that directly signs a passport's SOD — NOT CSCA root
- * certificates. ICAO's publicly downloadable "Master List" is CSCA roots
- * only; complete DSC lists are normally distributed through ICAO's PKD,
- * which is a paid/state-membership service, not an open download. This
- * project has no PKD membership and isn't a state, so there is no "just
- * download everything" path to a complete tree.
- *
- * `pallet_identity::AllowedMerkleRoots` is already governance-gated
- * (`AdminOrigin`/legislature) for exactly this kind of situation: the
- * intended model is INCREMENTAL, governance-approved onboarding, not a
- * one-shot bulk import —
- *
- *   1. Start from whatever DSC/CSCA data can legitimately be sourced in
- *      the open (national PKI publication pages many countries maintain,
- *      open mirrors, citizens submitting their own passport's DSC cert for
- *      review — a DSC is not secret, it's embedded in every passport
- *      signed with it).
- *   2. Before adding a DSC to the tree, verify it chains up to a
- *      recognized CSCA (CSCA roots ARE freely available via the ICAO
- *      Master List, so this step doesn't have the same access problem).
- *   3. Add it via a legislature-approved call to `add_allowed_merkle_root`
- *      with the new tree root this tool computes — this file only builds
- *      the tree offline; submitting the root on-chain is a separate,
- *      deliberate governance action, not something this tool does itself.
- *   4. Rebuild and re-register the root each time the certificate set
- *      changes. Existing citizens already registered under an old root are
- *      unaffected (`AllowedMerkleRoots` is additive — old roots can be left
- *      valid, or retired separately via `remove_allowed_merkle_root`).
- *
- * This tool takes a directory of certificates as a deliberate on-ramp for
- * that process, not a claim that the input directory is complete or
- * authoritative — verifying what goes into that directory is a governance
- * and PKI-chain-validation problem, not something this script can decide.
+ * Sourcing DSC certificates — the part of this that isn't just code — is
+ * unchanged from the Rarimo era; see git history for the original writeup
+ * (HANDOFF.md log #63): DSCs are normally distributed via ICAO's PKD (a
+ * paid/state-membership service this project has no access to), so
+ * `pallet_identity::AllowedMerkleRoots` is deliberately additive and
+ * governance-gated for incremental, legislature-approved onboarding rather
+ * than a one-shot bulk import.
  *
  * ---
  *
@@ -72,20 +56,40 @@
  *
  * `--certs-dir` should contain one DSC certificate per file, PEM or DER
  * (.pem/.crt/.cer/.der — content sniffed, not extension-trusted). Output
- * JSON: `{ root: "0x...", certificates: [{ pubkeyHash: "0x...", siblings:
- * ["0x...", ...80 entries] }] }`, all values 32-byte big-endian hex,
- * matching `Fr::from_be_bytes_mod_order` (runtime/src/verifier.rs) and
- * `fieldElementToBytes32BE` (mobile/src/chain/certificateTree.ts).
+ * JSON: `{ root: "0x...", certificates: [{ leafHash: "0x...", index, tags,
+ * certType, country, publicKey: "0x...", expiry, fingerprint: "0x...",
+ * siblings: ["0x...", ...16 entries] }] }`, all field-element values
+ * 32-byte big-endian hex, matching `Fr::from_be_bytes_mod_order`
+ * (runtime/src/verifier.rs) and `fieldElementToBytes32BE`
+ * (mobile/src/chain/certificateTree.ts).
  */
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { Merkletree, InMemoryDB, str2Bytes, circomSiblingsFromSiblings } from '@iden3/js-merkletree';
-import { computeDscPubkeyHash, extractPubkeyFromCertificate, fieldElementToBytes32BE, verifyInclusion } from '../../mobile/src/chain/certificateTree';
+import { AsnParser } from '@peculiar/asn1-schema';
+import { Certificate as X509Certificate } from '@peculiar/asn1-x509';
+import {
+  getCertificateIssuerCountry,
+  countryCodeAlpha2ToAlpha3,
+  getRSAInfo,
+  getECDSAInfo,
+  getKeySize,
+  OIDS_TO_PUBKEY_TYPE,
+} from '@zkpassport/utils';
+import { poseidon2Hash } from '@zkpassport/poseidon2';
+import {
+  CERT_TYPE_DSC,
+  TREE_DEPTH,
+  calculateCertificateLeafHash,
+  computeCertificateFingerprint,
+  computeMerkleRoot,
+  computeZeroes,
+  fieldElementToBytes32BE,
+  verifyInclusion,
+  type CertificateTreeLeaf,
+} from '../../mobile/src/chain/certificateTree';
 
-const TREE_DEPTH = 80;
-
-function toHex(bytes: Uint8Array): string {
-  return '0x' + Buffer.from(bytes).toString('hex');
+function toHex(x: bigint): string {
+  return '0x' + Buffer.from(fieldElementToBytes32BE(x)).toString('hex');
 }
 
 /** Strips PEM armor if present; passes DER through unchanged. Sniffed by content, not file extension. */
@@ -100,47 +104,152 @@ function certFileToDer(raw: Buffer): Uint8Array {
   return new Uint8Array(raw);
 }
 
-export interface CertificateTreeOutput {
-  root: string;
-  certificates: Array<{ pubkeyHash: string; siblings: string[] }>;
+/**
+ * Parses a DER-encoded X.509 certificate into a `CertificateTreeLeaf` —
+ * everything `calculateCertificateLeafHash` needs — using
+ * `@zkpassport/utils`' own first-party ASN.1 extraction helpers (the same
+ * building blocks `src/ts/test-helper.ts#convertPemToPackagedCertificateV1`
+ * in zkpassport/circuits uses; not copied from there since that file isn't
+ * published, reimplemented here against the same public exports).
+ * `tags` defaults to `[0n, 0n, 0n]` (untagged) — see
+ * `tagsArrayToBitsFlag`/`@zkpassport/utils/registry` if a future onboarding
+ * process needs real tags (e.g. jurisdiction/environment flags).
+ */
+export function certificateDerToLeaf(der: Uint8Array): CertificateTreeLeaf {
+  const x509 = AsnParser.parse(Buffer.from(der), X509Certificate);
+
+  const countryAlpha2 = getCertificateIssuerCountry(x509);
+  if (!countryAlpha2 || countryAlpha2.length !== 2) {
+    throw new Error(`certificateDerToLeaf: invalid or missing issuer country code: ${countryAlpha2}`);
+  }
+  const country = countryCodeAlpha2ToAlpha3(countryAlpha2);
+
+  const notAfter = Math.floor(x509.tbsCertificate.validity.notAfter.getTime().getTime() / 1000);
+
+  const publicKeyOID = x509.tbsCertificate.subjectPublicKeyInfo.algorithm.algorithm;
+  const publicKeyType = (OIDS_TO_PUBKEY_TYPE as Record<string, string>)[publicKeyOID] ?? publicKeyOID;
+
+  let publicKey: Uint8Array;
+  if (publicKeyType === 'rsaEncryption' || publicKeyType === 'rsassa-pss') {
+    const rsa = getRSAInfo(x509.tbsCertificate.subjectPublicKeyInfo);
+    const hex = rsa.modulus.toString(16);
+    const padded = hex.length % 2 === 0 ? hex : '0' + hex;
+    publicKey = new Uint8Array(Buffer.from(padded, 'hex'));
+  } else if (publicKeyType === 'ecPublicKey') {
+    const ec = getECDSAInfo(x509.tbsCertificate.subjectPublicKeyInfo);
+    const half = ec.publicKey.length / 2;
+    // Strip the uncompressed-point 0x04 prefix, matching test-helper.ts's convention.
+    publicKey = new Uint8Array([...ec.publicKey.slice(1, half + 1), ...ec.publicKey.slice(half + 1)]);
+  } else {
+    throw new Error(`certificateDerToLeaf: unsupported public key type: ${publicKeyType}`);
+  }
+
+  return {
+    tags: [0n, 0n, 0n],
+    certType: CERT_TYPE_DSC,
+    country,
+    publicKey,
+    expiry: notAfter,
+    fingerprint: computeCertificateFingerprint(der),
+  };
 }
 
-/** Builds the tree from a list of DER-encoded certificates and produces the on-disk output shape. Exported for tests; `main()` below is the CLI entry point. */
-export async function buildCertificateTree(certDers: Uint8Array[]): Promise<CertificateTreeOutput> {
-  const db = new InMemoryDB(str2Bytes('certificate-registry'));
-  const tree = new Merkletree(db, true, TREE_DEPTH);
+export interface CertificateTreeOutput {
+  root: string;
+  certificates: Array<{
+    leafHash: string;
+    index: number;
+    country: string;
+    publicKey: string;
+    expiry: number;
+    fingerprint: string;
+    siblings: string[];
+  }>;
+}
 
-  const pubkeyHashes: bigint[] = [];
-  for (const der of certDers) {
-    const pubkey = extractPubkeyFromCertificate(der);
-    const pubkeyHash = computeDscPubkeyHash(pubkey);
-    await tree.add(pubkeyHash, pubkeyHash);
-    pubkeyHashes.push(pubkeyHash);
+/**
+ * Builds a depth-16, index-addressed, Poseidon2 tree from a list of leaf
+ * hashes — sorted ascending, then assembled bottom-up exactly the way
+ * `@zkpassport/utils`' own tree class does (confirmed via
+ * `mobile/src/chain/certificateTree.test.ts`'s cross-checked vectors).
+ * Returns per-leaf sibling paths (indexed by the leaf's position in the
+ * SORTED order, not insertion order) plus the root.
+ */
+function buildIndexedTree(leafHashes: bigint[], depth: number): { root: bigint; siblingsByIndex: bigint[][] } {
+  const maxLeaves = 2 ** depth;
+  if (leafHashes.length > maxLeaves) {
+    throw new Error(`buildIndexedTree: cannot fit ${leafHashes.length} leaves in a depth-${depth} tree (max ${maxLeaves})`);
+  }
+  // zeroes[i] = the "empty subtree" hash at level i (0 at the leaf level,
+  // Poseidon2(zeroes[i-1], zeroes[i-1]) above that) — see
+  // certificateTree.ts's computeZeroes doc comment.
+  const zeroes = computeZeroes(depth);
+  const sorted = [...leafHashes].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+  if (sorted.length === 0) {
+    return { root: poseidon2Hash([zeroes[depth - 1], zeroes[depth - 1]]), siblingsByIndex: [] };
   }
 
-  const root = (await tree.root()).bigInt();
-  const certificates = [];
-  for (const pubkeyHash of pubkeyHashes) {
-    const { proof, value } = await tree.generateProof(pubkeyHash);
-    if (!proof.existence || value !== pubkeyHash) {
-      throw new Error(`buildCertificateTree: internal inconsistency — just-inserted certificate ${pubkeyHash} not found on lookup`);
+  const nodes: bigint[][] = [sorted];
+  for (let level = 0; level < depth; level++) {
+    const current = nodes[level];
+    const next: bigint[] = [];
+    for (let n = 0; n < Math.ceil(current.length / 2); n++) {
+      const left = current[n * 2] ?? zeroes[level];
+      const right = current[n * 2 + 1] ?? zeroes[level];
+      next.push(poseidon2Hash([left, right]));
     }
-    // allSiblings() returns only the real (unpadded) depth reached — pad to
-    // the circuit's fixed 80 levels the same way the circuit's own
-    // convention requires (see mobile/src/chain/certificateTree.ts's doc
-    // comment: zero beyond the leaf's real depth, never combined).
-    const siblings = circomSiblingsFromSiblings(proof.allSiblings(), TREE_DEPTH).map((s) => s.bigInt());
-    if (siblings.length !== TREE_DEPTH) {
-      throw new Error(`buildCertificateTree: expected ${TREE_DEPTH} siblings, got ${siblings.length}`);
+    nodes.push(next);
+  }
+  const root = nodes[depth][0];
+
+  const siblingsByIndex: bigint[][] = sorted.map((_, leafIndex) => {
+    const siblings: bigint[] = [];
+    let i = leafIndex;
+    for (let level = 0; level < depth; level++) {
+      const siblingIndex = i % 2 === 0 ? i + 1 : i - 1;
+      siblings.push(nodes[level][siblingIndex] ?? zeroes[level]);
+      i = Math.floor(i / 2);
     }
+    return siblings;
+  });
+
+  return { root, siblingsByIndex };
+}
+
+/** Exported for tests; `main()` below is the CLI entry point. */
+export function buildCertificateTree(certDers: Uint8Array[]): CertificateTreeOutput {
+  const leaves = certDers.map(certificateDerToLeaf);
+  const leafHashes = leaves.map(calculateCertificateLeafHash);
+
+  const { root, siblingsByIndex } = buildIndexedTree(leafHashes, TREE_DEPTH);
+  if (leaves.length === 0) {
+    return { root: toHex(root), certificates: [] };
+  }
+
+  // Sorted order determines index assignment — reproduce it to line leaves back up with their proofs.
+  const order = leaves
+    .map((leaf, originalIndex) => ({ leaf, hash: leafHashes[originalIndex] }))
+    .sort((a, b) => (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0));
+
+  const certificates = order.map(({ leaf, hash }, index) => {
+    const siblings = siblingsByIndex[index];
     // Self-check with the same verifier mobile uses, before trusting this output — a bug here would otherwise only surface on-device, mid-registration, for a real citizen.
-    if (!verifyInclusion(root, pubkeyHash, pubkeyHash, siblings)) {
-      throw new Error(`buildCertificateTree: generated proof for ${pubkeyHash} does not verify against the tree's own root — do not publish this output`);
+    if (!verifyInclusion(root, leaf, index, siblings)) {
+      throw new Error(`buildCertificateTree: generated proof for leaf ${toHex(hash)} does not verify against the tree's own root — do not publish this output`);
     }
-    certificates.push({ pubkeyHash: toHex(fieldElementToBytes32BE(pubkeyHash)), siblings: siblings.map((s) => toHex(fieldElementToBytes32BE(s))) });
-  }
+    return {
+      leafHash: toHex(hash),
+      index,
+      country: leaf.country,
+      publicKey: '0x' + Buffer.from(leaf.publicKey).toString('hex'),
+      expiry: leaf.expiry,
+      fingerprint: toHex(leaf.fingerprint),
+      siblings: siblings.map(toHex),
+    };
+  });
 
-  return { root: toHex(fieldElementToBytes32BE(root)), certificates };
+  return { root: toHex(root), certificates };
 }
 
 function parseArgs(argv: string[]): { certsDir: string; out: string } {
@@ -156,21 +265,18 @@ function parseArgs(argv: string[]): { certsDir: string; out: string } {
   return { certsDir, out };
 }
 
-async function main(): Promise<void> {
+function main(): void {
   const { certsDir, out } = parseArgs(process.argv.slice(2));
   const files = readdirSync(certsDir).filter((f) => !f.startsWith('.'));
   if (files.length === 0) {
     throw new Error(`no certificate files found in ${certsDir}`);
   }
   const certDers = files.map((f) => certFileToDer(readFileSync(join(certsDir, f))));
-  const result = await buildCertificateTree(certDers);
-  await import('node:fs').then((fs) => fs.writeFileSync(out, JSON.stringify(result, null, 2)));
+  const result = buildCertificateTree(certDers);
+  writeFileSync(out, JSON.stringify(result, null, 2));
   console.log(`wrote ${result.certificates.length} certificate(s), root ${result.root}, to ${out}`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  });
+  main();
 }

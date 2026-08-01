@@ -1,59 +1,86 @@
 /**
- * Validates `buildCertificateTree` two ways: the single-certificate case
- * against the same oracle value certificateTree.test.ts uses (independently
- * computed from rarimo/passport-zk-circuits' own reference code), and the
- * multi-certificate case via `verifyInclusion` — the same check
- * `buildCertificateTree` already runs on itself before returning, exercised
- * here from the outside too so a regression in that self-check can't hide
- * a broken build.
+ * Validates `certificateDerToLeaf` + `buildCertificateTree` against real,
+ * freshly-generated self-signed X.509 certificates (via `@peculiar/x509`'s
+ * `X509CertificateGenerator` — a real, standard-conformant DER encoder, not
+ * a hand-rolled fixture) — not bare SubjectPublicKeyInfo blobs, since this
+ * tool needs a full certificate (issuer country, validity) unlike
+ * `mobile/src/chain/certificateTree.test.ts`'s leaf-hash-only cross-checks.
  */
-import { generateKeyPairSync } from 'node:crypto';
+import { webcrypto } from 'node:crypto';
+import { X509CertificateGenerator } from '@peculiar/x509';
 import { describe, it, expect } from 'vitest';
-import { buildCertificateTree } from './buildTree';
-import { verifyInclusion } from '../../mobile/src/chain/certificateTree';
+import { buildCertificateTree, certificateDerToLeaf } from './buildTree';
+import { calculateCertificateLeafHash, verifyInclusion } from '../../mobile/src/chain/certificateTree';
 
-/**
- * A real, freshly-generated RSA SubjectPublicKeyInfo (DER) — `extractPubkeyFromCertificate`'s
- * DFS helpers match by ASN.1 shape, so a bare SPKI parses the same way a
- * full X.509 certificate's embedded SPKI would; no need to wrap it in a
- * complete `Certificate` structure for this test. `computeDscPubkeyHash`
- * itself is already cross-checked against an independent oracle in
- * certificateTree.test.ts — this file is about tree-building correctness
- * (does path-compressed multi-leaf insertion + proof generation actually
- * verify), not pubkey parsing, so a fresh key per call is enough.
- */
-function freshRsaSpkiDer(): Uint8Array {
-  const { publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  return new Uint8Array(publicKey.export({ type: 'spki', format: 'der' }) as Buffer);
+const crypto = webcrypto as unknown as Crypto;
+
+async function freshSelfSignedCertDer(countryCode: string): Promise<Uint8Array> {
+  const keys = await crypto.subtle.generateKey(
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) },
+    true,
+    ['sign', 'verify'],
+  );
+  const cert = await X509CertificateGenerator.createSelfSigned(
+    {
+      serialNumber: '01',
+      name: `C=${countryCode}, O=Agora Test, CN=Test DSC`,
+      notBefore: new Date('2024-01-01T00:00:00Z'),
+      notAfter: new Date('2034-01-01T00:00:00Z'),
+      signingAlgorithm: { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      keys,
+    },
+    crypto,
+  );
+  return new Uint8Array(cert.rawData);
 }
 
+describe('certificateDerToLeaf', () => {
+  it('extracts issuer country and expiry from a real self-signed certificate', async () => {
+    const der = await freshSelfSignedCertDer('US');
+    const leaf = certificateDerToLeaf(der);
+    expect(leaf.country).toBe('USA');
+    expect(leaf.expiry).toBe(Math.floor(new Date('2034-01-01T00:00:00Z').getTime() / 1000));
+    expect(leaf.publicKey.length).toBe(256); // 2048-bit RSA modulus
+  });
+});
+
 describe('buildCertificateTree', () => {
-  it('single certificate: root matches SMTHash1(pubkeyHash, pubkeyHash)', async () => {
-    const der = freshRsaSpkiDer();
+  it('single certificate: the leaf-level sibling is literally zero; every level above is a nonzero zero-subtree hash', async () => {
+    const der = await freshSelfSignedCertDer('US');
     const result = await buildCertificateTree([der]);
     expect(result.certificates).toHaveLength(1);
-    // Every sibling of a lone leaf must be zero (nothing to branch against).
-    expect(result.certificates[0].siblings.every((s) => BigInt(s) === 0n)).toBe(true);
+    expect(result.certificates[0].index).toBe(0);
+    // Level 0 has no second leaf to pair with, so that sibling is the raw
+    // zero value — but every level above combines a real ancestor with an
+    // "empty subtree" hash (Poseidon2(0,0), Poseidon2 of that, ...), which
+    // is NOT itself zero. Only the first sibling should be exactly 0n.
+    const siblings = result.certificates[0].siblings.map((s) => BigInt(s));
+    expect(siblings[0]).toBe(0n);
+    expect(siblings.slice(1).every((s) => s !== 0n)).toBe(true);
   });
 
   it('multiple certificates: every proof verifies against the shared root', async () => {
-    const ders = [freshRsaSpkiDer(), freshRsaSpkiDer(), freshRsaSpkiDer(), freshRsaSpkiDer()];
+    const ders = await Promise.all(['US', 'DE', 'FR', 'JP'].map(freshSelfSignedCertDer));
     const result = await buildCertificateTree(ders);
     expect(result.certificates).toHaveLength(4);
 
     const root = BigInt(result.root);
     for (const cert of result.certificates) {
-      const key = BigInt(cert.pubkeyHash);
-      const siblings = cert.siblings.map((s) => BigInt(s));
-      expect(verifyInclusion(root, key, key, siblings)).toBe(true);
+      const leaf = certificateDerToLeaf(ders.find((der) => {
+        const l = certificateDerToLeaf(der);
+        return calculateCertificateLeafHash(l).toString(16).padStart(64, '0') === cert.leafHash.slice(2);
+      })!);
+      expect(verifyInclusion(root, leaf, cert.index, cert.siblings.map((s) => BigInt(s)))).toBe(true);
     }
 
-    // Distinct RSA keys must not collapse onto the same tree leaf.
-    const hashes = new Set(result.certificates.map((c) => c.pubkeyHash));
+    // Distinct certificates must not collapse onto the same tree leaf.
+    const hashes = new Set(result.certificates.map((c) => c.leafHash));
     expect(hashes.size).toBe(4);
   });
 
   it('rejects a directory yielding zero certificates upstream (empty input)', async () => {
-    await expect(buildCertificateTree([])).resolves.toEqual({ root: expect.any(String), certificates: [] });
+    const result = await buildCertificateTree([]);
+    expect(result.certificates).toEqual([]);
+    expect(result.root).toMatch(/^0x[0-9a-f]{64}$/);
   });
 });
