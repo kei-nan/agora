@@ -21,13 +21,11 @@ pub const VALID_PROOF_MARKER: u8 = 1;
 /// Byte marker used by `TestZkVerifier` to signal a proof that should fail verification.
 pub const INVALID_PROOF_MARKER: u8 = 0;
 
-/// Test anchor-proof verifier. `verify_reverification`/`verify_migration` keep the original
-/// deterministic-by-proof-bytes convention (a proof whose first byte is `VALID_PROOF_MARKER`
-/// passes). `verify_registration_anchor` no longer takes proof bytes at all (HANDOFF log #75
-/// — the disclosure subproof rides inside the already-verified outer proof, so there is no
-/// separate anchor SNARK); this mock instead treats registration as valid whenever
-/// `outer_public_inputs` contains a `param_commitments[i]` equal to `anchor` itself. That is
-/// not how the real `Poseidon2AnchorVerifier` computes a match (see
+/// Test anchor-proof verifier. None of the three methods take proof bytes any more (HANDOFF
+/// log #75/#76 — the disclosure/migrate-disclosure subproof rides inside the already-verified
+/// outer proof, so there is no separate anchor SNARK); this mock instead treats a proof as
+/// valid whenever `outer_public_inputs` contains a `param_commitments[i]` equal to the
+/// claimed anchor(s). That is not how the real `Poseidon2AnchorVerifier` computes a match (see
 /// `runtime/src/anchor_verifier.rs`), but it is deterministic and lets pallet-level tests
 /// drive both the accept and reject paths without depending on the crypto crate.
 pub struct TestAnchorVerifier;
@@ -42,12 +40,25 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         outer_public_inputs.contains(&anchor)
     }
 
-    fn verify_reverification(proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
-        matches!(proof_bytes.first(), Some(1))
+    fn verify_reverification(
+        outer_public_inputs: &[[u8; 32]],
+        anchor: [u8; 32],
+        _scheme_version: u32,
+        _oprf_pk_hashes: [[u8; 32]; 5],
+    ) -> bool {
+        outer_public_inputs.contains(&anchor)
     }
 
-    fn verify_migration(proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
-        matches!(proof_bytes.first(), Some(1))
+    fn verify_migration(
+        outer_public_inputs: &[[u8; 32]],
+        old_anchor: [u8; 32],
+        new_anchor: [u8; 32],
+        _old_scheme_version: u32,
+        _new_scheme_version: u32,
+        _old_oprf_pk_hashes: [[u8; 32]; 5],
+        _new_oprf_pk_hashes: [[u8; 32]; 5],
+    ) -> bool {
+        outer_public_inputs.contains(&old_anchor) && outer_public_inputs.contains(&new_anchor)
     }
 }
 

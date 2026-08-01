@@ -65,16 +65,17 @@ Consequences:
 
 ## The circuits
 
-Four binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
+Five binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
 committee evaluates → unblind), so a single circuit cannot cover it; `query` is round one and
-`anchor`/`disclosure` are round two.
+`anchor`/`disclosure`/`migrate`/`migrate-disclosure` are round two.
 
 | Package | ACIR opcodes | bb circuit size | Role |
 |---|---:|---:|---|
 | `query` | 6,733 | 12,113 | Round 1. Fork of `oprf-auth`. Blinds the identity input, sent identically to all 5 committees. |
 | `anchor` | 217,477 | 280,304 | Round 2, standalone. Verifies **5** committees' responses, emits the combined anchor. |
-| `disclosure` | 219,440 | 283,679 | Round 2, **pipeline-integrated**. Same, shaped as an outer-circuit disclosure subproof. Adds an expiry check. |
-| `migrate` | 433,740 | 555,380 | Dual evaluation under two committee generations (**10** total OPRF checks), for OPRF scheme rotation. |
+| `disclosure` | 219,440 | 283,679 | Round 2, **pipeline-integrated**. Same, shaped as an outer-circuit disclosure subproof. Adds an expiry check. Backs `verify_registration_anchor` and `verify_reverification`. |
+| `migrate` | 433,740 | 555,380 | Dual evaluation under two committee generations (**10** total OPRF checks), for OPRF scheme rotation. Standalone — kept for testing, same unauthenticated-`comm_in` caveat as `anchor`. |
+| `migrate-disclosure` | 435,707 | 558,896 | Round 2, **pipeline-integrated** form of `migrate` (changelog entry 76) — same dual evaluation, shaped as a disclosure subproof, with an expiry check. Backs `verify_migration`. |
 
 For reference, unmodified upstream `oprf-auth` measures **6,644** ACIR opcodes with the same
 toolchain. `query`'s fork costs **+89 opcodes** — the personal-number slice, the populated
@@ -84,13 +85,16 @@ change since it produces one blinded query regardless of how many committees rec
 `anchor`/`disclosure`/`migrate`'s opcode counts above are ~4.9x their single-committee
 predecessors (44,462 / 46,423 / 87,715 respectively, as measured under bb 0.82.2 before
 changelog entry 74's 5-committee extension) — consistent with 5 (resp. 10) `verified_oprf`
-calls dominating cost, not a regression. Measured under bb 5.0.0, which by this point is also
-what `runtime/src/verifier.rs` targets (changelog entry 72); `bb write_vk` succeeds for all
-four circuits at this size, i.e. producing a verification key does not itself require a live
-committee — only *executing* the circuit (`nargo execute` / `bb prove`) does.
+calls dominating cost, not a regression. `migrate-disclosure` (changelog entry 76) costs
++1,967 opcodes over `migrate` — the expiry check and outer-layout plumbing, the same
+increment `disclosure` pays over `anchor` (+1,963). Measured under bb 5.0.0, which by this
+point is also what `runtime/src/verifier.rs` targets (changelog entry 72); `bb write_vk`
+succeeds for all five circuits at this size, i.e. producing a verification key does not
+itself require a live committee — only *executing* the circuit (`nargo execute` / `bb prove`)
+does.
 
-`lib/identity-anchor` holds the derivation shared by all four, so the value `query` blinds and
-the value `anchor` verifies cannot drift apart.
+`lib/identity-anchor` holds the derivation shared by all five, so the value `query` blinds and
+the value `anchor`/`migrate` verify cannot drift apart.
 
 ### Derivation
 
@@ -180,8 +184,12 @@ used as a blind oracle for arbitrary inputs.
 Changed by changelog entry 74 from the original single-committee 4-field layout (`comm_in`,
 `scheme_version`, `anchor`, `oprf_pk_hash`) to check and combine all 5 committees per entry 73.
 
-Maps to `AnchorProofVerifier::verify_registration_anchor(proof_bytes, anchor, scheme_version)`
-and, with an identical layout, to `verify_reverification(proof_bytes, anchor)`.
+**Superseded as the production verification target by `disclosure`, below, same as `anchor`
+below it — this earlier revision of this section claimed `verify_reverification` used this
+standalone layout "with an identical layout" to registration; that was wrong for the same
+reason a standalone `anchor` proof is unsafe for registration (see "Why `disclosure` exists").
+Changelog entry 76 corrects this: both `verify_registration_anchor` and `verify_reverification`
+are built on `disclosure`'s outer-embedded 8-field layout below.** Kept for testing only.
 
 ### `oprf_identity_anchor_migrate` — 15 fields
 
@@ -199,11 +207,15 @@ and, with an identical layout, to `verify_reverification(proof_bytes, anchor)`.
 with every other circuit here; not yet confirmed against a real `bb prove` run since `migrate`
 has never been executed — see "What is NOT done".)
 
-Maps to `AnchorProofVerifier::verify_migration(proof_bytes, old_anchor, new_anchor)`.
+**Superseded as the production verification target by `migrate-disclosure`, below, for the same
+reason `disclosure` supersedes `anchor`** (changelog entry 76 — this standalone layout's
+`comm_in` is an unauthenticated private witness of whatever outer proof it's paired with).
+Kept for testing only; `AnchorProofVerifier::verify_migration` is built on `migrate-disclosure`.
 
 There is exactly one `identity_input` binding in that circuit and all 10 `verified_oprf` calls
 consume it, so the two combined anchors are provably same-input by construction — no explicit
-equality constraint is needed or present.
+equality constraint is needed or present. `migrate-disclosure` inherits this property
+unchanged.
 
 ### `oprf_identity_anchor_disclosure` — 8 fields
 
@@ -235,20 +247,43 @@ The anchor committees' `oprf_pk_hashes` ride inside `param_commitment` rather th
 because slot 7 belongs to ZKPassport's salted-*nullifier* OPRF — a different key for a
 different purpose.
 
-### Why `disclosure` exists, and why a Rust verifier must use it
+### `oprf_identity_anchor_migrate_disclosure` — 8 fields
 
-`anchor` alone is **not safe to verify on-chain**. It proves the anchor came from the DG1
-committed at `comm_in`, but `comm_in` is a *private* witness inside ZKPassport's outer
-circuit — it is not among that proof's public inputs. So a standalone `anchor` proof and an
-outer passport proof cannot be linked to each other on-chain, and a prover could pair a
-genuine outer proof with an `anchor` proof over a `comm_in` of their own invention. That
-defeats the entire Sybil check.
+| # | Name | Value |
+|---|---|---|
+| 0 | `comm_in` | |
+| 1 | `current_date` | unix timestamp; drives the expiry check |
+| 2 | `service_scope` | unused; present to hold its slot |
+| 3 | `service_subscope` | unused; present to hold its slot |
+| 4 | `param_commitment` | `Poseidon2(201, old_anchor, new_anchor, old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5])` — 15-element hash |
+| 5 | `nullifier_type` | always 0 |
+| 6 | `scoped_nullifier` | always 0 |
+| 7 | `oprf_pk_hash` | always 0 |
 
-`disclosure` closes this by riding inside the outer proof, so there is one proof and one
-`comm_in`, authenticated all the way back to `certificate_registry_root`.
+Same fixed 8-field outer-circuit-facing shape as `disclosure` — the only room for the wider
+migration payload is `param_commitment` itself, so it folds in both anchors, both scheme
+versions, and all 10 committee-key hashes rather than occupying separate slots. `201` is a
+second Agora-specific proof-type tag, deliberately distinct from `disclosure`'s `200` so a
+migration commitment can never be substituted for a registration/reverification one (they have
+different field counts and different Rust-side check obligations).
 
-Keep `anchor` for testing and for any future flow that publishes `comm_in` some other way, but
-**a production `AnchorProofVerifier` should be built on `disclosure`.**
+### Why `disclosure`/`migrate-disclosure` exist, and why a Rust verifier must use them
+
+`anchor` (and, identically, `migrate`) alone is **not safe to verify on-chain**. Each proves its
+output came from the DG1 committed at `comm_in`, but `comm_in` is a *private* witness inside
+ZKPassport's outer circuit — it is not among that proof's public inputs. So a standalone
+`anchor`/`migrate` proof and an outer passport proof cannot be linked to each other on-chain,
+and a prover could pair a genuine outer proof with an `anchor`/`migrate` proof over a `comm_in`
+of their own invention. For `anchor` that defeats the Sybil check; for `migrate` it defeats
+both the same-human continuity the proof exists to establish and the freshness guarantee that
+the citizen still holds a currently valid passport at migration time (changelog entry 76).
+
+`disclosure`/`migrate-disclosure` close this by riding inside the outer proof, so there is one
+proof and one `comm_in`, authenticated all the way back to `certificate_registry_root`.
+
+Keep `anchor`/`migrate` for testing and for any future flow that publishes `comm_in` some other
+way, but **a production `AnchorProofVerifier` is built on `disclosure`/`migrate-disclosure`,
+as of changelog entry 76.**
 
 ## What the Rust verifier still has to enforce
 
@@ -267,15 +302,21 @@ The circuits cannot check these; they are on-chain obligations.
    public inputs of the outer proof. `pallet-identity`'s existing `AllowedMerkleRoots` pattern
    is the natural home. The Agora-governed circuit registry must include these forked
    circuits' vkey hashes.
-3. **`param_commitment` recomputation.** Recompute `Poseidon2(200, anchor, scheme_version,
-   oprf_pk_hashes[0..5])` (8-element hash) from the values submitted with the extrinsic and
-   check it equals the outer proof's `param_commitments[i]`.
+3. **`param_commitment` recomputation.** For registration/reverification, recompute
+   `Poseidon2(200, anchor, scheme_version, oprf_pk_hashes[0..5])` (8-element hash) from the
+   values submitted with the extrinsic and check it equals the outer proof's
+   `param_commitments[i]`. For migration, recompute `Poseidon2(201, old_anchor, new_anchor,
+   old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5])`
+   (15-element hash) the same way — see changelog entry 76.
 4. **`current_date` freshness**, so an old proof cannot be replayed past the passport's expiry.
+   Applies to registration, reverification, and migration alike (all three now ride
+   `disclosure`/`migrate-disclosure` subproofs, both of which carry `current_date`).
 5. **The `anchor` combination itself is not re-verified on-chain** — the chain trusts the
    circuit's `term_0 + ... + term_4` constraint and only checks the *inputs* to it (the 5 pk
-   hashes) against governance-approved keys. This is intentional: recomputing the combination
-   outside the SNARK would require the individual `oprf_output_i` values, which are exactly
-   the private witnesses the proof exists to keep off-chain.
+   hashes, on both sides of a migration) against governance-approved keys. This is
+   intentional: recomputing the combination outside the SNARK would require the individual
+   `oprf_output_i` values, which are exactly the private witnesses the proof exists to keep
+   off-chain.
 
 ---
 
@@ -296,7 +337,7 @@ Toolchain — already installed on the dev machine; do not reinstall:
 ```bash
 cd circuits/oprf-identity-anchor
 
-nargo compile --workspace     # 4 ACIR artifacts into target/
+nargo compile --workspace     # 5 ACIR artifacts into target/
 nargo test --workspace        # 18 tests (15 in identity_anchor, 3 in oprf_identity_anchor_query)
 nargo info --workspace        # opcode counts
 
@@ -314,13 +355,15 @@ bb verify   --scheme ultra_honk -k target/bb/vk -p target/bb/proof -i target/bb/
 `nargo test --package oprf_identity_anchor_query --show-output`; regenerate it there if any
 salted value changes.
 
-Verification keys can be produced for all four circuits (`bb write_vk`) without needing a live
+Verification keys can be produced for all five circuits (`bb write_vk`) without needing a live
 committee — VK generation only needs the compiled ACIR, not a satisfying witness. Their
 `vk_hash` values under bb 0.82.2 are recorded in changelog entry 69; changelog entry 74
-reconfirmed `bb write_vk` succeeds under bb 5.0.0 for all four (now-larger, post-5-committee)
-circuits, but did not byte-diff the resulting `vk_hash`es against entry 69's — **do not treat
-either set as stable identifiers yet**, and expect a fresh `vk_hash` once a genuine committee
-response lets `anchor`/`disclosure`/`migrate` actually execute.
+reconfirmed `bb write_vk` succeeds under bb 5.0.0 for the original four (now-larger,
+post-5-committee) circuits, and changelog entry 76 confirmed it again for the new
+`migrate-disclosure` circuit — but none of this byte-diffs the resulting `vk_hash`es against
+entry 69's **or against each other**: do not treat any of these as stable identifiers yet, and
+expect a fresh `vk_hash` once a genuine committee response lets `anchor`/`disclosure`/
+`migrate`/`migrate-disclosure` actually execute.
 
 ---
 
@@ -339,29 +382,25 @@ Honest list. Several of these are blocking.
   *one* instance (key generation, threshold split across a committee's members, node
   operation, `DS_DLOG` configuration), let alone 5 independently-keyed ones plus the founding
   DKG ceremonies changelog entry 73 specifies, is **explicitly out of scope for this work and
-  was not attempted**. Until at least 5 exist, `anchor`, `disclosure` and `migrate` cannot be
-  executed at all, only compiled.
-- **`anchor`, `disclosure` and `migrate` have never been executed.** They compile and produce
-  verification keys, and their constraint systems are counted, but no witness has ever been
-  solved for them because that needs a live committee response. Only `query` has a real
-  witness, proof and verification.
-- **Rust verifier — now real for one of the five obligations, changelog entry 75.**
-  `runtime/src/anchor_verifier.rs`'s `Poseidon2AnchorVerifier` implements obligations 3
-  (`param_commitment` recomputation, via the new `pallets/poseidon2-bn254` crate — a
-  from-source port of `noir-lang/noir`'s own Poseidon2 blackbox-solver implementation,
-  validated against real `nargo`-produced test vectors) for the registration path, and is
-  wired into the non-dev-mode `pallet_identity_zk::Config` in place of
-  `PassthroughAnchorVerifier`. `pallet-identity` itself now checks obligation 1 (the
-  governance-approved per-committee-slot key registry, `OprfCommitteeKeys`, mirroring
-  `AllowedMerkleRoots`) and obligation 4 (`current_date` freshness) directly in
-  `register_citizen`. Obligation 2 (`certificate_registry_root`/`circuit_registry_root`
-  allowlisting) was already handled by `AllowedMerkleRoots` before this entry. **Still not
-  real: `verify_reverification`/`verify_migration` remain unconditionally permissive** —
-  `reverify_citizen`/`migrate_oprf_scheme` don't accept an outer ZKPassport proof at all
-  (only a standalone proof-bytes blob), the same missing-`comm_in`-authentication problem
-  `disclosure` was built to solve for registration, never applied to those two calls. See
-  changelog entry 75 for the full trail and exactly what extending this to reverification/
-  migration would need.
+  was not attempted**. Until at least 5 exist, `anchor`, `disclosure`, `migrate` and
+  `migrate-disclosure` cannot be executed at all, only compiled.
+- **`anchor`, `disclosure`, `migrate` and `migrate-disclosure` have never been executed.** They
+  compile and produce verification keys, and their constraint systems are counted, but no
+  witness has ever been solved for any of them because that needs a live committee response.
+  Only `query` has a real witness, proof and verification.
+- **Rust verifier — real for registration, reverification, and migration as of changelog
+  entry 76 (all three of the "recompute and check `param_commitment`" family); the actual
+  committee service is still the unbuilt part.** `runtime/src/anchor_verifier.rs`'s
+  `Poseidon2AnchorVerifier` implements obligation 3 (`param_commitment` recomputation, via the
+  `pallets/poseidon2-bn254` crate — a from-source port of `noir-lang/noir`'s own Poseidon2
+  blackbox-solver implementation, validated against real `nargo`-produced test vectors) for
+  all three extrinsics, each now accepting the outer `zk_proof`/`public_inputs` directly
+  (`reverify_citizen`/`migrate_oprf_scheme` were restructured in entry 76 to match
+  `register_citizen`'s shape — no more bare proof-bytes parameter). `pallet-identity` checks
+  obligation 1 (the governance-approved per-committee-slot key registry, `OprfCommitteeKeys`)
+  and obligation 4 (`current_date` freshness) directly in all three calls. Obligation 2
+  (`certificate_registry_root`/`circuit_registry_root` allowlisting) is `AllowedMerkleRoots`,
+  unchanged since before entry 75. See changelog entry 76 for the full trail.
 - **Verifier-crate compatibility is no longer the open question it was.** Changelog entry 72
   landed the bb 5.0.0 port of `ultrahonk-no-std` for the passport (`outer`) verifier, and this
   session confirmed `bb write_vk --scheme ultra_honk` succeeds under the installed bb **5.0.0**
@@ -377,7 +416,10 @@ Honest list. Several of these are blocking.
 - **`disclosure`'s outer-circuit integration has never been run inside an actual outer proof.**
   The 8-field layout is empirically confirmed, but "the layout matches" is not the same as
   "the outer circuit accepts it". Confirming that needs the full subproof pipeline plus a
-  committee.
+  committee. `migrate-disclosure` inherits this same unconfirmed status — it was never
+  measured against a stubbed copy the way `disclosure` was (see next bullet); its 8-field
+  outer-facing shape is derived by direct analogy to `disclosure`'s, not independently
+  cross-checked against a real proof's public-input bytes.
 - **The 8-field layout was measured on a stubbed copy** of `disclosure` (in scratch, not in
   this repo) with the `verified_oprf` call replaced, since the real circuit cannot execute.
   Only the function body differed; the signature and returns were identical, and the ABI
@@ -393,13 +435,13 @@ Honest list. Several of these are blocking.
 
 ### Known design limits, by choice
 
-- **`migrate` is only sound while the outgoing committee is honest.** A leaked outgoing key
-  lets an attacker fabricate an `old_anchor` for an input they do not hold. This is why entry
-  67 routes a *suspected* break through `pallet-emergency-council`'s emergency rotation and its
-  disclosed degraded mode rather than through this circuit.
-- **`disclosure` compiles with one warning** — "Return variable contains a constant value" for
-  the three zero returns. They are required by the fixed outer-circuit interface and cannot be
-  dropped. Expected, benign.
+- **`migrate`/`migrate-disclosure` are only sound while the outgoing committee is honest.** A
+  leaked outgoing key lets an attacker fabricate an `old_anchor` for an input they do not hold.
+  This is why entry 67 routes a *suspected* break through `pallet-emergency-council`'s
+  emergency rotation and its disclosed degraded mode rather than through this circuit.
+- **`disclosure`/`migrate-disclosure` compile with one warning each** — "Return variable
+  contains a constant value" for the three zero returns. They are required by the fixed
+  outer-circuit interface and cannot be dropped. Expected, benign.
 - **No DG11 support.** Entry 67 evaluated the explicitly-labelled `5F10` "Personal number" tag
   in DG11 and recommended against it: it would need a whole new data-group parser, integrity
   check and SOD hash-list entry, for a field that is *more* optional than DG1's slot. Nothing

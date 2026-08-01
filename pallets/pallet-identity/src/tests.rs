@@ -82,6 +82,23 @@ fn register(who: u64, nullifier: [u8; 32], anchor: [u8; 32]) {
     ));
 }
 
+/// Builds a public_inputs vector shaped for `migrate_oprf_scheme`: `old_anchor` and
+/// `new_anchor` each in their own `param_commitments` slot (indices 5 and 6, as if two
+/// disclosure subproofs were folded into the outer proof) — `TestAnchorVerifier`'s
+/// `verify_migration` (see `mock.rs`) requires the outer public inputs to contain *both*.
+fn migration_public_inputs(
+    merkle_root: [u8; 32],
+    old_anchor: [u8; 32],
+    new_anchor: [u8; 32],
+) -> BoundedVec<[u8; 32], ConstU32<18>> {
+    let mut v = vec![[0u8; 32]; 10];
+    v[0] = merkle_root;
+    v[2] = current_date_field(TEST_NOW_UNIX_SECS);
+    v[5] = old_anchor;
+    v[6] = new_anchor;
+    BoundedVec::try_from(v).unwrap()
+}
+
 // ─── register_citizen ───────────────────────────────────────────────────────
 
 #[test]
@@ -748,7 +765,13 @@ fn reverify_citizen_works() {
         assert_eq!(ReverificationDeadline::<Test>::get(1), Some(11));
 
         System::set_block_number(5);
-        assert_ok!(Identity::reverify_citizen(RuntimeOrigin::signed(1), valid_proof()));
+        assert_ok!(Identity::reverify_citizen(
+            RuntimeOrigin::signed(1),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
 
         // Deadline is pushed forward from "now" (5), not from the old deadline (11).
         assert_eq!(ReverificationDeadline::<Test>::get(1), Some(15));
@@ -763,22 +786,129 @@ fn reverify_citizen_fails_when_not_registered() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         assert_noop!(
-            Identity::reverify_citizen(RuntimeOrigin::signed(1), valid_proof()),
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
             Error::<Test>::NotRegistered
         );
     });
 }
 
 #[test]
-fn reverify_citizen_fails_with_invalid_proof() {
+fn reverify_citizen_fails_when_anchor_does_not_match_on_file() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        // ANCHOR_B was never registered for this citizen — checked before any proof work.
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorMismatch
+        );
+    });
+}
+
+#[test]
+fn reverify_citizen_fails_with_invalid_zk_proof() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();
         register(1, NULLIFIER_A, ANCHOR_A);
 
         assert_noop!(
-            Identity::reverify_citizen(RuntimeOrigin::signed(1), invalid_proof()),
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                invalid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::InvalidZKProof
+        );
+    });
+}
+
+#[test]
+fn reverify_citizen_fails_when_outer_proof_does_not_contain_anchor() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        // anchor matches what's on file (passes AnchorMismatch), but the outer proof's own
+        // param_commitments slot carries a different value — TestAnchorVerifier's
+        // verify_reverification (mock.rs) requires the outer public inputs to contain the
+        // claimed anchor.
+        let mut mismatched = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        mismatched[5] = ANCHOR_B;
+
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                mismatched,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
             Error::<Test>::InvalidReverificationProof
+        );
+    });
+}
+
+#[test]
+fn reverify_citizen_fails_when_committee_key_not_approved() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        // Un-approve what `register` approved, so the committee-key check fails.
+        for slot in 0..5u8 {
+            Identity::remove_oprf_committee_key(RuntimeOrigin::root(), 0, slot).unwrap();
+        }
+
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::CommitteeKeyMismatch
+        );
+    });
+}
+
+#[test]
+fn reverify_citizen_fails_when_proof_is_stale() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        stale_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS - 999_999);
+
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                stale_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorProofStale
         );
     });
 }
@@ -809,7 +939,13 @@ fn reverify_citizen_reactivates_a_lapsed_citizen() {
         System::set_block_number(12);
         assert!(!Identity::is_active_citizen(&1));
 
-        assert_ok!(Identity::reverify_citizen(RuntimeOrigin::signed(1), valid_proof()));
+        assert_ok!(Identity::reverify_citizen(
+            RuntimeOrigin::signed(1),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
         assert!(Identity::is_active_citizen(&1));
     });
 }
@@ -823,12 +959,15 @@ fn migrate_oprf_scheme_works() {
         allow_root();
         register(1, NULLIFIER_A, ANCHOR_A);
         assert_eq!(OprfSchemeVersion::<Test>::get(), 0);
+        approve_committee_keys(1); // new_version's committee keys
 
         assert_ok!(Identity::migrate_oprf_scheme(
             RuntimeOrigin::signed(1),
-            ANCHOR_A,
-            ANCHOR_B,
             valid_proof(),
+            migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+            ANCHOR_B,
+            OPRF_PK_HASHES,
+            OPRF_PK_HASHES,
         ));
 
         assert_eq!(CitizenAnchor::<Test>::get(1), Some((1, ANCHOR_B)));
@@ -850,31 +989,13 @@ fn migrate_oprf_scheme_fails_when_caller_not_registered() {
         assert_noop!(
             Identity::migrate_oprf_scheme(
                 RuntimeOrigin::signed(1),
-                ANCHOR_A,
-                ANCHOR_B,
                 valid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::NotRegistered
-        );
-    });
-}
-
-#[test]
-fn migrate_oprf_scheme_fails_when_old_anchor_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        allow_root();
-        register(1, NULLIFIER_A, ANCHOR_A);
-
-        // Wrong old anchor — doesn't match what's on file for this citizen.
-        assert_noop!(
-            Identity::migrate_oprf_scheme(
-                RuntimeOrigin::signed(1),
-                ANCHOR_B,
-                ANCHOR_C,
-                valid_proof(),
-            ),
-            Error::<Test>::OldAnchorNotFound
         );
     });
 }
@@ -887,18 +1008,43 @@ fn migrate_oprf_scheme_fails_when_new_anchor_already_used() {
         register(1, NULLIFIER_A, ANCHOR_A);
 
         // Bump the global scheme version, then register a second citizen fresh under the
-        // new version with ANCHOR_B — that's now a genuinely taken (1, ANCHOR_B) entry.
+        // new version with ANCHOR_B — that's now a genuinely taken (1, ANCHOR_B) entry
+        // (this also approves scheme_version 1's committee keys, via `register`).
         assert_ok!(Identity::rotate_oprf_scheme(RuntimeOrigin::root()));
         register(2, NULLIFIER_B, ANCHOR_B);
 
         assert_noop!(
             Identity::migrate_oprf_scheme(
                 RuntimeOrigin::signed(1),
-                ANCHOR_A,
-                ANCHOR_B,
                 valid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::NewAnchorAlreadyUsed
+        );
+    });
+}
+
+#[test]
+fn migrate_oprf_scheme_fails_with_invalid_zk_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        approve_committee_keys(1);
+
+        assert_noop!(
+            Identity::migrate_oprf_scheme(
+                RuntimeOrigin::signed(1),
+                invalid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::InvalidZKProof
         );
     });
 }
@@ -909,15 +1055,70 @@ fn migrate_oprf_scheme_fails_with_invalid_migration_proof() {
         System::set_block_number(1);
         allow_root();
         register(1, NULLIFIER_A, ANCHOR_A);
+        approve_committee_keys(1);
+
+        // Wipe new_anchor's slot — TestAnchorVerifier's verify_migration (mock.rs) requires
+        // the outer public inputs to contain *both* old_anchor and new_anchor.
+        let mut mismatched = migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B);
+        mismatched[6] = [0u8; 32];
 
         assert_noop!(
             Identity::migrate_oprf_scheme(
                 RuntimeOrigin::signed(1),
-                ANCHOR_A,
+                valid_proof(),
+                mismatched,
                 ANCHOR_B,
-                invalid_proof(),
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
             ),
             Error::<Test>::InvalidMigrationProof
+        );
+    });
+}
+
+#[test]
+fn migrate_oprf_scheme_fails_when_new_committee_key_not_approved() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        // No approve_committee_keys(1) call — only the old (version 0) keys are approved.
+
+        assert_noop!(
+            Identity::migrate_oprf_scheme(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::CommitteeKeyMismatch
+        );
+    });
+}
+
+#[test]
+fn migrate_oprf_scheme_fails_when_proof_is_stale() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        approve_committee_keys(1);
+
+        let mut stale_inputs = migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B);
+        stale_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS - 999_999);
+
+        assert_noop!(
+            Identity::migrate_oprf_scheme(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                stale_inputs,
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorProofStale
         );
     });
 }

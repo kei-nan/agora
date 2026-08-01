@@ -122,12 +122,36 @@ pub mod pallet {
             oprf_pk_hashes: [[u8; 32]; 5],
         ) -> bool;
         /// Verifies a reverification/liveness proof: the citizen currently holds a
-        /// still-valid, unexpired passport that recomputes to the same anchor already on file.
-        fn verify_reverification(proof_bytes: &[u8], anchor: [u8; 32]) -> bool;
+        /// still-valid, unexpired passport that recomputes to the same anchor already on
+        /// file. `outer_public_inputs` is the outer ZKPassport proof `reverify_citizen` has
+        /// just validated via `T::ZkVerifier::verify` (HANDOFF log #76) — same shape and same
+        /// rationale as `verify_registration_anchor`'s parameter of the same name (a
+        /// standalone anchor proof's `comm_in` is an unauthenticated private witness; riding
+        /// inside a fresh outer proof is what proves the passport is *currently* valid, not
+        /// just was at original registration).
+        fn verify_reverification(
+            outer_public_inputs: &[[u8; 32]],
+            anchor: [u8; 32],
+            scheme_version: u32,
+            oprf_pk_hashes: [[u8; 32]; 5],
+        ) -> bool;
         /// Verifies a migration consistency ("dual evaluation") proof: `old_anchor` and
-        /// `new_anchor` were both derived from the same underlying personal-number value, just
-        /// under different OPRF scheme versions — without revealing that value.
-        fn verify_migration(proof_bytes: &[u8], old_anchor: [u8; 32], new_anchor: [u8; 32]) -> bool;
+        /// `new_anchor` were both derived from the same underlying personal-number value,
+        /// under the old and new OPRF scheme versions respectively, without revealing that
+        /// value. `outer_public_inputs` is the outer ZKPassport proof `migrate_oprf_scheme`
+        /// has just validated via `T::ZkVerifier::verify` (HANDOFF log #76) — same rationale
+        /// as above: a standalone `migrate` proof's `comm_in` is unauthenticated, so this
+        /// rides inside a fresh outer proof (`circuits/oprf-identity-anchor/migrate-disclosure`)
+        /// instead.
+        fn verify_migration(
+            outer_public_inputs: &[[u8; 32]],
+            old_anchor: [u8; 32],
+            new_anchor: [u8; 32],
+            old_scheme_version: u32,
+            new_scheme_version: u32,
+            old_oprf_pk_hashes: [[u8; 32]; 5],
+            new_oprf_pk_hashes: [[u8; 32]; 5],
+        ) -> bool;
     }
 
     /// Maps nullifier hash -> registered AccountId. Prevents double-registration.
@@ -289,9 +313,9 @@ pub mod pallet {
         AnchorAlreadyUsed,
         /// The reverification/liveness proof failed verification.
         InvalidReverificationProof,
-        /// The claimed old anchor is not a genuine, currently-registered anchor belonging to
-        /// the caller under their on-file OPRF scheme version.
-        OldAnchorNotFound,
+        /// The anchor submitted with a reverification proof does not match the citizen's
+        /// on-file anchor for their current OPRF scheme version.
+        AnchorMismatch,
         /// The proposed new anchor is already registered under the target scheme version.
         NewAnchorAlreadyUsed,
         /// The migration consistency ("dual evaluation") proof failed verification.
@@ -353,21 +377,10 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
-            // Smallest real outer-circuit variant is count_4 (8 fixed inputs + 1
-            // disclosure subproof) => 9 public inputs. Anything shorter cannot be a
-            // genuine ZKPassport proof.
-            ensure!(public_inputs.len() >= 9, Error::<T>::InvalidZKProof);
 
-            // 1. Check allowlist first (cheap storage lookup, no proof work yet).
-            //    certificate_registry_root is public_inputs[0].
-            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[0]), Error::<T>::IssuerNotAllowed);
-
-            // 2. Verify the ZK proof (expensive BN254 pairing). Only after confirming the
-            //    issuer root is trusted to avoid wasting compute on untrusted roots.
-            ensure!(
-                T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
-                Error::<T>::InvalidZKProof
-            );
+            // 1-2. Allowlist + ZK proof verification (expensive BN254 pairing) — see
+            //    `Self::verify_outer_proof`.
+            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
 
             // 3. Only after the proof is authenticated, extract and check the nullifier.
             //    Checking nullifier uniqueness before proof verification would let an attacker
@@ -380,22 +393,8 @@ pub mod pallet {
                 Error::<T>::NullifierAlreadyUsed
             );
 
-            // 4. Freshness (HANDOFF log #75): current_date is public_inputs[2] (see
-            //    runtime/src/verifier.rs's module docs for the full outer-circuit
-            //    public-input table), a u64 encoded as a field element's low 8 bytes.
-            let current_date_field = public_inputs[2];
-            ensure!(
-                current_date_field[..24].iter().all(|byte| *byte == 0),
-                Error::<T>::MalformedProofDate
-            );
-            let current_date = u64::from_be_bytes(
-                current_date_field[24..32].try_into().expect("slice is exactly 8 bytes"),
-            );
-            let now = T::Now::now().as_secs();
-            ensure!(
-                now.saturating_sub(current_date) <= T::MaxAnchorProofAge::get(),
-                Error::<T>::AnchorProofStale
-            );
+            // 4. Freshness (HANDOFF log #75) — see `Self::check_outer_proof_freshness`.
+            Self::check_outer_proof_freshness(public_inputs.as_slice())?;
 
             // 5. Each of the 5 committee key hashes must match the governance-approved key
             //    for its slot under the current scheme version — see
@@ -404,10 +403,7 @@ pub mod pallet {
             //    proof-independent) Poseidon2 recomputation below so a mismatched committee
             //    key fails on the more specific error.
             let scheme_version = OprfSchemeVersion::<T>::get();
-            for (slot, pk_hash) in oprf_pk_hashes.iter().enumerate() {
-                let approved = OprfCommitteeKeys::<T>::get((scheme_version, slot as u8));
-                ensure!(approved == Some(*pk_hash), Error::<T>::CommitteeKeyMismatch);
-            }
+            Self::check_committee_keys(scheme_version, &oprf_pk_hashes)?;
 
             // 6. Mandatory identity-anchor check (HANDOFF log #67/#75). Same ordering
             //    rationale as the nullifier above: verify the anchor before consulting the
@@ -554,22 +550,47 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Periodic re-verification (HANDOFF log #67): proves the caller still holds a
-        /// currently-valid, unexpired passport, and pushes `ReverificationDeadline` forward by
+        /// Periodic re-verification (HANDOFF log #67, restructured in log #76): proves the
+        /// caller still holds a currently-valid, unexpired passport that recomputes to the
+        /// same anchor already on file, and pushes `ReverificationDeadline` forward by
         /// `ReverificationPeriod` blocks from now. Checked lazily inside `is_active_citizen`
         /// rather than via a background sweep, matching this pallet's existing suspension
         /// pattern.
+        ///
+        /// `zk_proof`/`public_inputs` is a fresh outer ZKPassport proof — the same shape
+        /// `register_citizen` takes, and for the same reason (log #76): a standalone
+        /// reverification proof's `comm_in` would be an unauthenticated private witness,
+        /// unable to prove the passport is *currently* valid rather than merely was at
+        /// original registration. `anchor`/`oprf_pk_hashes` must recompute (via
+        /// `T::AnchorVerifier::verify_reverification`, riding the `disclosure` subproof
+        /// folded into `zk_proof`) to the same anchor already on file — checked directly here
+        /// via `CitizenAnchor`, not left to the proof alone, so a citizen cannot "reverify"
+        /// into a different anchor than the one their account is registered under.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn reverify_citizen(
             origin: OriginFor<T>,
-            reverify_proof: BoundedVec<u8, ConstU32<4096>>,
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
+            anchor: [u8; 32],
+            oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let (_version, anchor) =
+            let (scheme_version, on_file_anchor) =
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
+            ensure!(anchor == on_file_anchor, Error::<T>::AnchorMismatch);
+
+            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            Self::check_outer_proof_freshness(public_inputs.as_slice())?;
+            Self::check_committee_keys(scheme_version, &oprf_pk_hashes)?;
+
             ensure!(
-                T::AnchorVerifier::verify_reverification(reverify_proof.as_slice(), anchor),
+                T::AnchorVerifier::verify_reverification(
+                    public_inputs.as_slice(),
+                    anchor,
+                    scheme_version,
+                    oprf_pk_hashes,
+                ),
                 Error::<T>::InvalidReverificationProof
             );
             let deadline = frame_system::Pallet::<T>::block_number()
@@ -579,11 +600,20 @@ pub mod pallet {
             Ok(())
         }
 
-        /// OPRF scheme migration (HANDOFF log #67's "dual evaluation"): moves the caller's own
-        /// identity anchor from their current on-file scheme version to the next one
-        /// (on-file version + 1), given a proof that `old_anchor` and `new_anchor` were both
-        /// derived from the same underlying personal-number value. Requires only the citizen's
-        /// current passport — no second document, per log #67.
+        /// OPRF scheme migration (HANDOFF log #67's "dual evaluation", restructured in log
+        /// #76): moves the caller's own identity anchor from their current on-file scheme
+        /// version to the next one (on-file version + 1), given a proof that `old_anchor` and
+        /// `new_anchor` were both derived from the same underlying personal-number value.
+        /// Requires only the citizen's current passport — no second document, per log #67.
+        ///
+        /// `zk_proof`/`public_inputs` is a fresh outer ZKPassport proof carrying the
+        /// `migrate-disclosure` subproof (log #76 — same rationale as `reverify_citizen`
+        /// above: a standalone `migrate` proof's `comm_in` is unauthenticated, and migration
+        /// requires proving the passport is currently valid too, not just proving anchor
+        /// continuity). `old_anchor` is no longer a caller-supplied parameter — it is read
+        /// directly from the citizen's own `CitizenAnchor` entry, which also removes the need
+        /// for a separate "does this old_anchor genuinely belong to the caller" check that a
+        /// caller-supplied value would have required.
         ///
         /// Note on versioning: the migration target is always the *caller's own* on-file
         /// version plus one, not necessarily the global `OprfSchemeVersion`. This lets citizens
@@ -594,34 +624,36 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(25_000, 0))]
         pub fn migrate_oprf_scheme(
             origin: OriginFor<T>,
-            old_anchor: [u8; 32],
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
             new_anchor: [u8; 32],
-            migration_proof: BoundedVec<u8, ConstU32<4096>>,
+            old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+            new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            let (old_version, on_file_anchor) =
+            let (old_version, old_anchor) =
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
             let new_version =
                 old_version.checked_add(1).ok_or(Error::<T>::OprfSchemeVersionOverflow)?;
-
-            // The old anchor must be exactly what's on file for this citizen, genuinely
-            // registered under their current scheme version — this single check also catches
-            // a caller passing someone else's anchor, since the registry entry would map to a
-            // different AccountId (or not exist for this version at all).
-            ensure!(on_file_anchor == old_anchor, Error::<T>::OldAnchorNotFound);
-            ensure!(
-                IdentityAnchorRegistry::<T>::get((old_version, old_anchor)).as_ref() == Some(&who),
-                Error::<T>::OldAnchorNotFound
-            );
             ensure!(
                 !IdentityAnchorRegistry::<T>::contains_key((new_version, new_anchor)),
                 Error::<T>::NewAnchorAlreadyUsed
             );
+
+            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            Self::check_outer_proof_freshness(public_inputs.as_slice())?;
+            Self::check_committee_keys(old_version, &old_oprf_pk_hashes)?;
+            Self::check_committee_keys(new_version, &new_oprf_pk_hashes)?;
+
             ensure!(
                 T::AnchorVerifier::verify_migration(
-                    migration_proof.as_slice(),
+                    public_inputs.as_slice(),
                     old_anchor,
-                    new_anchor
+                    new_anchor,
+                    old_version,
+                    new_version,
+                    old_oprf_pk_hashes,
+                    new_oprf_pk_hashes,
                 ),
                 Error::<T>::InvalidMigrationProof
             );
@@ -779,6 +811,58 @@ pub mod pallet {
                 .ok_or(Error::<T>::OprfSchemeVersionOverflow)?;
             OprfSchemeVersion::<T>::put(new_version);
             Ok(new_version)
+        }
+
+        /// Shared by `register_citizen`/`reverify_citizen`/`migrate_oprf_scheme` (HANDOFF log
+        /// #76): allowlist check (cheap, no proof work yet) then the expensive BN254 pairing
+        /// check. `public_inputs.len() >= 9` is the smallest real outer-circuit variant
+        /// (count_4: 8 fixed inputs + 1 disclosure subproof) — anything shorter cannot be a
+        /// genuine ZKPassport proof.
+        fn verify_outer_proof(zk_proof: &[u8], public_inputs: &[[u8; 32]]) -> DispatchResult {
+            ensure!(public_inputs.len() >= 9, Error::<T>::InvalidZKProof);
+            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[0]), Error::<T>::IssuerNotAllowed);
+            ensure!(T::ZkVerifier::verify(zk_proof, public_inputs), Error::<T>::InvalidZKProof);
+            Ok(())
+        }
+
+        /// Shared by `register_citizen`/`reverify_citizen`/`migrate_oprf_scheme` (HANDOFF log
+        /// #75/#76): `current_date` is `public_inputs[2]` (see `runtime/src/verifier.rs`'s
+        /// module docs for the full outer-circuit public-input table), a u64 encoded as a
+        /// field element's low 8 bytes. Rejects a proof whose `current_date` is older than
+        /// `MaxAnchorProofAge` relative to `T::Now`, so a genuine-at-generation-time proof
+        /// cannot be replayed indefinitely.
+        fn check_outer_proof_freshness(public_inputs: &[[u8; 32]]) -> DispatchResult {
+            let current_date_field = public_inputs[2];
+            ensure!(
+                current_date_field[..24].iter().all(|byte| *byte == 0),
+                Error::<T>::MalformedProofDate
+            );
+            let current_date = u64::from_be_bytes(
+                current_date_field[24..32].try_into().expect("slice is exactly 8 bytes"),
+            );
+            let now = T::Now::now().as_secs();
+            ensure!(
+                now.saturating_sub(current_date) <= T::MaxAnchorProofAge::get(),
+                Error::<T>::AnchorProofStale
+            );
+            Ok(())
+        }
+
+        /// Shared by `register_citizen`/`reverify_citizen`/`migrate_oprf_scheme` (HANDOFF log
+        /// #75/#76): each of the `NUM_COMMITTEES` key hashes must match the
+        /// governance-approved key for its slot under `scheme_version` — see
+        /// `circuits/oprf-identity-anchor/README.md`'s "What the Rust verifier still has to
+        /// enforce", obligation 1. `migrate_oprf_scheme` calls this twice (once per scheme
+        /// version either side of the rotation).
+        fn check_committee_keys(
+            scheme_version: u32,
+            oprf_pk_hashes: &[[u8; 32]; NUM_COMMITTEES as usize],
+        ) -> DispatchResult {
+            for (slot, pk_hash) in oprf_pk_hashes.iter().enumerate() {
+                let approved = OprfCommitteeKeys::<T>::get((scheme_version, slot as u8));
+                ensure!(approved == Some(*pk_hash), Error::<T>::CommitteeKeyMismatch);
+            }
+            Ok(())
         }
     }
 }

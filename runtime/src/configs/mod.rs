@@ -234,11 +234,24 @@ impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
 		true
 	}
 
-	fn verify_reverification(_proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
+	fn verify_reverification(
+		_outer_public_inputs: &[[u8; 32]],
+		_anchor: [u8; 32],
+		_scheme_version: u32,
+		_oprf_pk_hashes: [[u8; 32]; 5],
+	) -> bool {
 		true
 	}
 
-	fn verify_migration(_proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
+	fn verify_migration(
+		_outer_public_inputs: &[[u8; 32]],
+		_old_anchor: [u8; 32],
+		_new_anchor: [u8; 32],
+		_old_scheme_version: u32,
+		_new_scheme_version: u32,
+		_old_oprf_pk_hashes: [[u8; 32]; 5],
+		_new_oprf_pk_hashes: [[u8; 32]; 5],
+	) -> bool {
 		true
 	}
 }
@@ -286,11 +299,10 @@ impl pallet_identity_zk::Config for Runtime {
 	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
-	/// Real for `verify_registration_anchor` (Poseidon2 `param_commitment` recomputation
-	/// against the already-verified outer proof, HANDOFF log #75); `verify_reverification`/
-	/// `verify_migration` remain unconditionally permissive, matching
-	/// `PassthroughAnchorVerifier` — see `crate::anchor_verifier::Poseidon2AnchorVerifier`'s
-	/// doc comment for exactly why those two are not yet real.
+	/// Real for all three methods (Poseidon2 `param_commitment` recomputation against the
+	/// already-verified outer proof — registration/reverification via `disclosure`,
+	/// migration via `migrate-disclosure`; HANDOFF log #75/#76) — see
+	/// `crate::anchor_verifier::Poseidon2AnchorVerifier`'s doc comment for the full trail.
 	type AnchorVerifier = crate::anchor_verifier::Poseidon2AnchorVerifier;
 	/// See the `dev-mode` impl above for the placeholder-cadence rationale.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;

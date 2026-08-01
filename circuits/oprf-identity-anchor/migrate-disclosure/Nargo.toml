@@ -1,0 +1,14 @@
+[package]
+name = "oprf_identity_anchor_migrate_disclosure"
+type = "bin"
+authors = ["Agora"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+identity_anchor = { path = "../lib/identity-anchor" }
+# Pinned to zkpassport/circuits d3a75acb8529e82c61be136a402553daec259257 (2026-07-21).
+utils = { tag = "bb-v5.0.0", git = "https://github.com/zkpassport/circuits", directory = "src/noir/lib/utils" }
+common = { tag = "bb-v5.0.0", git = "https://github.com/zkpassport/circuits", directory = "src/noir/lib/commitment/common" }
+data_check_expiry = { tag = "bb-v5.0.0", git = "https://github.com/zkpassport/circuits", directory = "src/noir/lib/data-check/expiry" }
+oprf = { tag = "v1.0.0", git = "https://github.com/TaceoLabs/oprf-nr", directory = "oprf" }
+poseidon = { tag = "v0.3.0", git = "https://github.com/noir-lang/poseidon" }

@@ -1,59 +1,62 @@
-//! Real (partial) `AnchorProofVerifier` for `pallet_identity_zk`'s OPRF identity-anchor
-//! checks — see `circuits/oprf-identity-anchor/README.md`'s "What the Rust verifier still
-//! has to enforce" and `docs/project/changelog/074.md`/`075.md` for the design this
-//! implements.
+//! Real `AnchorProofVerifier` for `pallet_identity_zk`'s OPRF identity-anchor checks — see
+//! `circuits/oprf-identity-anchor/README.md`'s "What the Rust verifier still has to enforce"
+//! and `docs/project/changelog/074.md`/`075.md`/`076.md` for the design this implements.
 //!
-//! # What is real here, and what is still `PassthroughAnchorVerifier`
+//! # What is real here
 //!
-//! Only [`Poseidon2AnchorVerifier::verify_registration_anchor`] does genuine cryptographic
-//! work. `verify_reverification` and `verify_migration` are **not** implemented here and
-//! stay wired to `PassthroughAnchorVerifier` in `configs/mod.rs` — not because they were
-//! forgotten, but because they hit a real, structural blocker distinct from (and larger
-//! than) the Poseidon2 one this module solves:
+//! All three of [`Poseidon2AnchorVerifier::verify_registration_anchor`],
+//! [`Poseidon2AnchorVerifier::verify_reverification`] and
+//! [`Poseidon2AnchorVerifier::verify_migration`] do genuine cryptographic work, as of
+//! changelog entry 76. Entry 75 landed only the first of these; entries 76's contribution is
+//! extending the same pattern to the other two, which needed real circuit engineering, not
+//! just Rust plumbing — see below.
 //!
-//! `reverify_citizen`/`migrate_oprf_scheme` (`pallets/pallet-identity/src/lib.rs`) take only
-//! a bare `proof_bytes: BoundedVec<u8, ConstU32<4096>>` and hand it straight to
+//! `reverify_citizen`/`migrate_oprf_scheme` (`pallets/pallet-identity/src/lib.rs`) used to
+//! take only a bare `proof_bytes: BoundedVec<u8, ConstU32<4096>>` and hand it straight to
 //! `AnchorVerifier`, with **no** `T::ZkVerifier::verify` call and no outer proof
-//! `public_inputs` in scope at all. That was fine under the pre-log-#74 mental model (a
+//! `public_inputs` in scope at all. That was fine under the pre-entry-74 mental model (a
 //! standalone anchor SNARK proof), but the README's own "why `disclosure` exists" section
 //! already ruled that model out for the *registration* path — `comm_in` is a private
 //! witness of the outer circuit, so a standalone anchor proof can't be bound to a genuine
 //! passport proof on-chain, and a prover could pair a real outer proof with a `comm_in` of
-//! their own invention. The exact same argument applies to reverification and migration:
-//! neither extrinsic currently accepts or verifies an outer ZKPassport proof at all, so
-//! there is no already-authenticated `param_commitments` array to recompute against for
-//! either of them. Building a real verifier for those two needs the same kind of extrinsic
-//! surgery `register_citizen` got in this session (accept the outer `zk_proof` +
-//! `public_inputs`, run `T::ZkVerifier::verify` first, then recompute against its
-//! `param_commitments`) — not attempted here; flagging it precisely is more honest than
-//! wiring `Poseidon2AnchorVerifier` in for a check it cannot actually perform.
+//! their own invention. The exact same argument applies to reverification and migration, and
+//! entry 75 flagged it precisely rather than wiring a check that couldn't actually perform
+//! anything real. Closing it needed two things, both delivered in entry 76: (1)
+//! `circuits/oprf-identity-anchor/migrate-disclosure`, a new outer-embedded circuit mirroring
+//! `disclosure`'s relationship to `anchor` but for the dual old/new committee evaluation
+//! `migrate` performs (reverification reuses `disclosure` itself — no new circuit needed,
+//! since reverification is exactly "recompute the anchor and check it's still the one on
+//! file", the same shape as registration); (2) the extrinsic surgery below, restructuring
+//! `reverify_citizen`/`migrate_oprf_scheme` to accept the outer `zk_proof`/`public_inputs`,
+//! run `T::ZkVerifier::verify` first, then recompute against `param_commitments`.
 //!
-//! # What `verify_registration_anchor` actually does
+//! # What each function actually does
 //!
-//! `pallet_identity_zk::register_citizen` already runs `T::ZkVerifier::verify(zk_proof,
-//! public_inputs)` (a real bb 5.0.0 pairing check, see `crate::verifier`) *before* calling
-//! `T::AnchorVerifier::verify_registration_anchor` — so by the time this function runs, the
-//! `disclosure` subproof folded into that same outer proof (see
+//! `pallet_identity_zk::register_citizen`/`reverify_citizen`/`migrate_oprf_scheme` each run
+//! `T::ZkVerifier::verify(zk_proof, public_inputs)` (a real bb 5.0.0 pairing check, see
+//! `crate::verifier`) *before* calling into this module — so by the time these functions run,
+//! the `disclosure`/`migrate-disclosure` subproof folded into that same outer proof (see
 //! `circuits/oprf-identity-anchor/README.md`) has already had its constraints checked,
-//! including all 5 committees' `verified_oprf` calls and the anchor combination. No second
-//! SNARK/pairing check is needed here; this function only has to:
+//! including all 5 (or 10, for migration) committees' `verified_oprf` calls and the anchor
+//! combination(s). No second SNARK/pairing check is needed here; each function only has to:
 //!
-//! 1. Recompute `param_commitment = Poseidon2(200, anchor, scheme_version,
-//!    oprf_pk_hashes[0..5])` from the tuple submitted with the extrinsic
-//!    ([`calculate_param_commitment`], via the [`poseidon2_bn254`] crate — see that crate's
-//!    module docs for how its Poseidon2 port was validated against real `nargo`-produced
-//!    output).
+//! 1. Recompute the relevant `param_commitment` from the tuple submitted with the extrinsic
+//!    ([`calculate_param_commitment`] for registration/reverification,
+//!    [`calculate_migration_param_commitment`] for migration — both via the
+//!    [`poseidon2_bn254`] crate; see that crate's module docs for how its Poseidon2 port was
+//!    validated against real `nargo`-produced output).
 //! 2. Check the recomputed value against *every* `param_commitments[i]` the already-verified
 //!    outer proof exposes (there can be more than one disclosure subproof; matching any one
 //!    is sufficient — see `circuits/oprf-identity-anchor/README.md`'s public-input-layout
 //!    table).
 //!
-//! It deliberately does **not** check the 5 `oprf_pk_hashes` against a governance-approved
-//! committee key, or `current_date` freshness — those are chain-storage-dependent checks
-//! that `pallet_identity_zk::register_citizen` performs directly (mirroring how it already
-//! checks `AllowedMerkleRoots` itself rather than delegating that to `T::ZkVerifier`), using
-//! the new `OprfCommitteeKeys` storage. Keeping this function pure (no storage reads) is
-//! also what makes it cleanly unit-testable below with plain fixtures.
+//! These functions deliberately do **not** check the `oprf_pk_hashes` against a
+//! governance-approved committee key, or `current_date` freshness — those are
+//! chain-storage-dependent checks that `pallet_identity_zk`'s extrinsics perform directly
+//! (mirroring how they already check `AllowedMerkleRoots` themselves rather than delegating
+//! that to `T::ZkVerifier`), using the `OprfCommitteeKeys` storage. Keeping these functions
+//! pure (no storage reads) is also what makes them cleanly unit-testable below with plain
+//! fixtures.
 
 #![cfg(not(feature = "dev-mode"))]
 
@@ -79,10 +82,17 @@ fn is_canonical_fr(value: &[u8; 32]) -> bool {
 /// `crate::verifier::FIXED_PUBLIC_INPUT_COUNT` for the same reason as the modulus above.
 const FIXED_PUBLIC_INPUT_COUNT: usize = 8;
 
-/// Agora's proof-type tag for the parameter commitment — must match
-/// `circuits/oprf-identity-anchor/disclosure/src/main.nr`'s
+/// Agora's proof-type tag for the registration/reverification parameter commitment — must
+/// match `circuits/oprf-identity-anchor/disclosure/src/main.nr`'s
 /// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR`.
 const PROOF_TYPE_AGORA_IDENTITY_ANCHOR: u8 = 200;
+
+/// Agora's proof-type tag for the migration parameter commitment — must match
+/// `circuits/oprf-identity-anchor/migrate-disclosure/src/main.nr`'s
+/// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE`. Deliberately distinct from the registration
+/// tag above so a migration commitment (15 elements) can never be confused with a
+/// registration one (8 elements).
+const PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE: u8 = 201;
 
 /// Number of OPRF committees — must match
 /// `circuits/oprf-identity-anchor/lib/identity-anchor`'s `NUM_COMMITTEES` (changelog entry
@@ -148,25 +158,77 @@ pub fn check_registration_anchor(
     param_commitments.iter().any(|commitment| *commitment == recomputed)
 }
 
-/// Real `AnchorProofVerifier` for the non-dev-mode runtime.
-///
-/// `verify_registration_anchor` is genuinely checked (see module docs). `verify_reverification`
-/// and `verify_migration` are **not** — they return `true` unconditionally, exactly matching
-/// `PassthroughAnchorVerifier`'s existing behavior, because there is currently no way to
-/// implement them for real: `pallet_identity_zk::reverify_citizen`/`migrate_oprf_scheme`
-/// don't accept an outer ZKPassport proof or run `T::ZkVerifier::verify` at all (see module
-/// docs), so there is no already-authenticated `param_commitments` array for either call to
-/// recompute against. Returning `true` here is not a security regression — both methods were
-/// already `true` unconditionally under `PassthroughAnchorVerifier`, which is what this type
-/// replaces only for `verify_registration_anchor` — but it is a deliberate choice not to
-/// return `false` either: failing closed on a check this type cannot actually perform would
-/// just permanently lock every citizen out of reverification/migration, which is an
-/// availability regression with no corresponding security gain (the check still wouldn't be
-/// validating anything real). Wiring one method real and two still-passthrough on the *same*
-/// type, rather than only ever using this type for registration and leaving `configs/mod.rs`
-/// to reference `PassthroughAnchorVerifier` directly for the other two, is a judgment call in
-/// favor of a single, greppable "this is the anchor verifier" type — see
-/// `runtime/src/configs/mod.rs` for how it's wired in.
+/// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE, old_anchor, new_anchor,
+/// old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5])`
+/// — a 15-element hash, matching
+/// `migrate_disclosure::calculate_param_commitment` field-for-field and argument-for-argument.
+pub fn calculate_migration_param_commitment(
+    old_anchor: [u8; 32],
+    new_anchor: [u8; 32],
+    old_scheme_version: u32,
+    new_scheme_version: u32,
+    old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+) -> [u8; 32] {
+    let mut tag = [0u8; 32];
+    tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE;
+
+    let mut input: Vec<[u8; 32]> = Vec::with_capacity(5 + 2 * NUM_COMMITTEES);
+    input.push(tag);
+    input.push(old_anchor);
+    input.push(new_anchor);
+    input.push(u32_to_field_bytes(old_scheme_version));
+    input.push(u32_to_field_bytes(new_scheme_version));
+    input.extend_from_slice(&old_oprf_pk_hashes);
+    input.extend_from_slice(&new_oprf_pk_hashes);
+
+    poseidon2_bn254::hash_bytes(&input)
+}
+
+/// The pure, storage-free half of the migration-anchor check — mirrors
+/// [`check_registration_anchor`] but over `migrate-disclosure`'s wider commitment shape.
+/// `outer_public_inputs` is the same `public_inputs` array `migrate_oprf_scheme` already
+/// validated via `T::ZkVerifier::verify`.
+pub fn check_migration_anchor(
+    outer_public_inputs: &[[u8; 32]],
+    old_anchor: [u8; 32],
+    new_anchor: [u8; 32],
+    old_scheme_version: u32,
+    new_scheme_version: u32,
+    old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+) -> bool {
+    if outer_public_inputs.len() <= FIXED_PUBLIC_INPUT_COUNT {
+        return false;
+    }
+
+    if !is_canonical_fr(&old_anchor) || !is_canonical_fr(&new_anchor) {
+        return false;
+    }
+    for pk_hash in old_oprf_pk_hashes.iter().chain(new_oprf_pk_hashes.iter()) {
+        if !is_canonical_fr(pk_hash) {
+            return false;
+        }
+    }
+
+    let param_commitments = &outer_public_inputs[5..outer_public_inputs.len() - 3];
+
+    let recomputed = calculate_migration_param_commitment(
+        old_anchor,
+        new_anchor,
+        old_scheme_version,
+        new_scheme_version,
+        old_oprf_pk_hashes,
+        new_oprf_pk_hashes,
+    );
+    param_commitments.iter().any(|commitment| *commitment == recomputed)
+}
+
+/// Real `AnchorProofVerifier` for the non-dev-mode runtime. All three methods are genuinely
+/// checked (see module docs). `verify_reverification` shares `verify_registration_anchor`'s
+/// exact recomputation (`disclosure`'s `param_commitment` shape is the same for both — see
+/// `circuits/oprf-identity-anchor/README.md`) since reverification is "recompute the anchor
+/// and confirm it's still the one on file", not a structurally different check.
 pub struct Poseidon2AnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
@@ -179,12 +241,33 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         check_registration_anchor(outer_public_inputs, anchor, scheme_version, oprf_pk_hashes)
     }
 
-    fn verify_reverification(_proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
-        true
+    fn verify_reverification(
+        outer_public_inputs: &[[u8; 32]],
+        anchor: [u8; 32],
+        scheme_version: u32,
+        oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    ) -> bool {
+        check_registration_anchor(outer_public_inputs, anchor, scheme_version, oprf_pk_hashes)
     }
 
-    fn verify_migration(_proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
-        true
+    fn verify_migration(
+        outer_public_inputs: &[[u8; 32]],
+        old_anchor: [u8; 32],
+        new_anchor: [u8; 32],
+        old_scheme_version: u32,
+        new_scheme_version: u32,
+        old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+        new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    ) -> bool {
+        check_migration_anchor(
+            outer_public_inputs,
+            old_anchor,
+            new_anchor,
+            old_scheme_version,
+            new_scheme_version,
+            old_oprf_pk_hashes,
+            new_oprf_pk_hashes,
+        )
     }
 }
 
@@ -332,6 +415,252 @@ mod tests {
         }
         let got = calculate_param_commitment(anchor, 1, pk_hashes);
         let expected_hex = "2bbdcc5187d2d2f63d3b906c678f5ef5af7e0e86984d60b7db38ee2c4731dc2f";
+        let expected = {
+            let mut out = [0u8; 32];
+            let bytes = (0..32)
+                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<u8>>();
+            out.copy_from_slice(&bytes);
+            out
+        };
+        assert_eq!(got, expected);
+    }
+
+    // --- verify_migration / check_migration_anchor ---
+
+    const OLD_ANCHOR: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 111;
+        b
+    };
+    const NEW_ANCHOR: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 222;
+        b
+    };
+    const OLD_SCHEME_VERSION: u32 = 1;
+    const NEW_SCHEME_VERSION: u32 = 2;
+    const OLD_PK_HASHES: [[u8; 32]; NUM_COMMITTEES] = {
+        let mut hashes = [[0u8; 32]; NUM_COMMITTEES];
+        hashes[0][31] = 10;
+        hashes[1][31] = 20;
+        hashes[2][31] = 30;
+        hashes[3][31] = 40;
+        hashes[4][31] = 50;
+        hashes
+    };
+    const NEW_PK_HASHES: [[u8; 32]; NUM_COMMITTEES] = {
+        let mut hashes = [[0u8; 32]; NUM_COMMITTEES];
+        hashes[0][31] = 60;
+        hashes[1][31] = 70;
+        hashes[2][31] = 80;
+        hashes[3][31] = 90;
+        hashes[4][31] = 100;
+        hashes
+    };
+
+    fn migration_commitment() -> [u8; 32] {
+        calculate_migration_param_commitment(
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        )
+    }
+
+    #[test]
+    fn accepts_a_correctly_recomputed_migration_commitment() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_old_anchor_in_migration() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        let mut wrong = OLD_ANCHOR;
+        wrong[0] ^= 1;
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            wrong,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_new_anchor_in_migration() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        let mut wrong = NEW_ANCHOR;
+        wrong[0] ^= 1;
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            wrong,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn rejects_swapped_scheme_versions_in_migration() {
+        // old/new scheme_version are not interchangeable — swapping them must not verify.
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            NEW_SCHEME_VERSION,
+            OLD_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn rejects_a_single_mutated_old_pk_hash_in_migration() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        for i in 0..NUM_COMMITTEES {
+            let mut mutated = OLD_PK_HASHES;
+            mutated[i][0] ^= 1;
+            assert!(
+                !check_migration_anchor(
+                    &public_inputs,
+                    OLD_ANCHOR,
+                    NEW_ANCHOR,
+                    OLD_SCHEME_VERSION,
+                    NEW_SCHEME_VERSION,
+                    mutated,
+                    NEW_PK_HASHES,
+                ),
+                "mutating old_pk_hash slot {i} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_single_mutated_new_pk_hash_in_migration() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        for i in 0..NUM_COMMITTEES {
+            let mut mutated = NEW_PK_HASHES;
+            mutated[i][0] ^= 1;
+            assert!(
+                !check_migration_anchor(
+                    &public_inputs,
+                    OLD_ANCHOR,
+                    NEW_ANCHOR,
+                    OLD_SCHEME_VERSION,
+                    NEW_SCHEME_VERSION,
+                    OLD_PK_HASHES,
+                    mutated,
+                ),
+                "mutating new_pk_hash slot {i} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_anchor_in_migration() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            BN254_FR_MODULUS_BE,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn rejects_when_no_migration_commitment_matches() {
+        let public_inputs = outer_public_inputs_with_commitment([7u8; 32]);
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn accepts_migration_commitment_when_not_the_first_slot() {
+        let commitment = migration_commitment();
+        let mut public_inputs = alloc::vec![[0u8; 32]; 10];
+        public_inputs[5] = [9u8; 32];
+        public_inputs[6] = commitment;
+        assert!(check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+        ));
+    }
+
+    #[test]
+    fn calculate_migration_param_commitment_matches_the_real_nargo_vector() {
+        // Real `nargo test --show-output` vector against
+        // `migrate-disclosure::calculate_param_commitment`'s exact shape: tag=201,
+        // old_anchor=111, new_anchor=222, old_scheme_version=1, new_scheme_version=2,
+        // old_oprf_pk_hashes=[10,20,30,40,50], new_oprf_pk_hashes=[60,70,80,90,100].
+        let got = migration_commitment();
+        let expected_hex = "1fc03013b1ebd0943d9fe6702ba50f7b7224d38ce69bdd3106f993d4f905ae88";
+        let expected = {
+            let mut out = [0u8; 32];
+            let bytes = (0..32)
+                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect::<Vec<u8>>();
+            out.copy_from_slice(&bytes);
+            out
+        };
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn calculate_migration_param_commitment_matches_the_all_zero_pk_hashes_nargo_vector() {
+        // Second real `nargo` vector, exercising all-zero pk-hash slots: tag=201, old_anchor=5,
+        // new_anchor=6, old_scheme_version=3, new_scheme_version=4, both pk-hash arrays zero.
+        let mut old_anchor = [0u8; 32];
+        old_anchor[31] = 5;
+        let mut new_anchor = [0u8; 32];
+        new_anchor[31] = 6;
+        let got = calculate_migration_param_commitment(
+            old_anchor,
+            new_anchor,
+            3,
+            4,
+            [[0u8; 32]; NUM_COMMITTEES],
+            [[0u8; 32]; NUM_COMMITTEES],
+        );
+        let expected_hex = "179f60a933aa9e2ea3ffcb201052443276bb8e1e16281ef0f0c9c816bad0d3f1";
         let expected = {
             let mut out = [0u8; 32];
             let bytes = (0..32)

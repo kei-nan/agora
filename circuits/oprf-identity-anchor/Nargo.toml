@@ -4,6 +4,7 @@ members = [
     "anchor",
     "disclosure",
     "migrate",
+    "migrate-disclosure",
     "lib/identity-anchor",
 ]
 default-member = "anchor"
