@@ -165,12 +165,13 @@ pub enum ProofVariant {
 /// installed yet", and every proof for that variant is rejected; it is never a reason to
 /// skip verification.
 ///
-/// `count_4`'s asset is now the real VK: compiled `main/outer/count_4` from
+/// `count_4`'s asset is the real VK: compiled `main/outer/count_4` from
 /// `zkpassport/circuits` at the pinned commit (`d3a75ac`, tag `bb-v5.0.0`) with
 /// `nargo 1.0.0-beta.22`, then ran `bb write_vk -t evm` under bb 5.0.0 against that
-/// ACIR — see `docs/project/changelog` for the exact commands. This does not by itself
-/// let any proof verify — [`ultrahonk::verify`] is still a stub — it only means
-/// `lookup_vk(4)` now succeeds instead of failing on a missing asset.
+/// ACIR — see `docs/project/changelog` for the exact commands. Its header reports
+/// `log_circuit_size = 22` and `combined_input_size = 17` (`= 9 + 8`), which is what pins
+/// the public-input layout documented at the top of this module; see
+/// `count_4_vk_matches_the_documented_public_input_layout`.
 const OUTER_CIRCUIT_VKS: &[(u8, &[u8])] = &[(
     4,
     include_bytes!("../assets/vk_zkpassport_outer_count_4.bin"),
