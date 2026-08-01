@@ -21,6 +21,25 @@ pub const VALID_PROOF_MARKER: u8 = 1;
 /// Byte marker used by `TestZkVerifier` to signal a proof that should fail verification.
 pub const INVALID_PROOF_MARKER: u8 = 0;
 
+/// Test anchor-proof verifier. Same deterministic-by-proof-bytes convention as
+/// `TestZkVerifier`, reused across all three `AnchorProofVerifier` methods so tests stay
+/// simple: a proof whose first byte is `VALID_PROOF_MARKER` passes, anything else fails.
+pub struct TestAnchorVerifier;
+
+impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
+    fn verify_registration_anchor(proof_bytes: &[u8], _anchor: [u8; 32], _scheme_version: u32) -> bool {
+        matches!(proof_bytes.first(), Some(1))
+    }
+
+    fn verify_reverification(proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
+        matches!(proof_bytes.first(), Some(1))
+    }
+
+    fn verify_migration(proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
+        matches!(proof_bytes.first(), Some(1))
+    }
+}
+
 #[frame_support::runtime]
 mod runtime {
     // The main runtime
@@ -59,6 +78,11 @@ impl pallet_identity_zk::Config for Test {
     // authorized and unauthorized-origin paths for suspend/restore and the admin calls.
     type SuspensionOrigin = frame_system::EnsureRoot<u64>;
     type AdminOrigin = frame_system::EnsureRoot<u64>;
+    type AnchorVerifier = TestAnchorVerifier;
+    // Short period so tests can cross a reverification deadline without huge block numbers.
+    type ReverificationPeriod = frame_support::traits::ConstU32<10>;
+    // Same convention as SuspensionOrigin/AdminOrigin above.
+    type EmergencyRotationOrigin = frame_system::EnsureRoot<u64>;
 }
 
 // Build genesis storage according to the mock runtime.

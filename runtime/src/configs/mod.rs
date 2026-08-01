@@ -211,6 +211,29 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 	}
 }
 
+/// Passthrough OPRF identity-anchor verifier: accepts any registration/reverification/
+/// migration proof. Unlike `PassthroughZkVerifier`, this is NOT gated behind `dev-mode` — no
+/// real OPRF-circuit verifier crate exists yet at all (the OPRF committee work tracked in
+/// HANDOFF log #67/#68 hasn't started), so there is nothing for a non-dev-mode build to force
+/// in its place the way `ZkVerifier` forces `RarimoGroth16Verifier`. This must be replaced
+/// before the identity-anchor check provides any real Sybil-resistance guarantee — it
+/// currently provides none, in either build mode.
+pub struct PassthroughAnchorVerifier;
+
+impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
+	fn verify_registration_anchor(_proof_bytes: &[u8], _anchor: [u8; 32], _scheme_version: u32) -> bool {
+		true
+	}
+
+	fn verify_reverification(_proof_bytes: &[u8], _anchor: [u8; 32]) -> bool {
+		true
+	}
+
+	fn verify_migration(_proof_bytes: &[u8], _old_anchor: [u8; 32], _new_anchor: [u8; 32]) -> bool {
+		true
+	}
+}
+
 #[cfg(feature = "dev-mode")]
 impl pallet_identity_zk::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -220,6 +243,18 @@ impl pallet_identity_zk::Config for Runtime {
 	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet.
+	type AnchorVerifier = PassthroughAnchorVerifier;
+	/// Placeholder cadence (~1 year at 6s/block) pending the human decision flagged as open in
+	/// HANDOFF log #67 (whether the liveness re-verification cadence should be shorter than
+	/// the 4-year OPRF-rotation cycle). Governance-tunable, not hardcoded logic.
+	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
+	/// No dedicated `EnsureOrigin` exists yet on `pallet-emergency-council` (it gates its own
+	/// calls via council-membership + supermajority-vote checks internally, not via a
+	/// reusable cross-pallet origin type — see its `src/lib.rs`). `EnsureRoot` is a
+	/// placeholder here, same pattern as `pallet_constitution::Config::RevocationOrigin`
+	/// below: replace with a real emergency-council-backed origin once one exists.
+	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -233,6 +268,13 @@ impl pallet_identity_zk::Config for Runtime {
 	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet, so
+	/// even this "real verifier" build path uses the passthrough for the anchor check only.
+	type AnchorVerifier = PassthroughAnchorVerifier;
+	/// See the `dev-mode` impl above for the placeholder-cadence rationale.
+	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
+	/// See the `dev-mode` impl above for why this is `EnsureRoot` for now.
+	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs.
