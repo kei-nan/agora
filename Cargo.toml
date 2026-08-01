@@ -94,6 +94,12 @@ sp-storage = { version = "22.0.0", default-features = false }
 sp-transaction-pool = { version = "36.0.0", default-features = false }
 sp-version = { version = "39.0.0", default-features = false }
 substrate-wasm-builder = { version = "26.0.1", default-features = false }
+# Fork of zkVerify/ultrahonk_verifier, porting its UltraHonk verifier from bb 3.0.3 to
+# bb 5.0.0 (ZKPassport's pinned version) — see runtime/src/verifier.rs's `ultrahonk` module
+# docs and docs/project/zk-verifier.md for why upstream can't be used as-is. Pinned to a
+# branch, not a rev, while the port is actively in progress; switch to a pinned `rev` once
+# it stabilizes.
+ultrahonk-no-std = { git = "https://github.com/kei-nan/ultrahonk_verifier", branch = "bb-5.0.0-port", default-features = false }
 
 [profile.release]
 opt-level = 3

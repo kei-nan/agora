@@ -161,6 +161,7 @@ dependencies = [
  "sp-transaction-pool",
  "sp-version",
  "substrate-wasm-builder",
+ "ultrahonk-no-std",
 ]
 
 [[package]]
@@ -321,6 +322,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark-bn254"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d69eab57e8d2663efa5c63135b2af4f396d66424f88954c21104125ab6b3e6bc"
+dependencies = [
+ "ark-ec 0.5.0",
+ "ark-ff 0.5.0",
+ "ark-std 0.5.0",
+]
+
+[[package]]
+name = "ark-bn254-ext"
+version = "0.6.0"
+source = "git+https://github.com/zkVerify/accelerated-bn-cryptography.git?tag=v0.6.0#6249e3a8e5f7d679af483339dfbcb391ac78450a"
+dependencies = [
+ "ark-bn254",
+ "ark-ec 0.5.0",
+ "ark-ff 0.5.0",
+ "ark-models-ext",
+ "ark-scale",
+ "ark-std 0.5.0",
+]
+
+[[package]]
 name = "ark-ec"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -457,6 +482,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ark-models-ext"
+version = "0.6.0"
+source = "git+https://github.com/zkVerify/accelerated-bn-cryptography.git?tag=v0.6.0#6249e3a8e5f7d679af483339dfbcb391ac78450a"
+dependencies = [
+ "ark-ec 0.5.0",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
+ "ark-std 0.5.0",
+ "educe",
+]
+
+[[package]]
 name = "ark-poly"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -482,6 +519,20 @@ dependencies = [
  "educe",
  "fnv",
  "hashbrown 0.15.3",
+]
+
+[[package]]
+name = "ark-scale"
+version = "0.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "985c81a9c7b23a72f62b7b20686d5326d2a9956806f37de9ee35cb1238faf0c0"
+dependencies = [
+ "ark-ec 0.5.0",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
+ "ark-std 0.5.0",
+ "parity-scale-codec",
+ "scale-info",
 ]
 
 [[package]]
@@ -9606,6 +9657,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "snafu-derive",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck 0.4.1",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.101",
+]
+
+[[package]]
 name = "snap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11459,6 +11531,22 @@ dependencies = [
  "crunchy",
  "hex",
  "static_assertions",
+]
+
+[[package]]
+name = "ultrahonk-no-std"
+version = "0.1.0"
+source = "git+https://github.com/kei-nan/ultrahonk_verifier?branch=bb-5.0.0-port#986b79b232d0f44c52fe50cd85ba8c3f505fc3c8"
+dependencies = [
+ "ark-bn254",
+ "ark-bn254-ext",
+ "ark-ec 0.5.0",
+ "ark-ff 0.5.0",
+ "ark-models-ext",
+ "ark-std 0.5.0",
+ "hex-literal",
+ "sha3",
+ "snafu",
 ]
 
 [[package]]

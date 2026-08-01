@@ -56,6 +56,7 @@ sp-session.workspace = true
 sp-storage.workspace = true
 sp-transaction-pool.workspace = true
 sp-version = { features = ["serde"], workspace = true }
+ultrahonk-no-std.workspace = true
 
 [build-dependencies]
 substrate-wasm-builder = { optional = true, workspace = true, default-features = true }
@@ -63,7 +64,8 @@ substrate-wasm-builder = { optional = true, workspace = true, default-features =
 [features]
 # dev-mode: enables PassthroughZkVerifier (accepts all ZK proofs). Must be disabled before
 # any testnet/mainnet deployment. A production build without this feature will fail to compile
-# until a real Rarimo Groth16 verifier is wired into pallet_identity_zk::Config.
+# until a real UltraHonk verifier is wired into pallet_identity_zk::Config (see
+# runtime/src/verifier.rs's ZkPassportUltraHonkVerifier and its `ultrahonk` module).
 default = ["std", "dev-mode"]
 dev-mode = []
 std = [
@@ -111,6 +113,7 @@ std = [
 	"sp-transaction-pool/std",
 	"sp-version/std",
 	"substrate-wasm-builder",
+	"ultrahonk-no-std/std",
 ]
 
 runtime-benchmarks = [
