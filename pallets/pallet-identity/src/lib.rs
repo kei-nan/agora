@@ -127,9 +127,10 @@ pub mod pallet {
     pub type SuspendedNullifiers<T: Config> =
         StorageMap<_, Blake2_128Concat, [u8; 32], Option<BlockNumberFor<T>>>;
 
-    /// Trusted issuer Merkle roots (slaveMerkleRoot from Rarimo circuit, public_inputs[4]).
-    /// A proof is only accepted if its slaveMerkleRoot matches one of these roots.
-    /// Roots represent trusted sets of country certificate authorities.
+    /// Trusted issuer Merkle roots (certificate_registry_root from ZKPassport's outer
+    /// circuit, public_inputs[0]). A proof is only accepted if its certificate_registry_root
+    /// matches one of these roots. Roots represent trusted sets of country certificate
+    /// authorities.
     #[pallet::storage]
     pub type AllowedMerkleRoots<T: Config> = StorageMap<_, Identity, [u8; 32], bool, ValueQuery>;
 
@@ -219,7 +220,8 @@ pub mod pallet {
         InvalidZKProof,
         NotRegistered,
         NotSuspended,
-        /// The proof's slaveMerkleRoot is not in the on-chain allowlist of trusted issuers.
+        /// The proof's certificate_registry_root is not in the on-chain allowlist of
+        /// trusted issuers.
         IssuerNotAllowed,
         /// Citizen registry is full (u32::MAX citizens).
         TotalCitizensOverflow,
@@ -246,17 +248,17 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Register a new citizen using a Rarimo ZK passport proof.
+        /// Register a new citizen using a ZKPassport passport proof.
         ///
-        /// Rarimo registerIdentity circuit public signals (nPublic = 5):
-        ///   [0] dg15PubKeyHash  — Poseidon hash of DG15 active-auth public key (0 if NA)
-        ///   [1] passportHash    — PoseidonHash(SHA-256(signedAttributes)[252:])
-        ///   [2] dg1Commitment   — PoseidonHash(DG1_chunks..., skIdentity)  ← used as nullifier
-        ///   [3] pkIdentityHash  — PoseidonHash(babyJubJub_pubkey.X, .Y)
-        ///   [4] slaveMerkleRoot — root of trusted issuer CA certificate tree (public INPUT)
-        ///
-        /// The nullifier is derived from public_inputs[2] (dg1Commitment). No need to pass it
-        /// separately — it binds the passport's MRZ data to the user's on-device identity key.
+        /// `public_inputs` is ZKPassport's `main/outer/count_N` layout — see
+        /// `runtime/src/verifier.rs`'s module docs for the authoritative field-by-field
+        /// breakdown (confirmed against the circuits repo source, not assumed). In short:
+        /// `certificate_registry_root` is index 0, `scoped_nullifier` is index `len - 2`
+        /// (`6 + D`, where `D = outer_count - 3` disclosure subproofs, so the exact index
+        /// shifts with which outer-circuit variant produced the proof — deriving it from
+        /// `len` rather than hardcoding it is what makes this work across variants).
+        /// **Not** Rarimo's old 5-signal layout (`dg15PubKeyHash`, `passportHash`,
+        /// `dg1Commitment`, `pkIdentityHash`, `slaveMerkleRoot`) this call used to assume.
         ///
         /// `anchor`/`anchor_proof`: the mandatory OPRF identity anchor and its registration
         /// proof (see HANDOFF log #67, `AnchorProofVerifier`). Checked in addition to, and
@@ -269,18 +271,22 @@ pub mod pallet {
         pub fn register_citizen(
             origin: OriginFor<T>,
             zk_proof: BoundedVec<u8, ConstU32<4096>>,
-            // Rarimo registerIdentity produces exactly 5 public signals.
-            public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
+            // count_N exposes N + 5 public inputs; count_13 (the largest allowlisted
+            // variant) is the ceiling at 18.
+            public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
             anchor: [u8; 32],
             anchor_proof: BoundedVec<u8, ConstU32<4096>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
-            ensure!(public_inputs.len() >= 5, Error::<T>::InvalidZKProof);
+            // Smallest real outer-circuit variant is count_4 (8 fixed inputs + 1
+            // disclosure subproof) => 9 public inputs. Anything shorter cannot be a
+            // genuine ZKPassport proof.
+            ensure!(public_inputs.len() >= 9, Error::<T>::InvalidZKProof);
 
             // 1. Check allowlist first (cheap storage lookup, no proof work yet).
-            //    slaveMerkleRoot is public_inputs[4].
-            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[4]), Error::<T>::IssuerNotAllowed);
+            //    certificate_registry_root is public_inputs[0].
+            ensure!(AllowedMerkleRoots::<T>::get(public_inputs[0]), Error::<T>::IssuerNotAllowed);
 
             // 2. Verify the ZK proof (expensive BN254 pairing). Only after confirming the
             //    issuer root is trusted to avoid wasting compute on untrusted roots.
@@ -292,7 +298,9 @@ pub mod pallet {
             // 3. Only after the proof is authenticated, extract and check the nullifier.
             //    Checking nullifier uniqueness before proof verification would let an attacker
             //    learn whether a nullifier is registered without submitting a valid proof.
-            let nullifier = public_inputs[2];
+            //    scoped_nullifier sits at index `6 + D` = `len - 2` (oprf_pk_hash is the
+            //    last field, at `len - 1`).
+            let nullifier = public_inputs[public_inputs.len() - 2];
             ensure!(
                 !NullifierRegistry::<T>::contains_key(nullifier),
                 Error::<T>::NullifierAlreadyUsed

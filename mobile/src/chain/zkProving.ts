@@ -1,66 +1,72 @@
 /**
- * On-device Groth16 ZK proving for Rarimo passport registration, plus the
- * IPFS-backed proving-key fetch/cache this needs (the Full-circuit
- * `circuit_final.zkey` is ~515MB — see HANDOFF.md item 8 for why Full mode
- * and IPFS distribution were chosen over a smaller "Light" circuit or a
- * bundled/server-hosted key).
+ * On-device Noir/UltraHonk proving for ZKPassport passport registration, plus the
+ * content-addressed circuit-artifact fetch/cache it needs.
  *
- * What's real here: `fetchZkAsset` (content-hash -> CIDv0 -> cached
- * download-to-file via RNFS, never loading the whole asset into JS memory)
- * and thin wrappers around the two real native modules
- * (`@iden3/react-native-circom-witnesscalc`'s `calculateWitness` and
- * `@iden3/react-native-rapidsnark`'s `groth16Prove`). Their actual shipped
- * TypeScript declarations were read directly out of node_modules to write
- * these wrappers (not assumed from README prose, which undersells a couple
- * of details — e.g. `calculateWitness` returns a base64 *string*, and
- * `groth16Prove` returns `{proof, pub_signals}` as JSON-encoded *strings*,
- * not parsed objects/arrays).
+ * Replaces the Rarimo-era Groth16 flow. That module wrapped
+ * `@iden3/react-native-circom-witnesscalc` (`calculateWitness`) and
+ * `@iden3/react-native-rapidsnark` (`groth16Prove`) — circom/snarkjs tooling with no
+ * bearing on Noir. Both imports are gone. See `docs/project/changelog/065-068.md`
+ * entries 65/66.
  *
- * What's NOT here, on purpose, per HANDOFF.md item 8 ("Real Rarimo passport
- * ZK flow (mobile)"):
- *  - NFC passport chip reading (BAC key derivation from the MRZ + APDU
- *    exchange). No confirmed off-the-shelf RN library exists for this;
- *    RegisterScreen.tsx still stubs it. Not attempted here.
- *  - The witness-calculator file-format mismatch: `passport-zk-circuits`'
- *    release bundles ship the classic circom C++ witness generator
- *    (`.cpp`/`.dat`), but `@iden3/react-native-circom-witnesscalc` expects
- *    the newer graph format (`.wcd`) from a different iden3 tool
- *    (`circom-witnesscalc`). No `.wcd` graph for any passport-zk-circuits
- *    variant is known to exist yet — one would need to be compiled from the
- *    circuit's `.circom` source using `circom-witnesscalc`'s own compiler
- *    tooling, or obtained some other way not yet determined. `computeWitness`
- *    below takes a `graphPath` argument for exactly this file and does not
- *    attempt to fabricate or derive it.
- *  - The snarkjs-JSON -> `verifier.rs` compact byte-layout (129-byte
- *    A/B/C-points-plus-variant-byte) conversion for the proof this module
- *    produces. `generateProof` below returns the raw parsed snarkjs shapes;
- *    turning that into the bytes `pallet-identity::register_citizen` expects
- *    is separate, not-yet-done work per HANDOFF item 8.
+ * # What's real here
  *
- * None of this has been runtime-tested — no device/emulator is available in
- * this environment, and neither the 515MB proving key nor a `.wcd` graph
- * file is obtainable yet. Only `tsc --noEmit` has been checked.
+ * `hashToCid` and `fetchZkAsset` are unchanged and were never vendor-specific: they map a
+ * 32-byte content hash to a CIDv0 and stream the asset to disk via RNFS, never buffering
+ * it in the JS heap. They now fetch Noir ACIR artifacts rather than a 515MB circom proving
+ * key, which is a much smaller job, but the mechanism is the same one the desktop app uses
+ * (`hash_to_cid` in `desktop/src-tauri/src/commands/chain.rs`).
+ *
+ * The pipeline orchestration below is real and unit-tested against a fake prover. What it
+ * orchestrates is not: **no Noir prover native module exists in this project yet.**
+ *
+ * # Why there is a `NoirProver` seam instead of a direct native import
+ *
+ * `@zkpassport/sdk` does not fill this slot — it is relying-party orchestration software
+ * (show a QR code, the user scans it with ZKPassport's own app, get results by callback),
+ * not an on-device proving SDK for someone else's app (changelog entry 66).
+ * `zkpassport/noir_rs` is the right low-level building block and is actively maintained,
+ * but ships no JNI/Swift/RN bridging of its own; wiring it up is the same order of custom
+ * native work the old rapidsnark integration was. Until that exists, this module defines
+ * the contract it must satisfy and fails loudly when nothing is registered, rather than
+ * pretending to prove.
+ *
+ * # ZKPassport's pipeline, and why the proving modes differ per stage
+ *
+ * ZKPassport is a modular multi-circuit pipeline, not one monolithic circuit:
+ *
+ *  1. `sig-check/dsc`          — the country signing cert signed this document signer cert
+ *  2. `sig-check/id-data`      — that document signer cert signed this passport
+ *  3. `data-check/integrity`   — the datagroup hashes are internally consistent
+ *  4. one or more `disclose`/`compare`/`inclusion-check`/`exclusion-check` circuits
+ *  5. `main/outer/count_N`     — recursively verifies all of the above into one proof
+ *
+ * Stages 1-4 are proved for *in-circuit* verification, so they need Barretenberg's
+ * recursion-friendly configuration (`noir-recursive`: poseidon2 transcript). The outer
+ * proof of stage 5 is the one that lands on-chain, so it needs the keccak/EVM
+ * configuration (`evm`) the runtime verifier is built around. Getting this backwards
+ * produces proofs that fail with no useful error, so the two are separate types below
+ * rather than a boolean.
+ *
+ * `N = 3 + (number of disclosure subproofs)`, which is why {@link outerCircuitFor} derives
+ * it rather than taking it as a parameter.
  */
-import { Buffer } from 'buffer';
 import { hexToU8a } from '@polkadot/util';
 import bs58 from 'bs58';
 import RNFS from 'react-native-fs';
-import { calculateWitness } from '@iden3/react-native-circom-witnesscalc';
-import { groth16Prove } from '@iden3/react-native-rapidsnark';
+import { encodeUltraHonkProof, splitPublicInputs } from './proofEncoding';
 
 /** Default public IPFS gateway — matches the desktop app's `fetch_ipfs_content` default (desktop/src-tauri/src/commands/chain.rs). */
 export const DEFAULT_IPFS_GATEWAY = 'https://ipfs.io/ipfs';
 
-/** Local cache directory for downloaded ZK assets (proving keys, witness graphs), keyed by CID. */
+/** Local cache directory for downloaded ZK assets (circuit bytecode, verification keys), keyed by CID. */
 const ZK_ASSET_CACHE_DIR = `${RNFS.CachesDirectoryPath}/zk-assets`;
 
 /**
- * Converts a 32-byte SHA-256 digest into a CIDv0 string: a base58-encoded
- * multihash, `[0x12 (sha2-256), 0x20 (32-byte length), ...digest]`. Direct
- * TypeScript port of `hash_to_cid` in
- * desktop/src-tauri/src/commands/chain.rs — same algorithm, same default
- * gateway convention, so a hash computed anywhere in this project resolves
- * to the same IPFS location from mobile and desktop alike.
+ * Converts a 32-byte SHA-256 digest into a CIDv0 string: a base58-encoded multihash,
+ * `[0x12 (sha2-256), 0x20 (32-byte length), ...digest]`. Direct TypeScript port of
+ * `hash_to_cid` in desktop/src-tauri/src/commands/chain.rs — same algorithm, same default
+ * gateway convention, so a hash computed anywhere in this project resolves to the same
+ * IPFS location from mobile and desktop alike.
  */
 export function hashToCid(digest: Uint8Array): string {
   if (digest.length !== 32) {
@@ -74,15 +80,14 @@ export function hashToCid(digest: Uint8Array): string {
 }
 
 /**
- * Fetches a content-addressed ZK asset (proving key, witness graph, etc.)
- * by its 32-byte SHA-256 hash (hex, with or without a `0x` prefix),
- * caching it on disk by CID so repeat calls don't re-download. Returns the
- * local filesystem path to the cached file — callers pass this straight to
- * `computeWitness/generateProof`.
+ * Fetches a content-addressed ZK asset (circuit bytecode, verification key, etc.) by its
+ * 32-byte SHA-256 hash (hex, with or without a `0x` prefix), caching it on disk by CID so
+ * repeat calls don't re-download. Returns the local filesystem path — callers pass this
+ * straight to the prover.
  *
- * Downloads stream directly to disk via RNFS's `downloadFile` rather than
- * an in-memory fetch, since the Full-circuit proving key is ~515MB and must
- * never be buffered whole in the JS heap.
+ * Downloads stream directly to disk via RNFS's `downloadFile` rather than an in-memory
+ * fetch. That mattered enormously for the Rarimo-era 515MB proving key and matters less
+ * for Noir ACIR artifacts, but a phone is still a phone and the pattern costs nothing.
  */
 export async function fetchZkAsset(
   hashHex: string,
@@ -100,9 +105,8 @@ export async function fetchZkAsset(
     await RNFS.mkdir(ZK_ASSET_CACHE_DIR);
   }
 
-  // Download to a temp path first so a crash/interruption mid-download can
-  // never leave a corrupt file sitting at `cachePath` that a later call
-  // would treat as a valid cache hit.
+  // Download to a temp path first so a crash/interruption mid-download can never leave a
+  // corrupt file sitting at `cachePath` that a later call would treat as a cache hit.
   const tmpPath = `${cachePath}.part`;
   const { promise } = RNFS.downloadFile({
     fromUrl: `${gatewayUrl}/${cid}`,
@@ -117,55 +121,259 @@ export async function fetchZkAsset(
   return cachePath;
 }
 
-/**
- * Computes a circuit witness via `@iden3/react-native-circom-witnesscalc`.
- *
- * `graphPath` must point at a `.wcd` witness-calculator graph file (the
- * *newer* iden3 `circom-witnesscalc` format) already resolved on disk — e.g.
- * the path returned by `fetchZkAsset`. As of this writing no such file is
- * known to exist for any `passport-zk-circuits` variant: their release
- * bundles ship the classic circom C++ generator (`.cpp`/`.dat`) instead, and
- * nothing in this codebase converts between the two. See the module doc
- * comment and HANDOFF.md item 8 — this function is real and callable, but
- * unusable end-to-end until a `.wcd` graph for the target circuit is
- * obtained by some means not yet determined.
- */
-export async function computeWitness(inputsJson: string, graphPath: string): Promise<Uint8Array> {
-  const graphBase64 = await RNFS.readFile(graphPath, 'base64');
-  // The native module returns the computed witness as a base64 string
-  // (confirmed from its shipped index.d.ts + README, not assumed).
-  const witnessBase64 = await calculateWitness(inputsJson, graphBase64);
-  return new Uint8Array(Buffer.from(witnessBase64, 'base64'));
-}
+// ---------------------------------------------------------------------------
+// The Noir prover seam
+// ---------------------------------------------------------------------------
 
-/** Groth16 proof + public signals, as produced by `generateProof` below. */
-export interface Groth16ProveResult {
-  /** Parsed snarkjs proof object (pi_a/pi_b/pi_c/protocol/curve). Not yet converted to `verifier.rs`'s compact byte layout — see module doc comment. */
-  proof: unknown;
-  /** Parsed public signals, as decimal-string field elements (snarkjs convention). */
-  pub_signals: string[];
+/**
+ * Barretenberg proving configuration.
+ *
+ * `noir-recursive` (poseidon2 transcript) for a proof that will be verified *inside*
+ * another circuit; `evm` (keccak transcript) for the outer proof that goes on-chain.
+ * These are `bb`'s own `-t` target names, kept verbatim so the mapping to the toolchain
+ * is not something anyone has to guess.
+ */
+export type ProvingTarget = 'noir-recursive' | 'evm';
+
+/** What a proving run returns, mirroring the files `bb prove` writes. */
+export interface NoirProof {
+  /** The raw proof bytes — a flat array of 32-byte big-endian words. */
+  proof: Uint8Array;
+  /** The circuit's public inputs, concatenated. Split with `splitPublicInputs`. */
+  publicInputs: Uint8Array;
+  /** The circuit's verification key. Needed to feed a subproof into the outer circuit. */
+  verificationKey: Uint8Array;
 }
 
 /**
- * Generates a Groth16 proof via `@iden3/react-native-rapidsnark`.
+ * The native-module contract a Noir prover must satisfy. Nothing in this project
+ * implements it yet — see the module doc comment for why, and what the candidates are
+ * (`zkpassport/noir_rs` plus `Swoir` / `noir_android` / `madztheo/noir-react-native-starter`
+ * bridging).
  *
- * `witnessBase64` is the base64-encoded witness bytes (e.g.
- * `Buffer.from(await computeWitness(...)).toString('base64')`, or a witness
- * read straight off disk with `RNFS.readFile(path, 'base64')`).
- *
- * The native module's actual return shape is `{proof: string, pub_signals:
- * string}` — both JSON-encoded strings, per its shipped `index.d.ts`, not
- * the already-parsed shapes some usage examples imply. This wrapper parses
- * both before returning so callers get real objects/arrays; no other
- * transformation is applied.
+ * Deliberately narrow: witness generation and proving, nothing else. Circuit artifacts
+ * arrive as filesystem paths (from {@link fetchZkAsset}) rather than buffers so the
+ * implementation can memory-map them.
  */
-export async function generateProof(
-  zkeyPath: string,
-  witnessBase64: string,
-): Promise<Groth16ProveResult> {
-  const { proof, pub_signals } = await groth16Prove(zkeyPath, witnessBase64);
+export interface NoirProver {
+  /**
+   * Solves the circuit's witness from its inputs.
+   * @param bytecodePath path to the compiled ACIR artifact (nargo's `<circuit>.json`)
+   * @param inputs the circuit's named inputs (nargo's `Prover.toml` fields, as JSON)
+   */
+  execute(bytecodePath: string, inputs: Record<string, unknown>): Promise<Uint8Array>;
+  /** Proves a solved witness under the given target configuration. */
+  prove(bytecodePath: string, witness: Uint8Array, target: ProvingTarget): Promise<NoirProof>;
+}
+
+/** Thrown when proving is attempted with no prover registered. */
+export class NoirProverUnavailableError extends Error {
+  constructor() {
+    super(
+      'No Noir prover is registered. On-device ZKPassport proving needs a native module ' +
+        '(zkpassport/noir_rs plus Swoir/noir_android bridging) that this project has not built yet; ' +
+        'call setNoirProver() with an implementation, or with a fake in tests.',
+    );
+    this.name = 'NoirProverUnavailableError';
+  }
+}
+
+let activeProver: NoirProver | null = null;
+
+/** Registers the prover implementation. Pass `null` to unregister (used by tests). */
+export function setNoirProver(prover: NoirProver | null): void {
+  activeProver = prover;
+}
+
+/** Returns the registered prover, or throws {@link NoirProverUnavailableError}. */
+export function getNoirProver(): NoirProver {
+  if (activeProver === null) {
+    throw new NoirProverUnavailableError();
+  }
+  return activeProver;
+}
+
+// ---------------------------------------------------------------------------
+// The ZKPassport proving pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * The three subproofs every ZKPassport registration needs, regardless of what is being
+ * disclosed. Order matters: it is the order `main/outer/count_N` takes them in
+ * (`csc_to_dsc_proof`, `dsc_to_id_data_proof`, `integrity_check_proof`), and the
+ * commitment chain runs through them in exactly this sequence.
+ */
+export const BASE_SUBPROOF_CIRCUITS = [
+  'sig-check/dsc',
+  'sig-check/id-data',
+  'data-check/integrity',
+] as const;
+
+/** One circuit to prove: which circuit, where to get it, and what to feed it. */
+export interface SubproofRequest {
+  /** Circuit path, e.g. `sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256`. Identification only. */
+  circuit: string;
+  /** 32-byte SHA-256 content hash (hex) of the compiled ACIR artifact, for {@link fetchZkAsset}. */
+  bytecodeHash: string;
+  /** The circuit's named inputs. */
+  inputs: Record<string, unknown>;
+}
+
+/** A proved subproof, in the shape the outer circuit consumes. */
+export interface SubproofResult {
+  circuit: string;
+  proof: Uint8Array;
+  /** Split into 32-byte field elements — the outer circuit indexes these positionally. */
+  publicInputs: Uint8Array[];
+  verificationKey: Uint8Array;
+}
+
+/** Options shared by every step of the pipeline. */
+export interface ProvingOptions {
+  gatewayUrl?: string;
+  /** Called after each subproof, for progress UI. Proving a passport takes a while. */
+  onProgress?: (stage: string, completed: number, total: number) => void;
+}
+
+/**
+ * Proves one subproof, for in-circuit verification by the outer circuit.
+ *
+ * Always uses the `noir-recursive` target: the outer circuit verifies these with
+ * `verify_proof_with_type(..., PROOF_TYPE_HONK_ZK)`, which expects the poseidon2
+ * transcript. An `evm`-target subproof would be rejected by the outer circuit with no
+ * useful diagnostic, so the target is not a caller-supplied option here.
+ */
+export async function proveSubcircuit(
+  request: SubproofRequest,
+  options: ProvingOptions = {},
+): Promise<SubproofResult> {
+  const prover = getNoirProver();
+  const bytecodePath = await fetchZkAsset(request.bytecodeHash, options.gatewayUrl);
+  const witness = await prover.execute(bytecodePath, request.inputs);
+  const proved = await prover.prove(bytecodePath, witness, 'noir-recursive');
   return {
-    proof: JSON.parse(proof),
-    pub_signals: JSON.parse(pub_signals),
+    circuit: request.circuit,
+    proof: proved.proof,
+    publicInputs: splitPublicInputs(proved.publicInputs),
+    verificationKey: proved.verificationKey,
+  };
+}
+
+/**
+ * The `main/outer/count_N` circuit path for a given number of disclosure subproofs.
+ *
+ * `N` counts *all* wrapped subproofs — the 3 base ones plus the disclosures — which is
+ * why this derives it rather than trusting a caller's arithmetic. ZKPassport ships
+ * `count_4` through `count_13`, i.e. 1 to 10 disclosure subproofs.
+ */
+export function outerCircuitFor(disclosureCount: number): { path: string; outerCount: number } {
+  if (!Number.isInteger(disclosureCount) || disclosureCount < 1 || disclosureCount > 10) {
+    throw new RangeError(
+      `outerCircuitFor: ZKPassport's outer circuits wrap 1..10 disclosure subproofs, got ${disclosureCount}`,
+    );
+  }
+  const outerCount = BASE_SUBPROOF_CIRCUITS.length + disclosureCount;
+  return { path: `main/outer/count_${outerCount}`, outerCount };
+}
+
+/** Everything the outer circuit needs beyond the subproofs themselves. */
+export interface OuterProofInputs {
+  /** 32-byte SHA-256 content hash (hex) of the compiled `main/outer/count_N` artifact. */
+  bytecodeHash: string;
+  /**
+   * The outer circuit's own named inputs — `certificate_registry_root`,
+   * `circuit_registry_root`, `current_date`, `service_scope`, `service_subscope`,
+   * `param_commitments`, `nullifier_type`, `scoped_nullifier`, `oprf_pk_hash`, plus each
+   * subproof's Merkle path into the circuit registry. The subproof
+   * proof/vkey/public-input fields are filled in by {@link proveRegistration}.
+   */
+  inputs: Record<string, unknown>;
+}
+
+/** The finished artifact: exactly what `pallet_identity_zk::register_citizen` takes. */
+export interface RegistrationProof {
+  /** `zk_proof` — the envelope `runtime/src/verifier.rs` parses. */
+  zkProof: Uint8Array;
+  /** `public_inputs` — 32-byte big-endian field elements in the circuit's own order. */
+  publicInputs: Uint8Array[];
+  /** Which outer circuit produced it, for diagnostics. */
+  outerCount: number;
+}
+
+/**
+ * Runs the whole pipeline: every subproof, then the outer proof, then the envelope.
+ *
+ * @param baseSubproofs the three {@link BASE_SUBPROOF_CIRCUITS} requests, in that order
+ * @param disclosureSubproofs one or more disclosure-circuit requests
+ * @param outer the outer circuit's artifact hash and its own inputs
+ *
+ * The outer proof is the only one proved with the `evm` target, because it is the only
+ * one that gets verified on-chain.
+ */
+export async function proveRegistration(
+  baseSubproofs: readonly SubproofRequest[],
+  disclosureSubproofs: readonly SubproofRequest[],
+  outer: OuterProofInputs,
+  options: ProvingOptions = {},
+): Promise<RegistrationProof> {
+  if (baseSubproofs.length !== BASE_SUBPROOF_CIRCUITS.length) {
+    throw new RangeError(
+      `proveRegistration: expected ${BASE_SUBPROOF_CIRCUITS.length} base subproofs ` +
+        `(${BASE_SUBPROOF_CIRCUITS.join(', ')}), got ${baseSubproofs.length}`,
+    );
+  }
+  baseSubproofs.forEach((request, index) => {
+    const expected = BASE_SUBPROOF_CIRCUITS[index];
+    if (!request.circuit.startsWith(expected)) {
+      throw new Error(
+        `proveRegistration: base subproof ${index} is "${request.circuit}", expected a "${expected}" circuit — ` +
+          'the outer circuit takes these positionally, so order matters',
+      );
+    }
+  });
+
+  const { outerCount } = outerCircuitFor(disclosureSubproofs.length);
+
+  const prover = getNoirProver();
+  const requests = [...baseSubproofs, ...disclosureSubproofs];
+  const results: SubproofResult[] = [];
+  for (const request of requests) {
+    results.push(await proveSubcircuit(request, options));
+    options.onProgress?.(request.circuit, results.length, requests.length + 1);
+  }
+
+  const outerBytecodePath = await fetchZkAsset(outer.bytecodeHash, options.gatewayUrl);
+  const outerWitness = await prover.execute(outerBytecodePath, {
+    ...outer.inputs,
+    csc_to_dsc_proof: toOuterSubproofInput(results[0]),
+    dsc_to_id_data_proof: toOuterSubproofInput(results[1]),
+    integrity_check_proof: toOuterSubproofInput(results[2]),
+    disclosure_proofs: results.slice(3).map(toOuterSubproofInput),
+  });
+  const outerProof = await prover.prove(outerBytecodePath, outerWitness, 'evm');
+  options.onProgress?.(`main/outer/count_${outerCount}`, requests.length + 1, requests.length + 1);
+
+  return {
+    zkProof: encodeUltraHonkProof(outerProof.proof, { outerCount, variant: 'zk' }),
+    publicInputs: splitPublicInputs(outerProof.publicInputs),
+    outerCount,
+  };
+}
+
+/**
+ * Shapes a subproof for the outer circuit's `CSCtoDSCProof`/`DSCtoIDDataProof`/
+ * `IntegrityCheckProof`/`DisclosureProof` struct fields.
+ *
+ * `key_hash`, `tree_index` and `tree_hash_path` are deliberately absent: they are the
+ * subproof's position in the on-chain circuit-registry Merkle tree, which is chain
+ * configuration rather than proving output, and belong in `OuterProofInputs.inputs`.
+ * Filling them in with placeholders here would hide a missing input behind a proof that
+ * simply fails.
+ */
+function toOuterSubproofInput(result: SubproofResult): Record<string, unknown> {
+  return {
+    proof: result.proof,
+    vkey: result.verificationKey,
+    public_inputs: result.publicInputs,
   };
 }

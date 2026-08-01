@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "query",
+    "anchor",
+    "disclosure",
+    "migrate",
+    "lib/identity-anchor",
+]
+default-member = "anchor"

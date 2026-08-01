@@ -1,0 +1,3 @@
+# nargo/bb build output — ACIR artifacts, witnesses, proofs and verification keys are all
+# reproducible from source via the commands in README.md, so none of them are committed.
+target/

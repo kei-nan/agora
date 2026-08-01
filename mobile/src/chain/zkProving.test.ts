@@ -1,0 +1,214 @@
+/**
+ * Tests the ZKPassport proving-pipeline orchestration against a fake `NoirProver`.
+ *
+ * No real prover exists (no Noir native module is built yet — see `zkProving.ts`'s module
+ * doc), so what is testable is the orchestration itself: that the pipeline proves the
+ * subproofs in the order the outer circuit consumes them, uses the recursion-friendly
+ * target for subproofs and the EVM target for the outer proof, derives the right
+ * `count_N` variant, and hands back an envelope `runtime/src/verifier.rs` will parse.
+ *
+ * Those are exactly the things that are easy to get quietly wrong and produce proofs that
+ * fail with no useful diagnostic.
+ */
+import { decodeUltraHonkProof } from './proofEncoding';
+import {
+  BASE_SUBPROOF_CIRCUITS,
+  NoirProver,
+  NoirProverUnavailableError,
+  outerCircuitFor,
+  proveRegistration,
+  ProvingTarget,
+  setNoirProver,
+  SubproofRequest,
+} from './zkProving';
+
+jest.mock('react-native-fs', () => ({
+  CachesDirectoryPath: '/tmp/caches',
+  exists: jest.fn(async () => true),
+  mkdir: jest.fn(async () => undefined),
+  moveFile: jest.fn(async () => undefined),
+  unlink: jest.fn(async () => undefined),
+  downloadFile: jest.fn(() => ({ promise: Promise.resolve({ statusCode: 200 }) })),
+}));
+
+/** A 32-byte content hash, hex, distinct per circuit so the fetch path is identifiable. */
+function assetHash(seed: number): string {
+  return seed.toString(16).padStart(2, '0').repeat(32);
+}
+
+function request(circuit: string, seed: number): SubproofRequest {
+  return { circuit, bytecodeHash: assetHash(seed), inputs: { seed } };
+}
+
+interface ProveCall {
+  bytecodePath: string;
+  target: ProvingTarget;
+}
+
+/**
+ * A prover that records what it was asked to do and returns well-formed dummy artifacts.
+ * Proof lengths are multiples of 32 so the envelope encoder accepts them, as real bb
+ * output would be.
+ */
+function fakeProver(): { prover: NoirProver; proveCalls: ProveCall[]; executeCalls: string[] } {
+  const proveCalls: ProveCall[] = [];
+  const executeCalls: string[] = [];
+  const prover: NoirProver = {
+    async execute(bytecodePath, _inputs) {
+      executeCalls.push(bytecodePath);
+      return new Uint8Array([1, 2, 3]);
+    },
+    async prove(bytecodePath, _witness, target) {
+      proveCalls.push({ bytecodePath, target });
+      const publicInputs = new Uint8Array(32 * 9); // count_4's 9 public inputs
+      publicInputs[32 * 7 + 31] = 1; // non-zero scoped_nullifier
+      return {
+        proof: new Uint8Array(32 * 142).fill(0xcd),
+        publicInputs,
+        verificationKey: new Uint8Array(1888),
+      };
+    },
+  };
+  return { prover, proveCalls, executeCalls };
+}
+
+const baseRequests = [
+  request('sig-check/dsc/tbs_1000/rsa/pkcs/2048/sha256', 1),
+  request('sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256', 2),
+  request('data-check/integrity/sa_sha256/dg_sha256', 3),
+];
+
+afterEach(() => setNoirProver(null));
+
+describe('outerCircuitFor', () => {
+  it('counts the three base subproofs alongside the disclosures', () => {
+    expect(outerCircuitFor(1)).toEqual({ path: 'main/outer/count_4', outerCount: 4 });
+    expect(outerCircuitFor(2)).toEqual({ path: 'main/outer/count_5', outerCount: 5 });
+    expect(outerCircuitFor(10)).toEqual({ path: 'main/outer/count_13', outerCount: 13 });
+  });
+
+  it('rejects a disclosure count ZKPassport has no outer circuit for', () => {
+    expect(() => outerCircuitFor(0)).toThrow(RangeError);
+    expect(() => outerCircuitFor(11)).toThrow(RangeError);
+  });
+});
+
+describe('proveRegistration', () => {
+  it('fails loudly when no prover is registered', async () => {
+    setNoirProver(null);
+    await expect(
+      proveRegistration(baseRequests, [request('disclose/bytes', 4)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(NoirProverUnavailableError);
+  });
+
+  it('proves subproofs recursively and the outer proof for the EVM', async () => {
+    const { prover, proveCalls } = fakeProver();
+    setNoirProver(prover);
+
+    await proveRegistration(baseRequests, [request('disclose/bytes', 4)], {
+      bytecodeHash: assetHash(9),
+      inputs: {},
+    });
+
+    // 3 base + 1 disclosure + 1 outer.
+    expect(proveCalls).toHaveLength(5);
+    expect(proveCalls.slice(0, 4).map((c) => c.target)).toEqual([
+      'noir-recursive',
+      'noir-recursive',
+      'noir-recursive',
+      'noir-recursive',
+    ]);
+    // Only the outer proof is verified on-chain, so only it uses the keccak/EVM target.
+    expect(proveCalls[4].target).toBe('evm');
+  });
+
+  it('produces an envelope the runtime verifier will parse', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const result = await proveRegistration(baseRequests, [request('disclose/bytes', 4)], {
+      bytecodeHash: assetHash(9),
+      inputs: {},
+    });
+
+    expect(result.outerCount).toBe(4);
+    const decoded = decodeUltraHonkProof(result.zkProof);
+    expect(decoded.header).toEqual({ outerCount: 4, variant: 'zk', proofLength: 32 * 142 });
+    expect(result.publicInputs).toHaveLength(9);
+    expect(result.publicInputs.every((value) => value.length === 32)).toBe(true);
+  });
+
+  it('picks count_5 when two attributes are disclosed', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const result = await proveRegistration(
+      baseRequests,
+      [request('disclose/bytes', 4), request('compare/age', 5)],
+      { bytecodeHash: assetHash(9), inputs: {} },
+    );
+    expect(result.outerCount).toBe(5);
+    expect(decodeUltraHonkProof(result.zkProof).header.outerCount).toBe(5);
+  });
+
+  it('rejects base subproofs given in the wrong order', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const swapped = [baseRequests[1], baseRequests[0], baseRequests[2]];
+    await expect(
+      proveRegistration(swapped, [request('disclose/bytes', 4)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(/order matters/);
+  });
+
+  it('rejects a missing base subproof', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    await expect(
+      proveRegistration(baseRequests.slice(0, 2), [request('disclose/bytes', 4)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it('reports progress once per subproof plus once for the outer proof', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const stages: string[] = [];
+    await proveRegistration(
+      baseRequests,
+      [request('disclose/bytes', 4)],
+      { bytecodeHash: assetHash(9), inputs: {} },
+      { onProgress: (stage) => stages.push(stage) },
+    );
+
+    expect(stages).toEqual([
+      'sig-check/dsc/tbs_1000/rsa/pkcs/2048/sha256',
+      'sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256',
+      'data-check/integrity/sa_sha256/dg_sha256',
+      'disclose/bytes',
+      'main/outer/count_4',
+    ]);
+  });
+});
+
+describe('BASE_SUBPROOF_CIRCUITS', () => {
+  it('is the order the outer circuit takes them in', () => {
+    // main/outer/count_N's signature: csc_to_dsc_proof, dsc_to_id_data_proof,
+    // integrity_check_proof, disclosure_proofs.
+    expect(BASE_SUBPROOF_CIRCUITS).toEqual([
+      'sig-check/dsc',
+      'sig-check/id-data',
+      'data-check/integrity',
+    ]);
+  });
+});

@@ -35,16 +35,19 @@ democracy-chain/
 ├── node/                          # chain binary (agora-node)
 ├── runtime/                       # WASM runtime (agora-runtime) — all 11 pallets wired in
 │   ├── assets/
-│   │   ├── vk_sha256.bin          # REAL VK — Rarimo registerIdentity_11_256 (424 bytes)
-│   │   └── vk_sha1.bin            # REAL VK — Rarimo registerIdentity_20_160 (424 bytes)
+│   │   ├── vk_zkpassport_outer_count_4.bin  # ZKPassport outer VK — real, 1888 bytes (log #71); pairing backend still stubbed
+│   │   ├── vk_sha256.bin          # STALE — Rarimo Groth16 VK, referenced by nothing since #70
+│   │   └── vk_sha1.bin            # STALE — ditto
 │   └── src/
 │       ├── configs/mod.rs         # all pallet Config impls + cross-pallet trait wiring
 │       ├── lib.rs                 # runtime construction (construct_runtime!)
-│       └── verifier.rs            # RarimoGroth16Verifier (gated behind !dev-mode)
+│       └── verifier.rs            # ZkPassportUltraHonkVerifier (!dev-mode) — fail-closed, see changelog #70
 ├── pallets/                       # see pallets/ below, one file per pallet
 ├── scripts/
-│   ├── convert_vk.py              # converts Rarimo snarkjs JSON VK → ark-serialize binary
+│   ├── convert_vk.py              # STALE — Rarimo snarkjs JSON VK → ark-serialize binary
 │   └── certificate-registry/      # builds our own DSC Merkle tree (see changelog #63) — off-chain only
+├── circuits/
+│   └── oprf-identity-anchor/      # forked ZKPassport OPRF circuits (Noir) — see changelog #69
 ├── mobile/                        # React Native + Android native project (android/ generated)
 ├── desktop/                       # Tauri 2 app — wired to real chain RPC + Claude AI agent
 ├── CLAUDE.md
@@ -64,7 +67,7 @@ Build is clean. Next available pallet index: **19**.
 | Mobile app (React Native) | [apps/mobile.md](apps/mobile.md) |
 | Remaining work, prioritized | [next-steps.md](next-steps.md) |
 | External docs/repos referenced throughout | [references.md](references.md) |
-| Historical "completed work" log (68 entries, chronological, append-only) | [changelog/](changelog/) — chunked by entry range, see below |
+| Historical "completed work" log (71 entries, chronological, append-only) | [changelog/](changelog/) — chunked by entry range, see below |
 
 ### Pallets (`pallets/`)
 
@@ -97,6 +100,8 @@ find a specific one, or jump straight to its range file:
 | 55–60 | [055-060.md](changelog/055-060.md) |
 | 61–64 | [061-064.md](changelog/061-064.md) |
 | 65–68 | [065-068.md](changelog/065-068.md) — ZKPassport migration decision + Sybil-resistance architecture |
+| 69–70 | [069-070.md](changelog/069-070.md) — forked ZKPassport OPRF circuits onto the MRZ personal-number field (`circuits/oprf-identity-anchor/`); reworked the passport verifier + mobile proving pipeline onto ZKPassport/UltraHonk (verifier is fail-closed — no Rust verifier handles bb 5.0.0 proofs yet) |
+| 71 | [071.md](changelog/071.md) — populated `runtime/assets/vk_zkpassport_outer_count_4.bin` with the real `count_4` VK (still fail-closed pending the pairing backend) |
 
 Quick lookup for a specific entry number:
 ```bash

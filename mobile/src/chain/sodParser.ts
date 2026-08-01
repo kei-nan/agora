@@ -1,42 +1,57 @@
 /**
- * Assembles `RegisterIdentityBuilder` circuit inputs from a passport's raw
- * DG1 / DG15 / SOD bytes (as read by ../native/nfcPassportReader.ts).
+ * Assembles ZKPassport circuit inputs from a passport's raw DG1 / DG15 / SOD bytes (as
+ * read by ../native/nfcPassportReader.ts).
  *
- * This is a TypeScript port of rarimo/passport-zk-circuits' `test/
- * process_passport.js` (MIT licensed) — the reference implementation for
- * turning a scanned passport into this exact circuit's input schema (see
- * that repo's README, "Register identity circuit inputs"). Ported (not
- * copied verbatim, unlike ./asn1.js) because the original is Node-specific
- * (`require('crypto')`, `fs`) and mixes input-building with file-writing;
- * every function below mirrors its namesake there field-for-field, with
- * three deliberate, disclosed departures from the original's behavior —
- * search "DEPARTURE" below for each one and why.
+ * # What changed when Rarimo was dropped, and what deliberately did not
  *
- * What this module does NOT produce, and why — both are real, unresolved
- * blockers, not oversights (see HANDOFF.md item 8):
+ * This file began as a TypeScript port of rarimo/passport-zk-circuits'
+ * `test/process_passport.js`. When the project replatformed onto ZKPassport (see
+ * `docs/project/changelog/065-068.md` entry 65), the question was whether it needed a
+ * rewrite. It did not, and the reason is worth stating: **the extraction was never
+ * Rarimo-specific.** Everything that walks the SOD — the ASN.1 tree helpers, the
+ * encapsulated-content and signed-attributes extraction, the RSA/ECDSA public key and
+ * signature extraction, DG15 Active Authentication parsing, the datagroup-hash offset
+ * search — reads the ICAO CMS SignedData structure the *passport* defines, which is the
+ * same structure whichever circuit vendor consumes it afterwards. All of it is unchanged,
+ * including the three disclosed DEPARTUREs from the reference script (search "DEPARTURE").
  *
- *  - `skIdentity`: the reference script derives this from the passport's
- *    own public SOD bytes (`hash(encapsulatedContent)`, truncated) — fine
- *    for generating deterministic *test* fixtures, but wrong for production:
- *    a secret derived entirely from data anyone can read off the chip isn't
- *    secret at all. The real identity secret must be generated locally
- *    on-device (e.g. a random field element) and persisted the same way
- *    ../native's signing key eventually will be — not attempted here.
- *  - `slaveMerkleRoot` / `slaveMerkleInclusionBranches`: these prove the
- *    passport's signing certificate is ICAO-trusted, against Rarimo's own
- *    `CertificatesSMT` registry (a live Sparse Merkle Tree on their zkRollup
- *    — see docs.rarimo.com/zk-passport/contracts). No documented client API
- *    for reading a proof from it was found; getting one requires the same
- *    kind of source-level research HANDOFF log #57 did for NFC reading, not
- *    yet done. `buildCircuitInputs` below takes these as caller-supplied
- *    parameters for exactly this reason.
+ * What was genuinely Rarimo-specific was the *encoding* of the result, and that is
+ * entirely replaced:
  *
- * Also not produced: which prebuilt circuit variant (proving key / `.wcd`
- * graph / VK) this passport needs. `circuitVariant` below identifies it
- * (mirrors the original's `old_naming_convention` string), but whether a
- * matching prebuilt asset actually exists anywhere is a separate, unverified
- * question — passport-zk-circuits only ships prebuilt bundles for the
- * variant combinations Rarimo has actually encountered.
+ *  - `padBits` (SHA Merkle-Damgard padding flattened into a bit array of '0'/'1'
+ *    strings) -> `padToFixedLength`. ZKPassport's Noir circuits take fixed-length **byte**
+ *    arrays and do their own padding in-circuit.
+ *  - `bigintToArrayString` (little-endian 64/66-bit limbs as decimal strings, circom's
+ *    `bigIntFunc.circom` convention) -> `bigintToBeBytes`. `noir-bignum` takes plain
+ *    big-endian byte arrays.
+ *  - `getSigType` (Rarimo's hand-maintained SIGNATURE_TYPE integer table) ->
+ *    `classifySignatureAlgorithm`, which returns a ZKPassport circuit *path*, because
+ *    ZKPassport ships a directory tree of small circuits rather than one monolithic
+ *    `registerIdentity_*` per parameter combination.
+ *  - `extractTbsCertificate` is new. ZKPassport's `sig-check` circuits take the Document
+ *    Signer Certificate's raw TBSCertificate DER and authenticate the DSC public key
+ *    against it in-circuit; Rarimo's circuit trusted that key unauthenticated.
+ *
+ * # What this module still does NOT produce, and why
+ *
+ * These are real, unstarted work rather than oversights, and `ParsedPassport.unresolved`
+ * names each one so a caller cannot quietly forget it:
+ *
+ *  - **The CSC (country signing) certificate and its Barrett-reduction parameters**, which
+ *    `sig-check/dsc` needs to check that the DSC was genuinely signed by a trusted country
+ *    root. That comes from the certificate registry, not from the passport chip.
+ *    `certificateTree.ts` and `scripts/certificate-registry/` already build that registry
+ *    (changelog entry 66), but nothing wires the two together yet.
+ *  - **The commitment-chain salts** each subproof consumes (`salt_in`/`salt_out`). These
+ *    must be freshly random per proof and generated on-device — deriving them from
+ *    passport bytes, as the Rarimo reference script did for `skIdentity`, would make them
+ *    not secret at all.
+ *  - **`service_scope` / `service_subscope`**, which are chain-level constants, not
+ *    passport data.
+ *
+ * ZKPassport also has no Active Authentication circuit today, so DG15 is parsed
+ * (`ParsedPassport.activeAuthentication`) but unused — kept because the parsing is correct
+ * and re-deriving it later would be wasted work.
  */
 import { Buffer } from 'buffer';
 import { sha256, sha384, sha512 } from '@noble/hashes/sha2';
@@ -134,72 +149,89 @@ export function computeHash(outLen: HashOutLen, input: Uint8Array): Uint8Array {
 }
 
 // ---------------------------------------------------------------------------
-// SHA padding (mirrors process_passport.js's `padding`)
+// Fixed-length byte packing (ZKPassport's Noir circuits take bytes, not bits)
 // ---------------------------------------------------------------------------
 
 /**
- * Pads `bytes` per the SHA Merkle-Damgard scheme (append 0x80, zero-pad,
- * append the bit-length as a big-endian integer) so the circuit can hash it
- * with a fixed-size, block-count-parameterized SHA template instead of
- * parsing/measuring the message itself (see passport-zk-circuits' README,
- * "Padded data hashing").
+ * REPLACES the Rarimo-era `padBits`. That function produced SHA Merkle-Damgard
+ * padding flattened into an array of '0'/'1' *strings* — the circom convention, where
+ * the circuit hashes a pre-padded, pre-measured bit array with a fixed block count.
  *
- * DEPARTURE from the original: `process_passport.js` computes this by
- * building a padded *hex string*, round-tripping it through `BigInt(...).
- * toString(2)`, then patching the front back up with zeros to fix the
- * leading zero bits `BigInt`'s binary conversion silently drops. That patch
- * is necessary *because* of the BigInt round-trip, not because of anything
- * about SHA padding itself. This builds the bit array directly from the
- * padded bytes (each byte -> 8 MSB-first '0'/'1' chars), which can't lose
- * leading zeros in the first place — same output, no patch-up needed. A
- * unit test below checks a known SHA-256 padding vector byte-for-byte
- * against this implementation.
+ * ZKPassport's Noir circuits do neither. They take raw fixed-length **byte** arrays
+ * (`DG1Data = [u8; 95]`, `EContentData = [u8; 700]`, `SignedAttrsData = [u8; 256]` —
+ * `src/noir/lib/utils/src/types.nr`) and recover the real length in-circuit by parsing
+ * the ASN.1 header (`unsafe_get_asn1_element_length`), then do their own SHA padding
+ * (`sha256_and_check_data_to_sign(signed_attributes, signed_attributes_size)`).
+ *
+ * So the mobile side's job is much simpler than it was: right-pad with zeros to the
+ * circuit's fixed array size. Nothing else.
  */
-export function padBits(bytes: Uint8Array, blockSizeBits: 512 | 1024): string[] {
-  const blockSizeBytes = blockSizeBits / 8;
-  const lengthSizeBytes = blockSizeBits === 512 ? 8 : 16;
 
-  const totalLenWith1AndLength = bytes.length + 1 + lengthSizeBytes;
-  const paddingLen = (blockSizeBytes - (totalLenWith1AndLength % blockSizeBytes)) % blockSizeBytes;
-  const totalLen = bytes.length + 1 + paddingLen + lengthSizeBytes;
+/** `DG1_LENGTH` — `src/noir/lib/utils/src/constants.nr`. Sized for the longer ID-card MRZ; passports use 93 of the 95 bytes. */
+export const DG1_LENGTH = 95;
 
-  const padded = new Uint8Array(totalLen);
-  padded.set(bytes, 0);
-  padded[bytes.length] = 0x80;
-  // Remaining padding bytes are already zero (Uint8Array default-initializes).
+/** `ECONTENT_LENGTH` — `src/noir/lib/utils/src/constants.nr`. */
+export const ECONTENT_LENGTH = 700;
 
-  const bitLen = BigInt(bytes.length) * 8n;
-  let tmp = bitLen;
-  for (let i = 0; i < lengthSizeBytes; i++) {
-    padded[totalLen - 1 - i] = Number(tmp & 0xffn);
-    tmp >>= 8n;
+/** `SIGNED_ATTRS_LENGTH` — `src/noir/lib/utils/src/constants.nr`. */
+export const SIGNED_ATTRS_LENGTH = 256;
+
+/**
+ * Right-pads `bytes` with zeros to exactly `length`, the way a Noir `[u8; length]`
+ * parameter needs. Throws rather than truncating if the data is already too long — a
+ * silently truncated e-content would produce a proof that simply never verifies, with
+ * nothing to point at.
+ */
+export function padToFixedLength(bytes: Uint8Array, length: number, what: string): Uint8Array {
+  if (bytes.length > length) {
+    throw new RangeError(
+      `padToFixedLength: ${what} is ${bytes.length} bytes, longer than the circuit's ${length}-byte array`,
+    );
   }
-
-  const bits: string[] = new Array(totalLen * 8);
-  for (let i = 0; i < totalLen; i++) {
-    const byte = padded[i];
-    for (let b = 0; b < 8; b++) {
-      bits[i * 8 + b] = ((byte >> (7 - b)) & 1).toString();
-    }
-  }
-  return bits;
+  const out = new Uint8Array(length);
+  out.set(bytes, 0);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
-// Big-integer <-> circuit-limb conversion (mirrors bigintToArrayString)
+// Big-integer -> fixed-width big-endian bytes
 // ---------------------------------------------------------------------------
 
-/** Splits `x` into `k` little-endian limbs of `n` bits each, as decimal strings — the `bigIntFunc.circom` chunked representation. */
-export function bigintToArrayString(n: number, k: number, x: bigint): string[] {
-  const mod = 1n << BigInt(n);
-  const result: string[] = [];
+/**
+ * REPLACES the Rarimo-era `bigintToArrayString`, which split a big integer into
+ * little-endian 64/66-bit limbs as decimal strings (circom's `bigIntFunc.circom`
+ * representation).
+ *
+ * ZKPassport uses `noir-bignum`, whose RSA/ECDSA circuits take plain **big-endian byte
+ * arrays** of a fixed width (`csc_pubkey: [u8; 384]`, `sod_signature: [u8; 128]`,
+ * `dsc_pubkey_x: [u8; 64]`). No limb splitting, no decimal strings.
+ */
+export function bigintToBeBytes(x: bigint, byteLength: number): Uint8Array {
+  if (x < 0n) {
+    throw new RangeError(`bigintToBeBytes: value must be non-negative, got ${x}`);
+  }
+  const out = new Uint8Array(byteLength);
   let rem = x;
-  for (let i = 0; i < k; i++) {
-    result.push((rem % mod).toString(10));
-    rem /= mod;
+  for (let i = byteLength - 1; i >= 0; i--) {
+    out[i] = Number(rem & 0xffn);
+    rem >>= 8n;
   }
-  return result;
+  if (rem !== 0n) {
+    throw new RangeError(`bigintToBeBytes: value does not fit in ${byteLength} bytes`);
+  }
+  return out;
 }
+
+/**
+ * Same, from a hex string. Left-pads to `byteLength`, which matters: `BigInt(...)`
+ * round-trips in this file's ancestry have lost leading zero bytes before (see
+ * `certificateTree.ts`'s notes on the same hazard), and a pubkey missing its leading
+ * zero byte is a pubkey the circuit will reject.
+ */
+export function hexToBeBytes(hex: string, byteLength: number): Uint8Array {
+  return bigintToBeBytes(BigInt('0x' + hex), byteLength);
+}
+
 
 // ---------------------------------------------------------------------------
 // Public key / signature shapes extracted from the SOD
@@ -471,54 +503,196 @@ function extractFromDg15(dg15: Uint8Array): Dg15Info | null {
 }
 
 // ---------------------------------------------------------------------------
-// Signature type classification (mirrors getSigType)
+// ZKPassport circuit selection (REPLACES Rarimo's getSigType / SIGNATURE_TYPE)
+// ---------------------------------------------------------------------------
+//
+// Rarimo compiled one monolithic `registerIdentity_<sigType>_...` circuit per parameter
+// combination, and `getSigType` mapped a passport onto a small integer in its own
+// hand-maintained SIGNATURE_TYPE table. ZKPassport instead ships a directory tree of
+// small circuits, selected by a path — see `src/noir/bin/` in the circuits repo. These
+// helpers produce those paths. The names below are the real directory names, checked
+// against the repo at `d3a75ac`, not invented.
+
+/** Hash algorithms ZKPassport's circuits are built for. */
+export type HashAlgorithm = 'sha1' | 'sha224' | 'sha256' | 'sha384' | 'sha512';
+
+/** TBSCertificate size buckets ZKPassport compiles `sig-check` circuits for. */
+export type TbsBucket = 700 | 1000 | 1200 | 1600;
+
+const TBS_BUCKETS: TbsBucket[] = [700, 1000, 1200, 1600];
+
+/** Maps a digest length in bytes onto its algorithm name. */
+export function hashAlgorithmFor(digestLength: number, what: string): HashAlgorithm {
+  switch (digestLength) {
+    case 20:
+      return 'sha1';
+    case 28:
+      return 'sha224';
+    case 32:
+      return 'sha256';
+    case 48:
+      return 'sha384';
+    case 64:
+      return 'sha512';
+    default:
+      throw new Error(`hashAlgorithmFor: no ZKPassport circuit for a ${digestLength}-byte ${what} digest`);
+  }
+}
+
+/**
+ * Smallest `tbs_N` bucket that fits a DER TBSCertificate of `length` bytes. Picking the
+ * smallest is not just tidiness: it is the cheapest circuit that can hold the data, and
+ * an oversized bucket means proving a much larger circuit for no benefit.
+ */
+export function tbsBucketFor(length: number): TbsBucket {
+  const bucket = TBS_BUCKETS.find((candidate) => length <= candidate);
+  if (bucket === undefined) {
+    throw new Error(
+      `tbsBucketFor: TBSCertificate is ${length} bytes; ZKPassport's largest bucket is tbs_${TBS_BUCKETS[TBS_BUCKETS.length - 1]}`,
+    );
+  }
+  return bucket;
+}
+
+/** The signature-algorithm half of a `sig-check` circuit path. */
+export interface SignatureAlgorithm {
+  kind: 'rsa' | 'ecdsa';
+  /** Path fragment under `sig-check/*\/tbs_N/`, e.g. `rsa/pkcs/2048/sha256` or `ecdsa/nist/p256/sha256`. */
+  path: string;
+  /**
+   * Width, in bytes, of one big-endian value for this algorithm: the RSA modulus, or one
+   * ECDSA coordinate. An ECDSA signature is two of these; an RSA signature is one.
+   */
+  byteWidth: number;
+}
+
+/** RSA modulus sizes ZKPassport compiles circuits for, in bits. */
+const RSA_KEY_BITS = [1024, 2048, 3072, 4096];
+
+/**
+ * Named curves, keyed by the curve's `a` parameter as this parser extracts it
+ * (`EcdsaPubkey.param`). Values are ZKPassport's own directory names.
+ *
+ * Carried over from the Rarimo-era `getSigType` table, which recognised these same
+ * parameters — the curve identification was never vendor-specific, only the integer it
+ * mapped to was.
+ */
+const CURVE_BY_PARAM: Record<string, { path: string; byteWidth: number }> = {
+  FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC: { path: 'nist/p256', byteWidth: 32 },
+  FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFE: { path: 'nist/p224', byteWidth: 28 },
+  '7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9': { path: 'brainpool/256r1', byteWidth: 32 },
+  '7BC382C63D8C150C3C72080ACE05AFA0C2BEA28E4FB22787139165EFBA91F90F8AA5814A503AD4EB04A8C7DD22CE2826': {
+    path: 'brainpool/384r1',
+    byteWidth: 48,
+  },
+  '7830A3318B603B89E2327145AC234CC594CBDD8D3DF91610A83441CAEA9863BC2DED5D5AA8253AA10A2EF1C98B9AC8B57F1117A72BF2C7B9E7C1AC4D77FC94CA': {
+    path: 'brainpool/512r1',
+    byteWidth: 64,
+  },
+};
+
+/**
+ * Picks the ZKPassport `sig-check` circuit path for a passport's signature algorithm.
+ *
+ * REPLACES `getSigType`. The classification inputs are the same (key size, exponent, PSS
+ * salt presence, curve parameter); only the output changed, from Rarimo's SIGNATURE_TYPE
+ * integer to a circuit path.
+ */
+export function classifySignatureAlgorithm(
+  pubkey: Pubkey,
+  signature: Signature,
+  hash: HashAlgorithm,
+): SignatureAlgorithm {
+  if (pubkey.kind === 'rsa' && signature.kind === 'rsa') {
+    // `RsaPubkey.n` is a hex string, so 4 bits per character.
+    const bits = pubkey.n.length * 4;
+    if (!RSA_KEY_BITS.includes(bits)) {
+      throw new Error(`classifySignatureAlgorithm: no ZKPassport circuit for a ${bits}-bit RSA key`);
+    }
+    // A non-zero PSS salt length is what distinguishes RSASSA-PSS from PKCS#1 v1.5 here;
+    // `extractSignature` already reads it off the signature's algorithm parameters.
+    const padding = signature.salt ? 'pss' : 'pkcs';
+    return { kind: 'rsa', path: `rsa/${padding}/${bits}/${hash}`, byteWidth: bits / 8 };
+  }
+
+  if (pubkey.kind === 'ecdsa' && signature.kind === 'ecdsa') {
+    const curve = CURVE_BY_PARAM[pubkey.param.toUpperCase()];
+    if (curve === undefined) {
+      throw new Error(
+        `classifySignatureAlgorithm: unrecognized ECDSA curve parameter ${pubkey.param} — add it to CURVE_BY_PARAM if ZKPassport ships a circuit for it`,
+      );
+    }
+    return { kind: 'ecdsa', path: `ecdsa/${curve.path}/${hash}`, byteWidth: curve.byteWidth };
+  }
+
+  throw new Error(
+    `classifySignatureAlgorithm: pubkey (${pubkey.kind}) and signature (${signature.kind}) algorithms disagree`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DSC certificate extraction (NEW — ZKPassport needs the raw TBSCertificate)
 // ---------------------------------------------------------------------------
 
-// SIGNATURE_TYPE, per passport-zk-circuits:
-//   1: RSA 2048 + SHA2-256, e=65537        2: RSA 4096 + SHA2-256, e=65537
-//   3: RSA 2048 + SHA1, e=65537
-//  10: RSASSA-PSS 2048 MGF1(SHA256) e=3  salt=32     11: e=65537 salt=32
-//  12: RSASSA-PSS 2048 MGF1(SHA256) e=65537 salt=64  13: MGF1(SHA384) salt=48
-//  14: RSASSA-PSS 3072 MGF1(SHA256) e=65537 salt=32
-//  20: ECDSA secp256r1     21: ECDSA brainpoolP256r1
-//  22: ECDSA brainpoolP320r1   23: ECDSA secp192r1
-export function getSigType(pk: Pubkey, sig: Signature, hashType: number): number {
-  if (pk.kind === 'rsa' && sig.kind === 'rsa') {
-    if (sig.salt) {
-      const salt = String(sig.salt);
-      const hash = String(hashType);
-      if (pk.n.length === 512 && pk.exp === '3' && salt === '32' && hash === '32') return 10;
-      if (pk.n.length === 512 && pk.exp === '10001' && salt === '32' && hash === '32') return 11;
-      if (pk.n.length === 512 && pk.exp === '10001' && salt === '64' && hash === '32') return 12;
-      if (pk.n.length === 512 && pk.exp === '10001' && salt === '48' && hash === '48') return 13;
-      if (pk.n.length === 768 && pk.exp === '10001' && salt === '32' && hash === '32') return 14;
-    }
-    if (sig.salt === 0) {
-      if (pk.n.length === 512 && pk.exp === '10001' && hashType === 32) return 1;
-      if (pk.n.length === 1024 && pk.exp === '10001' && hashType === 32) return 2;
-      if (pk.n.length === 512 && pk.exp === '10001' && hashType === 20) return 3;
-    }
+/**
+ * Pulls the Document Signer Certificate's `TBSCertificate` DER out of the SOD's CMS
+ * `certificates` field.
+ *
+ * NEW relative to the Rarimo parser, which never needed it: ZKPassport's `sig-check`
+ * circuits take `tbs_certificate: [u8; N]` and verify in-circuit both that the CSC signed
+ * it (`sig-check/dsc`) and that the DSC public key used for the SOD signature really is
+ * the one inside it (`verify_ecdsa_pubkey_in_tbs` / `verify_rsa_pubkey_in_tbs` in
+ * `sig-check/id-data`). Without it the DSC public key would be unauthenticated.
+ *
+ * The TBSCertificate is the first element of the `Certificate` SEQUENCE (RFC 5280
+ * `Certificate ::= SEQUENCE { tbsCertificate TBSCertificate, signatureAlgorithm .., signatureValue .. }`),
+ * and is passed to the circuit as its full tag-length-value DER, since the circuit
+ * re-parses its ASN.1 header to recover the real length.
+ */
+export function extractTbsCertificate(sod: Asn1Node): Uint8Array {
+  const certificate = findCertificate(sod);
+  if (certificate === null) {
+    throw new Error(
+      'extractTbsCertificate: no X.509 certificate found in the SOD — this SOD omits the Document Signer Certificate, so ZKPassport cannot authenticate its public key',
+    );
   }
-  if (pk.kind === 'ecdsa' && sig.kind === 'ecdsa') {
-    switch (pk.param) {
-      case '7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9':
-        return 21; // brainpoolP256r1
-      case 'FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC':
-        return 20; // secp256r1
-      case 'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFE':
-        return 24; // secp224r1
-      case '7BC382C63D8C150C3C72080ACE05AFA0C2BEA28E4FB22787139165EFBA91F90F8AA5814A503AD4EB04A8C7DD22CE2826':
-        return 25; // brainpoolP384r1
-      case '7830A3318B603B89E2327145AC234CC594CBDD8D3DF91610A83441CAEA9863BC2DED5D5AA8253AA10A2EF1C98B9AC8B57F1117A72BF2C7B9E7C1AC4D77FC94CA':
-        return 26; // brainpoolP512r1
-      case 'secp521r1':
-        return 27;
-      default:
-        return 0;
-    }
+  const tbs = certificate.sub?.[0];
+  if (tbs === undefined) {
+    throw new Error('extractTbsCertificate: certificate SEQUENCE has no TBSCertificate element');
   }
-  return 0;
+  return hexToBytes(tbs.dump);
 }
+
+/**
+ * Finds the X.509 `Certificate` SEQUENCE inside the SOD tree, by shape rather than by
+ * position — the same strategy the rest of this file uses for the SOD's other elements,
+ * and for the same reason: real SODs vary in exactly which optional CMS fields are
+ * present, so index-based paths are brittle.
+ *
+ * A `Certificate` is recognised as a SEQUENCE of exactly 3 children whose first child is
+ * itself a SEQUENCE containing an explicit `[0]` version tag or an INTEGER serial number,
+ * followed by an AlgorithmIdentifier SEQUENCE and a BIT STRING signature.
+ */
+function findCertificate(node: Asn1Node): Asn1Node | null {
+  const children = node.sub ?? [];
+  if (node.name === 'SEQUENCE' && children.length === 3) {
+    const [tbs, algorithm, signatureValue] = children;
+    if (
+      tbs.name === 'SEQUENCE' &&
+      (tbs.sub?.length ?? 0) >= 6 &&
+      algorithm.name === 'SEQUENCE' &&
+      signatureValue.name === 'BIT_STRING'
+    ) {
+      return node;
+    }
+  }
+  for (const child of children) {
+    const found = findCertificate(child);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
 
 // ---------------------------------------------------------------------------
 // Shift computation (mirrors getDg1Shift / getDg15Shift / getEcShift)
@@ -540,85 +714,117 @@ function hexShift(haystackHex: string, needle: Uint8Array, what: string): number
 }
 
 // ---------------------------------------------------------------------------
-// RSA/ECDSA limb chunking (mirrors getChunkedParams)
+// Top-level assembly — ZKPassport circuit inputs
 // ---------------------------------------------------------------------------
 
-interface ChunkedParams {
-  ecFieldSize: number;
-  chunkNumber: number;
-  pkChunked: string[];
-  sigChunked: string[];
-}
-
-const reHexOnly = /^[0-9A-Fa-f]+$/;
-
-function getChunkedParams(pk: Pubkey, sig: Signature): ChunkedParams {
-  const ecFieldSize =
-    pk.kind === 'ecdsa'
-      ? reHexOnly.test(pk.param)
-        ? pk.param.length * 4
-        : (pk.param.match(/\d+/)?.[0] && parseInt(pk.param.match(/\d+/)![0], 10)) || 0
-      : 0;
-  const rawChunkNumber = pk.kind === 'ecdsa' ? Math.ceil(pk.x.length / 16) : Math.ceil(pk.n.length / 16);
-  const chunkSize = ecFieldSize > 512 ? 66 : 64;
-  const chunkNumber = ecFieldSize !== 0 ? rawChunkNumber * 2 : rawChunkNumber;
-
-  const pkChunked =
-    pk.kind === 'ecdsa'
-      ? [...bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + pk.x)), ...bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + pk.y))]
-      : bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + pk.n));
-
-  const sigChunked =
-    sig.kind === 'ecdsa'
-      ? [...bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + sig.r)), ...bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + sig.s))]
-      : bigintToArrayString(chunkSize, rawChunkNumber, BigInt('0x' + sig.n));
-
-  return { ecFieldSize, chunkNumber, pkChunked, sigChunked };
-}
-
-// ---------------------------------------------------------------------------
-// Top-level assembly
-// ---------------------------------------------------------------------------
-
-/** Identifies exactly which `RegisterIdentityBuilder` instantiation this passport needs — the params `writeToCircom` compiles a concrete circuit with, and what a prebuilt-asset bundle (proving key / `.wcd` graph / VK) must be built for to match. */
+/**
+ * Identifies which ZKPassport circuits this passport needs. These are real directory
+ * paths under the circuits repo's `src/noir/bin/`, so a name here maps 1:1 onto a
+ * compiled artifact (and, eventually, onto a leaf of the on-chain `circuit_registry_root`
+ * tree the outer circuit checks each subproof's verification key against).
+ */
 export interface CircuitVariant {
-  sigAlgo: number;
-  /** Bits (not bytes) — matches writeToCircom's dg_hash_type*8 convention. */
-  dgHashTypeBits: number;
-  docType: 1 | 3;
-  ecBlocks: number;
-  ecShiftBits: number;
-  dg1ShiftBits: number;
-  dg15SigAlgo: number;
-  dg15ShiftBits: number;
-  dg15Blocks: number;
-  aaShiftBits: number;
-  /** Human-readable variant id, mirrors the original's `old_naming_convention`, e.g. `registerIdentity_11_256_3_2_336_216_NA`. */
+  /**
+   * Human-readable id for the whole variant — the `id-data` circuit path, which is the
+   * most specific of the three and uniquely determines the other two.
+   * e.g. `sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256`.
+   */
   name: string;
+  /** `sig-check/id-data/tbs_{bucket}/...` — DSC-signs-passport check. */
+  idDataCircuit: string;
+  /** `sig-check/dsc/tbs_{bucket}/...` — CSC-signs-DSC check. Same algorithm shape, different TBS. */
+  dscCircuit: string;
+  /** `data-check/integrity/sa_{hash}/dg_{hash}` — datagroup-hash integrity check. */
+  integrityCircuit: string;
+  /** The `tbs_N` size bucket the DSC's TBSCertificate falls into. */
+  tbsBucket: TbsBucket;
+  signature: SignatureAlgorithm;
+  /** Hash over `signedAttributes` (the SOD signature's message digest). */
+  signedAttrsHash: HashAlgorithm;
+  /** Hash over each datagroup, listed inside the encapsulated content. */
+  dataGroupHash: HashAlgorithm;
 }
 
-/** The `RegisterIdentityBuilder` circuit's inputs, minus `skIdentity` / `slaveMerkleRoot` / `slaveMerkleInclusionBranches` — see this module's doc comment for why those are the caller's responsibility. */
-export interface RegisterIdentityInputs {
-  dg1: string[];
-  dg15: string[];
-  encapsulatedContent: string[];
-  signedAttributes: string[];
-  pubkey: string[];
-  signature: string[];
+/**
+ * The `sig-check/id-data` circuit's inputs that are derivable from DG1/DG15/SOD alone.
+ *
+ * Byte arrays are already padded to the circuit's fixed sizes; `*Size` fields record the
+ * real length for cross-checking (the circuit re-derives them from the ASN.1 itself, so
+ * they are not passed in — they are here so a caller can assert the padding is right).
+ */
+export interface IdDataInputs {
+  /** `dg1: DG1Data` — `[u8; 95]`. */
+  dg1: Uint8Array;
+  dg1Size: number;
+  /** `signed_attributes: SignedAttrsData` — `[u8; 256]`. */
+  signedAttributes: Uint8Array;
+  signedAttributesSize: number;
+  /** `e_content: EContentData` — `[u8; 700]`. */
+  eContent: Uint8Array;
+  eContentSize: number;
+  /** `sod_signature` — raw big-endian bytes, width set by the key size. */
+  sodSignature: Uint8Array;
+  /** `tbs_certificate` — the DSC's TBSCertificate DER, padded to `tbsBucket`. */
+  tbsCertificate: Uint8Array;
+  tbsCertificateSize: number;
+  /** RSA: `dsc_pubkey` (the modulus). ECDSA: `dsc_pubkey_x`/`dsc_pubkey_y`. */
+  dscPubkey: DscPubkeyBytes;
+}
+
+/** The DSC public key, in whichever shape its algorithm's circuit takes. */
+export type DscPubkeyBytes =
+  | { kind: 'rsa'; modulus: Uint8Array; exponent: number }
+  | { kind: 'ecdsa'; x: Uint8Array; y: Uint8Array };
+
+/**
+ * The `data-check/integrity` circuit's positional inputs: where each hash sits inside the
+ * next structure up. Same values the Rarimo circuit called `dg1Shift`/`ecShift`, in bytes
+ * rather than bits — Noir indexes byte arrays, circom indexed bit arrays.
+ */
+export interface IntegrityInputs {
+  /** Offset of `SHA(dg1)` within the encapsulated content, in bytes. */
+  dg1HashOffset: number;
+  /** Offset of `SHA(eContent)` within the signed attributes, in bytes. */
+  eContentHashOffset: number;
+  /** Offset of `SHA(dg15)` within the encapsulated content, in bytes. `null` when the passport has no Active Authentication. */
+  dg15HashOffset: number | null;
+}
+
+/**
+ * Inputs ZKPassport's pipeline needs that **cannot** come from the passport chip, listed
+ * explicitly so a caller cannot forget one. Assembling these is separate, unstarted work
+ * (see the module doc comment).
+ */
+export interface UnresolvedInputs {
+  /** `sig-check/dsc` needs the CSC (country signing) certificate that signed this DSC, plus its `redc` params. Comes from the certificate registry, not the chip. */
+  cscCertificate: null;
+  /** The DSC's inclusion proof in the certificate registry tree — `certificateTree.ts` builds these, but wiring is not done. */
+  certificateTreeProof: null;
+  /** Per-subproof commitment-chain salts. Must be freshly random per proof, generated on-device. */
+  commitmentSalts: null;
+  /** `service_scope` / `service_subscope` — chain-level constants, not passport data. */
+  serviceScope: null;
 }
 
 export interface ParsedPassport {
   variant: CircuitVariant;
-  inputs: RegisterIdentityInputs;
+  idData: IdDataInputs;
+  integrity: IntegrityInputs;
+  /** Active Authentication key material, when DG15 is present. ZKPassport has no AA circuit today, so this is parsed but unused. */
+  activeAuthentication: Dg15Info | null;
+  unresolved: UnresolvedInputs;
 }
 
 /**
- * Builds `RegisterIdentityBuilder` circuit inputs from a passport's raw
- * DG1 / DG15 / SOD bytes. `dg15` may be an empty `Uint8Array` for passports
- * without Active Authentication — this produces an `_NA` variant with empty
- * `dg15`/AA fields, exactly like the `registerIdentity_*_NA` variants
- * upstream ships (this is also the case log #61 fixed a real
- * `circom-witnesscalc` bug for — see HANDOFF.md item 8).
+ * Builds ZKPassport circuit inputs from a passport's raw DG1 / DG15 / SOD bytes.
+ * `dg15` may be an empty `Uint8Array` for passports without Active Authentication.
+ *
+ * Everything above this function — the ASN.1 walk, the encapsulated-content and
+ * signed-attributes extraction, the RSA/ECDSA public key and signature extraction, the
+ * hash-offset search — is unchanged from the Rarimo-era parser, because it was never
+ * Rarimo-specific: it reads the ICAO CMS SignedData structure the passport itself
+ * defines. Only the encoding of the result changed (bits/limbs -> fixed-length bytes),
+ * and with it the variant naming.
  */
 export function buildCircuitInputs(dg1: Uint8Array, dg15: Uint8Array, sod: Uint8Array): ParsedPassport {
   const sodTree = decodeAsn1(sod);
@@ -628,91 +834,89 @@ export function buildCircuitInputs(dg1: Uint8Array, dg15: Uint8Array, sod: Uint8
   const { saHex, hashType } = extractSignedAttributes(sodTree);
   const saBytes = hexToBytes(saHex);
 
-  const dgHashBlockBits = dgHashType <= 32 ? 512 : 1024;
-  const hashBlockBits = hashType <= 32 ? 512 : 1024;
-
   const signature = extractSignature(sodTree);
   const pubkey = signature.kind === 'rsa' ? extractRsaPubkey(sodTree) : extractEcdsaPubkey(sodTree);
   if (pubkey.kind !== signature.kind) {
     throw new Error(`buildCircuitInputs: pubkey algorithm (${pubkey.kind}) doesn't match signature algorithm (${signature.kind})`);
   }
 
-  const sigType = getSigType(pubkey, signature, hashType);
-  if (sigType === 0) {
-    throw new Error('buildCircuitInputs: unrecognized signature/pubkey/hash combination — see getSigType\'s SIGNATURE_TYPE table');
-  }
+  const signedAttrsHash = hashAlgorithmFor(hashType, 'signedAttributes');
+  const dataGroupHash = hashAlgorithmFor(dgHashType, 'datagroup');
+  const sigAlgorithm = classifySignatureAlgorithm(pubkey, signature, signedAttrsHash);
 
-  const dg1ShiftBits = hexShift(ecHex, computeHash(dgHashType as HashOutLen, dg1), 'DG1') * 8;
-  const ecShiftBits = hexShift(saHex, computeHash(hashType as HashOutLen, ecBytes), 'encapsulated content') * 8;
-  // Offset of DG15's own hash within the encapsulated content — distinct
-  // from `aaShift` below (the offset of the AA public key *within DG15
-  // itself*); the original conflates neither, and an earlier draft of this
-  // port mistakenly did — kept as two separate values on purpose.
-  const dg15ShiftBits = dg15.length !== 0 ? hexShift(ecHex, computeHash(dgHashType as HashOutLen, dg15), 'DG15') * 8 : 0;
+  const tbsCertificateDer = extractTbsCertificate(sodTree);
+  const tbsBucket = tbsBucketFor(tbsCertificateDer.length);
 
-  const dg15Info = extractFromDg15(dg15);
+  const dg1HashOffset = hexShift(ecHex, computeHash(dgHashType as HashOutLen, dg1), 'DG1');
+  const eContentHashOffset = hexShift(saHex, computeHash(hashType as HashOutLen, ecBytes), 'encapsulated content');
+  const dg15HashOffset =
+    dg15.length !== 0 ? hexShift(ecHex, computeHash(dgHashType as HashOutLen, dg15), 'DG15') : null;
 
-  const chunked = getChunkedParams(pubkey, signature);
-
-  const docType: 1 | 3 = dg1.length === 93 ? 3 : 1;
-  const ecBlocks = hashType <= 32 ? Math.ceil((ecBytes.length + 8) / 64) : Math.ceil((ecBytes.length + 8) / 128);
-  const dg15Blocks = dg15.length !== 0 ? (dgHashType <= 32 ? Math.ceil((dg15.length + 8) / 64) : Math.ceil((dg15.length + 8) / 128)) : 0;
-
-  const aaShiftBits = dg15Info ? dg15Info.aaShift * 8 : 0;
-
-  // The *display name* built here is a separate, disclosed quirk from the
-  // real circuit params above: process_passport.js's own naming-string
-  // template re-multiplies the already-bit-converted `ec_shift`/`dg1_shift`
-  // by another `*8` (i.e. the name embeds shift-in-bits-treated-as-bytes-
-  // then-re-converted, not the actual bit shift), while its `writeToCircom`
-  // call — the thing that actually compiles a circuit — uses the correctly
-  // single-multiplied values, matching `ecShiftBits`/`dg1ShiftBits` above.
-  // Confirmed empirically against the unmodified reference script (see
-  // sodParser.test.ts) and independently already flagged in HANDOFF.md log
-  // #60 ("the release name's shift digits are not guaranteed to be
-  // literally identical to the constructor's raw shift arguments"). This
-  // reproduces the same doubling *only* in the name string, since matching
-  // Rarimo's actual published release-asset filenames (which use this same
-  // buggy convention, per log #60) is the whole point of computing a name —
-  // never use the digits inside `variant.name` as real shift values; use
-  // the `CircuitVariant` fields for that.
-  //
-  // The DG15-present branch below is NOT verified against a real DG15
-  // fixture (this module's test only covers an _NA/no-DG15 passport) — its
-  // `writeToCircom` call passes `aa_shift` raw (byte units, despite the
-  // reference's own comment there claiming "AA shift in bits"), a further
-  // inconsistency this port hasn't independently confirmed one way or the
-  // other. Treat `dg15SigAlgo`/`dg15ShiftBits`/`aaShiftBits` and this name's
-  // DG15 segment as unverified until checked against a real AA-bearing
-  // passport's reference output the same way the NA path was here.
-  const variantName = `registerIdentity_${sigType}_${dgHashType * 8}_${docType}_${ecBlocks}_${ecShiftBits * 8}_${dg1ShiftBits * 8}_${
-    dg15.length === 0 ? 'NA' : `${dg15Info!.aaSigType}_${dg15ShiftBits * 8}_${dg15Blocks}_${aaShiftBits}`
-  }`;
-
+  const idDataCircuit = `sig-check/id-data/tbs_${tbsBucket}/${sigAlgorithm.path}`;
   const variant: CircuitVariant = {
-    sigAlgo: sigType,
-    dgHashTypeBits: dgHashType * 8,
-    docType,
-    ecBlocks,
-    ecShiftBits,
-    dg1ShiftBits,
-    dg15SigAlgo: dg15Info?.aaSigType ?? 0,
-    dg15ShiftBits,
-    dg15Blocks,
-    aaShiftBits,
-    name: variantName,
+    name: idDataCircuit,
+    idDataCircuit,
+    dscCircuit: `sig-check/dsc/tbs_${tbsBucket}/${sigAlgorithm.path}`,
+    integrityCircuit: `data-check/integrity/sa_${signedAttrsHash}/dg_${dataGroupHash}`,
+    tbsBucket,
+    signature: sigAlgorithm,
+    signedAttrsHash,
+    dataGroupHash,
   };
 
-  const inputs: RegisterIdentityInputs = {
-    dg1: padBits(dg1, dgHashBlockBits as 512 | 1024),
-    dg15: dg15.length !== 0 ? padBits(dg15, dgHashBlockBits as 512 | 1024) : [],
-    encapsulatedContent: padBits(ecBytes, hashBlockBits as 512 | 1024),
-    signedAttributes: padBits(saBytes, hashBlockBits as 512 | 1024),
-    pubkey: chunked.pkChunked,
-    signature: chunked.sigChunked,
+  const idData: IdDataInputs = {
+    dg1: padToFixedLength(dg1, DG1_LENGTH, 'DG1'),
+    dg1Size: dg1.length,
+    signedAttributes: padToFixedLength(saBytes, SIGNED_ATTRS_LENGTH, 'signedAttributes'),
+    signedAttributesSize: saBytes.length,
+    eContent: padToFixedLength(ecBytes, ECONTENT_LENGTH, 'encapsulatedContent'),
+    eContentSize: ecBytes.length,
+    sodSignature: signatureToBytes(signature, sigAlgorithm),
+    tbsCertificate: padToFixedLength(tbsCertificateDer, tbsBucket, 'TBSCertificate'),
+    tbsCertificateSize: tbsCertificateDer.length,
+    dscPubkey: pubkeyToBytes(pubkey, sigAlgorithm),
   };
 
-  return { variant, inputs };
+  return {
+    variant,
+    idData,
+    integrity: { dg1HashOffset, eContentHashOffset, dg15HashOffset },
+    activeAuthentication: extractFromDg15(dg15),
+    unresolved: {
+      cscCertificate: null,
+      certificateTreeProof: null,
+      commitmentSalts: null,
+      serviceScope: null,
+    },
+  };
+}
+
+/** Packs a parsed signature into the raw big-endian byte array its circuit takes. */
+function signatureToBytes(signature: Signature, algorithm: SignatureAlgorithm): Uint8Array {
+  if (signature.kind === 'rsa') {
+    return hexToBeBytes(signature.n, algorithm.byteWidth);
+  }
+  // ECDSA: r || s, each padded to the curve's field width.
+  const out = new Uint8Array(algorithm.byteWidth * 2);
+  out.set(hexToBeBytes(signature.r, algorithm.byteWidth), 0);
+  out.set(hexToBeBytes(signature.s, algorithm.byteWidth), algorithm.byteWidth);
+  return out;
+}
+
+/** Packs a parsed public key into the raw big-endian byte array(s) its circuit takes. */
+function pubkeyToBytes(pubkey: Pubkey, algorithm: SignatureAlgorithm): DscPubkeyBytes {
+  if (pubkey.kind === 'rsa') {
+    return {
+      kind: 'rsa',
+      modulus: hexToBeBytes(pubkey.n, algorithm.byteWidth),
+      exponent: Number(BigInt('0x' + pubkey.exp)),
+    };
+  }
+  return {
+    kind: 'ecdsa',
+    x: hexToBeBytes(pubkey.x, algorithm.byteWidth),
+    y: hexToBeBytes(pubkey.y, algorithm.byteWidth),
+  };
 }
 
 export { Hex, Base64 };

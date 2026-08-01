@@ -200,7 +200,7 @@ impl pallet_template::Config for Runtime {
 
 /// Passthrough ZK verifier: accepts any proof during development.
 /// Gated behind `dev-mode` feature — a production build without that feature will
-/// fail to compile here, forcing a real Rarimo Groth16 verifier to be wired in.
+/// fail to compile here, forcing the real ZKPassport UltraHonk verifier to be wired in.
 #[cfg(feature = "dev-mode")]
 pub struct PassthroughZkVerifier;
 
@@ -215,7 +215,7 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 /// migration proof. Unlike `PassthroughZkVerifier`, this is NOT gated behind `dev-mode` — no
 /// real OPRF-circuit verifier crate exists yet at all (the OPRF committee work tracked in
 /// HANDOFF log #67/#68 hasn't started), so there is nothing for a non-dev-mode build to force
-/// in its place the way `ZkVerifier` forces `RarimoGroth16Verifier`. This must be replaced
+/// in its place the way `ZkVerifier` forces `ZkPassportUltraHonkVerifier`. This must be replaced
 /// before the identity-anchor check provides any real Sybil-resistance guarantee — it
 /// currently provides none, in either build mode.
 pub struct PassthroughAnchorVerifier;
@@ -260,9 +260,12 @@ impl pallet_identity_zk::Config for Runtime {
 #[cfg(not(feature = "dev-mode"))]
 impl pallet_identity_zk::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// Real Rarimo Groth16 BN254 verifier. Requires runtime/assets/vk_sha256.bin and
-	/// vk_sha1.bin to be populated (see scripts/convert_vk.py).
-	type ZkVerifier = crate::verifier::RarimoGroth16Verifier;
+	/// Real ZKPassport UltraHonk verifier (replaces the dropped Rarimo Groth16 one).
+	/// Currently fail-closed: it enforces the envelope and public-input layout for real,
+	/// but rejects every proof because no Rust UltraHonk verifier can handle the bb 5.0.0
+	/// proof format ZKPassport's circuits produce. See `crate::verifier`'s module docs for
+	/// the experiment that established that, and what would unblock it.
+	type ZkVerifier = crate::verifier::ZkPassportUltraHonkVerifier;
 	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
 	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
 	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
@@ -591,7 +594,7 @@ impl pallet_elections::Config for Runtime {
 // ── Anti-Corruption module ───────────────────────────────────────────────────
 
 /// Passthrough ZK verifier for the anti-corruption pallet (dev mode only).
-/// In production, wire in the same Rarimo Groth16 verifier used by pallet-identity.
+/// In production, wire in the same ZKPassport UltraHonk verifier used by pallet-identity.
 #[cfg(feature = "dev-mode")]
 pub struct PassthroughAntiCorruptionZkVerifier;
 
@@ -613,13 +616,16 @@ impl pallet_anticorruption::Config for Runtime {
 }
 
 #[cfg(not(feature = "dev-mode"))]
-pub struct RarimoAntiCorruptionZkVerifier;
+pub struct ZkPassportAntiCorruptionZkVerifier;
 
 #[cfg(not(feature = "dev-mode"))]
-impl pallet_anticorruption::ZkProofVerifier for RarimoAntiCorruptionZkVerifier {
+impl pallet_anticorruption::ZkProofVerifier for ZkPassportAntiCorruptionZkVerifier {
 	fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
-		// Reuse the same Rarimo Groth16 circuit that pallet-identity uses.
-		<crate::verifier::RarimoGroth16Verifier as pallet_identity_zk::ZkProofVerifier>::verify(
+		// Reuse the same ZKPassport outer circuit that pallet-identity uses. Note this
+		// inherits its fail-closed behaviour too — see `crate::verifier`'s module docs.
+		// The whistleblower circuit this pallet eventually wants is a different circuit
+		// anyway (HANDOFF item 8); this binding only keeps the two paths consistent.
+		<crate::verifier::ZkPassportUltraHonkVerifier as pallet_identity_zk::ZkProofVerifier>::verify(
 			proof_bytes,
 			public_inputs,
 		)
@@ -629,7 +635,7 @@ impl pallet_anticorruption::ZkProofVerifier for RarimoAntiCorruptionZkVerifier {
 #[cfg(not(feature = "dev-mode"))]
 impl pallet_anticorruption::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	type ZkVerifier = RarimoAntiCorruptionZkVerifier;
+	type ZkVerifier = ZkPassportAntiCorruptionZkVerifier;
 	type MaxInvestigators = ConstU32<20>;
 	type AssetDisclosureRenewalBlocks = ConstU32<5_256_000>;
 }

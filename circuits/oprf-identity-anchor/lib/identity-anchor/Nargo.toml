@@ -1,0 +1,12 @@
+[package]
+name = "identity_anchor"
+type = "lib"
+authors = ["Agora"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+# Pinned to zkpassport/circuits d3a75acb8529e82c61be136a402553daec259257 (2026-07-21).
+# Both `bb-v5.0.0` and `noir-v1.0.0-beta.22` tags point at that commit; `bb-v5.0.0`
+# is used here because it is the one `git describe` resolves to.
+utils = { tag = "bb-v5.0.0", git = "https://github.com/zkpassport/circuits", directory = "src/noir/lib/utils" }
+poseidon = { tag = "v0.3.0", git = "https://github.com/noir-lang/poseidon" }

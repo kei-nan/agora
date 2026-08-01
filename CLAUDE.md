@@ -155,7 +155,7 @@ democracy-chain/
 ```
 
 ## Remaining Work (in priority order)
-1. **VK assets** — populate `runtime/assets/vk_sha256.bin` + `vk_sha1.bin` to enable real ZK proof verification (see `scripts/convert_vk.py`)
+1. **ZKPassport UltraHonk verifier** — `runtime/src/verifier.rs` is fail-closed pending a `no_std` UltraHonk verifier crate compatible with bb 5.0.0 (see `docs/project/zk-verifier.md`). `runtime/assets/vk_zkpassport_outer_count_4.bin` is now populated with the real `count_4` VK (1888 bytes, `bb write_vk -t evm` under bb 5.0.0); this alone doesn't unblock verification — `verifier.rs`'s `ultrahonk::verify` is still a stub — but it's no longer part of what's left
 2. **Mobile app** — `npx react-native init` + custom NFC native modules + ZKPassport Noir circuits for ZK proof generation
 3. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
 4. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF

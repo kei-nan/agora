@@ -37,10 +37,6 @@ pallet-elections.workspace = true
 pallet-audit.workspace = true
 pallet-anticorruption.workspace = true
 pallet-executive.workspace = true
-ark-bn254.workspace = true
-ark-groth16.workspace = true
-ark-serialize.workspace = true
-ark-ff.workspace = true
 pallet-timestamp.workspace = true
 pallet-transaction-payment-rpc-runtime-api.workspace = true
 pallet-transaction-payment.workspace = true
@@ -95,10 +91,6 @@ std = [
 	"pallet-audit/std",
 	"pallet-anticorruption/std",
 	"pallet-executive/std",
-	"ark-bn254/std",
-	"ark-groth16/std",
-	"ark-serialize/std",
-	"ark-ff/std",
 	"pallet-timestamp/std",
 	"pallet-transaction-payment-rpc-runtime-api/std",
 	"pallet-transaction-payment/std",

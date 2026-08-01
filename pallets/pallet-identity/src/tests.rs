@@ -14,13 +14,14 @@ fn invalid_proof() -> BoundedVec<u8, ConstU32<4096>> {
     BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap()
 }
 
-/// Builds a well-formed 5-signal public_inputs vector (matching the Rarimo
-/// registerIdentity circuit layout) with the given nullifier (index 2, dg1Commitment)
-/// and merkle root (index 4, slaveMerkleRoot); the other slots are left zeroed.
-fn public_inputs(nullifier: [u8; 32], merkle_root: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<16>> {
-    let mut v = vec![[0u8; 32]; 5];
-    v[2] = nullifier;
-    v[4] = merkle_root;
+/// Builds a well-formed count_4 public_inputs vector (ZKPassport's outer-circuit layout,
+/// 9 fields: 8 fixed + 1 disclosure subproof — see `runtime/src/verifier.rs`) with the
+/// given nullifier (index 7 = `6 + D`, `scoped_nullifier`) and merkle root (index 0,
+/// `certificate_registry_root`); the other slots are left zeroed.
+fn public_inputs(nullifier: [u8; 32], merkle_root: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<18>> {
+    let mut v = vec![[0u8; 32]; 9];
+    v[0] = merkle_root;
+    v[7] = nullifier;
     BoundedVec::try_from(v).unwrap()
 }
 
@@ -111,8 +112,9 @@ fn register_citizen_fails_with_too_few_public_inputs() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();
-        let short_inputs: BoundedVec<[u8; 32], ConstU32<16>> =
-            BoundedVec::try_from(vec![[0u8; 32]; 4]).unwrap();
+        // One short of count_4's 9-field minimum.
+        let short_inputs: BoundedVec<[u8; 32], ConstU32<18>> =
+            BoundedVec::try_from(vec![[0u8; 32]; 8]).unwrap();
 
         assert_noop!(
             Identity::register_citizen(
