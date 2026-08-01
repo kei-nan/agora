@@ -10,17 +10,12 @@
 //! runtime crate, so a plain `cargo check --workspace` does not compile this file — use
 //! `cargo check -p agora-runtime --no-default-features --features std`.
 //!
-//! # !! CURRENT STATUS: FAIL-CLOSED, NO PAIRING CHECK !!
+//! # Current status: real pairing check, backed by `ultrahonk-no-std`
 //!
-//! Every structural check below is real and enforced, but the UltraHonk pairing check
-//! itself is **not implemented**, because no Rust verifier exists that can verify the
-//! proofs ZKPassport's circuits actually produce. This was established experimentally,
-//! not assumed — see [`ultrahonk`] for the exact evidence. [`ZkPassportUltraHonkVerifier`]
-//! therefore rejects *every* proof. A non-dev-mode build compiles and is safe (it cannot
-//! be tricked into accepting a forged proof), but it also cannot register any citizen.
-//! This is the same posture the Rarimo-era code shipped in (its VK assets were never
-//! populated, so `verify_inner` returned `false` for every proof too) — deliberately
-//! preserved rather than papered over.
+//! The UltraHonk pairing check is now performed for real by `ultrahonk-no-std`
+//! (<https://github.com/kei-nan/ultrahonk_verifier>, branch `bb-5.0.0-port`), a fork of
+//! zkVerify's verifier ported from bb 3.0.3 to bb 5.0.0 — the version ZKPassport pins.
+//! See [`ultrahonk`] for the integration and for what the port had to change.
 //!
 //! # Proof envelope (what `zk_proof` must contain)
 //!
@@ -69,13 +64,55 @@
 //! This is **not** Rarimo's old 5-signal layout
 //! (`dg15PubKeyHash`, `passportHash`, `dg1Commitment`, `pkIdentityHash`, `slaveMerkleRoot`).
 //!
+//! ## Where the pairing-point (aggregation) object lives — and why it is *not* here
+//!
+//! ZKPassport's outer circuit recursively verifies its subproofs (`verify_proof_with_type`),
+//! so bb attaches an 8-word **pairing-point object** to it. The obvious worry is that those
+//! 8 words are spliced into the public-input array, silently shifting every index above —
+//! which would make index `0` a pairing limb rather than `certificate_registry_root`. They
+//! are not. **bb 5.0.0 carries the pairing-point object as the first 8 words of the `proof`
+//! file, never in the `public_inputs` file**, and this holds for *every* circuit, recursive
+//! or not; recursion changes only the values (non-trivial vs. eight zero words), not the
+//! location. The verifier backend parses those 8 words straight off the front of the proof
+//! (`ZKProof::from_bytes`/`PlainProof::from_bytes`), so nothing here has to know about them.
+//!
+//! This was established from real bytes, by two independent routes that agree:
+//!
+//! * **bb 5.0.0 fixtures.** Across all six of the backend's fixtures
+//!   (`simple`/`rich`/`recursive` × `plain`/`zk`), the VK header's `combined_input_size`
+//!   is exactly `len(public_inputs file)/32 + 8` — `10 = 2 + 8`, `11 = 3 + 8`, `10 = 2 + 8`.
+//!   The `recursive_*` proofs (a circuit that genuinely recursion-verifies) begin with eight
+//!   non-zero 136/118-bit limb words; the non-recursive `simple_*` proofs begin with eight
+//!   zero words. The pairing object is in the proof in both cases, and in the public inputs
+//!   in neither.
+//! * **ZKPassport's own compiled VK.** `assets/vk_zkpassport_outer_count_4.bin` — the real
+//!   `bb write_vk -t evm` output for `main/outer/count_4` — has `log_circuit_size = 22`,
+//!   `pub_inputs_offset = 5` and `combined_input_size = 17`. That is `9 + 8`: nine semantic
+//!   public inputs, exactly the `N + 5` table above, plus the eight pairing words bb counts
+//!   separately. Cross-checked against `main/outer/count_4/src/main.nr` at the pinned commit,
+//!   whose `fn main` declares exactly those nine `pub` parameters in exactly that order and
+//!   returns nothing.
+//!
+//! `assert_count_4_vk_matches_the_documented_public_input_layout` pins this down in CI: it
+//! parses the production VK asset with the backend's own parser and asserts
+//! `combined_input_size == (4 + 5) + 8`. If ZKPassport ever changes the circuit's public
+//! interface, that test fails loudly rather than this file silently misreading field indices.
+//!
+//! The backend independently enforces the same invariant on every call
+//! (`combined_input_size - 8 == public_inputs.len()`), so a `count_N`-shaped array that
+//! disagreed with the VK would be rejected there even if [`check_public_inputs`] let it past.
+//!
 //! `pallet_identity_zk::register_citizen` reads this layout correctly: index `0`
 //! (`certificate_registry_root`) for the allowlist check, index `len - 2` (`6 + D`,
 //! `scoped_nullifier`) for the nullifier, and its `public_inputs` bound is
 //! `ConstU32<18>` (the `count_13` ceiling, `13 + 5`). This was previously mismatched
-//! against Rarimo's old indices; fixed once this module pinned the real layout down.
+//! against Rarimo's old indices; fixed once this module pinned the real layout down. Those
+//! indices were re-checked against the pairing-point finding above and need no adjustment —
+//! the array the pallet sees is the semantic `N + 5` one, unshifted.
 
 #![cfg(not(feature = "dev-mode"))]
+
+extern crate alloc;
 
 /// Envelope magic byte — `'Z'`, for ZKPassport.
 const ENVELOPE_MAGIC: u8 = 0x5A;
@@ -141,10 +178,10 @@ const OUTER_CIRCUIT_VKS: &[(u8, &[u8])] = &[(
 
 /// Implements `ZkProofVerifier` against ZKPassport's `main/outer/count_N` circuits.
 ///
-/// See the module docs: this currently rejects every proof because no usable UltraHonk
-/// verifier backend exists. It is wired in anyway so that the non-dev-mode runtime binds
-/// a real, fail-closed verifier rather than a passthrough, and so the envelope /
-/// public-input contract with the mobile app is pinned down and testable now.
+/// Performs a real UltraHonk pairing check via [`ultrahonk`]. Every failure mode —
+/// malformed envelope, unknown circuit variant, wrong public-input shape, and a proof that
+/// simply does not verify — collapses to `false`, so there is no path by which a caller can
+/// mistake "could not check" for "checked and passed".
 pub struct ZkPassportUltraHonkVerifier;
 
 impl pallet_identity_zk::ZkProofVerifier for ZkPassportUltraHonkVerifier {
@@ -258,9 +295,13 @@ fn check_public_inputs(outer_count: u8, public_inputs: &[[u8; 32]]) -> Option<us
     Some(disclosure_count)
 }
 
-/// Full verification. `Some(())` only if the proof is genuinely valid; `None` for any
-/// malformed input *and* for "no verifier backend available", so the caller cannot
-/// accidentally treat the second case as success.
+/// Full verification. `Some(())` only if the proof is genuinely valid; `None` for every
+/// failure mode alike, so the caller cannot accidentally treat a structural rejection as
+/// anything other than a rejection.
+///
+/// Order matters: the cheap structural checks run before the pairing check, so a malformed
+/// envelope or a wrong-shaped public-input array costs nothing rather than a full
+/// verification.
 fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<()> {
     let envelope = parse_envelope(proof_bytes)?;
     let vk = lookup_vk(envelope.outer_count)?;
@@ -269,66 +310,85 @@ fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<()> {
     ultrahonk::verify(vk, envelope.variant, envelope.proof, public_inputs)
 }
 
-/// The pluggable UltraHonk backend.
+/// The UltraHonk backend: `ultrahonk-no-std`, forked and ported to bb 5.0.0.
 ///
-/// # Why this is empty, and what was actually tested
+/// # Which crate, and why a fork was needed
 ///
-/// The obvious candidate is `ultrahonk-no-std`
-/// (<https://github.com/zkVerify/ultrahonk_verifier>) — genuinely `no_std`
-/// (`#![cfg_attr(not(feature = "std"), no_std)]`), genuinely in production inside
-/// zkVerify's own Substrate WASM runtime, and with a `verify(vk, proof, pubs)` signature
-/// that lines up exactly with `ZkProofVerifier::verify`. It was cloned at its newest tag
-/// (`v0.3.2`) and tested directly rather than judged on its README:
+/// The natural candidate was `ultrahonk-no-std`
+/// (<https://github.com/zkVerify/ultrahonk_verifier>) — genuinely `no_std`, already in
+/// production inside zkVerify's own Substrate WASM runtime, and with a
+/// `verify(vk, proof, pubs)` signature that lines up with `ZkProofVerifier::verify`. Its
+/// newest tag (`v0.3.2`) targets **bb 3.0.3**, whereas ZKPassport pins **bb 5.0.0**, and
+/// that gap turned out to be cryptographic rather than cosmetic: for the same `log_n = 5`
+/// circuit the crate expected a 4800-byte proof where bb 5.0.0 emits 4544. The 256-byte
+/// (8-word) difference is the pairing-point object, which shrank from 16 words to 8 —
+/// but simply patching that constant made the length checks pass and then failed inside
+/// sumcheck ("Total Sum differs from Round Target Sum"), i.e. the transcript had changed
+/// too.
 ///
-/// * It verifies its own bundled test vector fine, so the crate itself works.
-/// * ZKPassport pins **bb 5.0.0** (`.github/workflows/test.yml`, `@aztec/bb.js` in
-///   `package.json`). `ultrahonk-no-std` v0.3.2 targets **bb 3.0.3**
-///   (`scripts/generate_benchmark_projects.sh`).
-/// * bb 5.0.0 was installed via `bbup` and used to prove a trivial Noir circuit with
-///   `bb prove -t evm --write_vk`. The verification key matched byte-for-byte in size
-///   (1888 bytes, exactly the crate's `VK_SIZE`), but the **proof did not**: 4544 bytes
-///   against the 4800 the crate computes for the same `log_n = 5`.
-/// * The 256-byte (8-word) gap is the pairing-point object: bb 3.0.3 carries 16 words of
-///   it, bb 5.0.0 carries 8. Both the VK header (`combined_input_size` = 17 = 1 + 16 for
-///   the old vector, 10 = 2 + 8 for the new proof) and the proof length agree on that.
-/// * Patching `PAIRING_POINTS_SIZE` from 16 to 8 makes every length check pass — and
-///   then verification fails inside sumcheck ("Total Sum differs from Round Target Sum"),
-///   i.e. the transcript changed too. It is a real cryptographic divergence, not a
-///   constant that can be bumped.
+/// Nothing upstream targeted bb 5.x (no tag, branch or open PR), no equivalent crate exists
+/// on crates.io, and the nearest Polkadot-adjacent alternative —
+/// `zkemail/polkavm-noir-verifier` — generates PolkaVM *contracts* from
+/// `bb write_solidity_verifier` output and leans on EVM pairing precompiles, so it cannot be
+/// linked into a runtime as a library. Hence the fork:
+/// <https://github.com/kei-nan/ultrahonk_verifier>, branch `bb-5.0.0-port`, which ports the
+/// pairing-point encoding (16 → 8 words, 136/118-bit limbs), the VK precomputed-commitment
+/// reordering to bb 5.0.0's `EntityId` layout, the sumcheck relation changes, and
+/// `CONST_PROOF_SIZE_LOG_N` (28 → 25). It carries regression fixtures generated by real bb
+/// 5.0.0 for three circuit shapes × both proving modes, including a genuinely recursive
+/// circuit whose pairing-point object is not the point at infinity.
 ///
-/// No newer tag, branch, or open PR upstream targets bb 4.x/5.x, no equivalent crate
-/// exists on crates.io (`ultrahonk-no-std` is git-only and unpublished), and the nearest
-/// Polkadot-adjacent alternative — `zkemail/polkavm-noir-verifier` — generates PolkaVM
-/// *contracts* from `bb write_solidity_verifier` output and leans on EVM pairing
-/// precompiles, so it cannot be linked into a runtime as a library.
+/// # What this wrapper does and does not check
 ///
-/// # What unblocks this
+/// It maps [`ProofVariant`] onto the crate's `ProofType` and hands over the bytes. The
+/// variant is **not** inferred from the proof length: bb's ZK and non-ZK proofs are
+/// different lengths for a given `log_n`, but each length is valid for *some* `log_n`, so
+/// guessing would let a caller steer the parse. The envelope declares it; the crate then
+/// checks the declared variant's expected length against the VK's `log_circuit_size` and
+/// rejects a mismatch. Declaring the wrong variant therefore fails rather than silently
+/// reinterpreting the transcript.
 ///
-/// Any one of: an upstream `ultrahonk-no-std` release targeting bb 5.x; a fork of it that
-/// ports the bb 5.0.0 pairing-point/transcript changes (real cryptography work, and it
-/// needs a ZKPassport-generated outer proof to test against); or ZKPassport publishing a
-/// Rust verifier of their own (as of `d3a75ac` their `src/rust/` holds only
-/// `masterlist-interpreter` and `redc-param-gen`, and their only shipped on-chain
-/// verifiers are Solidity).
+/// The crate also re-checks the public-input count against the VK
+/// (`combined_input_size - 8 == pubs.len()`), which is an independent confirmation of the
+/// layout conclusion in this module's docs.
 ///
-/// When one lands, implement [`verify`] and delete this comment. Nothing else in this
-/// file needs to change — the envelope, the VK lookup and the public-input checks are all
-/// already the right shape for it.
+/// Panic posture: the crate performs its length checks before any indexing, and its
+/// internal `expect`s sit behind those checks. The VK is a compile-time `include_bytes!`
+/// asset rather than caller data, so the one arithmetic edge in the crate's own
+/// public-input check (`combined_input_size - 8` underflowing for a nonsense VK) is not
+/// reachable from an extrinsic.
 mod ultrahonk {
     use super::ProofVariant;
+    use alloc::boxed::Box;
+    use ultrahonk_no_std::{errors::VerifyError, ProofType};
 
-    /// Verifies an UltraHonk proof. Returns `Some(())` only on a genuinely valid proof.
+    /// Verifies an UltraHonk proof. `Some(())` only on a genuinely valid proof.
     ///
-    /// Currently always `None` — see the module docs. Deliberately fail-closed: there is
-    /// no build configuration, feature flag or asset that turns this into `Some(())`
-    /// without someone writing a real implementation here first.
+    /// Every error the backend can report — bad VK, unparseable proof, wrong length, wrong
+    /// public-input count, failed sumcheck, failed pairing — collapses to `None`. The
+    /// distinction matters for debugging but not for the decision, and keeping it out of the
+    /// return type means no caller can pattern-match its way into treating a soft failure as
+    /// success.
     pub fn verify(
-        _vk: &[u8],
-        _variant: ProofVariant,
-        _proof: &[u8],
-        _public_inputs: &[[u8; 32]],
+        vk: &[u8],
+        variant: ProofVariant,
+        proof: &[u8],
+        public_inputs: &[[u8; 32]],
     ) -> Option<()> {
-        None
+        let bytes: Box<[u8]> = Box::from(proof);
+        let proof = match variant {
+            ProofVariant::Zk => ProofType::ZK(bytes),
+            ProofVariant::Plain => ProofType::Plain(bytes),
+        };
+
+        // `H = ()` selects arkworks' pure-Rust BN254 arithmetic. zkVerify's `CurveHooks`
+        // trait exists so a host can swap in accelerated pairing host-functions; this
+        // runtime registers none, and picking `()` keeps verification self-contained in
+        // WASM rather than depending on a host function the node may not provide.
+        let result: Result<(), VerifyError> =
+            ultrahonk_no_std::verify::<()>(vk, &proof, public_inputs);
+
+        result.ok()
     }
 }
 
@@ -490,13 +550,253 @@ mod tests {
         assert_eq!(vk.len(), 1888, "count_4 VK must be the 1888-byte bb -t evm UltraHonk VK");
     }
 
-    /// The whole point of the current state: nothing verifies. If this ever passes,
-    /// either a real backend landed (update this test) or something is badly wrong.
+    // ---------------------------------------------------------------------------
+    // Real bb 5.0.0 backend tests.
+    //
+    // The fixtures under `assets/test/` are copied byte-for-byte from the backend
+    // fork's own `tests/data/bb5/recursive_{zk,plain}` — real `bb prove` output for a
+    // Noir circuit that recursively verifies another proof, which also verifies under
+    // `bb verify` itself. The recursive shape is deliberate: it is the closest
+    // structural analog to ZKPassport's outer circuit, and it is the only fixture whose
+    // pairing-point object is a genuine non-infinity point, so it exercises the
+    // 136/118-bit limb reconstruction rather than the trivial all-zero path.
+    //
+    // These are *not* passport proofs, and they cannot be routed through
+    // `verify_inner`: that circuit exposes 2 public inputs, and no `count_N` shape has
+    // `N + 5 == 2`, so `check_public_inputs` rejects them by construction — correctly.
+    // What they do prove is that everything downstream of the shape check is real:
+    // envelope parsing hands the backend the right bytes and the right variant, the
+    // public-input conversion is right, and the pairing check genuinely accepts valid
+    // proofs and genuinely rejects tampered ones. `lookup_vk` and `check_public_inputs`
+    // are covered independently above, and the count_4 layout invariant that ties the
+    // two halves together is asserted against the real production VK below.
+    // ---------------------------------------------------------------------------
+
+    const REC_ZK_PROOF: &[u8] = include_bytes!("../assets/test/ultrahonk_bb5_recursive_zk/proof");
+    const REC_ZK_VK: &[u8] = include_bytes!("../assets/test/ultrahonk_bb5_recursive_zk/vk");
+    const REC_ZK_PUBS: &[u8] = include_bytes!("../assets/test/ultrahonk_bb5_recursive_zk/pubs");
+
+    const REC_PLAIN_PROOF: &[u8] =
+        include_bytes!("../assets/test/ultrahonk_bb5_recursive_plain/proof");
+    const REC_PLAIN_VK: &[u8] = include_bytes!("../assets/test/ultrahonk_bb5_recursive_plain/vk");
+    const REC_PLAIN_PUBS: &[u8] =
+        include_bytes!("../assets/test/ultrahonk_bb5_recursive_plain/pubs");
+
+    /// Chunk a raw bb `public_inputs` file into 32-byte words.
+    fn split_pubs(raw: &[u8]) -> Vec<[u8; 32]> {
+        assert_eq!(raw.len() % 32, 0, "a pubs file is a whole number of words");
+        raw.chunks_exact(32)
+            .map(|chunk| <[u8; 32]>::try_from(chunk).expect("chunks_exact(32) yields 32 bytes"))
+            .collect()
+    }
+
+    /// Wrap raw proof bytes in a well-formed envelope, then run the whole path from
+    /// `parse_envelope` through to the backend against an explicitly supplied VK.
+    ///
+    /// This is `verify_inner` with `lookup_vk` and `check_public_inputs` lifted out — the
+    /// two steps that are specific to ZKPassport's circuit shape and so cannot accept a
+    /// foreign fixture. Everything else is the production path, unmodified.
+    fn verify_fixture(
+        vk: &[u8],
+        variant: ProofVariant,
+        proof: &[u8],
+        public_inputs: &[[u8; 32]],
+    ) -> Option<()> {
+        let mut bytes = Vec::with_capacity(ENVELOPE_HEADER_LEN + proof.len());
+        bytes.extend_from_slice(&[
+            ENVELOPE_MAGIC,
+            ENVELOPE_VERSION,
+            4,
+            match variant {
+                ProofVariant::Zk => 0,
+                ProofVariant::Plain => 1,
+            },
+        ]);
+        bytes.extend_from_slice(&(proof.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(proof);
+
+        let envelope = parse_envelope(&bytes)?;
+        assert_eq!(envelope.variant, variant);
+        ultrahonk::verify(vk, envelope.variant, envelope.proof, public_inputs)
+    }
+
     #[test]
-    fn rejects_every_proof_while_no_backend_exists() {
+    fn verifies_a_real_bb5_zk_proof() {
+        assert_eq!(
+            verify_fixture(
+                REC_ZK_VK,
+                ProofVariant::Zk,
+                REC_ZK_PROOF,
+                &split_pubs(REC_ZK_PUBS)
+            ),
+            Some(()),
+            "a genuine bb 5.0.0 `-t evm` proof of a recursive circuit must verify",
+        );
+    }
+
+    #[test]
+    fn verifies_a_real_bb5_plain_proof() {
+        assert_eq!(
+            verify_fixture(
+                REC_PLAIN_VK,
+                ProofVariant::Plain,
+                REC_PLAIN_PROOF,
+                &split_pubs(REC_PLAIN_PUBS)
+            ),
+            Some(()),
+            "a genuine bb 5.0.0 `-t evm-no-zk` proof of a recursive circuit must verify",
+        );
+    }
+
+    #[test]
+    fn rejects_a_proof_whose_declared_variant_is_wrong() {
+        // The ZK and Plain flavors are different lengths and different transcripts. A
+        // caller that mislabels one must be rejected, not silently reinterpreted.
+        assert!(verify_fixture(
+            REC_ZK_VK,
+            ProofVariant::Plain,
+            REC_ZK_PROOF,
+            &split_pubs(REC_ZK_PUBS)
+        )
+        .is_none());
+        assert!(verify_fixture(
+            REC_PLAIN_VK,
+            ProofVariant::Zk,
+            REC_PLAIN_PROOF,
+            &split_pubs(REC_PLAIN_PUBS)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_single_bit_mutations_anywhere_in_a_real_proof() {
+        // Sample offsets right across the proof so that a flip landing in any region —
+        // pairing points, commitments, sumcheck univariates, evaluations, the opening
+        // proof — is covered. The first 256 bytes are specifically the pairing-point
+        // object, so this also confirms those words are genuinely being checked and not
+        // just parsed and discarded.
+        let pubs = split_pubs(REC_ZK_PUBS);
+        let step = REC_ZK_PROOF.len() / 40;
+        let mut checked = 0;
+        for offset in (0..REC_ZK_PROOF.len()).step_by(step) {
+            let mut mutated = REC_ZK_PROOF.to_vec();
+            mutated[offset] ^= 0x01;
+            assert!(
+                verify_fixture(REC_ZK_VK, ProofVariant::Zk, &mutated, &pubs).is_none(),
+                "flipping bit 0 of proof byte {offset} must be rejected",
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "expected a meaningful spread of offsets");
+    }
+
+    #[test]
+    fn rejects_mutated_public_inputs_for_a_real_proof() {
+        for index in 0..REC_ZK_PUBS.len() {
+            let mut raw = REC_ZK_PUBS.to_vec();
+            raw[index] ^= 0x01;
+            assert!(
+                verify_fixture(REC_ZK_VK, ProofVariant::Zk, REC_ZK_PROOF, &split_pubs(&raw))
+                    .is_none(),
+                "flipping bit 0 of public-input byte {index} must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_real_proof_against_the_wrong_verification_key() {
+        // The two fixtures are the same circuit proved in different modes, so their VKs
+        // differ. Swapping in the count_4 VK is the sharper case: a real, well-formed,
+        // correctly-sized VK for a different circuit entirely.
+        let pubs = split_pubs(REC_ZK_PUBS);
+        let count_4_vk = lookup_vk(4).expect("count_4 VK must be installed");
+        assert!(verify_fixture(count_4_vk, ProofVariant::Zk, REC_ZK_PROOF, &pubs).is_none());
+    }
+
+    #[test]
+    fn rejects_a_truncated_verification_key() {
+        let pubs = split_pubs(REC_ZK_PUBS);
+        assert!(verify_fixture(
+            &REC_ZK_VK[..REC_ZK_VK.len() - 32],
+            ProofVariant::Zk,
+            REC_ZK_PROOF,
+            &pubs
+        )
+        .is_none());
+        assert!(verify_fixture(&[], ProofVariant::Zk, REC_ZK_PROOF, &pubs).is_none());
+    }
+
+    /// The load-bearing claim of this module's public-input docs, asserted against the
+    /// real production VK asset with the backend's own parser.
+    ///
+    /// `combined_input_size` is bb's count of *all* words in the circuit's public-input
+    /// region, semantic inputs plus the 8-word pairing-point object. If it equals
+    /// `(4 + 5) + 8`, then `main/outer/count_4` really does expose exactly the nine
+    /// semantic inputs this module documents, and the pairing object really is accounted
+    /// for separately (bb carries it at the front of the proof, not in the public-input
+    /// file). If ZKPassport ever changes that circuit's public interface, this fails here
+    /// rather than in `check_public_inputs` silently reading the wrong field index.
+    #[test]
+    fn count_4_vk_matches_the_documented_public_input_layout() {
+        use ultrahonk_no_std::key::VerificationKey;
+
+        /// bb 5.0.0's pairing-point object: 2 G1 points, 2 limbs per coordinate.
+        const PAIRING_POINTS_SIZE: u64 = 8;
+
+        let vk = VerificationKey::<()>::try_from(lookup_vk(4).expect("count_4 VK installed"))
+            .expect("the count_4 asset must parse as a bb 5.0.0 UltraHonk VK");
+
+        let semantic_inputs = 4 + 5;
+        assert_eq!(
+            vk.combined_input_size,
+            semantic_inputs + PAIRING_POINTS_SIZE,
+            "count_4 must expose {semantic_inputs} semantic public inputs plus \
+             {PAIRING_POINTS_SIZE} pairing-point words",
+        );
+
+        // Sanity: the outer circuit is large, and log_n must be within what the backend
+        // (and bb 5.0.0's CONST_PROOF_SIZE_LOG_N of 25) supports.
+        assert_eq!(vk.log_circuit_size, 22);
+    }
+
+    /// End-to-end through the *whole* production path, including `lookup_vk(4)` and
+    /// `check_public_inputs`, with the real ZKPassport VK.
+    ///
+    /// There is no genuine `count_4` proof to test the accepting side with — producing one
+    /// needs real passport data and satisfying subproofs — so this pins the rejecting side:
+    /// a perfectly well-formed envelope and a perfectly well-shaped 9-element public-input
+    /// array still fail, because the proof bytes are not a valid proof. The failure now
+    /// comes from the pairing check rather than from a stubbed-out backend.
+    #[test]
+    fn rejects_a_well_formed_count_4_envelope_carrying_a_bogus_proof() {
         use pallet_identity_zk::ZkProofVerifier;
         assert!(!ZkPassportUltraHonkVerifier::verify(
             &valid_envelope(),
+            &valid_public_inputs()
+        ));
+    }
+
+    /// A real proof, correctly labelled, but presented as a `count_4` passport proof.
+    /// `check_public_inputs` must reject it on shape before the backend ever sees it.
+    #[test]
+    fn rejects_a_foreign_circuits_proof_presented_as_a_passport_proof() {
+        use pallet_identity_zk::ZkProofVerifier;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[ENVELOPE_MAGIC, ENVELOPE_VERSION, 4, 0]);
+        bytes.extend_from_slice(&(REC_ZK_PROOF.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(REC_ZK_PROOF);
+
+        // Its own (2-element) public inputs: wrong shape for count_4.
+        assert!(!ZkPassportUltraHonkVerifier::verify(
+            &bytes,
+            &split_pubs(REC_ZK_PUBS)
+        ));
+
+        // And padded out to count_4's 9 elements, so it passes the shape check and is
+        // rejected by the pairing check instead.
+        assert!(!ZkPassportUltraHonkVerifier::verify(
+            &bytes,
             &valid_public_inputs()
         ));
     }
