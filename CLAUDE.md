@@ -155,15 +155,14 @@ democracy-chain/
 ```
 
 ## Remaining Work (in priority order)
-1. **ZKPassport UltraHonk verifier** — `runtime/src/verifier.rs` is fail-closed pending a `no_std` UltraHonk verifier crate compatible with bb 5.0.0 (see `docs/project/zk-verifier.md`). `runtime/assets/vk_zkpassport_outer_count_4.bin` is now populated with the real `count_4` VK (1888 bytes, `bb write_vk -t evm` under bb 5.0.0); this alone doesn't unblock verification — `verifier.rs`'s `ultrahonk::verify` is still a stub — but it's no longer part of what's left
-2. **Mobile app** — `npx react-native init` + custom NFC native modules + ZKPassport Noir circuits for ZK proof generation
-3. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
-4. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
-5. **Per-referendum threshold** — supermajority for constitutional-tier laws
-6. **IPFS content fetching** (desktop) — fetch law/proposal text from gateway by on-chain hash
-7. **Batched voting epochs** — Swiss model periodic windows instead of continuous voting
-8. **Anti-Corruption module** — asset disclosure, ZK whistleblower (needs Noir circuits)
-9. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
+1. **Mobile app** — `npx react-native init` + custom NFC native modules + ZKPassport Noir circuits for ZK proof generation. This is now also what gates the **first end-to-end ZK verification test**: `runtime/src/verifier.rs` is complete and verifies real bb 5.0.0 UltraHonk proofs (see `docs/project/zk-verifier.md`), but no genuine ZKPassport `count_4` proof has been through it yet — that needs real passport NFC data
+2. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
+3. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
+4. **Per-referendum threshold** — supermajority for constitutional-tier laws
+5. **IPFS content fetching** (desktop) — fetch law/proposal text from gateway by on-chain hash
+6. **Batched voting epochs** — Swiss model periodic windows instead of continuous voting
+7. **Anti-Corruption module** — asset disclosure, ZK whistleblower (needs Noir circuits)
+8. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
 
 See `HANDOFF.md` for full pallet-by-pallet status and completed work log.
 

@@ -41,7 +41,7 @@ democracy-chain/
 │   └── src/
 │       ├── configs/mod.rs         # all pallet Config impls + cross-pallet trait wiring
 │       ├── lib.rs                 # runtime construction (construct_runtime!)
-│       └── verifier.rs            # ZkPassportUltraHonkVerifier (!dev-mode) — fail-closed, see changelog #70
+│       └── verifier.rs            # ZkPassportUltraHonkVerifier (!dev-mode) — verifying, see changelog #72
 ├── pallets/                       # see pallets/ below, one file per pallet
 ├── scripts/
 │   ├── convert_vk.py              # STALE — Rarimo snarkjs JSON VK → ark-serialize binary
@@ -67,7 +67,7 @@ Build is clean. Next available pallet index: **19**.
 | Mobile app (React Native) | [apps/mobile.md](apps/mobile.md) |
 | Remaining work, prioritized | [next-steps.md](next-steps.md) |
 | External docs/repos referenced throughout | [references.md](references.md) |
-| Historical "completed work" log (71 entries, chronological, append-only) | [changelog/](changelog/) — chunked by entry range, see below |
+| Historical "completed work" log (72 entries, chronological, append-only) | [changelog/](changelog/) — chunked by entry range, see below |
 
 ### Pallets (`pallets/`)
 
@@ -102,6 +102,7 @@ find a specific one, or jump straight to its range file:
 | 65–68 | [065-068.md](changelog/065-068.md) — ZKPassport migration decision + Sybil-resistance architecture |
 | 69–70 | [069-070.md](changelog/069-070.md) — forked ZKPassport OPRF circuits onto the MRZ personal-number field (`circuits/oprf-identity-anchor/`); reworked the passport verifier + mobile proving pipeline onto ZKPassport/UltraHonk (verifier is fail-closed — no Rust verifier handles bb 5.0.0 proofs yet) |
 | 71 | [071.md](changelog/071.md) — populated `runtime/assets/vk_zkpassport_outer_count_4.bin` with the real `count_4` VK (still fail-closed pending the pairing backend) |
+| 72 | [072.md](changelog/072.md) — implemented the real UltraHonk pairing check against the bb 5.0.0 fork; settled where bb puts the pairing-point object (in the proof, not the public inputs) so the `N+5` layout and `pallet-identity`'s indices are confirmed correct |
 
 Quick lookup for a specific entry number:
 ```bash

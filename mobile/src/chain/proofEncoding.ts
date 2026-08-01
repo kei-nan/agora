@@ -49,11 +49,20 @@
  * 7+D            oprf_pk_hash
  * ```
  *
+ * That is the whole array — pass bb's `public_inputs` file through as-is. **Do not prepend
+ * or append the 8-word pairing-point (aggregation) object.** The outer circuit recursively
+ * verifies its subproofs, so bb does attach one, but bb 5.0.0 carries it as the first 8
+ * words of the *`proof`* file, never in `public_inputs` — the on-chain verifier reads it
+ * from there. Confirmed against ZKPassport's real compiled `count_4` VK, whose
+ * `combined_input_size` is `17 = 9 + 8`. Adding those words here would shift every index
+ * above and the chain would reject the proof. See `runtime/src/verifier.rs`'s module docs.
+ *
  * # Status
  *
- * The encoder is real and tested against genuine bb 5.0.0 output. The chain will still
- * reject whatever it produces: no Rust UltraHonk verifier can check bb 5.0.0 proofs yet,
- * so `verifier.rs` is deliberately fail-closed. See its module docs for the evidence.
+ * The encoder is real and tested against genuine bb 5.0.0 output, and the chain now
+ * performs a real UltraHonk pairing check (`verifier.rs`, backed by the bb 5.0.0 port of
+ * `ultrahonk-no-std`). No genuine passport proof has been round-tripped through both ends
+ * yet, though — that needs real NFC data, and it is the outstanding integration test.
  */
 
 /** Envelope magic byte — `'Z'`, for ZKPassport. Mirrors `verifier.rs::ENVELOPE_MAGIC`. */
