@@ -1,10 +1,16 @@
 import React, { useState } from 'react';
 import { Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
+import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { readPassport, RawPassportData } from '../native/nfcPassportReader';
 import { buildCircuitInputs } from '../chain/sodParser';
+import {
+  TEST_PASSPORT_DG1_BASE64,
+  TEST_PASSPORT_DG15_BASE64,
+  TEST_PASSPORT_SOD_BASE64,
+} from '../chain/__fixtures__/testPassport';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
 // imported here anymore — this screen can no longer honestly claim
@@ -45,6 +51,23 @@ const TODAY = new Date();
 const MIN_BIRTH_DATE = new Date(TODAY.getFullYear() - 120, 0, 1);
 const MAX_EXPIRY_DATE = new Date(TODAY.getFullYear() + 15, 11, 31);
 
+/**
+ * A synthetic but genuinely-valid ICAO-shaped SOD (see
+ * scripts/generate-test-passport-fixture.js) — a real self-signed test
+ * certificate really signs a real LDSSecurityObject over a real hash of the
+ * DG1 bytes below, so it exercises buildCircuitInputs() exactly like a real
+ * passport would. Lets registration be exercised on the emulator (no NFC
+ * hardware) and without a physical passport. __DEV__-gated: never available
+ * in a release build.
+ */
+function getTestPassportData(): RawPassportData {
+  return {
+    dg1: new Uint8Array(Buffer.from(TEST_PASSPORT_DG1_BASE64, 'base64')),
+    dg15: new Uint8Array(Buffer.from(TEST_PASSPORT_DG15_BASE64, 'base64')),
+    sod: new Uint8Array(Buffer.from(TEST_PASSPORT_SOD_BASE64, 'base64')),
+  };
+}
+
 export default function RegisterScreen({ navigation }: Props) {
   const [step, setStep] = useState<Step>('idle');
   // MRZ fields feed BAC key derivation for the NFC read (see
@@ -59,8 +82,8 @@ export default function RegisterScreen({ navigation }: Props) {
 
   const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
 
-  async function start() {
-    if (Platform.OS !== 'android') {
+  async function start(useTestPassport: boolean = false) {
+    if (!useTestPassport && Platform.OS !== 'android') {
       Alert.alert(
         'Not available on this device',
         'Passport NFC reading is only implemented for Android so far. See HANDOFF.md item 8.',
@@ -73,12 +96,16 @@ export default function RegisterScreen({ navigation }: Props) {
       // doc comment; iOS needs a Swift module wrapping AndyQ/NFCPassportReader,
       // not built yet, no ios/ project exists). Returns raw EF.DG1/EF.DG15/
       // EF.SOD bytes via BAC, not parsed fields — these are the actual ZK
-      // circuit witness inputs.
-      const raw = await readPassport({
-        documentNumber,
-        dateOfBirth: toMrz(dateOfBirth!),
-        dateOfExpiry: toMrz(dateOfExpiry!),
-      });
+      // circuit witness inputs. The test-passport path skips this entirely
+      // (see getTestPassportData() above) — MRZ fields are irrelevant there
+      // since no real BAC handshake happens.
+      const raw = useTestPassport
+        ? getTestPassportData()
+        : await readPassport({
+            documentNumber,
+            dateOfBirth: toMrz(dateOfBirth!),
+            dateOfExpiry: toMrz(dateOfExpiry!),
+          });
       setRawPassport(raw);
       setStep('liveness');
       // TODO: await FaceMatch.verify(scan.faceImage);
@@ -219,11 +246,17 @@ export default function RegisterScreen({ navigation }: Props) {
           )}
           <TouchableOpacity
             style={[s.btn, !mrzComplete && s.btnDisabled]}
-            onPress={start}
+            onPress={() => start()}
             disabled={!mrzComplete}
           >
             <Text style={s.btnText}>Begin Registration</Text>
           </TouchableOpacity>
+
+          {__DEV__ && (
+            <TouchableOpacity style={s.testBtn} onPress={() => start(true)}>
+              <Text style={s.testBtnText}>Use test passport (dev only, no NFC needed)</Text>
+            </TouchableOpacity>
+          )}
         </>
       )}
 
@@ -266,6 +299,16 @@ const s = StyleSheet.create({
     alignItems: 'center',
   },
   btnText: { color: '#ffffff', fontWeight: '700', fontSize: 16 },
+  testBtn: {
+    marginTop: 12,
+    paddingVertical: 12,
+    borderRadius: 14,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#374151',
+    borderStyle: 'dashed',
+  },
+  testBtnText: { color: '#9ca3af', fontWeight: '600', fontSize: 13 },
   successBox: { alignItems: 'center', gap: 12 },
   successIcon: { fontSize: 56, color: '#22c55e' },
   successText: { fontSize: 18, fontWeight: '600', color: '#22c55e', textAlign: 'center' },
