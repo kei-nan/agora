@@ -6,6 +6,9 @@ build/
 .gradle/
 *.iml
 
+# Android Studio project state (machine-specific)
+.idea/
+
 # Native build intermediates (CMake/NDK)
 .cxx/
 .externalNativeBuild/

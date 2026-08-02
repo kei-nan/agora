@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator } from 'react-native';
+import { Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
+import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { readPassport, RawPassportData } from '../native/nfcPassportReader';
@@ -28,19 +29,35 @@ const STEP_ORDER: Step[] = ['idle', 'nfc', 'liveness', 'proving', 'submitting', 
 /** Distinguishes "we got further than before but the rest isn't built" from an actual failure. */
 class NotImplementedError extends Error {}
 
+/** MRZ dates are `YYMMDD` per ICAO Doc 9303 — this is what the native BAC key derivation needs, not a display format. */
+function toMrz(d: Date): string {
+  const yy = String(d.getFullYear() % 100).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${yy}${mm}${dd}`;
+}
+
+function formatDate(d: Date): string {
+  return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+const TODAY = new Date();
+const MIN_BIRTH_DATE = new Date(TODAY.getFullYear() - 120, 0, 1);
+const MAX_EXPIRY_DATE = new Date(TODAY.getFullYear() + 15, 11, 31);
+
 export default function RegisterScreen({ navigation }: Props) {
   const [step, setStep] = useState<Step>('idle');
   // MRZ fields feed BAC key derivation for the NFC read (see
-  // ../native/nfcPassportReader.ts). Dates are YYMMDD, matching the Android
+  // ../native/nfcPassportReader.ts) via toMrz() below, matching the Android
   // native module's BACKey requirement (confirmed from JMRTD source, HANDOFF
-  // log #58) — not validated/masked here yet, that's real form-UX work for
-  // whoever picks this up next.
+  // log #58).
   const [documentNumber, setDocumentNumber] = useState('');
-  const [dateOfBirth, setDateOfBirth] = useState('');
-  const [dateOfExpiry, setDateOfExpiry] = useState('');
+  const [dateOfBirth, setDateOfBirth] = useState<Date | null>(null);
+  const [dateOfExpiry, setDateOfExpiry] = useState<Date | null>(null);
+  const [activePicker, setActivePicker] = useState<'dob' | 'expiry' | null>(null);
   const [rawPassport, setRawPassport] = useState<RawPassportData | null>(null);
 
-  const mrzComplete = documentNumber.length > 0 && dateOfBirth.length === 6 && dateOfExpiry.length === 6;
+  const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
 
   async function start() {
     if (Platform.OS !== 'android') {
@@ -57,7 +74,11 @@ export default function RegisterScreen({ navigation }: Props) {
       // not built yet, no ios/ project exists). Returns raw EF.DG1/EF.DG15/
       // EF.SOD bytes via BAC, not parsed fields — these are the actual ZK
       // circuit witness inputs.
-      const raw = await readPassport({ documentNumber, dateOfBirth, dateOfExpiry });
+      const raw = await readPassport({
+        documentNumber,
+        dateOfBirth: toMrz(dateOfBirth!),
+        dateOfExpiry: toMrz(dateOfExpiry!),
+      });
       setRawPassport(raw);
       setStep('liveness');
       // TODO: await FaceMatch.verify(scan.faceImage);
@@ -106,7 +127,11 @@ export default function RegisterScreen({ navigation }: Props) {
   const activeIndex = STEP_ORDER.indexOf(step);
 
   return (
-    <View style={s.container}>
+    <ScrollView
+      style={s.container}
+      contentContainerStyle={s.scrollContent}
+      keyboardShouldPersistTaps="handled"
+    >
       <Text style={s.title}>Citizen Registration</Text>
       <Text style={s.subtitle}>
         Your identity is verified using your biometric passport. Nothing leaves your phone — only a
@@ -150,26 +175,37 @@ export default function RegisterScreen({ navigation }: Props) {
               placeholderTextColor="#4b5563"
               autoCapitalize="characters"
             />
-            <Text style={s.mrzLabel}>Date of birth (YYMMDD)</Text>
-            <TextInput
-              style={s.mrzInput}
-              value={dateOfBirth}
-              onChangeText={setDateOfBirth}
-              placeholder="e.g. 740812"
-              placeholderTextColor="#4b5563"
-              keyboardType="number-pad"
-              maxLength={6}
-            />
-            <Text style={s.mrzLabel}>Date of expiry (YYMMDD)</Text>
-            <TextInput
-              style={s.mrzInput}
-              value={dateOfExpiry}
-              onChangeText={setDateOfExpiry}
-              placeholder="e.g. 341231"
-              placeholderTextColor="#4b5563"
-              keyboardType="number-pad"
-              maxLength={6}
-            />
+            <Text style={s.mrzLabel}>Date of birth</Text>
+            <TouchableOpacity style={s.mrzInput} onPress={() => setActivePicker('dob')}>
+              <Text style={dateOfBirth ? s.dateValue : s.datePlaceholder}>
+                {dateOfBirth ? formatDate(dateOfBirth) : 'Select date of birth'}
+              </Text>
+            </TouchableOpacity>
+
+            <Text style={s.mrzLabel}>Date of expiry</Text>
+            <TouchableOpacity style={s.mrzInput} onPress={() => setActivePicker('expiry')}>
+              <Text style={dateOfExpiry ? s.dateValue : s.datePlaceholder}>
+                {dateOfExpiry ? formatDate(dateOfExpiry) : 'Select date of expiry'}
+              </Text>
+            </TouchableOpacity>
+
+            {activePicker && (
+              <DateTimePicker
+                value={(activePicker === 'dob' ? dateOfBirth : dateOfExpiry) ?? TODAY}
+                mode="date"
+                display="default"
+                minimumDate={activePicker === 'dob' ? MIN_BIRTH_DATE : TODAY}
+                maximumDate={activePicker === 'dob' ? TODAY : MAX_EXPIRY_DATE}
+                onChange={(_event: DateTimePickerEvent, selected?: Date) => {
+                  const picker = activePicker;
+                  setActivePicker(null);
+                  if (!selected) return;
+                  if (picker === 'dob') setDateOfBirth(selected);
+                  else if (picker === 'expiry') setDateOfExpiry(selected);
+                }}
+              />
+            )}
+
             <Text style={s.mrzHint}>
               These three fields, printed in your passport's machine-readable zone, derive the key
               your phone uses to unlock the chip (Basic Access Control) — they never leave your device.
@@ -200,12 +236,13 @@ export default function RegisterScreen({ navigation }: Props) {
           </TouchableOpacity>
         </View>
       )}
-    </View>
+    </ScrollView>
   );
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117', padding: 24 },
+  container: { flex: 1, backgroundColor: '#0f1117' },
+  scrollContent: { padding: 24, paddingBottom: 48 },
   title: { fontSize: 24, fontWeight: '700', color: '#ffffff', marginBottom: 8 },
   subtitle: { fontSize: 14, color: '#6b7280', lineHeight: 20, marginBottom: 32 },
   stepList: { gap: 20, marginBottom: 40 },
@@ -244,6 +281,8 @@ const s = StyleSheet.create({
     color: '#ffffff',
     backgroundColor: '#161a23',
   },
+  dateValue: { fontSize: 15, color: '#ffffff' },
+  datePlaceholder: { fontSize: 15, color: '#4b5563' },
   mrzHint: { fontSize: 11, color: '#4b5563', lineHeight: 15, marginTop: 10 },
   scanResult: { fontSize: 12, color: '#22c55e', textAlign: 'center', marginBottom: 12 },
   btnDisabled: { backgroundColor: '#374151' },
