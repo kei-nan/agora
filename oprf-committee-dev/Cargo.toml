@@ -1,0 +1,20 @@
+[workspace]
+# Deliberately its own workspace root, NOT a member of the root repo's Cargo.toml. This
+# crate has nothing to do with the runtime/node build graph and must never be pulled into
+# it by accident (see README.md — this is dev/test tooling, not production code).
+
+[package]
+name = "oprf-committee-dev"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "DEV-ONLY simulator for TaceoLabs/oprf-nr committee evaluation. Not a production OPRF service. See README.md."
+
+[dependencies]
+ark-bn254 = { version = "0.5.0", default-features = false, features = ["std", "curve"] }
+ark-ff = { version = "0.5.0", default-features = false, features = ["std"] }
+ark-std = { version = "0.5.0", default-features = false, features = ["std"] }
+num-bigint = { version = "0.4", default-features = false, features = ["std", "rand"] }
+num-traits = { version = "0.2", default-features = false, features = ["std"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+hex = { version = "0.4", default-features = false, features = ["alloc", "std"] }
