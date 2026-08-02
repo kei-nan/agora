@@ -9,7 +9,10 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 - Chain builds and runs in dev mode
 - **9 pallets** implemented at runtime indices 8–16 (see HANDOFF.md for detail)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
-- Mobile: TypeScript scaffold exists but is not a runnable React Native project yet
+- Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
+  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (77 tests); no
+  JDK/Android SDK in this WSL2 environment yet, so no Gradle build has actually run here —
+  `ios/` still doesn't exist (see `docs/project/apps/mobile.md`, changelog #80)
 
 ## Critical Build Command
 Always build with:
@@ -149,13 +152,14 @@ democracy-chain/
 │   ├── pallet-emergency-council/ ← time-locked emergency powers, auto-sunset   (index 15)
 │   └── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
 ├── circuits/          ← Noir ZK circuits (not yet started)
-├── mobile/            ← React Native app (TypeScript scaffold — not runnable yet)
+├── mobile/            ← React Native app; android/ real + committed (JS tests pass, no
+│                         JDK/SDK here to build it yet); ios/ not started
 ├── desktop/           ← Tauri 2 app (functional: chain RPC + Claude AI agent)
 └── CLAUDE.md          ← this file
 ```
 
 ## Remaining Work (in priority order)
-1. **Mobile app** — `npx react-native init` + custom NFC native modules + ZKPassport Noir circuits for ZK proof generation. This is now also what gates the **first end-to-end ZK verification test**: `runtime/src/verifier.rs` is complete and verifies real bb 5.0.0 UltraHonk proofs (see `docs/project/zk-verifier.md`), but no genuine ZKPassport `count_4` proof has been through it yet — that needs real passport NFC data
+1. **Mobile app** — `android/` native project and its NFC module (`NfcPassportModule.kt`) already exist and are committed; blocked instead on (a) no JDK/Android SDK in this WSL2 environment to actually run `./gradlew assembleDebug` (see changelog #80 for exact versions needed), and (b) ZKPassport Noir circuits for on-device ZK proof generation, still unwired. This is also what gates the **first end-to-end ZK verification test**: `runtime/src/verifier.rs` is complete and verifies real bb 5.0.0 UltraHonk proofs (see `docs/project/zk-verifier.md`), but no genuine ZKPassport `count_4` proof has been through it yet — that needs real passport NFC data
 2. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
 3. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
 4. **Per-referendum threshold** — supermajority for constitutional-tier laws
