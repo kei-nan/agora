@@ -203,9 +203,12 @@ are built on `disclosure`'s outer-embedded 8-field layout below.** Kept for test
 | 5–9 | `old_oprf_pk_hashes[0..5]` |
 | 10–14 | `new_oprf_pk_hashes[0..5]` |
 
-(Field indices above assume Barretenberg's declared-params-then-return-values ordering, as
-with every other circuit here; not yet confirmed against a real `bb prove` run since `migrate`
-has never been executed — see "What is NOT done".)
+Confirmed against a real `bb prove` run as of changelog entry 081 (`oprf-committee-dev`'s
+dual-committee-generation simulator; see that entry and `docs/project/next-steps.md` item 8):
+`nargo execute` solved a genuine 10-`verified_oprf`-call witness and the resulting
+`public_inputs` file is exactly this 15-field layout, `old_anchor` matching `oprf_identity_anchor`'s
+own already-proven `anchor` output byte-for-byte (both driven from the same committee
+generation and identity input).
 
 **Superseded as the production verification target by `migrate-disclosure`, below, for the same
 reason `disclosure` supersedes `anchor`** (changelog entry 76 — this standalone layout's
@@ -266,6 +269,13 @@ versions, and all 10 committee-key hashes rather than occupying separate slots. 
 second Agora-specific proof-type tag, deliberately distinct from `disclosure`'s `200` so a
 migration commitment can never be substituted for a registration/reverification one (they have
 different field counts and different Rust-side check obligations).
+
+Confirmed against a real `bb prove` run as of changelog entry 081, same `oprf-committee-dev`
+driver as `migrate` above: `nargo execute` solved a genuine witness, the resulting
+`public_inputs` file is exactly `[comm_in, current_date, service_scope, service_subscope,
+param_commitment, 0, 0, 0]`, and `bb verify` accepted the proof. This closes the gap entry 077
+flagged — that entry only confirmed this layout via a stubbed scratch copy, never a real
+committee-backed witness.
 
 ### Why `disclosure`/`migrate-disclosure` exist, and why a Rust verifier must use them
 
@@ -384,10 +394,14 @@ Honest list. Several of these are blocking.
   DKG ceremonies changelog entry 73 specifies, is **explicitly out of scope for this work and
   was not attempted**. Until at least 5 exist, `anchor`, `disclosure`, `migrate` and
   `migrate-disclosure` cannot be executed at all, only compiled.
-- **`anchor`, `disclosure`, `migrate` and `migrate-disclosure` have never been executed.** They
-  compile and produce verification keys, and their constraint systems are counted, but no
-  witness has ever been solved for any of them because that needs a live committee response.
-  Only `query` has a real witness, proof and verification.
+- **`anchor`, `disclosure`, `migrate`, and `migrate-disclosure` have now all been executed —
+  but only against `oprf-committee-dev`'s DEV-ONLY simulator, not a real committee.**
+  `anchor`/`disclosure` in changelog entry 078, `migrate`/`migrate-disclosure` in entry 081.
+  All four have a real solved witness, a real bb 5.0.0 proof, and a `bb verify` accepting it.
+  This closes the "never been executed" gap specifically — it does **not** touch the actual
+  blocker above: the simulator's 5 (or, for migrate, 10) key pairs are one process's RNG
+  output, not real committees, so nothing here proves anything about a genuine citizen's
+  identity.
 - **Rust verifier — real for registration, reverification, and migration as of changelog
   entry 76 (all three of the "recompute and check `param_commitment`" family); the actual
   committee service is still the unbuilt part.** `runtime/src/anchor_verifier.rs`'s
@@ -402,24 +416,23 @@ Honest list. Several of these are blocking.
   (`certificate_registry_root`/`circuit_registry_root` allowlisting) is `AllowedMerkleRoots`,
   unchanged since before entry 75. See changelog entry 76 for the full trail.
 - **Verifier-crate compatibility is no longer the open question it was.** Changelog entry 72
-  landed the bb 5.0.0 port of `ultrahonk-no-std` for the passport (`outer`) verifier, and this
-  session confirmed `bb write_vk --scheme ultra_honk` succeeds under the installed bb **5.0.0**
-  for all four circuits in this workspace, including the two largest (`migrate` at 433,740
-  ACIR opcodes / 555,380 circuit size). What's still unconfirmed is proof-level, not VK-level:
-  no witness has ever been solved for `anchor`/`disclosure`/`migrate` (needs a live committee),
-  so nobody has run a real bb 5.0.0 `anchor`/`disclosure`/`migrate` proof through
-  `ultrahonk-no-std` and confirmed a full prove/verify round-trip the way entry 72 did for the
-  passport `outer` circuit.
+  landed the bb 5.0.0 port of `ultrahonk-no-std` for the passport (`outer`) verifier, and entry
+  074 confirmed `bb write_vk --scheme ultra_honk` succeeds under bb **5.0.0** for all four
+  circuits in this workspace, including the two largest (`migrate` at 433,740 ACIR opcodes /
+  555,380 circuit size). Proof-level round-trips (not just VK generation) are now confirmed too
+  — entries 078 and 081, via the dev simulator — for all four, the same way entry 72 confirmed
+  it for the passport `outer` circuit. **Still open at the same level entry 72 closed for
+  `outer`**: no circuit here has been proven against a *real* committee response, only the
+  simulator's.
 
 ### Not verified
 
-- **`disclosure`'s outer-circuit integration has never been run inside an actual outer proof.**
-  The 8-field layout is empirically confirmed, but "the layout matches" is not the same as
-  "the outer circuit accepts it". Confirming that needs the full subproof pipeline plus a
-  committee. `migrate-disclosure` inherits this same unconfirmed status — it was never
-  measured against a stubbed copy the way `disclosure` was (see next bullet); its 8-field
-  outer-facing shape is derived by direct analogy to `disclosure`'s, not independently
-  cross-checked against a real proof's public-input bytes.
+- **`disclosure`'s and `migrate-disclosure`'s outer-circuit integration have never been run
+  inside an actual outer proof.** Both 8-field layouts are now empirically confirmed against a
+  real, committee-simulator-backed `bb prove` run (entries 078/081), but "the standalone
+  subproof's layout matches" is not the same as "the outer circuit's own recursive
+  verification accepts it". Confirming that needs the full outer-proof assembly pipeline
+  (a genuine ZKPassport passport proof) plus a committee, neither of which exists yet.
 - **The 8-field layout was measured on a stubbed copy** of `disclosure` (in scratch, not in
   this repo) with the `verified_oprf` call replaced, since the real circuit cannot execute.
   Only the function body differed; the signature and returns were identical, and the ABI

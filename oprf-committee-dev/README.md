@@ -76,14 +76,18 @@ committees changelog entry 73 decided on.
 
 ## What this closes, concretely
 
-`circuits/oprf-identity-anchor/anchor` and `.../disclosure` have been proven and verified
+All four of `circuits/oprf-identity-anchor`'s committee-consuming circuits — `anchor`,
+`disclosure`, `migrate`, `migrate-disclosure` — have now been proven and verified
 **end-to-end with real bb 5.0.0** using this crate's simulated committee output in place of
-the `oprf_proof.beta` stub — i.e., a genuine witness was solved (all 5 `verified_oprf` calls'
+the `oprf_proof.beta` stub: a genuine witness was solved (every `verified_oprf` call's
 Chaum-Pedersen and unblinding checks actually passed, not vacuously satisfied), a proof was
-generated, and `bb verify` accepted it. See `docs/project/changelog/078.md` for the exact
-commands, output, and what this does and does not establish about `migrate`/
-`migrate-disclosure` (not attempted this session, though nothing about them requires new
-simulator code — only re-running the same flow twice under two key generations).
+generated, and `bb verify` accepted it. `anchor`/`disclosure` were closed in changelog entry
+078; `migrate`/`migrate-disclosure` in entry 081, using two independent committee-key
+generations (`generate_migrate_prover_toml`/`generate_migrate_disclosure_prover_toml`,
+10 `verified_oprf` calls per proof instead of 5). Entry 081's `old_oprf_proofs` deliberately
+replays entry 078's exact committee generation (same RNG seed, same beta) as a cross-check:
+`migrate`'s `old_anchor` output matched `anchor/Prover.toml`'s already-proven `anchor` value
+byte-for-byte. See `docs/project/changelog/078.md` and `081.md` for exact commands and output.
 
 ## Layout
 
@@ -97,11 +101,18 @@ simulator code — only re-running the same flow twice under two key generations
 - `src/oprf.rs` — client/committee protocol glue (`blinded_query`, `evaluate`, `unblind`,
   `generate_output`).
 - `src/committee.rs` — the 5-committee dev simulator.
-- `src/prover_toml.rs` — renders a `Prover.toml` for the `anchor`/`disclosure` circuits from
-  simulated output.
-- `src/bin/generate_anchor_prover_toml.rs` — the actual end-to-end driver used in changelog
-  entry 078: runs the simulated flow once for the `query` circuit's own committed fixture
-  and prints an `anchor`-shaped `Prover.toml` to stdout.
+- `src/prover_toml.rs` — renders a `Prover.toml` for the `anchor`/`disclosure`/`migrate`/
+  `migrate-disclosure` circuits from simulated output. `generate_proof_set` runs one full
+  client+committee-generation round (used once by `anchor`/`disclosure`'s driver, twice by
+  `migrate`/`migrate-disclosure`'s).
+- `src/bin/generate_anchor_prover_toml.rs` — the driver used in changelog entry 078: runs the
+  simulated flow once for the `query` circuit's own committed fixture and prints an
+  `anchor`-shaped `Prover.toml` to stdout.
+- `src/bin/generate_migrate_prover_toml.rs` / `generate_migrate_disclosure_prover_toml.rs` —
+  the drivers used in changelog entry 081: run the simulated flow twice (old committee
+  generation — byte-identical to `generate_anchor_prover_toml`'s recipe — then an
+  independently-generated new one) and print a `migrate`/`migrate-disclosure`-shaped
+  `Prover.toml`.
 
 ## Reproducing
 
@@ -121,4 +132,31 @@ bb prove    --scheme ultra_honk -b target/oprf_identity_anchor.json \
             -w target/anchor_witness.gz -k target/bb_anchor/vk -o target/bb_anchor
 bb verify   --scheme ultra_honk -k target/bb_anchor/vk \
             -p target/bb_anchor/proof -i target/bb_anchor/public_inputs
+```
+
+`migrate`/`migrate-disclosure` follow the identical pattern with their own binaries:
+
+```bash
+cd oprf-committee-dev
+cargo run --bin generate_migrate_prover_toml > /tmp/migrate_prover.toml
+cp /tmp/migrate_prover.toml ../circuits/oprf-identity-anchor/migrate/Prover.toml
+cargo run --bin generate_migrate_disclosure_prover_toml > /tmp/migrate_disclosure_prover.toml
+cp /tmp/migrate_disclosure_prover.toml ../circuits/oprf-identity-anchor/migrate-disclosure/Prover.toml
+
+cd ../circuits/oprf-identity-anchor
+nargo execute --package oprf_identity_anchor_migrate migrate_witness
+nargo execute --package oprf_identity_anchor_migrate_disclosure migrate_disclosure_witness
+nargo compile --workspace
+mkdir -p target/bb_migrate target/bb_migrate_disclosure
+bb write_vk --scheme ultra_honk -b target/oprf_identity_anchor_migrate.json -o target/bb_migrate
+bb prove    --scheme ultra_honk -b target/oprf_identity_anchor_migrate.json \
+            -w target/migrate_witness.gz -k target/bb_migrate/vk -o target/bb_migrate
+bb verify   --scheme ultra_honk -k target/bb_migrate/vk \
+            -p target/bb_migrate/proof -i target/bb_migrate/public_inputs
+
+bb write_vk --scheme ultra_honk -b target/oprf_identity_anchor_migrate_disclosure.json -o target/bb_migrate_disclosure
+bb prove    --scheme ultra_honk -b target/oprf_identity_anchor_migrate_disclosure.json \
+            -w target/migrate_disclosure_witness.gz -k target/bb_migrate_disclosure/vk -o target/bb_migrate_disclosure
+bb verify   --scheme ultra_honk -k target/bb_migrate_disclosure/vk \
+            -p target/bb_migrate_disclosure/proof -i target/bb_migrate_disclosure/public_inputs
 ```
