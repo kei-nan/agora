@@ -102,6 +102,13 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    packagingOptions {
+        // bcprov-jdk18on and bcutil-jdk18on (both transitive deps of
+        // org.jmrtd:jmrtd) bundle identical OSGi manifests at this path.
+        resources {
+            excludes += ["META-INF/versions/9/OSGI-INF/MANIFEST.MF"]
+        }
+    }
 }
 
 dependencies {
