@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Alert, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
+import { Alert, Modal, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
 import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -79,6 +79,7 @@ export default function RegisterScreen({ navigation }: Props) {
   const [dateOfExpiry, setDateOfExpiry] = useState<Date | null>(null);
   const [activePicker, setActivePicker] = useState<'dob' | 'expiry' | null>(null);
   const [rawPassport, setRawPassport] = useState<RawPassportData | null>(null);
+  const [resultModal, setResultModal] = useState<{ title: string; message: string; devDetails?: string } | null>(null);
 
   const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
 
@@ -111,41 +112,49 @@ export default function RegisterScreen({ navigation }: Props) {
       // TODO: await FaceMatch.verify(scan.faceImage);
       setStep('proving');
       // Real as of this session (../chain/sodParser.ts) — parses the SOD's
-      // CMS SignedData structure and assembles the RegisterIdentityBuilder
-      // circuit's dg1/dg15/encapsulatedContent/signedAttributes/pubkey/
-      // signature inputs, and identifies which circuit variant this
-      // passport needs. Still stops here, though, blocked on two things
-      // buildCircuitInputs deliberately does NOT produce (see its module
-      // doc comment for why both are real, unresolved blockers, not
-      // oversights):
-      //  (1) `skIdentity` — must be a genuine locally-generated secret, not
-      //      derived from public passport bytes.
-      //  (2) `slaveMerkleRoot` / `slaveMerkleInclusionBranches` — an
-      //      inclusion proof against Rarimo's live `CertificatesSMT`
-      //      registry; no documented client API for that was found yet.
-      // ...plus obtaining a `.wcd` witness graph + the ~515MB proving key
-      // for the specific variant identified below (see ../chain/
-      // zkProving.ts's module doc + HANDOFF item 8/log #56).
-      // Once all of that exists, this step becomes roughly:
-      //   const graphPath = await fetchZkAsset(WCD_GRAPH_HASH_FOR[variant.name]);
-      //   const zkeyPath = await fetchZkAsset(PROVING_KEY_HASH_FOR[variant.name]);
-      //   const fullInputs = { ...inputs, skIdentity, slaveMerkleRoot, slaveMerkleInclusionBranches };
-      //   const witness = await computeWitness(JSON.stringify(fullInputs), graphPath);
-      //   const { proof, pub_signals } = await generateProof(zkeyPath, toBase64(witness));
-      //   const zkProof = encodeGroth16Proof(proof as SnarkjsGroth16Proof, 0);
+      // CMS SignedData structure and assembles the ZKPassport sig-check/
+      // data-check circuits' dg1/eContent/signedAttributes/pubkey/signature
+      // inputs, and identifies which circuit variant this passport needs.
+      // Still stops here, though, blocked on what buildCircuitInputs
+      // deliberately does NOT produce (see its module doc comment /
+      // `UnresolvedInputs` for why these are real, unstarted work rather
+      // than oversights):
+      //  (1) `cscCertificate` — the CSC (country signing) certificate that
+      //      signed this passport's DSC, plus its Barrett-reduction params.
+      //  (2) `certificateTreeProof` — the DSC's inclusion proof in Agora's
+      //      certificate registry tree (certificateTree.ts already builds
+      //      this tree — changelog entry 66 — but nothing wires the two
+      //      together yet).
+      //  (3) `commitmentSalts` — must be freshly random per proof, generated
+      //      on-device, not derived from passport bytes.
+      //  (4) `serviceScope` / `serviceSubscope` — chain-level constants.
+      // ...plus obtaining a `.wcd` witness graph + proving key for the
+      // specific variant identified below (see ../chain/zkProving.ts's
+      // module doc + HANDOFF item 8/log #56).
       const { variant } = buildCircuitInputs(raw.dg1, raw.dg15, raw.sod);
       throw new NotImplementedError(
         `Passport chip read succeeded (DG1: ${raw.dg1.length}B, DG15: ${raw.dg15.length}B, ` +
           `SOD: ${raw.sod.length}B) and circuit inputs were assembled for variant "${variant.name}" — ` +
-          'but proof generation still needs a real identity secret, a Merkle inclusion proof from ' +
-          "Rarimo's certificate registry, and this variant's proving key/witness graph, none of which " +
-          'exist yet. See RegisterScreen.tsx TODOs.',
+          'but proof generation still needs a certificate-registry inclusion proof, on-device ' +
+          "commitment salts, and this variant's proving key/witness graph, none of which exist yet. " +
+          'See RegisterScreen.tsx TODOs.',
       );
     } catch (e: any) {
       if (e instanceof NotImplementedError) {
-        Alert.alert('Scan succeeded — registration not complete yet', e.message);
+        setResultModal({
+          title: 'Almost there',
+          message:
+            "Your passport was read and verified successfully. We're still building the last part " +
+            "of the system that turns that into a proof for the chain, so registration can't finish " +
+            'in this version yet — please check back in a future update.',
+          devDetails: __DEV__ ? e.message : undefined,
+        });
       } else {
-        Alert.alert('Registration failed', e.message);
+        setResultModal({
+          title: "Registration didn't complete",
+          message: 'Something went wrong while reading or processing your passport. Please try again.',
+          devDetails: __DEV__ ? e.message : undefined,
+        });
       }
       setStep('idle');
     }
@@ -154,6 +163,7 @@ export default function RegisterScreen({ navigation }: Props) {
   const activeIndex = STEP_ORDER.indexOf(step);
 
   return (
+    <>
     <ScrollView
       style={s.container}
       contentContainerStyle={s.scrollContent}
@@ -270,6 +280,31 @@ export default function RegisterScreen({ navigation }: Props) {
         </View>
       )}
     </ScrollView>
+
+    <Modal
+      visible={resultModal !== null}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setResultModal(null)}
+    >
+      <View style={s.modalBackdrop}>
+        <View style={s.modalCard}>
+          <Text style={s.modalTitle}>{resultModal?.title}</Text>
+          <Text style={s.modalMessage}>{resultModal?.message}</Text>
+          {resultModal?.devDetails && (
+            <>
+              <View style={s.modalDivider} />
+              <Text style={s.modalDevLabel}>DEV DETAILS</Text>
+              <Text style={s.modalDevText}>{resultModal.devDetails}</Text>
+            </>
+          )}
+          <TouchableOpacity style={s.modalBtn} onPress={() => setResultModal(null)}>
+            <Text style={s.btnText}>OK</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+    </>
   );
 }
 
@@ -329,4 +364,32 @@ const s = StyleSheet.create({
   mrzHint: { fontSize: 11, color: '#4b5563', lineHeight: 15, marginTop: 10 },
   scanResult: { fontSize: 12, color: '#22c55e', textAlign: 'center', marginBottom: 12 },
   btnDisabled: { backgroundColor: '#374151' },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 400,
+    backgroundColor: '#161b27',
+    borderRadius: 16,
+    padding: 24,
+    borderWidth: 1,
+    borderColor: '#1f2937',
+  },
+  modalTitle: { fontSize: 18, fontWeight: '700', color: '#ffffff', marginBottom: 10 },
+  modalMessage: { fontSize: 14, color: '#d1d5db', lineHeight: 20 },
+  modalDivider: { height: 1, backgroundColor: '#1f2937', marginVertical: 16 },
+  modalDevLabel: { fontSize: 10, fontWeight: '700', color: '#6b7280', letterSpacing: 0.8, marginBottom: 6 },
+  modalDevText: { fontSize: 12, color: '#6b7280', lineHeight: 17 },
+  modalBtn: {
+    marginTop: 20,
+    backgroundColor: '#6C63FF',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
 });
