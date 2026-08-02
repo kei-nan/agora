@@ -290,7 +290,17 @@ export interface OuterProofInputs {
   inputs: Record<string, unknown>;
 }
 
-/** The finished artifact: exactly what `pallet_identity_zk::register_citizen` takes. */
+/**
+ * The finished artifact: exactly the `zk_proof`/`public_inputs` pair
+ * `pallet_identity_zk::register_citizen` takes.
+ *
+ * HANDOFF log #76 restructured `reverify_citizen`/`migrate_oprf_scheme` to take this same
+ * shape (previously they took only a bare, unauthenticated proof-bytes blob) — so this type,
+ * despite the name, is also what {@link proveReverification}/{@link proveMigration} below
+ * return. Kept as one name rather than three near-identical interfaces since the shape truly
+ * is identical; `mobile/src/chain/identity.ts` defines its own `OuterProofPayload` with the
+ * same fields for callers that don't want a dependency on this module.
+ */
 export interface RegistrationProof {
   /** `zk_proof` — the envelope `runtime/src/verifier.rs` parses. */
   zkProof: Uint8Array;
@@ -358,6 +368,51 @@ export async function proveRegistration(
     publicInputs: splitPublicInputs(outerProof.publicInputs),
     outerCount,
   };
+}
+
+/**
+ * Produces the outer ZKPassport proof for periodic re-verification (`reverify_citizen`,
+ * call index 6).
+ *
+ * HANDOFF log #76 found reverification needs no new circuit at all: it rides the identical
+ * `disclosure` subproof shape registration already uses (recompute the anchor from the
+ * fresh proof, confirm it still matches the one on file), so there is no separate proving
+ * pipeline here — this is `proveRegistration`'s exact mechanics under a name that matches
+ * the call site it feeds. `disclosureSubproofs` should be `disclosure` circuit requests,
+ * exactly as for registration.
+ */
+export async function proveReverification(
+  baseSubproofs: readonly SubproofRequest[],
+  disclosureSubproofs: readonly SubproofRequest[],
+  outer: OuterProofInputs,
+  options: ProvingOptions = {},
+): Promise<RegistrationProof> {
+  return proveRegistration(baseSubproofs, disclosureSubproofs, outer, options);
+}
+
+/**
+ * Produces the outer ZKPassport proof for OPRF scheme migration (`migrate_oprf_scheme`,
+ * call index 7).
+ *
+ * Unlike reverification, log #76 found migration genuinely needed a new circuit —
+ * `circuits/oprf-identity-anchor/migrate-disclosure` — because the standalone `migrate`
+ * circuit shared the same unauthenticated-`comm_in` flaw `disclosure` was built to close for
+ * `anchor`. `migrate-disclosure` folds both the old and new anchor/scheme-version/committee-
+ * hash sets into one 15-element `param_commitment` (tag `201`) plus an expiry check
+ * `migrate` never had, but it still exposes the same fixed 8-field outer-circuit disclosure-
+ * subproof interface `disclosure` does (empirically confirmed in changelog entry 77) — so the
+ * outer-proof assembly below is mechanically identical to registration's; only the *content*
+ * of `disclosureSubproofs` differs. Pass `migrate-disclosure` circuit requests here instead of
+ * `disclosure` ones; everything else (base subproofs, outer witness assembly, envelope
+ * encoding) is unchanged.
+ */
+export async function proveMigration(
+  baseSubproofs: readonly SubproofRequest[],
+  disclosureSubproofs: readonly SubproofRequest[],
+  outer: OuterProofInputs,
+  options: ProvingOptions = {},
+): Promise<RegistrationProof> {
+  return proveRegistration(baseSubproofs, disclosureSubproofs, outer, options);
 }
 
 /**

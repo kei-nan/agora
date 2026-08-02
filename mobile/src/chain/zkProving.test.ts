@@ -16,7 +16,9 @@ import {
   NoirProver,
   NoirProverUnavailableError,
   outerCircuitFor,
+  proveMigration,
   proveRegistration,
+  proveReverification,
   ProvingTarget,
   setNoirProver,
   SubproofRequest,
@@ -196,6 +198,112 @@ describe('proveRegistration', () => {
       'sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256',
       'data-check/integrity/sa_sha256/dg_sha256',
       'disclose/bytes',
+      'main/outer/count_4',
+    ]);
+  });
+});
+
+/**
+ * `proveReverification`/`proveMigration` (HANDOFF log #76): `reverify_citizen`/
+ * `migrate_oprf_scheme` now take the same outer `zk_proof`/`public_inputs` shape
+ * `register_citizen` does, so these two are thin, differently-named wrappers over the exact
+ * same orchestration `proveRegistration` already implements and the tests above already
+ * cover in detail (subproof ordering, proving targets, envelope shape, count_N derivation).
+ * These tests exist to pin that the wrappers really do delegate rather than silently
+ * diverge, not to re-prove the underlying mechanics a second time.
+ */
+describe('proveReverification', () => {
+  it('produces the identical outer-proof shape proveRegistration does', async () => {
+    const { prover, proveCalls } = fakeProver();
+    setNoirProver(prover);
+
+    const result = await proveReverification(baseRequests, [request('disclosure/anchor', 4)], {
+      bytecodeHash: assetHash(9),
+      inputs: {},
+    });
+
+    expect(proveCalls).toHaveLength(5);
+    expect(proveCalls[4].target).toBe('evm');
+    expect(result.outerCount).toBe(4);
+    expect(decodeUltraHonkProof(result.zkProof).header.outerCount).toBe(4);
+    expect(result.publicInputs).toHaveLength(9);
+  });
+
+  it('fails loudly when no prover is registered, same as proveRegistration', async () => {
+    setNoirProver(null);
+    await expect(
+      proveReverification(baseRequests, [request('disclosure/anchor', 4)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(NoirProverUnavailableError);
+  });
+
+  it('still enforces base-subproof ordering', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const swapped = [baseRequests[1], baseRequests[0], baseRequests[2]];
+    await expect(
+      proveReverification(swapped, [request('disclosure/anchor', 4)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(/order matters/);
+  });
+});
+
+describe('proveMigration', () => {
+  it('produces the identical outer-proof shape proveRegistration does, over a migrate-disclosure subproof', async () => {
+    const { prover, proveCalls } = fakeProver();
+    setNoirProver(prover);
+
+    const result = await proveMigration(
+      baseRequests,
+      [request('migrate-disclosure/bytes', 5)],
+      { bytecodeHash: assetHash(9), inputs: {} },
+    );
+
+    expect(proveCalls).toHaveLength(5);
+    expect(proveCalls.slice(0, 4).map((c) => c.target)).toEqual([
+      'noir-recursive',
+      'noir-recursive',
+      'noir-recursive',
+      'noir-recursive',
+    ]);
+    expect(proveCalls[4].target).toBe('evm');
+    expect(result.outerCount).toBe(4);
+    expect(decodeUltraHonkProof(result.zkProof).header.outerCount).toBe(4);
+    expect(result.publicInputs).toHaveLength(9);
+  });
+
+  it('fails loudly when no prover is registered, same as proveRegistration', async () => {
+    setNoirProver(null);
+    await expect(
+      proveMigration(baseRequests, [request('migrate-disclosure/bytes', 5)], {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(NoirProverUnavailableError);
+  });
+
+  it('reports progress the same way proveRegistration does', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const stages: string[] = [];
+    await proveMigration(
+      baseRequests,
+      [request('migrate-disclosure/bytes', 5)],
+      { bytecodeHash: assetHash(9), inputs: {} },
+      { onProgress: (stage) => stages.push(stage) },
+    );
+
+    expect(stages).toEqual([
+      'sig-check/dsc/tbs_1000/rsa/pkcs/2048/sha256',
+      'sig-check/id-data/tbs_1000/rsa/pkcs/2048/sha256',
+      'data-check/integrity/sa_sha256/dg_sha256',
+      'migrate-disclosure/bytes',
       'main/outer/count_4',
     ]);
   });
