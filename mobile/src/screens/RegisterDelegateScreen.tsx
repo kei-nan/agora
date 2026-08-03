@@ -9,6 +9,7 @@ import { RootStackParamList } from '../App';
 import { registerAsDelegate } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { getPassportName } from '../chain/citizenState';
+import { colors } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'RegisterDelegate'>;
 type Step = 'idle' | 'submitting' | 'done';
@@ -63,11 +64,12 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
         value={bio}
         onChangeText={setBio}
         placeholder="Describe your positions and why citizens should delegate to you…"
-        placeholderTextColor="#4b5563"
+        placeholderTextColor={colors.textDim}
         multiline
         numberOfLines={5}
         maxLength={500}
         editable={step === 'idle'}
+        accessibilityLabel="Bio or policy positions, optional"
       />
       <Text style={s.charCount}>{bio.length}/500</Text>
 
@@ -78,7 +80,12 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
           <Text style={s.successSub}>
             You are now in Pending status. Gather 50 backers to become Active and receive delegations.
           </Text>
-          <TouchableOpacity style={s.doneBtn} onPress={() => navigation.goBack()}>
+          <TouchableOpacity
+            style={s.doneBtn}
+            onPress={() => navigation.goBack()}
+            accessibilityRole="button"
+            accessibilityLabel="Back to Delegates"
+          >
             <Text style={s.doneBtnText}>Back to Delegates</Text>
           </TouchableOpacity>
         </View>
@@ -87,9 +94,12 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
           style={[s.submitBtn, !canSubmit && s.submitBtnDisabled]}
           onPress={submit}
           disabled={!canSubmit}
+          accessibilityRole="button"
+          accessibilityLabel="Register as Delegate"
+          accessibilityState={{ disabled: !canSubmit }}
         >
           {step === 'submitting'
-            ? <ActivityIndicator color="#fff" />
+            ? <ActivityIndicator color={colors.textPrimary} />
             : <Text style={s.submitBtnText}>Register as Delegate</Text>}
         </TouchableOpacity>
       )}
@@ -107,47 +117,47 @@ function InfoRow({ icon, text }: { icon: string; text: string }) {
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117' },
+  container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: 24, paddingBottom: 40 },
-  title: { fontSize: 22, fontWeight: '700', color: '#ffffff', marginBottom: 8 },
-  subtitle: { fontSize: 14, color: '#6b7280', lineHeight: 20, marginBottom: 20 },
+  title: { fontSize: 22, fontWeight: '700', color: colors.textPrimary, marginBottom: 8 },
+  subtitle: { fontSize: 14, color: colors.textMuted, lineHeight: 20, marginBottom: 20 },
   infoBox: {
-    backgroundColor: '#161b27', borderRadius: 14, padding: 16,
-    borderWidth: 1, borderColor: '#1f2937', marginBottom: 28, gap: 12,
+    backgroundColor: colors.card, borderRadius: 14, padding: 16,
+    borderWidth: 1, borderColor: colors.border, marginBottom: 28, gap: 12,
   },
   infoRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   infoIcon: { fontSize: 18, width: 24 },
   infoText: { fontSize: 13, color: '#d1d5db', flex: 1, lineHeight: 18 },
-  label: { fontSize: 12, fontWeight: '600', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
+  label: { fontSize: 12, fontWeight: '600', color: colors.textSecondary, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
   optional: { fontWeight: '400', textTransform: 'none', letterSpacing: 0 },
   input: {
-    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
-    borderRadius: 12, padding: 14, color: '#ffffff', fontSize: 14, marginBottom: 4,
+    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
+    borderRadius: 12, padding: 14, color: colors.textPrimary, fontSize: 14, marginBottom: 4,
   },
   bioInput: { height: 120, textAlignVertical: 'top', marginBottom: 4 },
   passportNameBox: {
-    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
     borderRadius: 12, padding: 14, flexDirection: 'row', alignItems: 'center',
     marginBottom: 20, gap: 12,
   },
   passportNameLeft: { flex: 1 },
-  passportName: { fontSize: 16, fontWeight: '600', color: '#ffffff', marginBottom: 3 },
-  passportNameSub: { fontSize: 11, color: '#4b5563' },
+  passportName: { fontSize: 16, fontWeight: '600', color: colors.textPrimary, marginBottom: 3 },
+  passportNameSub: { fontSize: 11, color: colors.textDim },
   passportLock: { fontSize: 18 },
-  charCount: { fontSize: 11, color: '#4b5563', textAlign: 'right', marginBottom: 28 },
+  charCount: { fontSize: 11, color: colors.textDim, textAlign: 'right', marginBottom: 28 },
   submitBtn: {
-    backgroundColor: '#6C63FF', paddingVertical: 16,
+    backgroundColor: colors.accent, paddingVertical: 16,
     borderRadius: 14, alignItems: 'center',
   },
   submitBtnDisabled: { opacity: 0.4 },
-  submitBtnText: { color: '#fff', fontWeight: '700', fontSize: 16 },
+  submitBtnText: { color: colors.textPrimary, fontWeight: '700', fontSize: 16 },
   successBox: { alignItems: 'center', paddingTop: 16, gap: 12 },
-  successIcon: { fontSize: 56, color: '#22c55e' },
-  successTitle: { fontSize: 20, fontWeight: '700', color: '#22c55e' },
-  successSub: { fontSize: 14, color: '#6b7280', textAlign: 'center', lineHeight: 20 },
+  successIcon: { fontSize: 56, color: colors.success },
+  successTitle: { fontSize: 20, fontWeight: '700', color: colors.success },
+  successSub: { fontSize: 14, color: colors.textMuted, textAlign: 'center', lineHeight: 20 },
   doneBtn: {
-    marginTop: 8, backgroundColor: '#6C63FF', paddingVertical: 14,
+    marginTop: 8, backgroundColor: colors.accent, paddingVertical: 14,
     paddingHorizontal: 32, borderRadius: 12,
   },
-  doneBtnText: { color: '#fff', fontWeight: '600', fontSize: 15 },
+  doneBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 15 },
 });

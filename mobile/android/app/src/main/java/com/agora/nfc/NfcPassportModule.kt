@@ -19,14 +19,14 @@ import java.io.IOException
 /**
  * Reads the RAW EF.DG1 / EF.DG15 / EF.SOD data-group bytes off a biometric
  * passport's NFC chip via Basic Access Control (BAC) — not parsed/summarized
- * fields, since these bytes are direct witness inputs to the Rarimo ZK
+ * fields, since these bytes are direct witness inputs to the ZKPassport ZK
  * circuit (see `mobile/src/chain/zkProving.ts` / `proofEncoding.ts` for the
  * proving half this feeds; this module is strictly upstream and does not
  * touch those files).
  *
  * Built on **JMRTD** (`org.jmrtd:jmrtd`, LGPL) — the real, current, standard
  * open-source library for ICAO 9303 chip access, and confirmed (HANDOFF.md
- * log #57) to be exactly what Rarimo's own production Android app pins,
+ * log #57) to be exactly what a production passport-scanning app would pin,
  * alongside **scuba-sc-android** (`net.sf.scuba:scuba-sc-android`), the
  * bridge from Android's `android.nfc.tech.IsoDep` to JMRTD's `CardService`
  * abstraction. Every JMRTD/scuba API call below was cross-checked against
@@ -88,6 +88,23 @@ class NfcPassportModule(reactContext: ReactApplicationContext) : ReactContextBas
   private var pendingBacKey: BACKey? = null
 
   init {
+    // RN can construct a new module instance while an old one still has a
+    // read pending — a JS bridge reload / dev fast-refresh / ReactInstanceManager
+    // recreation, none of which involve the user cancelling their in-flight
+    // scan. `onTagDiscovered` only ever calls into whichever instance is
+    // `activeInstance` at the time a tag arrives, so without this the old
+    // instance's promise would simply never settle: no resolve, no reject,
+    // forever. Reject it here so a stale scan fails loudly instead of hanging.
+    activeInstance?.let { previous ->
+      synchronized(previous.lock) {
+        previous.pendingPromise?.reject(
+          "NFC_MODULE_REPLACED",
+          "The passport-reader native module was re-created while a read was pending (e.g. app reload)",
+        )
+        previous.pendingPromise = null
+        previous.pendingBacKey = null
+      }
+    }
     activeInstance = this
   }
 
@@ -98,7 +115,8 @@ class NfcPassportModule(reactContext: ReactApplicationContext) : ReactContextBas
    * the given MRZ fields as the BAC key. Resolves once a tag is presented
    * *and* the full BAC + DG1/DG15/SOD read completes; rejects on any
    * failure (BAC denied — usually wrong MRZ data, connection lost mid-read,
-   * unsupported/non-ICAO tag, etc).
+   * unsupported/non-ICAO tag, etc), or if `cancelPendingRead` is called
+   * first (see its doc comment for why the JS side needs that).
    *
    * `dateOfBirth`/`dateOfExpiry` must be `YYMMDD` (confirmed against
    * `BACKey`'s source: `SDF = "yyMMdd"`, and its constructor throws
@@ -125,6 +143,29 @@ class NfcPassportModule(reactContext: ReactApplicationContext) : ReactContextBas
       pendingBacKey = bacKey
       pendingPromise = promise
     }
+  }
+
+  /**
+   * Clears a pending `readPassport` call that never got a tag, rejecting its
+   * promise. Nothing here times this out on its own — the JS wrapper
+   * (`mobile/src/native/nfcPassportReader.ts`) is what enforces a deadline
+   * and calls this when it expires, and also calls it if the user navigates
+   * away mid-scan. Without this, a tag that never gets tapped (or a screen
+   * the user backs out of) left `pendingPromise` set forever, so the *next*
+   * `readPassport` call — even a fresh one, well after the user gave up on
+   * the first — would fail immediately with `NFC_BUSY` until the app process
+   * was restarted.
+   *
+   * Safe to call with nothing pending (no-ops).
+   */
+  @ReactMethod
+  fun cancelPendingRead(promise: Promise) {
+    synchronized(lock) {
+      pendingPromise?.reject("NFC_CANCELLED", "The passport read was cancelled before a tag was presented")
+      pendingPromise = null
+      pendingBacKey = null
+    }
+    promise.resolve(null)
   }
 
   private fun handleTagDiscovered(tag: Tag) {

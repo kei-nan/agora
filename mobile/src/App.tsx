@@ -11,6 +11,7 @@ enableScreens();
 import RegisterScreen from './screens/RegisterScreen';
 import HomeScreen from './screens/HomeScreen';
 import ProposalsScreen from './screens/ProposalsScreen';
+import LawsScreen from './screens/LawsScreen';
 import PetitionScreen from './screens/PetitionScreen';
 import DelegateScreen from './screens/DelegateScreen';
 import DelegateDetailScreen from './screens/DelegateDetailScreen';
@@ -29,6 +30,7 @@ export type RootStackParamList = {
 export type TabParamList = {
   Home: undefined;
   Proposals: undefined;
+  Laws: undefined;
   Petitions: undefined;
   Delegate: undefined;
   Budget: undefined;
@@ -50,6 +52,7 @@ function MainTabs() {
     >
       <Tab.Screen name="Home" component={HomeScreen} options={{ title: 'Agora', headerShown: false }} />
       <Tab.Screen name="Proposals" component={ProposalsScreen} />
+      <Tab.Screen name="Laws" component={LawsScreen} />
       <Tab.Screen name="Petitions" component={PetitionScreen} />
       <Tab.Screen name="Delegate" component={DelegateScreen} />
       <Tab.Screen name="Budget" component={VoteScreen} />

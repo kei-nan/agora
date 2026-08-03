@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   RefreshControl,
   StyleSheet,
@@ -8,6 +9,7 @@ import {
   View,
 } from 'react-native';
 import { Law, fetchLaws } from '../chain/governance';
+import { colors } from '../theme';
 
 export default function LawsScreen() {
   const [laws, setLaws] = useState<Law[]>([]);
@@ -17,6 +19,11 @@ export default function LawsScreen() {
   const load = useCallback(async () => {
     try {
       setLaws(await fetchLaws());
+    } catch (e: any) {
+      // Without this, a chain-unreachable error left `laws` at its previous
+      // value (empty on first load) with no indication anything went wrong —
+      // indistinguishable from "no laws enacted yet."
+      Alert.alert('Error', e.message);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -26,7 +33,7 @@ export default function LawsScreen() {
   useEffect(() => { load(); }, [load]);
 
   if (loading) {
-    return <View style={s.center}><ActivityIndicator color="#6C63FF" /></View>;
+    return <View style={s.center}><ActivityIndicator color={colors.accent} /></View>;
   }
 
   return (
@@ -38,7 +45,7 @@ export default function LawsScreen() {
         <RefreshControl
           refreshing={refreshing}
           onRefresh={() => { setRefreshing(true); load(); }}
-          tintColor="#6C63FF"
+          tintColor={colors.accent}
         />
       }
       ListEmptyComponent={<Text style={s.empty}>No laws enacted yet.</Text>}
@@ -72,29 +79,29 @@ export default function LawsScreen() {
 }
 
 const s = StyleSheet.create({
-  list: { flex: 1, backgroundColor: '#0f1117', padding: 16 },
-  center: { flex: 1, backgroundColor: '#0f1117', alignItems: 'center', justifyContent: 'center' },
-  empty: { color: '#6b7280', textAlign: 'center', marginTop: 40 },
+  list: { flex: 1, backgroundColor: colors.bg, padding: 16 },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+  empty: { color: colors.textMuted, textAlign: 'center', marginTop: 40 },
   card: {
-    backgroundColor: '#161b27',
+    backgroundColor: colors.card,
     borderRadius: 14,
     padding: 16,
     marginBottom: 10,
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
   },
   chips: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' },
   chip: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   chipText: { fontSize: 11, fontWeight: '600' },
   chipActive: { backgroundColor: '#052e16' },
-  chipTextActive: { color: '#22c55e' },
+  chipTextActive: { color: colors.success },
   chipPaused: { backgroundColor: '#2a2a1a' },
-  chipTextPaused: { color: '#f59e0b' },
+  chipTextPaused: { color: colors.warning },
   chipRepealed: { backgroundColor: '#2d1515' },
-  chipTextRepealed: { color: '#ef4444' },
+  chipTextRepealed: { color: colors.danger },
   chipConstitutional: { backgroundColor: '#1e1040' },
   chipTextConstitutional: { color: '#a78bfa' },
-  meta: { fontSize: 11, color: '#4b5563', marginLeft: 'auto' },
-  title: { fontSize: 15, fontWeight: '600', color: '#ffffff', marginBottom: 8, lineHeight: 21 },
-  hash: { fontSize: 11, color: '#374151', fontFamily: 'monospace' },
+  meta: { fontSize: 11, color: colors.textDim, marginLeft: 'auto' },
+  title: { fontSize: 15, fontWeight: '600', color: colors.textPrimary, marginBottom: 8, lineHeight: 21 },
+  hash: { fontSize: 11, color: colors.textFaint, fontFamily: 'monospace' },
 });

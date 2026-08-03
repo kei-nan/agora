@@ -48,9 +48,9 @@ class MainActivity : ReactActivity() {
    * — NFC dispatch needs to write the discovered `Tag` into the intent's
    * extras, which an immutable `PendingIntent` would reject. The flag's
    * underlying int value (`0x02000000`) is simply an unused bit on pre-31
-   * devices (minSdkVersion 23 here), so this is safe across the whole
-   * supported range — this is the standard pattern for NFC foreground
-   * dispatch on modern Android.
+   * devices (minSdkVersion 24 here — see mobile/android/build.gradle), so
+   * this is safe across the whole supported range — this is the standard
+   * pattern for NFC foreground dispatch on modern Android.
    */
   override fun onResume() {
     super.onResume()
@@ -81,6 +81,13 @@ class MainActivity : ReactActivity() {
     // needed for the democracychain:// auth deep link (AndroidManifest.xml)
     // to keep working on a warm start now that this override exists.
     setIntent(intent)
+    // Only treat this as an NFC tag event if it's actually the tech-discovery
+    // dispatch registered in onResume (ACTION_TECH_DISCOVERED, since a tech
+    // list rather than an NDEF filter was passed to enableForegroundDispatch)
+    // — this activity is also exported for the democracychain:// deep link,
+    // so it can receive arbitrary external VIEW intents, and there's no
+    // reason to go looking for an EXTRA_TAG parcelable in those.
+    if (intent.action != NfcAdapter.ACTION_TECH_DISCOVERED) return
     val tag: Tag? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       intent.getParcelableExtra(NfcAdapter.EXTRA_TAG, Tag::class.java)
     } else {

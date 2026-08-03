@@ -1,16 +1,17 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Alert, Modal, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
 import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
-import { readPassport, RawPassportData } from '../native/nfcPassportReader';
+import { readPassport, cancelPendingScan, RawPassportData } from '../native/nfcPassportReader';
 import { buildCircuitInputs } from '../chain/sodParser';
 import {
   TEST_PASSPORT_DG1_BASE64,
   TEST_PASSPORT_DG15_BASE64,
   TEST_PASSPORT_SOD_BASE64,
 } from '../chain/__fixtures__/testPassport';
+import { colors } from '../theme';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
 // imported here anymore — this screen can no longer honestly claim
@@ -82,6 +83,16 @@ export default function RegisterScreen({ navigation }: Props) {
   const [resultModal, setResultModal] = useState<{ title: string; message: string; devDetails?: string } | null>(null);
 
   const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
+
+  // If the user navigates away mid-scan (e.g. taps back while "Scan passport
+  // NFC chip" is active), cancel the native side's pending read rather than
+  // leaving it occupying NfcPassportModule's single pending-read slot until
+  // its own timeout elapses.
+  useEffect(() => {
+    return () => {
+      cancelPendingScan();
+    };
+  }, []);
 
   async function start(useTestPassport: boolean = false) {
     if (!useTestPassport && Platform.OS !== 'android') {
@@ -186,7 +197,7 @@ export default function RegisterScreen({ navigation }: Props) {
                 {isDone ? (
                   <Text style={s.stepNumText}>✓</Text>
                 ) : isActive ? (
-                  <ActivityIndicator size="small" color="#fff" />
+                  <ActivityIndicator size="small" color={colors.textPrimary} />
                 ) : (
                   <Text style={s.stepNumText}>{i + 1}</Text>
                 )}
@@ -209,18 +220,29 @@ export default function RegisterScreen({ navigation }: Props) {
               value={documentNumber}
               onChangeText={setDocumentNumber}
               placeholder="e.g. L898902C3"
-              placeholderTextColor="#4b5563"
+              placeholderTextColor={colors.textDim}
               autoCapitalize="characters"
+              accessibilityLabel="Passport number"
             />
             <Text style={s.mrzLabel}>Date of birth</Text>
-            <TouchableOpacity style={s.mrzInput} onPress={() => setActivePicker('dob')}>
+            <TouchableOpacity
+              style={s.mrzInput}
+              onPress={() => setActivePicker('dob')}
+              accessibilityRole="button"
+              accessibilityLabel={dateOfBirth ? `Date of birth: ${formatDate(dateOfBirth)}` : 'Select date of birth'}
+            >
               <Text style={dateOfBirth ? s.dateValue : s.datePlaceholder}>
                 {dateOfBirth ? formatDate(dateOfBirth) : 'Select date of birth'}
               </Text>
             </TouchableOpacity>
 
             <Text style={s.mrzLabel}>Date of expiry</Text>
-            <TouchableOpacity style={s.mrzInput} onPress={() => setActivePicker('expiry')}>
+            <TouchableOpacity
+              style={s.mrzInput}
+              onPress={() => setActivePicker('expiry')}
+              accessibilityRole="button"
+              accessibilityLabel={dateOfExpiry ? `Date of expiry: ${formatDate(dateOfExpiry)}` : 'Select date of expiry'}
+            >
               <Text style={dateOfExpiry ? s.dateValue : s.datePlaceholder}>
                 {dateOfExpiry ? formatDate(dateOfExpiry) : 'Select date of expiry'}
               </Text>
@@ -258,12 +280,20 @@ export default function RegisterScreen({ navigation }: Props) {
             style={[s.btn, !mrzComplete && s.btnDisabled]}
             onPress={() => start()}
             disabled={!mrzComplete}
+            accessibilityRole="button"
+            accessibilityLabel="Begin Registration"
+            accessibilityState={{ disabled: !mrzComplete }}
           >
             <Text style={s.btnText}>Begin Registration</Text>
           </TouchableOpacity>
 
           {__DEV__ && (
-            <TouchableOpacity style={s.testBtn} onPress={() => start(true)}>
+            <TouchableOpacity
+              style={s.testBtn}
+              onPress={() => start(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Use test passport, dev only, no NFC needed"
+            >
               <Text style={s.testBtnText}>Use test passport (dev only, no NFC needed)</Text>
             </TouchableOpacity>
           )}
@@ -274,7 +304,12 @@ export default function RegisterScreen({ navigation }: Props) {
         <View style={s.successBox}>
           <Text style={s.successIcon}>✓</Text>
           <Text style={s.successText}>You are now a registered citizen</Text>
-          <TouchableOpacity style={[s.btn, { marginTop: 24 }]} onPress={() => navigation.goBack()}>
+          <TouchableOpacity
+            style={[s.btn, { marginTop: 24 }]}
+            onPress={() => navigation.goBack()}
+            accessibilityRole="button"
+            accessibilityLabel="Go to Home"
+          >
             <Text style={s.btnText}>Go to Home</Text>
           </TouchableOpacity>
         </View>
@@ -298,7 +333,12 @@ export default function RegisterScreen({ navigation }: Props) {
               <Text style={s.modalDevText}>{resultModal.devDetails}</Text>
             </>
           )}
-          <TouchableOpacity style={s.modalBtn} onPress={() => setResultModal(null)}>
+          <TouchableOpacity
+            style={s.modalBtn}
+            onPress={() => setResultModal(null)}
+            accessibilityRole="button"
+            accessibilityLabel="OK"
+          >
             <Text style={s.btnText}>OK</Text>
           </TouchableOpacity>
         </View>
@@ -309,61 +349,61 @@ export default function RegisterScreen({ navigation }: Props) {
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117' },
+  container: { flex: 1, backgroundColor: colors.bg },
   scrollContent: { padding: 24, paddingBottom: 48 },
-  title: { fontSize: 24, fontWeight: '700', color: '#ffffff', marginBottom: 8 },
-  subtitle: { fontSize: 14, color: '#6b7280', lineHeight: 20, marginBottom: 32 },
+  title: { fontSize: 24, fontWeight: '700', color: colors.textPrimary, marginBottom: 8 },
+  subtitle: { fontSize: 14, color: colors.textMuted, lineHeight: 20, marginBottom: 32 },
   stepList: { gap: 20, marginBottom: 40 },
   stepRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 14 },
   stepNum: {
     width: 36, height: 36, borderRadius: 18,
     alignItems: 'center', justifyContent: 'center', marginTop: 2,
   },
-  stepPending: { backgroundColor: '#1f2937' },
-  stepActive: { backgroundColor: '#6C63FF' },
+  stepPending: { backgroundColor: colors.border },
+  stepActive: { backgroundColor: colors.accent },
   stepDone: { backgroundColor: '#166534' },
-  stepNumText: { color: '#ffffff', fontWeight: '700', fontSize: 14 },
+  stepNumText: { color: colors.textPrimary, fontWeight: '700', fontSize: 14 },
   stepText: { flex: 1 },
-  stepLabel: { fontSize: 15, fontWeight: '600', color: '#6b7280', marginBottom: 2 },
-  stepLabelActive: { color: '#ffffff' },
-  stepDetail: { fontSize: 12, color: '#4b5563', lineHeight: 17 },
+  stepLabel: { fontSize: 15, fontWeight: '600', color: colors.textMuted, marginBottom: 2 },
+  stepLabelActive: { color: colors.textPrimary },
+  stepDetail: { fontSize: 12, color: colors.textDim, lineHeight: 17 },
   btn: {
-    backgroundColor: '#6C63FF',
+    backgroundColor: colors.accent,
     paddingVertical: 16,
     borderRadius: 14,
     alignItems: 'center',
   },
-  btnText: { color: '#ffffff', fontWeight: '700', fontSize: 16 },
+  btnText: { color: colors.textPrimary, fontWeight: '700', fontSize: 16 },
   testBtn: {
     marginTop: 12,
     paddingVertical: 12,
     borderRadius: 14,
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: '#374151',
+    borderColor: colors.textFaint,
     borderStyle: 'dashed',
   },
-  testBtnText: { color: '#9ca3af', fontWeight: '600', fontSize: 13 },
+  testBtnText: { color: colors.textSecondary, fontWeight: '600', fontSize: 13 },
   successBox: { alignItems: 'center', gap: 12 },
-  successIcon: { fontSize: 56, color: '#22c55e' },
-  successText: { fontSize: 18, fontWeight: '600', color: '#22c55e', textAlign: 'center' },
+  successIcon: { fontSize: 56, color: colors.success },
+  successText: { fontSize: 18, fontWeight: '600', color: colors.success, textAlign: 'center' },
   mrzForm: { marginBottom: 20, gap: 6 },
-  mrzLabel: { fontSize: 12, fontWeight: '600', color: '#9ca3af', marginTop: 10 },
+  mrzLabel: { fontSize: 12, fontWeight: '600', color: colors.textSecondary, marginTop: 10 },
   mrzInput: {
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
     borderRadius: 10,
     paddingHorizontal: 14,
     paddingVertical: 10,
     fontSize: 15,
-    color: '#ffffff',
+    color: colors.textPrimary,
     backgroundColor: '#161a23',
   },
-  dateValue: { fontSize: 15, color: '#ffffff' },
-  datePlaceholder: { fontSize: 15, color: '#4b5563' },
-  mrzHint: { fontSize: 11, color: '#4b5563', lineHeight: 15, marginTop: 10 },
-  scanResult: { fontSize: 12, color: '#22c55e', textAlign: 'center', marginBottom: 12 },
-  btnDisabled: { backgroundColor: '#374151' },
+  dateValue: { fontSize: 15, color: colors.textPrimary },
+  datePlaceholder: { fontSize: 15, color: colors.textDim },
+  mrzHint: { fontSize: 11, color: colors.textDim, lineHeight: 15, marginTop: 10 },
+  scanResult: { fontSize: 12, color: colors.success, textAlign: 'center', marginBottom: 12 },
+  btnDisabled: { backgroundColor: colors.textFaint },
   modalBackdrop: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.65)',
@@ -374,20 +414,20 @@ const s = StyleSheet.create({
   modalCard: {
     width: '100%',
     maxWidth: 400,
-    backgroundColor: '#161b27',
+    backgroundColor: colors.card,
     borderRadius: 16,
     padding: 24,
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
   },
-  modalTitle: { fontSize: 18, fontWeight: '700', color: '#ffffff', marginBottom: 10 },
+  modalTitle: { fontSize: 18, fontWeight: '700', color: colors.textPrimary, marginBottom: 10 },
   modalMessage: { fontSize: 14, color: '#d1d5db', lineHeight: 20 },
-  modalDivider: { height: 1, backgroundColor: '#1f2937', marginVertical: 16 },
-  modalDevLabel: { fontSize: 10, fontWeight: '700', color: '#6b7280', letterSpacing: 0.8, marginBottom: 6 },
-  modalDevText: { fontSize: 12, color: '#6b7280', lineHeight: 17 },
+  modalDivider: { height: 1, backgroundColor: colors.border, marginVertical: 16 },
+  modalDevLabel: { fontSize: 10, fontWeight: '700', color: colors.textMuted, letterSpacing: 0.8, marginBottom: 6 },
+  modalDevText: { fontSize: 12, color: colors.textMuted, lineHeight: 17 },
   modalBtn: {
     marginTop: 20,
-    backgroundColor: '#6C63FF',
+    backgroundColor: colors.accent,
     paddingVertical: 12,
     borderRadius: 10,
     alignItems: 'center',

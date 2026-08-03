@@ -8,6 +8,7 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { fetchDelegateRegistry, DelegateProfile } from '../chain/governance';
 import { getAllDelegations, getRegistered, DelegationEntry } from '../chain/citizenState';
+import { colors } from '../theme';
 
 const TOPICS = ['General', 'Budget', 'Constitutional', 'Foreign Affairs', 'Public Safety'];
 type StatusFilter = 'All' | 'Active' | 'Pending' | 'OnBreak';
@@ -36,6 +37,8 @@ function HelpIcon({ title, message }: { title: string; message: string }) {
       onPress={() => help(title, message)}
       hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
       style={s.helpBtn}
+      accessibilityRole="button"
+      accessibilityLabel={`Help: ${title}`}
     >
       <Text style={s.helpIcon}>?</Text>
     </TouchableOpacity>
@@ -52,7 +55,10 @@ export default function DelegateScreen() {
   const isRegistered = getRegistered();
 
   useFocusEffect(useCallback(() => {
-    fetchDelegateRegistry().then(d => { setDelegates(d); setLoading(false); });
+    fetchDelegateRegistry()
+      .then(d => setDelegates(d))
+      .catch((e: any) => Alert.alert('Error', e.message))
+      .finally(() => setLoading(false));
     setDelegations(getAllDelegations());
   }, []));
 
@@ -83,7 +89,10 @@ export default function DelegateScreen() {
       refreshing={loading}
       onRefresh={() => {
         setLoading(true);
-        fetchDelegateRegistry().then(d => { setDelegates(d); setLoading(false); });
+        fetchDelegateRegistry()
+          .then(d => setDelegates(d))
+          .catch((e: any) => Alert.alert('Error', e.message))
+          .finally(() => setLoading(false));
       }}
       ListHeaderComponent={
         <View>
@@ -119,6 +128,8 @@ export default function DelegateScreen() {
                       key={topicId}
                       style={s.delegationRow}
                       onPress={() => navigation.navigate('DelegateDetail', { address: addr })}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${TOPICS[topicId] ?? `Topic ${topicId}`} delegated to ${profile?.displayName ?? 'delegate'}, until ${expiryStr}`}
                     >
                       <View>
                         <Text style={s.delegationTopic}>{TOPICS[topicId] ?? `Topic ${topicId}`}</Text>
@@ -144,6 +155,8 @@ export default function DelegateScreen() {
               <TouchableOpacity
                 style={s.becomeBtn}
                 onPress={() => navigation.navigate('RegisterDelegate')}
+                accessibilityRole="button"
+                accessibilityLabel="Become a delegate"
               >
                 <Text style={s.becomeBtnText}>+ Become a delegate</Text>
               </TouchableOpacity>
@@ -163,8 +176,9 @@ export default function DelegateScreen() {
               value={searchQuery}
               onChangeText={setSearchQuery}
               placeholder="Search by name…"
-              placeholderTextColor="#4b5563"
+              placeholderTextColor={colors.textDim}
               clearButtonMode="while-editing"
+              accessibilityLabel="Search delegates by name"
             />
           </View>
 
@@ -174,6 +188,9 @@ export default function DelegateScreen() {
                 key={f.value}
                 style={[s.filterChip, statusFilter === f.value && s.filterChipActive]}
                 onPress={() => setStatusFilter(f.value)}
+                accessibilityRole="button"
+                accessibilityLabel={`Filter: ${f.label}`}
+                accessibilityState={{ selected: statusFilter === f.value }}
               >
                 <Text style={[s.filterChipText, statusFilter === f.value && s.filterChipTextActive]}>
                   {f.label}
@@ -201,9 +218,14 @@ export default function DelegateScreen() {
 }
 
 function DelegateRow({ delegate: d, onPress }: { delegate: DelegateProfile; onPress: () => void }) {
-  const statusColor = d.status === 'Active' ? '#22c55e' : d.status === 'Pending' ? '#f59e0b' : '#6b7280';
+  const statusColor = d.status === 'Active' ? colors.success : d.status === 'Pending' ? colors.warning : colors.textMuted;
   return (
-    <TouchableOpacity style={s.delegateCard} onPress={onPress}>
+    <TouchableOpacity
+      style={s.delegateCard}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${d.displayName}, ${d.status}, ${d.backingCount} backers`}
+    >
       <View style={s.delegateHeader}>
         <View style={s.delegateNameRow}>
           <Text style={s.delegateName}>{d.displayName}</Text>
@@ -233,7 +255,7 @@ function DelegateRow({ delegate: d, onPress }: { delegate: DelegateProfile; onPr
       {d.status === 'Active' && (
         <View style={s.progressBg}>
           <View style={[s.progressFill, { width: `${d.termProgressPct}%` as any,
-            backgroundColor: d.warningEmitted ? '#f59e0b' : '#6C63FF' }]} />
+            backgroundColor: d.warningEmitted ? colors.warning : colors.accent }]} />
         </View>
       )}
 
@@ -249,40 +271,40 @@ function DelegateRow({ delegate: d, onPress }: { delegate: DelegateProfile; onPr
 }
 
 const s = StyleSheet.create({
-  list: { flex: 1, backgroundColor: '#0f1117' },
+  list: { flex: 1, backgroundColor: colors.bg },
   content: { padding: 16, paddingBottom: 32 },
 
   sectionHeading: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, marginTop: 4 },
   sectionLabel: {
-    fontSize: 12, fontWeight: '600', color: '#9ca3af',
+    fontSize: 12, fontWeight: '600', color: colors.textSecondary,
     textTransform: 'uppercase', letterSpacing: 0.8,
   },
   helpBtn: {
     width: 20, height: 20, borderRadius: 10,
-    backgroundColor: '#1e1b4b', borderWidth: 1, borderColor: '#6C63FF',
+    backgroundColor: '#1e1b4b', borderWidth: 1, borderColor: colors.accent,
     alignItems: 'center', justifyContent: 'center',
   },
   helpIcon: { fontSize: 12, color: '#a5b4fc', fontWeight: '700', lineHeight: 14 },
 
   section: { marginBottom: 16 },
   card: {
-    backgroundColor: '#161b27', borderRadius: 14,
-    borderWidth: 1, borderColor: '#1f2937', overflow: 'hidden',
+    backgroundColor: colors.card, borderRadius: 14,
+    borderWidth: 1, borderColor: colors.border, overflow: 'hidden',
   },
-  emptyText: { color: '#6b7280', padding: 16, textAlign: 'center' },
+  emptyText: { color: colors.textMuted, padding: 16, textAlign: 'center' },
 
   delegationRow: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
     paddingHorizontal: 16, paddingVertical: 12,
-    borderBottomWidth: 1, borderBottomColor: '#1f2937',
+    borderBottomWidth: 1, borderBottomColor: colors.border,
   },
-  delegationTopic: { fontSize: 14, color: '#9ca3af', fontWeight: '500' },
-  delegationExpiry: { fontSize: 11, color: '#4b5563', marginTop: 2 },
+  delegationTopic: { fontSize: 14, color: colors.textSecondary, fontWeight: '500' },
+  delegationExpiry: { fontSize: 11, color: colors.textDim, marginTop: 2 },
   delegationRight: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  delegationName: { fontSize: 14, fontWeight: '600', color: '#ffffff' },
-  warningDot: { fontSize: 14, color: '#f59e0b' },
-  warningDotSmall: { fontSize: 12, color: '#f59e0b' },
-  chevron: { fontSize: 18, color: '#6b7280', marginLeft: 4 },
+  delegationName: { fontSize: 14, fontWeight: '600', color: colors.textPrimary },
+  warningDot: { fontSize: 14, color: colors.warning },
+  warningDotSmall: { fontSize: 12, color: colors.warning },
+  chevron: { fontSize: 18, color: colors.textMuted, marginLeft: 4 },
 
   warningBanner: {
     backgroundColor: '#451a03', borderRadius: 10, padding: 12,
@@ -292,42 +314,42 @@ const s = StyleSheet.create({
 
   becomeDelegateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 20 },
   becomeBtn: {
-    flex: 1, borderWidth: 1, borderColor: '#6C63FF', borderRadius: 12,
+    flex: 1, borderWidth: 1, borderColor: colors.accent, borderRadius: 12,
     paddingVertical: 12, alignItems: 'center',
   },
-  becomeBtnText: { color: '#6C63FF', fontWeight: '600', fontSize: 14 },
+  becomeBtnText: { color: colors.accent, fontWeight: '600', fontSize: 14 },
 
   searchRow: { marginBottom: 10 },
   searchInput: {
-    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
     borderRadius: 12, paddingHorizontal: 14, paddingVertical: 10,
-    color: '#ffffff', fontSize: 14,
+    color: colors.textPrimary, fontSize: 14,
   },
   filterRow: { flexDirection: 'row', gap: 8, marginBottom: 14, flexWrap: 'wrap' },
   filterChip: {
     paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8,
-    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
   },
-  filterChipActive: { backgroundColor: '#6C63FF', borderColor: '#6C63FF' },
-  filterChipText: { fontSize: 13, color: '#6b7280', fontWeight: '500' },
-  filterChipTextActive: { color: '#ffffff', fontWeight: '600' },
+  filterChipActive: { backgroundColor: colors.accent, borderColor: colors.accent },
+  filterChipText: { fontSize: 13, color: colors.textMuted, fontWeight: '500' },
+  filterChipTextActive: { color: colors.textPrimary, fontWeight: '600' },
 
   delegateCard: {
-    backgroundColor: '#161b27', borderRadius: 14, padding: 16,
-    marginBottom: 10, borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderRadius: 14, padding: 16,
+    marginBottom: 10, borderWidth: 1, borderColor: colors.border,
   },
   delegateHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
   delegateNameRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  delegateName: { fontSize: 15, fontWeight: '700', color: '#ffffff' },
+  delegateName: { fontSize: 15, fontWeight: '700', color: colors.textPrimary },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   statusText: { fontSize: 11, fontWeight: '600' },
   delegateMeta: { flexDirection: 'row', gap: 16, marginBottom: 8, flexWrap: 'wrap' },
   metaItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  backingText: { fontSize: 12, color: '#6b7280' },
-  termText: { fontSize: 12, color: '#6b7280' },
-  breakText: { fontSize: 12, color: '#6b7280' },
-  pendingHint: { fontSize: 12, color: '#6b7280', marginTop: 2 },
-  progressBg: { height: 4, backgroundColor: '#1f2937', borderRadius: 2, marginBottom: 4 },
+  backingText: { fontSize: 12, color: colors.textMuted },
+  termText: { fontSize: 12, color: colors.textMuted },
+  breakText: { fontSize: 12, color: colors.textMuted },
+  pendingHint: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
+  progressBg: { height: 4, backgroundColor: colors.border, borderRadius: 2, marginBottom: 4 },
   progressFill: { height: 4, borderRadius: 2 },
-  chevronRight: { position: 'absolute', right: 16, top: '50%', fontSize: 20, color: '#4b5563' },
+  chevronRight: { position: 'absolute', right: 16, top: '50%', fontSize: 20, color: colors.textDim },
 });

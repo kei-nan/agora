@@ -12,6 +12,7 @@ import {
 import { Petition, fetchPetitions, signPetition } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { getRegistered } from '../chain/citizenState';
+import { colors } from '../theme';
 
 export default function PetitionScreen() {
   const [petitions, setPetitions] = useState<Petition[]>([]);
@@ -23,6 +24,8 @@ export default function PetitionScreen() {
   const load = useCallback(async () => {
     try {
       setPetitions(await fetchPetitions());
+    } catch (e: any) {
+      Alert.alert('Error', e.message);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -49,7 +52,7 @@ export default function PetitionScreen() {
   }
 
   if (loading) {
-    return <View style={s.center}><ActivityIndicator color="#6C63FF" /></View>;
+    return <View style={s.center}><ActivityIndicator color={colors.accent} /></View>;
   }
 
   return (
@@ -61,7 +64,7 @@ export default function PetitionScreen() {
         <RefreshControl
           refreshing={refreshing}
           onRefresh={() => { setRefreshing(true); load(); }}
-          tintColor="#6C63FF"
+          tintColor={colors.accent}
         />
       }
       ListEmptyComponent={<Text style={s.empty}>No active petitions.</Text>}
@@ -96,9 +99,14 @@ export default function PetitionScreen() {
               style={[s.signBtn, (hasSigned || reached) && s.signBtnDone]}
               onPress={() => handleSign(item.id)}
               disabled={signing === item.id || hasSigned || reached}
+              accessibilityRole="button"
+              accessibilityLabel={
+                hasSigned ? `Petition ${item.id} signed` : `Sign petition ${item.id}`
+              }
+              accessibilityState={{ disabled: signing === item.id || hasSigned || reached }}
             >
               {signing === item.id
-                ? <ActivityIndicator color="#fff" size="small" />
+                ? <ActivityIndicator color={colors.textPrimary} size="small" />
                 : <Text style={s.signBtnText}>
                     {hasSigned ? '✓ Signed' : reached ? 'Threshold reached' : 'Sign this petition'}
                   </Text>}
@@ -111,30 +119,30 @@ export default function PetitionScreen() {
 }
 
 const s = StyleSheet.create({
-  list: { flex: 1, backgroundColor: '#0f1117', padding: 16 },
-  center: { flex: 1, backgroundColor: '#0f1117', alignItems: 'center', justifyContent: 'center' },
-  empty: { color: '#6b7280', textAlign: 'center', marginTop: 40 },
+  list: { flex: 1, backgroundColor: colors.bg, padding: 16 },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+  empty: { color: colors.textMuted, textAlign: 'center', marginTop: 40 },
   card: {
-    backgroundColor: '#161b27',
+    backgroundColor: colors.card,
     borderRadius: 14,
     padding: 16,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
   },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  id: { fontSize: 12, color: '#4b5563', fontWeight: '600' },
+  id: { fontSize: 12, color: colors.textDim, fontWeight: '600' },
   reachedBadge: { backgroundColor: '#052e16', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
-  reachedText: { fontSize: 11, color: '#22c55e', fontWeight: '600' },
-  title: { fontSize: 16, fontWeight: '700', color: '#ffffff', marginBottom: 8, lineHeight: 22 },
-  description: { fontSize: 13, color: '#9ca3af', lineHeight: 19, marginBottom: 14 },
+  reachedText: { fontSize: 11, color: colors.success, fontWeight: '600' },
+  title: { fontSize: 16, fontWeight: '700', color: colors.textPrimary, marginBottom: 8, lineHeight: 22 },
+  description: { fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 14 },
   sigRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  sigCount: { fontSize: 12, color: '#6b7280' },
-  pct: { fontSize: 12, color: '#6b7280' },
-  barBg: { height: 6, backgroundColor: '#1f2937', borderRadius: 3, marginBottom: 14 },
-  barFill: { height: 6, backgroundColor: '#6C63FF', borderRadius: 3 },
-  barFillReached: { backgroundColor: '#22c55e' },
-  signBtn: { backgroundColor: '#6C63FF', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
-  signBtnDone: { backgroundColor: '#1f2937' },
-  signBtnText: { color: '#ffffff', fontWeight: '600', fontSize: 14 },
+  sigCount: { fontSize: 12, color: colors.textMuted },
+  pct: { fontSize: 12, color: colors.textMuted },
+  barBg: { height: 6, backgroundColor: colors.border, borderRadius: 3, marginBottom: 14 },
+  barFill: { height: 6, backgroundColor: colors.accent, borderRadius: 3 },
+  barFillReached: { backgroundColor: colors.success },
+  signBtn: { backgroundColor: colors.accent, paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
+  signBtnDone: { backgroundColor: colors.border },
+  signBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
 });

@@ -13,6 +13,7 @@ import {
 } from '../chain/governance';
 import { getAllDelegations } from '../chain/citizenState';
 import { getSigningKeypair } from '../chain/identity';
+import { colors } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DelegateDetail'>;
 
@@ -52,9 +53,14 @@ export default function DelegateDetailScreen({ route }: Props) {
   useFocusEffect(useCallback(() => {
     async function load() {
       const allDelegations = getAllDelegations();
+      // isBackingDelegate needs the signed-in citizen's own address, not the
+      // delegate's — passing '' (as this used to) always short-circuits to
+      // false (see governance.ts's isBackingDelegate doc comment), so the
+      // "Your Backing" section could never reflect a real existing backing.
+      const { keypair } = await getSigningKeypair();
       const [p, backing, registry] = await Promise.all([
         fetchDelegateProfile(address),
-        isBackingDelegate('', address),
+        isBackingDelegate(keypair.address, address),
         fetchDelegateRegistry(),
       ]);
       setProfile(p);
@@ -155,14 +161,14 @@ export default function DelegateDetailScreen({ route }: Props) {
   }
 
   if (loading) {
-    return <View style={s.center}><ActivityIndicator color="#6C63FF" /></View>;
+    return <View style={s.center}><ActivityIndicator color={colors.accent} /></View>;
   }
   if (!profile) {
     return <View style={s.center}><Text style={s.emptyText}>Delegate not found.</Text></View>;
   }
 
-  const statusColor = profile.status === 'Active' ? '#22c55e'
-    : profile.status === 'Pending' ? '#f59e0b' : '#6b7280';
+  const statusColor = profile.status === 'Active' ? colors.success
+    : profile.status === 'Pending' ? colors.warning : colors.textMuted;
   const isActive = profile.status === 'Active';
 
   return (
@@ -195,7 +201,7 @@ export default function DelegateDetailScreen({ route }: Props) {
             <View style={s.progressBg}>
               <View style={[s.progressFill, {
                 width: `${profile.termProgressPct}%` as any,
-                backgroundColor: profile.warningEmitted ? '#f59e0b' : '#6C63FF',
+                backgroundColor: profile.warningEmitted ? colors.warning : colors.accent,
               }]} />
             </View>
           </>
@@ -226,9 +232,11 @@ export default function DelegateDetailScreen({ route }: Props) {
             style={[s.backingBtn, isBacking ? s.backingBtnActive : s.backingBtnInactive]}
             onPress={toggleBacking}
             disabled={actionLoading === 'back' || profile.status === 'OnBreak'}
+            accessibilityRole="button"
+            accessibilityLabel={isBacking ? 'Remove backing' : 'Back this delegate'}
           >
             {actionLoading === 'back'
-              ? <ActivityIndicator size="small" color="#fff" />
+              ? <ActivityIndicator size="small" color={colors.textPrimary} />
               : <Text style={s.backingBtnText}>{isBacking ? 'Remove' : 'Back'}</Text>}
           </TouchableOpacity>
         </View>
@@ -246,6 +254,9 @@ export default function DelegateDetailScreen({ route }: Props) {
                 key={d.days}
                 style={[s.durationChip, durationDays === d.days && s.durationChipActive]}
                 onPress={() => setDurationDays(d.days)}
+                accessibilityRole="button"
+                accessibilityLabel={`Duration: ${d.label}`}
+                accessibilityState={{ selected: durationDays === d.days }}
               >
                 <Text style={[s.durationChipText, durationDays === d.days && s.durationChipTextActive]}>
                   {d.label}
@@ -284,9 +295,13 @@ export default function DelegateDetailScreen({ route }: Props) {
                 ]}
                 onPress={() => toggleDelegation(t.id)}
                 disabled={disabled}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  isDelegated ? `Revoke ${t.label} delegation` : delegatedElsewhere ? `Switch ${t.label} delegation to this delegate` : `Delegate ${t.label} to this delegate`
+                }
               >
                 {isLoading
-                  ? <ActivityIndicator size="small" color="#fff" />
+                  ? <ActivityIndicator size="small" color={colors.textPrimary} />
                   : <Text style={s.topicBtnText}>
                       {isDelegated ? 'Revoke' : delegatedElsewhere ? 'Switch' : 'Delegate'}
                     </Text>}
@@ -315,78 +330,78 @@ export default function DelegateDetailScreen({ route }: Props) {
 }
 
 const s = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117' },
+  container: { flex: 1, backgroundColor: colors.bg },
   content: { padding: 20, paddingBottom: 40 },
-  center: { flex: 1, backgroundColor: '#0f1117', alignItems: 'center', justifyContent: 'center' },
-  emptyText: { color: '#6b7280' },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+  emptyText: { color: colors.textMuted },
   sectionLabel: {
-    fontSize: 12, fontWeight: '600', color: '#9ca3af',
+    fontSize: 12, fontWeight: '600', color: colors.textSecondary,
     textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 10, marginTop: 4,
   },
   profileCard: {
-    backgroundColor: '#161b27', borderRadius: 16, padding: 20,
-    borderWidth: 1, borderColor: '#1f2937', marginBottom: 20,
+    backgroundColor: colors.card, borderRadius: 16, padding: 20,
+    borderWidth: 1, borderColor: colors.border, marginBottom: 20,
   },
   profileHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 6 },
-  name: { fontSize: 20, fontWeight: '700', color: '#ffffff', flex: 1, marginRight: 10 },
+  name: { fontSize: 20, fontWeight: '700', color: colors.textPrimary, flex: 1, marginRight: 10 },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   statusText: { fontSize: 11, fontWeight: '600' },
-  address: { fontSize: 11, color: '#4b5563', fontFamily: 'monospace', marginBottom: 8 },
-  backingCount: { fontSize: 13, color: '#6b7280', marginBottom: 12 },
+  address: { fontSize: 11, color: colors.textDim, fontFamily: 'monospace', marginBottom: 8 },
+  backingCount: { fontSize: 13, color: colors.textMuted, marginBottom: 12 },
   warningBox: {
     backgroundColor: '#451a03', borderRadius: 8, padding: 10,
     marginBottom: 12, borderWidth: 1, borderColor: '#92400e',
   },
   warningText: { color: '#fcd34d', fontSize: 12, lineHeight: 17 },
   termRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  termLabel: { fontSize: 12, color: '#9ca3af' },
-  termPct: { fontSize: 12, color: '#9ca3af' },
-  progressBg: { height: 6, backgroundColor: '#1f2937', borderRadius: 3 },
+  termLabel: { fontSize: 12, color: colors.textSecondary },
+  termPct: { fontSize: 12, color: colors.textSecondary },
+  progressBg: { height: 6, backgroundColor: colors.border, borderRadius: 3 },
   progressFill: { height: 6, borderRadius: 3 },
-  breakText: { fontSize: 13, color: '#6b7280', marginTop: 4 },
+  breakText: { fontSize: 13, color: colors.textMuted, marginTop: 4 },
   card: {
-    backgroundColor: '#161b27', borderRadius: 14,
-    borderWidth: 1, borderColor: '#1f2937', marginBottom: 20, overflow: 'hidden',
+    backgroundColor: colors.card, borderRadius: 14,
+    borderWidth: 1, borderColor: colors.border, marginBottom: 20, overflow: 'hidden',
   },
   backingRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     padding: 16, gap: 12,
   },
-  backingRowTitle: { fontSize: 14, fontWeight: '600', color: '#ffffff', marginBottom: 3 },
-  backingRowSub: { fontSize: 12, color: '#6b7280', maxWidth: 200 },
+  backingRowTitle: { fontSize: 14, fontWeight: '600', color: colors.textPrimary, marginBottom: 3 },
+  backingRowSub: { fontSize: 12, color: colors.textMuted, maxWidth: 200 },
   backingBtn: { paddingVertical: 8, paddingHorizontal: 16, borderRadius: 8, minWidth: 70, alignItems: 'center' },
   backingBtnActive: { backgroundColor: '#7f1d1d' },
-  backingBtnInactive: { backgroundColor: '#6C63FF' },
-  backingBtnText: { color: '#fff', fontWeight: '600', fontSize: 13 },
+  backingBtnInactive: { backgroundColor: colors.accent },
+  backingBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 13 },
   topicRow: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     paddingHorizontal: 16, paddingVertical: 12,
   },
-  topicBorder: { borderBottomWidth: 1, borderBottomColor: '#1f2937' },
+  topicBorder: { borderBottomWidth: 1, borderBottomColor: colors.border },
   topicLeft: { flex: 1, marginRight: 10 },
   topicLabel: { fontSize: 14, color: '#d1d5db', fontWeight: '500' },
-  topicExpiry: { fontSize: 11, color: '#9ca3af', marginTop: 2 },
-  topicElsewhere: { fontSize: 11, color: '#6b7280', marginTop: 2 },
+  topicExpiry: { fontSize: 11, color: colors.textSecondary, marginTop: 2 },
+  topicElsewhere: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
   topicBtn: { paddingVertical: 6, paddingHorizontal: 14, borderRadius: 8, minWidth: 80, alignItems: 'center' },
   topicBtnOn: { backgroundColor: '#7f1d1d' },
-  topicBtnOff: { backgroundColor: '#6C63FF' },
+  topicBtnOff: { backgroundColor: colors.accent },
   topicBtnSwitch: { backgroundColor: '#92400e' },
   topicBtnDisabled: { opacity: 0.4 },
-  topicBtnText: { color: '#fff', fontWeight: '600', fontSize: 13 },
-  inactiveNote: { fontSize: 12, color: '#6b7280', padding: 14, paddingTop: 0, lineHeight: 17 },
+  topicBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 13 },
+  inactiveNote: { fontSize: 12, color: colors.textMuted, padding: 14, paddingTop: 0, lineHeight: 17 },
   durationRow: { marginBottom: 10 },
-  durationLabel: { fontSize: 12, fontWeight: '600', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
+  durationLabel: { fontSize: 12, fontWeight: '600', color: colors.textSecondary, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
   durationPicker: { flexDirection: 'row', gap: 8 },
   durationChip: {
     paddingHorizontal: 12, paddingVertical: 7, borderRadius: 8,
-    backgroundColor: '#161b27', borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
   },
-  durationChipActive: { backgroundColor: '#6C63FF', borderColor: '#6C63FF' },
-  durationChipText: { fontSize: 13, color: '#9ca3af', fontWeight: '500' },
-  durationChipTextActive: { color: '#ffffff', fontWeight: '700' },
+  durationChipActive: { backgroundColor: colors.accent, borderColor: colors.accent },
+  durationChipText: { fontSize: 13, color: colors.textSecondary, fontWeight: '500' },
+  durationChipTextActive: { color: colors.textPrimary, fontWeight: '700' },
   infoBox: {
-    backgroundColor: '#161b27', borderRadius: 12, padding: 14,
-    borderWidth: 1, borderColor: '#1f2937',
+    backgroundColor: colors.card, borderRadius: 12, padding: 14,
+    borderWidth: 1, borderColor: colors.border,
   },
-  infoText: { fontSize: 12, color: '#6b7280', lineHeight: 18 },
+  infoText: { fontSize: 12, color: colors.textMuted, lineHeight: 18 },
 });

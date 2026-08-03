@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import { Proposal, fetchProposals, voteOnReferendum } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
+import { colors } from '../theme';
 
 export default function ProposalsScreen() {
   const [proposals, setProposals] = useState<Proposal[]>([]);
@@ -47,7 +48,7 @@ export default function ProposalsScreen() {
   }
 
   if (loading) {
-    return <View style={s.center}><ActivityIndicator color="#6C63FF" /></View>;
+    return <View style={s.center}><ActivityIndicator color={colors.accent} /></View>;
   }
 
   return (
@@ -55,7 +56,7 @@ export default function ProposalsScreen() {
       style={s.list}
       data={proposals}
       keyExtractor={(p) => String(p.id)}
-      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor="#6C63FF" />}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor={colors.accent} />}
       ListEmptyComponent={<Text style={s.empty}>No proposals on-chain yet.</Text>}
       renderItem={({ item }) => (
         <View style={s.card}>
@@ -84,15 +85,19 @@ export default function ProposalsScreen() {
                 style={[s.voteBtn, s.voteBtnFor]}
                 onPress={() => vote(item.id, true)}
                 disabled={voting === item.id}
+                accessibilityRole="button"
+                accessibilityLabel={`Vote for proposal ${item.id}`}
               >
                 {voting === item.id
-                  ? <ActivityIndicator color="#fff" size="small" />
+                  ? <ActivityIndicator color={colors.textPrimary} size="small" />
                   : <Text style={s.voteBtnText}>Vote For</Text>}
               </TouchableOpacity>
               <TouchableOpacity
                 style={[s.voteBtn, s.voteBtnAgainst]}
                 onPress={() => vote(item.id, false)}
                 disabled={voting === item.id}
+                accessibilityRole="button"
+                accessibilityLabel={`Vote against proposal ${item.id}`}
               >
                 <Text style={s.voteBtnText}>Vote Against</Text>
               </TouchableOpacity>
@@ -105,31 +110,31 @@ export default function ProposalsScreen() {
 }
 
 const s = StyleSheet.create({
-  list: { flex: 1, backgroundColor: '#0f1117', padding: 16 },
-  center: { flex: 1, backgroundColor: '#0f1117', alignItems: 'center', justifyContent: 'center' },
-  empty: { color: '#6b7280', textAlign: 'center', marginTop: 40 },
+  list: { flex: 1, backgroundColor: colors.bg, padding: 16 },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+  empty: { color: colors.textMuted, textAlign: 'center', marginTop: 40 },
   card: {
-    backgroundColor: '#161b27',
+    backgroundColor: colors.card,
     borderRadius: 14,
     padding: 16,
     marginBottom: 12,
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
   },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
   chips: { flexDirection: 'row', gap: 6 },
   chip: { fontSize: 11, fontWeight: '600', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
-  chipActive: { backgroundColor: '#1a3a1a', color: '#22c55e' },
-  chipDone: { backgroundColor: '#1f2937', color: '#9ca3af' },
+  chipActive: { backgroundColor: '#1a3a1a', color: colors.success },
+  chipDone: { backgroundColor: colors.border, color: colors.textSecondary },
   chipConst: { backgroundColor: '#1e1040', color: '#a78bfa' },
-  id: { fontSize: 12, color: '#6b7280' },
-  hash: { fontSize: 11, color: '#4b5563', fontFamily: 'monospace', marginBottom: 10 },
+  id: { fontSize: 12, color: colors.textMuted },
+  hash: { fontSize: 11, color: colors.textDim, fontFamily: 'monospace', marginBottom: 10 },
   tally: { flexDirection: 'row', gap: 16, marginBottom: 14 },
-  forVotes: { color: '#22c55e', fontSize: 14, fontWeight: '600' },
-  againstVotes: { color: '#ef4444', fontSize: 14, fontWeight: '600' },
+  forVotes: { color: colors.success, fontSize: 14, fontWeight: '600' },
+  againstVotes: { color: colors.danger, fontSize: 14, fontWeight: '600' },
   voteRow: { flexDirection: 'row', gap: 10 },
   voteBtn: { flex: 1, paddingVertical: 10, borderRadius: 10, alignItems: 'center' },
   voteBtnFor: { backgroundColor: '#166534' },
   voteBtnAgainst: { backgroundColor: '#7f1d1d' },
-  voteBtnText: { color: '#ffffff', fontWeight: '600', fontSize: 14 },
+  voteBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
 });

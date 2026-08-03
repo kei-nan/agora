@@ -25,6 +25,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { claimFiscalYearTokens, allocateBudget } from '../chain/voting';
 import { getSigningKeypair } from '../chain/identity';
 import { getApi } from '../chain/api';
+import { colors } from '../theme';
 
 // pallet-voting's BudgetCategoryCount constant currently allows up to 10
 // category ids (see runtime/src/configs/mod.rs). Real category names/
@@ -124,7 +125,7 @@ export default function VoteScreen() {
   if (loading) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator color="#6C63FF" />
+        <ActivityIndicator color={colors.accent} />
       </View>
     );
   }
@@ -136,7 +137,7 @@ export default function VoteScreen() {
         <RefreshControl
           refreshing={refreshing}
           onRefresh={() => { setRefreshing(true); load(); }}
-          tintColor="#6C63FF"
+          tintColor={colors.accent}
         />
       }
     >
@@ -149,7 +150,7 @@ export default function VoteScreen() {
         <Text style={styles.cardTitle}>Fiscal Year {state?.epoch ?? 0}</Text>
         <Text style={styles.balanceText}>Balance: {state?.balance ?? 0} tokens</Text>
         {claiming ? (
-          <ActivityIndicator color="#6C63FF" />
+          <ActivityIndicator color={colors.accent} />
         ) : (
           <Button
             title={state?.claimed ? 'Already Claimed' : 'Claim Budget Tokens'}
@@ -166,13 +167,14 @@ export default function VoteScreen() {
           <TextInput
             style={styles.input}
             placeholder="Vote count"
-            placeholderTextColor="#6b7280"
+            placeholderTextColor={colors.textMuted}
             keyboardType="numeric"
             value={voteCounts[cat.id]}
             onChangeText={(text) => setVoteCounts((prev) => ({ ...prev, [cat.id]: text }))}
+            accessibilityLabel={`Vote count for ${cat.name}`}
           />
           {allocating === cat.id ? (
-            <ActivityIndicator color="#6C63FF" />
+            <ActivityIndicator color={colors.accent} />
           ) : (
             <Button title="Allocate" onPress={() => handleAllocate(cat.id)} />
           )}
@@ -183,28 +185,28 @@ export default function VoteScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f1117', padding: 16 },
-  center: { flex: 1, backgroundColor: '#0f1117', alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 22, fontWeight: '700', color: '#ffffff', marginBottom: 4 },
-  subtitle: { fontSize: 13, color: '#6b7280', marginBottom: 16 },
+  container: { flex: 1, backgroundColor: colors.bg, padding: 16 },
+  center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
+  title: { fontSize: 22, fontWeight: '700', color: colors.textPrimary, marginBottom: 4 },
+  subtitle: { fontSize: 13, color: colors.textMuted, marginBottom: 16 },
   card: {
-    backgroundColor: '#161b27',
+    backgroundColor: colors.card,
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#1f2937',
+    borderColor: colors.border,
     padding: 16,
     marginBottom: 12,
     gap: 8,
   },
-  cardTitle: { fontSize: 15, fontWeight: '600', color: '#ffffff' },
-  balanceText: { fontSize: 13, color: '#9ca3af' },
-  currentText: { fontSize: 12, color: '#6b7280' },
+  cardTitle: { fontSize: 15, fontWeight: '600', color: colors.textPrimary },
+  balanceText: { fontSize: 13, color: colors.textSecondary },
+  currentText: { fontSize: 12, color: colors.textMuted },
   input: {
     borderWidth: 1,
-    borderColor: '#1f2937',
-    backgroundColor: '#0f1117',
+    borderColor: colors.border,
+    backgroundColor: colors.bg,
     borderRadius: 8,
     padding: 10,
-    color: '#ffffff',
+    color: colors.textPrimary,
   },
 });

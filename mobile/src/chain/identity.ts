@@ -47,6 +47,7 @@ import { KeyringPair } from '@polkadot/keyring/types';
 import { blake2AsHex, cryptoWaitReady } from '@polkadot/util-crypto';
 import { getApi } from './api';
 import { assertValidPublicInputs } from './proofEncoding';
+import { submitExtrinsic } from './submitExtrinsic';
 
 // DEV-ONLY — this is the well-known Substrate test mnemonic. Every install of
 // this build derives the SAME keypair from it. It exists purely so the
@@ -193,18 +194,10 @@ export async function registerCitizen(params: RegisterCitizenParams): Promise<vo
 
   const api = await getApi();
   const { keypair } = await getSigningKeypair();
-  return new Promise((resolve, reject) => {
-    api.tx.identity
-      .registerCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes)
-      .signAndSend(keypair, ({ status, dispatchError }: any) => {
-        if (dispatchError) {
-          reject(new Error(dispatchError.toString()));
-        } else if (status.isFinalized) {
-          resolve();
-        }
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(
+    api.tx.identity.registerCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes),
+    keypair,
+  );
 }
 
 /**
@@ -232,18 +225,10 @@ export async function reverifyCitizen(params: ReverifyCitizenParams): Promise<vo
 
   const api = await getApi();
   const { keypair } = await getSigningKeypair();
-  return new Promise((resolve, reject) => {
-    api.tx.identity
-      .reverifyCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes)
-      .signAndSend(keypair, ({ status, dispatchError }: any) => {
-        if (dispatchError) {
-          reject(new Error(dispatchError.toString()));
-        } else if (status.isFinalized) {
-          resolve();
-        }
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(
+    api.tx.identity.reverifyCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes),
+    keypair,
+  );
 }
 
 /**
@@ -274,22 +259,14 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
 
   const api = await getApi();
   const { keypair } = await getSigningKeypair();
-  return new Promise((resolve, reject) => {
-    api.tx.identity
-      .migrateOprfScheme(
-        params.zkProof,
-        params.publicInputs,
-        params.newAnchor,
-        params.oldOprfPkHashes,
-        params.newOprfPkHashes,
-      )
-      .signAndSend(keypair, ({ status, dispatchError }: any) => {
-        if (dispatchError) {
-          reject(new Error(dispatchError.toString()));
-        } else if (status.isFinalized) {
-          resolve();
-        }
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(
+    api.tx.identity.migrateOprfScheme(
+      params.zkProof,
+      params.publicInputs,
+      params.newAnchor,
+      params.oldOprfPkHashes,
+      params.newOprfPkHashes,
+    ),
+    keypair,
+  );
 }

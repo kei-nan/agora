@@ -5,7 +5,7 @@
  * (`net.sf.scuba:scuba-sc-android`) to perform a BAC-authenticated NFC read
  * of a biometric passport chip and return the RAW EF.DG1 / EF.DG15 / EF.SOD
  * data-group bytes — not parsed/summarized fields (name, DOB, etc.) — since
- * these bytes are direct witness inputs to the Rarimo ZK circuit. See
+ * these bytes are direct witness inputs to the ZKPassport ZK circuit. See
  * `../chain/zkProving.ts` / `../chain/proofEncoding.ts` for the on-device
  * proving half this feeds into (this module is strictly upstream of those —
  * it does not touch them, and they don't touch this).
@@ -48,9 +48,14 @@ interface NfcPassportModuleNative {
     dateOfBirth: string,
     dateOfExpiry: string,
   ): Promise<{ dg1: string; dg15: string; sod: string }>;
+  /** Clears a pending `readPassport` call, rejecting it if one is in flight. No-ops if none is pending. */
+  cancelPendingRead(): Promise<null>;
 }
 
 const NfcPassportModule = NativeModules.NfcPassportModule as NfcPassportModuleNative | undefined;
+
+/** How long to wait for a passport tap before giving up. Generous — finding the chip's antenna position can take a few tries. */
+export const DEFAULT_SCAN_TIMEOUT_MS = 60_000;
 
 /**
  * Reads the raw DG1/DG15/SOD bytes off a biometric passport's NFC chip via
@@ -60,10 +65,20 @@ const NfcPassportModule = NativeModules.NfcPassportModule as NfcPassportModuleNa
  * step exposed here (see `NfcPassportModule.readPassport`'s doc comment for
  * how tag delivery actually works on the native side).
  *
+ * Rejects after `timeoutMs` (default {@link DEFAULT_SCAN_TIMEOUT_MS}) if no
+ * tag is ever presented, calling `cancelPendingRead` on the native side so
+ * the abandoned call doesn't permanently occupy the module's single pending
+ * slot (`NfcPassportModule.kt`'s `readPassport` rejects any second call with
+ * `NFC_BUSY` while one is pending) — without this, a passport that's never
+ * tapped left every later scan attempt failing until the app was restarted.
+ *
  * Android only — rejects immediately on other platforms or if the native
  * module isn't linked.
  */
-export async function readPassport(mrz: PassportMrz): Promise<RawPassportData> {
+export async function readPassport(
+  mrz: PassportMrz,
+  timeoutMs: number = DEFAULT_SCAN_TIMEOUT_MS,
+): Promise<RawPassportData> {
   if (Platform.OS !== 'android') {
     throw new Error(
       `readPassport: NFC passport reading is only implemented for Android in this codebase (got Platform.OS=${Platform.OS}). ` +
@@ -76,16 +91,43 @@ export async function readPassport(mrz: PassportMrz): Promise<RawPassportData> {
         '(MainApplication.kt should register NfcPassportPackage.)',
     );
   }
+  const nativeModule = NfcPassportModule;
 
-  const { dg1, dg15, sod } = await NfcPassportModule.readPassport(
-    mrz.documentNumber,
-    mrz.dateOfBirth,
-    mrz.dateOfExpiry,
-  );
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    nativeModule.cancelPendingRead().catch(() => undefined);
+  }, timeoutMs);
 
-  return {
-    dg1: new Uint8Array(Buffer.from(dg1, 'base64')),
-    dg15: new Uint8Array(Buffer.from(dg15, 'base64')),
-    sod: new Uint8Array(Buffer.from(sod, 'base64')),
-  };
+  try {
+    const { dg1, dg15, sod } = await nativeModule.readPassport(
+      mrz.documentNumber,
+      mrz.dateOfBirth,
+      mrz.dateOfExpiry,
+    );
+
+    return {
+      dg1: new Uint8Array(Buffer.from(dg1, 'base64')),
+      dg15: new Uint8Array(Buffer.from(dg15, 'base64')),
+      sod: new Uint8Array(Buffer.from(sod, 'base64')),
+    };
+  } catch (e) {
+    if (timedOut) {
+      throw new Error(`readPassport: no passport was tapped within ${timeoutMs}ms — timed out`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Cancels a passport scan that's currently waiting for a tag — e.g. the user
+ * navigated away from the scanning screen. Safe to call even if no scan is
+ * in progress. Exposed separately from `readPassport`'s own timeout so a
+ * screen's unmount/cleanup can call this without waiting for the timeout.
+ */
+export async function cancelPendingScan(): Promise<void> {
+  if (Platform.OS !== 'android' || !NfcPassportModule) return;
+  await NfcPassportModule.cancelPendingRead().catch(() => undefined);
 }

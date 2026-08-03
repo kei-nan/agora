@@ -466,6 +466,27 @@ export interface Dg15Info {
 }
 
 /**
+ * Locates `needleHex`'s byte offset within `haystackHex`, throwing if it
+ * isn't found rather than returning a garbage offset. Mirrors the same
+ * DEPARTURE fix `hexShift` (below) applies to `getDg1Shift`/`getDg15Shift`/
+ * `getEcShift`: the original reference script's `.split(needle)[0].length`
+ * pattern silently returns the *whole haystack's* length when the needle
+ * isn't present at all, rather than failing loudly. `aaShift` below was
+ * still using that unsafe pattern even after `hexShift` fixed it elsewhere
+ * in this file — dormant today since ZKPassport has no Active Authentication
+ * circuit yet (so `Dg15Info.aaShift` is parsed but never consumed), but
+ * silently wrong is still the wrong failure mode for AA to inherit if it's
+ * ever wired up.
+ */
+function requireHexOffset(haystackHex: string, needleHex: string, what: string): number {
+  const idx = haystackHex.toLowerCase().indexOf(needleHex.toLowerCase());
+  if (idx < 0) {
+    throw new Error(`requireHexOffset: ${what} not found in DG15 — wrong key material, or this DG15 doesn't match this passport`);
+  }
+  return idx / 2;
+}
+
+/**
  * DG15 ::= [APPLICATION 15] SubjectPublicKeyInfo (raw file bytes, as
  * ../native/nfcPassportReader.ts returns them — outer application tag
  * included, matching what `decoded()` expects here).
@@ -490,7 +511,11 @@ function extractFromDg15(dg15: Uint8Array): Dg15Info | null {
       FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFFFFFFFFFF: 23, // secp192r1
     };
     const aaSigType = curveSigType[p] ?? 0;
-    const aaShift = dg15Decoded.dump.split(BigInt('0x' + x).toString(16).toUpperCase())[0].length / 2;
+    const aaShift = requireHexOffset(
+      dg15Decoded.dump,
+      BigInt('0x' + x).toString(16).toUpperCase(),
+      'AA ECDSA public key',
+    );
     return { pubkey: { kind: 'ecdsa', x, y, param: p }, aaShift, aaSigType };
   }
 
@@ -498,7 +523,7 @@ function extractFromDg15(dg15: Uint8Array): Dg15Info | null {
   if (!pkLocation?.sub) throw new Error('extractFromDg15: RSA SubjectPublicKeyInfo shape mismatch');
   const n = pkLocation.sub[0].content!;
   const exp = pkLocation.sub[1].content!;
-  const aaShift = dg15Decoded.dump.split(BigInt(n).toString(16).toUpperCase())[0].length / 2;
+  const aaShift = requireHexOffset(dg15Decoded.dump, BigInt(n).toString(16).toUpperCase(), 'AA RSA modulus');
   return { pubkey: { kind: 'rsa', n: BigInt(n).toString(16), exp: BigInt(exp).toString(16) }, aaShift, aaSigType: 1 };
 }
 

@@ -8,28 +8,37 @@
  */
 import { KeyringPair } from '@polkadot/keyring/types';
 import { getApi } from './api';
+import { submitExtrinsic } from './submitExtrinsic';
 
+/**
+ * Mirrors `pallet_voting::ReferendumTier` (`pallets/pallet-voting/src/lib.rs`) — a
+ * fieldless enum, so `@polkadot/api` accepts the bare variant name as a string.
+ */
+export type ReferendumTier = 'Ordinary' | 'Constitutional' | 'Foundational';
+
+/**
+ * `submit_proposal(origin, topic_hash, tier, duration_blocks)` (call index 0) takes
+ * three arguments beyond origin — a previous version of this wrapper only took
+ * `durationBlocks` and dropped `topic_hash`/`tier` entirely, so every call failed at
+ * the chain (wrong argument count against the metadata) rather than at compile time,
+ * since `api.tx.voting.submitProposal` isn't checked by TypeScript here.
+ */
 export async function submitProposal(
   pair: KeyringPair,
+  topicHash: Uint8Array,
+  tier: ReferendumTier,
   durationBlocks: number,
 ): Promise<number> {
   const api = await getApi();
   let proposalId = -1;
-  await new Promise<void>((resolve, reject) => {
-    api.tx.voting
-      .submitProposal(durationBlocks)
-      .signAndSend(pair, ({ status, events, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) {
-          for (const { event } of events) {
-            if (api.events.voting.ProposalCreated.is(event)) {
-              proposalId = (event.data as any).id.toNumber();
-            }
-          }
-          resolve();
+  await submitExtrinsic(api.tx.voting.submitProposal(topicHash, tier, durationBlocks), pair, {
+    onEvents: (events) => {
+      for (const { event } of events) {
+        if (api.events.voting.ProposalCreated.is(event)) {
+          proposalId = (event.data as any).id.toNumber();
         }
-      })
-      .catch(reject);
+      }
+    },
   });
   return proposalId;
 }
@@ -50,15 +59,7 @@ export async function commitVote(
   commitment: Uint8Array,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .commitVote(proposalId, commitment)
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.commitVote(proposalId, commitment), pair);
 }
 
 /**
@@ -79,15 +80,7 @@ export async function delegateVote(
   durationBlocks: number,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .delegateVote(delegate, topicId, durationBlocks)
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.delegateVote(delegate, topicId, durationBlocks), pair);
 }
 
 /**
@@ -100,15 +93,7 @@ export async function voteReferendum(
   inFavor: boolean,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .voteReferendum(referendumId, inFavor)
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.voteReferendum(referendumId, inFavor), pair);
 }
 
 export async function revokeDelegation(
@@ -116,30 +101,14 @@ export async function revokeDelegation(
   topicId: number,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .revokeDelegation(topicId)
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.revokeDelegation(topicId), pair);
 }
 
 export async function claimFiscalYearTokens(
   pair: KeyringPair,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .claimFiscalYearTokens()
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.claimFiscalYearTokens(), pair);
 }
 
 export async function allocateBudget(
@@ -148,13 +117,5 @@ export async function allocateBudget(
   voteCount: number,
 ): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.voting
-      .allocateBudget(categoryId, voteCount)
-      .signAndSend(pair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.voting.allocateBudget(categoryId, voteCount), pair);
 }

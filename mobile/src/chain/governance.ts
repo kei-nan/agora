@@ -21,6 +21,7 @@ import { getApi } from './api';
 import * as votingChain from './voting';
 import * as constitutionChain from './constitution';
 import { removeDelegation, setDelegation } from './citizenState';
+import { submitExtrinsic } from './submitExtrinsic';
 
 // 12s block time (see runtime/src/lib.rs MILLI_SECS_PER_BLOCK) => 7200
 // blocks/day. Matches the same constant already assumed for term-limit
@@ -284,28 +285,12 @@ export async function fetchDelegateProfile(address: string): Promise<DelegatePro
 
 export async function backDelegate(keypair: KeyringPair, address: string): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.palletElections
-      .backDelegate(address)
-      .signAndSend(keypair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.palletElections.backDelegate(address), keypair);
 }
 
 export async function removeBackingFromDelegate(keypair: KeyringPair, address: string): Promise<void> {
   const api = await getApi();
-  return new Promise((resolve, reject) => {
-    api.tx.palletElections
-      .removeBacking(address)
-      .signAndSend(keypair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.palletElections.removeBacking(address), keypair);
 }
 
 /**
@@ -333,13 +318,5 @@ export async function registerAsDelegate(
   // well-typed — it is NOT a real IPFS content hash and nothing is actually
   // pinned anywhere.
   const profileHash = sha256AsU8a(stringToU8a(bio || displayName));
-  return new Promise((resolve, reject) => {
-    api.tx.palletElections
-      .registerAsDelegate(displayName, profileHash)
-      .signAndSend(keypair, ({ status, dispatchError }) => {
-        if (dispatchError) { reject(new Error(dispatchError.toString())); return; }
-        if (status.isFinalized) resolve();
-      })
-      .catch(reject);
-  });
+  return submitExtrinsic(api.tx.palletElections.registerAsDelegate(displayName, profileHash), keypair);
 }
