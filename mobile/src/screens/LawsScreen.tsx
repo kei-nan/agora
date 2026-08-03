@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   FlatList,
   RefreshControl,
   StyleSheet,
@@ -9,12 +8,14 @@ import {
   View,
 } from 'react-native';
 import { Law, fetchLaws } from '../chain/governance';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 export default function LawsScreen() {
   const [laws, setLaws] = useState<Law[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const { showError } = useAppModal();
 
   const load = useCallback(async () => {
     try {
@@ -23,12 +24,12 @@ export default function LawsScreen() {
       // Without this, a chain-unreachable error left `laws` at its previous
       // value (empty on first load) with no indication anything went wrong —
       // indistinguishable from "no laws enacted yet."
-      Alert.alert('Error', e.message);
+      showError("Couldn't load laws", e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [showError]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -93,7 +94,7 @@ const s = StyleSheet.create({
   chips: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 10, flexWrap: 'wrap' },
   chip: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   chipText: { fontSize: 11, fontWeight: '600' },
-  chipActive: { backgroundColor: '#052e16' },
+  chipActive: { backgroundColor: colors.successBg },
   chipTextActive: { color: colors.success },
   chipPaused: { backgroundColor: '#2a2a1a' },
   chipTextPaused: { color: colors.warning },

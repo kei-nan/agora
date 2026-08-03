@@ -1,7 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   StyleSheet,
   Text,
   TouchableOpacity,
@@ -12,6 +11,7 @@ import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { RootStackParamList } from '../App';
 import { getRegistered, setRegistered } from '../chain/citizenState';
 import { getSigningKeypair, isCitizen } from '../chain/identity';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 // HomeScreen is registered as a Tab.Screen (see App.tsx's MainTabs), not a
@@ -32,6 +32,7 @@ export default function HomeScreen() {
   const navigation = useNavigation<Nav>();
   const [citizenStatus, setCitizenStatus] = useState<'checking' | 'registered' | 'unregistered'>('checking');
   const [stats, setStats] = useState<ChainStats | null>(null);
+  const { showConfirm } = useAppModal();
 
   useFocusEffect(useCallback(() => {
     // citizenState.ts's cache is a UI-convenience mirror, not the source of
@@ -72,10 +73,13 @@ export default function HomeScreen() {
         activeOpacity={1}
         onLongPress={() => {
           if (citizenStatus !== 'registered') return;
-          Alert.alert('Reset registration?', 'This will clear your citizen status for this session.', [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Reset', style: 'destructive', onPress: () => { setRegistered(false); setCitizenStatus('unregistered'); } },
-          ]);
+          showConfirm({
+            title: 'Reset registration?',
+            message: 'This will clear your citizen status for this session.',
+            confirmLabel: 'Reset',
+            destructive: true,
+            onConfirm: () => { setRegistered(false); setCitizenStatus('unregistered'); },
+          });
         }}
       >
         {citizenStatus === 'checking' ? (
@@ -189,7 +193,7 @@ const s = StyleSheet.create({
     borderColor: colors.border,
   },
   cardEmoji: { fontSize: 28, marginBottom: 8 },
-  cardLabel: { fontSize: 13, fontWeight: '600', color: '#d1d5db' },
+  cardLabel: { fontSize: 13, fontWeight: '600', color: colors.textBody },
   cardDisabled: { opacity: 0.4 },
   cardEmojiDisabled: { opacity: 0.6 },
   cardLabelDisabled: { color: colors.textMuted },

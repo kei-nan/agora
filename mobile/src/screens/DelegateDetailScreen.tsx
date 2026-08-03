@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import {
-  ActivityIndicator, Alert, ScrollView, StyleSheet,
+  ActivityIndicator, ScrollView, StyleSheet,
   Text, TouchableOpacity, View,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
@@ -13,6 +13,7 @@ import {
 } from '../chain/governance';
 import { getAllDelegations } from '../chain/citizenState';
 import { getSigningKeypair } from '../chain/identity';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DelegateDetail'>;
@@ -41,6 +42,7 @@ export default function DelegateDetailScreen({ route }: Props) {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [durationDays, setDurationDays] = useState(90);
+  const { showError, showConfirm } = useAppModal();
 
   const DURATIONS = [
     { label: '30d',  days: 30 },
@@ -102,43 +104,55 @@ export default function DelegateDetailScreen({ route }: Props) {
         setProfile(p => p ? { ...p, backingCount: p.backingCount + 1 } : p);
       }
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      showError('Backing failed', e, isBacking
+        ? 'Your backing could not be removed. Please try again.'
+        : 'Your backing could not be submitted. Please try again.');
     } finally {
       setActionLoading(null);
     }
   }
 
-  async function toggleDelegation(topicId: number) {
+  async function performRevoke(topicId: number) {
+    setActionLoading(`topic-${topicId}`);
+    try {
+      const { keypair } = await getSigningKeypair();
+      await revokeDelegation(keypair, topicId);
+      setTopicDelegations(prev => ({ ...prev, [topicId]: false }));
+      setTopicCurrentDelegate(prev => ({ ...prev, [topicId]: null }));
+      setTopicExpiry(prev => ({ ...prev, [topicId]: null }));
+    } catch (e: any) {
+      showError('Revoke failed', e, 'Your delegation could not be revoked. Please try again.');
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  function toggleDelegation(topicId: number) {
+    const topic = TOPICS.find(t => t.id === topicId)?.label ?? `Topic ${topicId}`;
+
     if (topicDelegations[topicId]) {
       // Revoking from this delegate — always allowed, even before expiry
-      setActionLoading(`topic-${topicId}`);
-      try {
-        const { keypair } = await getSigningKeypair();
-        await revokeDelegation(keypair, topicId);
-        setTopicDelegations(prev => ({ ...prev, [topicId]: false }));
-        setTopicCurrentDelegate(prev => ({ ...prev, [topicId]: null }));
-        setTopicExpiry(prev => ({ ...prev, [topicId]: null }));
-      } catch (e: any) {
-        Alert.alert('Error', e.message);
-      } finally {
-        setActionLoading(null);
-      }
+      showConfirm({
+        title: 'Revoke delegation?',
+        message: `This will revoke your ${topic} delegation immediately. You'll vote directly on this topic until you delegate again.`,
+        confirmLabel: 'Revoke',
+        destructive: true,
+        onConfirm: () => performRevoke(topicId),
+      });
       return;
     }
 
     const existing = topicCurrentDelegate[topicId];
-    const topic = TOPICS.find(t => t.id === topicId)?.label ?? `Topic ${topicId}`;
 
     if (existing && existing !== address) {
       const existingName = delegateNames[existing] ?? existing.slice(0, 8) + '…';
-      Alert.alert(
-        'Switch delegation?',
-        `Your ${topic} vote is currently delegated to ${existingName}. Delegating to this person will revoke that.`,
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Switch', style: 'destructive', onPress: () => performDelegate(topicId) },
-        ],
-      );
+      showConfirm({
+        title: 'Switch delegation?',
+        message: `Your ${topic} vote is currently delegated to ${existingName}. Delegating to this person will revoke that.`,
+        confirmLabel: 'Switch',
+        destructive: true,
+        onConfirm: () => performDelegate(topicId),
+      });
     } else {
       performDelegate(topicId);
     }
@@ -154,7 +168,7 @@ export default function DelegateDetailScreen({ route }: Props) {
       setTopicCurrentDelegate(prev => ({ ...prev, [topicId]: address }));
       setTopicExpiry(prev => ({ ...prev, [topicId]: expiresAt }));
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      showError('Delegation failed', e, 'Your delegation could not be submitted. Please try again.');
     } finally {
       setActionLoading(null);
     }
@@ -349,10 +363,10 @@ const s = StyleSheet.create({
   address: { fontSize: 11, color: colors.textDim, fontFamily: 'monospace', marginBottom: 8 },
   backingCount: { fontSize: 13, color: colors.textMuted, marginBottom: 12 },
   warningBox: {
-    backgroundColor: '#451a03', borderRadius: 8, padding: 10,
-    marginBottom: 12, borderWidth: 1, borderColor: '#92400e',
+    backgroundColor: colors.warningBg, borderRadius: 8, padding: 10,
+    marginBottom: 12, borderWidth: 1, borderColor: colors.warningBorder,
   },
-  warningText: { color: '#fcd34d', fontSize: 12, lineHeight: 17 },
+  warningText: { color: colors.warningTextStrong, fontSize: 12, lineHeight: 17 },
   termRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
   termLabel: { fontSize: 12, color: colors.textSecondary },
   termPct: { fontSize: 12, color: colors.textSecondary },
@@ -370,7 +384,7 @@ const s = StyleSheet.create({
   backingRowTitle: { fontSize: 14, fontWeight: '600', color: colors.textPrimary, marginBottom: 3 },
   backingRowSub: { fontSize: 12, color: colors.textMuted, maxWidth: 200 },
   backingBtn: { paddingVertical: 8, paddingHorizontal: 16, borderRadius: 8, minWidth: 70, alignItems: 'center' },
-  backingBtnActive: { backgroundColor: '#7f1d1d' },
+  backingBtnActive: { backgroundColor: colors.dangerSolid },
   backingBtnInactive: { backgroundColor: colors.accent },
   backingBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 13 },
   topicRow: {
@@ -379,13 +393,13 @@ const s = StyleSheet.create({
   },
   topicBorder: { borderBottomWidth: 1, borderBottomColor: colors.border },
   topicLeft: { flex: 1, marginRight: 10 },
-  topicLabel: { fontSize: 14, color: '#d1d5db', fontWeight: '500' },
+  topicLabel: { fontSize: 14, color: colors.textBody, fontWeight: '500' },
   topicExpiry: { fontSize: 11, color: colors.textSecondary, marginTop: 2 },
   topicElsewhere: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
   topicBtn: { paddingVertical: 6, paddingHorizontal: 14, borderRadius: 8, minWidth: 80, alignItems: 'center' },
-  topicBtnOn: { backgroundColor: '#7f1d1d' },
+  topicBtnOn: { backgroundColor: colors.dangerSolid },
   topicBtnOff: { backgroundColor: colors.accent },
-  topicBtnSwitch: { backgroundColor: '#92400e' },
+  topicBtnSwitch: { backgroundColor: colors.warningBorder },
   topicBtnDisabled: { opacity: 0.4 },
   topicBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 13 },
   inactiveNote: { fontSize: 12, color: colors.textMuted, padding: 14, paddingTop: 0, lineHeight: 17 },

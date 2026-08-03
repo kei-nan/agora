@@ -12,19 +12,19 @@
 import React, { useCallback, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
-  Button,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
+  TouchableOpacity,
   View,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { claimFiscalYearTokens, allocateBudget } from '../chain/voting';
 import { getSigningKeypair } from '../chain/identity';
 import { getApi } from '../chain/api';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 // pallet-voting's BudgetCategoryCount constant currently allows up to 10
@@ -51,6 +51,7 @@ export default function VoteScreen() {
   const [claiming, setClaiming] = useState(false);
   const [allocating, setAllocating] = useState<number | null>(null);
   const [voteCounts, setVoteCounts] = useState<Record<number, string>>({ 0: '', 1: '', 2: '' });
+  const { showInfo, showError } = useAppModal();
 
   const load = useCallback(async () => {
     try {
@@ -80,12 +81,12 @@ export default function VoteScreen() {
         Object.fromEntries(BUDGET_CATEGORIES.map((c) => [c.id, String(allocations[c.id] ?? 0)])),
       );
     } catch (e: any) {
-      Alert.alert('Failed to load budget', e.message);
+      showError('Failed to load budget', e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [showError]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
 
@@ -94,10 +95,10 @@ export default function VoteScreen() {
     try {
       const { keypair } = await getSigningKeypair();
       await claimFiscalYearTokens(keypair);
-      Alert.alert('Tokens claimed', 'Your fiscal year budget tokens have been claimed.');
+      showInfo('Tokens claimed', 'Your fiscal year budget tokens have been claimed.');
       await load();
     } catch (e: any) {
-      Alert.alert('Claim failed', e.message);
+      showError('Claim failed', e, 'Your budget tokens could not be claimed. Please try again.');
     } finally {
       setClaiming(false);
     }
@@ -106,17 +107,17 @@ export default function VoteScreen() {
   async function handleAllocate(categoryId: number) {
     const count = parseInt(voteCounts[categoryId] ?? '0', 10);
     if (isNaN(count) || count < 0) {
-      Alert.alert('Invalid amount', 'Enter a whole number of votes (0 or more).');
+      showInfo('Invalid amount', 'Enter a whole number of votes (0 or more).');
       return;
     }
     setAllocating(categoryId);
     try {
       const { keypair } = await getSigningKeypair();
       await allocateBudget(keypair, categoryId, count);
-      Alert.alert('Allocated', `Set ${count} votes on this category.`);
+      showInfo('Allocated', `Set ${count} votes on this category.`);
       await load();
     } catch (e: any) {
-      Alert.alert('Allocation failed', e.message);
+      showError('Allocation failed', e, 'Your allocation could not be submitted. Please try again.');
     } finally {
       setAllocating(null);
     }
@@ -152,11 +153,16 @@ export default function VoteScreen() {
         {claiming ? (
           <ActivityIndicator color={colors.accent} />
         ) : (
-          <Button
-            title={state?.claimed ? 'Already Claimed' : 'Claim Budget Tokens'}
+          <TouchableOpacity
+            style={[styles.btn, (!state?.epoch || state?.claimed) && styles.btnDisabled]}
             onPress={handleClaim}
             disabled={!state?.epoch || state?.claimed}
-          />
+            accessibilityRole="button"
+            accessibilityLabel={state?.claimed ? 'Already claimed' : 'Claim budget tokens'}
+            accessibilityState={{ disabled: !state?.epoch || state?.claimed }}
+          >
+            <Text style={styles.btnText}>{state?.claimed ? 'Already Claimed' : 'Claim Budget Tokens'}</Text>
+          </TouchableOpacity>
         )}
       </View>
 
@@ -176,7 +182,14 @@ export default function VoteScreen() {
           {allocating === cat.id ? (
             <ActivityIndicator color={colors.accent} />
           ) : (
-            <Button title="Allocate" onPress={() => handleAllocate(cat.id)} />
+            <TouchableOpacity
+              style={styles.btn}
+              onPress={() => handleAllocate(cat.id)}
+              accessibilityRole="button"
+              accessibilityLabel={`Allocate votes to ${cat.name}`}
+            >
+              <Text style={styles.btnText}>Allocate</Text>
+            </TouchableOpacity>
           )}
         </View>
       ))}
@@ -209,4 +222,12 @@ const styles = StyleSheet.create({
     padding: 10,
     color: colors.textPrimary,
   },
+  btn: {
+    backgroundColor: colors.accent,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  btnDisabled: { backgroundColor: colors.border },
+  btnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
 });

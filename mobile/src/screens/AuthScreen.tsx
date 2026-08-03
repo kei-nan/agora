@@ -373,7 +373,7 @@ const styles = StyleSheet.create({
   flowStepText: {
     flex: 1,
     fontSize: 14,
-    color: "#d1d5db",
+    color: colors.textBody,
     lineHeight: 20,
   },
 });
