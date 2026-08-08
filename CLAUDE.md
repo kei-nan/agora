@@ -7,13 +7,14 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 ## Current State
 - Ubuntu 24.04 (WSL2), Rust 1.96 stable
 - Chain builds and runs in dev mode
-- **11 pallets exist as source, but only 10 are actually wired into the runtime** (see
-  `docs/project/README.md` for detail — `HANDOFF.md` is now just a thin pointer there, split out
-  2026-08-01). `pallet-emergency-council` (meant to be index 15) has real, tested source code but
-  is **not** in `runtime/Cargo.toml`, not configured in `runtime/src/configs/mod.rs`, and not in
-  `construct_runtime!` — confirmed 2026-08-04: the real pallet index sequence jumps straight from
-  14 to 16. The "Emergency Council" branch described below does not currently exist in the
-  compiled chain, contrary to what this file claimed until today.
+- **All 11 pallets are wired into the runtime**, index 8–18 (see `docs/project/README.md` for
+  detail — `HANDOFF.md` is now just a thin pointer there, split out 2026-08-01).
+  `pallet-emergency-council` is in `runtime/Cargo.toml`, configured in
+  `runtime/src/configs/mod.rs`, and present at `pallet_index(15)` in the
+  `#[frame_support::runtime]` macro in `runtime/src/lib.rs` — confirmed 2026-08-08 by reading
+  the file directly. (This section claimed until 2026-08-04 that it was missing; that claim was
+  itself stale by 2026-08-08 — check `runtime/src/lib.rs` directly rather than trusting this note
+  if it matters for what you're doing.)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
   `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (77 tests); no
@@ -43,9 +44,14 @@ To run the dev chain:
     Rarimo's own mobile SDK never actually shipped Noir proving, and ZKPassport is the more
     actively maintained, more complete non-Rarimo stack covering the same problem)
   - Saves the equivalent circuit-engineering work vs. building ICAO passport verification from scratch;
-    NOTE — the previously-built Rarimo-specific integration (VK assets, `verifier.rs`, `sodParser.ts`,
-    `certificateTree.ts`, mobile proving code) all need rework against ZKPassport's actual circuit
-    shape, none of that rework has started yet
+    the earlier Rarimo-specific integration has since been reworked against ZKPassport's actual
+    circuit shape: `verifier.rs` verifies real bb 5.0.0 UltraHonk proofs (changelog #72),
+    `certificateTree.ts` was rebuilt against ZKPassport's depth-16 Poseidon2 tree (changelog #66),
+    and `sodParser.ts`/`zkProving.ts`/`proofEncoding.ts` were reworked too (confirmed 2026-08-08 by
+    reading the files directly — SOD parsing itself was never Rarimo-specific, only proof encoding
+    was, and that part is now ZKPassport-shaped). Still open: no real ZKPassport proof has ever gone
+    through the verifier end-to-end (gated on the OPRF committee below), and whether a real outer
+    proof actually accepts the `disclosure`/`migrate-disclosure` subproofs is unconfirmed
 - **MACI** (Minimal Anti-Collusion Infrastructure) — receipt-free anonymous voting
   - Docs: https://maci.pse.dev/
   - Plug Rarimo nullifier as eligibility gate
@@ -189,10 +195,17 @@ authoritative version of this list; treat this section as a summary, not the sou
    genuine end-to-end ZK verification test — `runtime/src/verifier.rs` is complete and verifies
    real bb 5.0.0 UltraHonk proofs, but no real ZKPassport proof has gone through it yet.
 2. **An AI-ruling oracle service** — `pallet-courts` has real, tested on-chain machinery to
-   *accept* a ruling (`submit_ai_ruling`, a real `OracleOrigin`), but nothing off-chain actually
-   generates one by calling an AI model. The desktop app's existing Claude integration is a
-   separate, read-only citizen Q&A feature, not a court oracle. Not currently tracked in
-   `next-steps.md` — found 2026-08-04, still open.
+   *accept* a ruling (`submit_ai_ruling`, a real `OracleOrigin`) and a separate `finalize_ruling`
+   call that applies the verdict. `court-oracle/` (changelog #086) is now a real standalone
+   service that polls filed cases, builds context from chain storage, calls Claude for a
+   ruling, publishes reasoning to IPFS, and submits `submit_ai_ruling`. The desktop app's
+   existing Claude integration remains a separate, read-only citizen Q&A feature, not this.
+   Still PARTIAL, not done: never run against a real chain/Claude API/IPFS daemon (unit-tested
+   at the pure-logic level only); `Courts::set_oracle_account` has never been called on a real
+   chain; and the service does not yet schedule `finalize_ruling` after an appeal window closes
+   unappealed, so a submitted ruling currently starts the appeal clock but nothing ever finalizes
+   it. See `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full
+   accounting.
 3. **Mobile app native build** — `android/` and its NFC module already exist and are committed;
    blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and
    (b) the OPRF committee service above, which gates on-device ZK proof generation.
