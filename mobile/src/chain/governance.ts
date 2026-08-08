@@ -115,6 +115,37 @@ export async function voteOnReferendum(
   await votingChain.voteReferendum(keypair, id, inFavor);
 }
 
+/**
+ * Whether `address` has already cast a vote in referendum `id` — pallet-voting's
+ * `ReferendumHasVoted` (`(referendum_id, account) -> bool`, `ValueQuery`, so no
+ * isSome/unwrap needed; a missing entry just reads back `false`). Used to seed
+ * ProposalsScreen's already-voted guard from real chain state rather than only
+ * this session's in-memory votes, since a citizen who voted in an earlier
+ * session/app-install would otherwise see live Vote buttons again.
+ */
+export async function hasVotedOnReferendum(address: string, referendumId: number): Promise<boolean> {
+  const api = await getApi();
+  const voted = await api.query.voting.referendumHasVoted([referendumId, address]);
+  return Boolean((voted as any).toJSON());
+}
+
+/**
+ * The referendum created for a petition once it crosses its signature
+ * threshold — pallet-voting's `PetitionReferendum` (`petition_id -> referendum_id`).
+ * `create_referendum` is called synchronously inside the same `sign_petition`
+ * extrinsic that emits `PetitionThresholdReached`
+ * (pallets/pallet-constitution/src/lib.rs), so once a petition's on-chain
+ * signature count has reached its threshold this mapping is already
+ * populated — `null` should only happen for petitions that haven't reached
+ * threshold yet (callers are expected to check that first).
+ */
+export async function fetchReferendumIdForPetition(petitionId: number): Promise<number | null> {
+  const api = await getApi();
+  const entry = await api.query.voting.petitionReferendum(petitionId);
+  if ((entry as any).isNone) return null;
+  return (entry as any).unwrap().toNumber();
+}
+
 // ── Laws (pallet-constitution) ───────────────────────────────────────────
 
 export async function fetchLaws(): Promise<Law[]> {

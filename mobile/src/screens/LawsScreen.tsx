@@ -50,7 +50,14 @@ export default function LawsScreen() {
       }
       ListEmptyComponent={<Text style={s.empty}>No laws enacted yet.</Text>}
       renderItem={({ item }) => (
-        <View style={s.card}>
+        <View
+          style={s.card}
+          accessible
+          accessibilityRole="summary"
+          accessibilityLabel={
+            `Law ${item.id}, version ${item.version}, ${item.status}${item.tier === 'Constitutional' ? ', Constitutional' : ''}. ${item.title}.`
+          }
+        >
           <View style={s.chips}>
             <View style={[s.chip,
               item.status === 'Active' ? s.chipActive

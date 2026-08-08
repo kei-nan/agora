@@ -9,22 +9,77 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import { Proposal, fetchProposals, voteOnReferendum } from '../chain/governance';
+import { Proposal, fetchProposals, hasVotedOnReferendum, voteOnReferendum } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { colors } from '../theme';
+
+/**
+ * pallet-voting's `dispatchError.toString()` surfaces as raw module-error
+ * text (module name + Rust error variant, e.g. `voting.AlreadyVotedInReferendum:
+ * ...`, per submitExtrinsic.ts) — not something a citizen should have to
+ * parse to understand why their vote didn't go through. Maps the errors
+ * `vote_referendum` can actually return (pallets/pallet-voting/src/lib.rs's
+ * `Error<T>` enum) to plain language; anything unrecognized falls back to a
+ * generic message. The real error is never discarded — callers still show it
+ * via a "Details" button.
+ */
+function translateVoteError(raw: string): string {
+  if (raw.includes('AlreadyVotedInReferendum')) {
+    return 'You have already voted on this proposal.';
+  }
+  if (raw.includes('VotingEpochNotActive')) {
+    return 'Voting is not open right now — this proposal is outside the current voting epoch.';
+  }
+  if (raw.includes('ReferendumNotActive')) {
+    return 'Voting has closed on this proposal.';
+  }
+  if (raw.includes('ReferendumNotFound')) {
+    return 'This proposal could not be found on-chain.';
+  }
+  if (raw.includes('CitizenNotActive')) {
+    return 'Your citizen registration is not active — re-verify your passport to vote.';
+  }
+  return 'The chain rejected this vote. Please try again.';
+}
 
 export default function ProposalsScreen() {
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [voting, setVoting] = useState<number | null>(null);
+  // Mirrors PetitionScreen.tsx's `signed` Set — local, per-item "already
+  // acted" tracking so the buttons can't be re-tapped once a vote lands.
+  // Seeded from chain state in load() (see hasVotedOnReferendum) so it
+  // reflects votes cast in earlier sessions too, not just this one.
+  const [voted, setVoted] = useState<Set<number>>(new Set());
 
   const load = useCallback(async () => {
+    let data: Proposal[];
     try {
-      const data = await fetchProposals();
+      data = await fetchProposals();
       setProposals(data);
     } catch (e: any) {
       Alert.alert('Error', e.message);
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
+
+    // Seeding the already-voted set is a best-effort UX nicety, not the
+    // primary load — if it fails (e.g. no signing keypair yet), the
+    // proposals list should still render rather than showing an error for a
+    // problem unrelated to fetching proposals. Worst case, `voted` just
+    // stays at its previous value and a repeat vote is caught by the chain
+    // (and translateVoteError) instead of being pre-empted in the UI.
+    try {
+      const { keypair } = await getSigningKeypair();
+      const votingIds = data.filter((p) => p.state === 'Voting').map((p) => p.id);
+      const results = await Promise.all(
+        votingIds.map((id) => hasVotedOnReferendum(keypair.address, id)),
+      );
+      setVoted(new Set(votingIds.filter((_, i) => results[i])));
+    } catch {
+      // ignore — see comment above
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -38,10 +93,15 @@ export default function ProposalsScreen() {
     try {
       const { keypair } = await getSigningKeypair();
       await voteOnReferendum(keypair, id, inFavor);
+      setVoted((prev) => new Set(prev).add(id));
       Alert.alert('Vote cast', `You voted ${inFavor ? 'for' : 'against'} proposal #${id}.`);
       load();
     } catch (e: any) {
-      Alert.alert('Vote failed', e.message);
+      const rawMessage = e.message ?? String(e);
+      Alert.alert('Vote failed', translateVoteError(rawMessage), [
+        { text: 'OK', style: 'cancel' },
+        { text: 'Details', onPress: () => Alert.alert('Technical details', rawMessage) },
+      ]);
     } finally {
       setVoting(null);
     }
@@ -58,53 +118,72 @@ export default function ProposalsScreen() {
       keyExtractor={(p) => String(p.id)}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor={colors.accent} />}
       ListEmptyComponent={<Text style={s.empty}>No proposals on-chain yet.</Text>}
-      renderItem={({ item }) => (
-        <View style={s.card}>
-          <View style={s.cardHeader}>
-            <View style={s.chips}>
-              <Text style={[s.chip, item.state === 'Voting' ? s.chipActive : s.chipDone]}>
-                {item.state}
-              </Text>
-              {item.tier === 'Constitutional' && (
-                <Text style={[s.chip, s.chipConst]}>constitutional</Text>
-              )}
+      renderItem={({ item }) => {
+        const hasVoted = voted.has(item.id);
+        return (
+          <View style={s.card}>
+            <View
+              style={s.cardHeader}
+              accessible
+              accessibilityLabel={`Proposal ${item.id}, ${item.tier}, ${item.state}`}
+            >
+              <View style={s.chips}>
+                <Text style={[s.chip, item.state === 'Voting' ? s.chipActive : s.chipDone]}>
+                  {item.state}
+                </Text>
+                {item.tier === 'Constitutional' && (
+                  <Text style={[s.chip, s.chipConst]}>constitutional</Text>
+                )}
+              </View>
+              <Text style={s.id}>#{item.id}</Text>
             </View>
-            <Text style={s.id}>#{item.id}</Text>
-          </View>
 
-          <Text style={s.hash} numberOfLines={1}>{item.topicHash}</Text>
+            <Text style={s.hash} numberOfLines={1}>{item.topicHash}</Text>
 
-          <View style={s.tally}>
-            <Text style={s.forVotes}>▲ {item.votesFor} for</Text>
-            <Text style={s.againstVotes}>▼ {item.votesAgainst} against</Text>
-          </View>
-
-          {item.state === 'Voting' && (
-            <View style={s.voteRow}>
-              <TouchableOpacity
-                style={[s.voteBtn, s.voteBtnFor]}
-                onPress={() => vote(item.id, true)}
-                disabled={voting === item.id}
-                accessibilityRole="button"
-                accessibilityLabel={`Vote for proposal ${item.id}`}
-              >
-                {voting === item.id
-                  ? <ActivityIndicator color={colors.textPrimary} size="small" />
-                  : <Text style={s.voteBtnText}>Vote For</Text>}
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[s.voteBtn, s.voteBtnAgainst]}
-                onPress={() => vote(item.id, false)}
-                disabled={voting === item.id}
-                accessibilityRole="button"
-                accessibilityLabel={`Vote against proposal ${item.id}`}
-              >
-                <Text style={s.voteBtnText}>Vote Against</Text>
-              </TouchableOpacity>
+            <View
+              style={s.tally}
+              accessible
+              accessibilityLabel={`${item.votesFor} votes for, ${item.votesAgainst} votes against${hasVoted ? ', you already voted on this proposal' : ''}`}
+            >
+              <Text style={s.forVotes}>▲ {item.votesFor} for</Text>
+              <Text style={s.againstVotes}>▼ {item.votesAgainst} against</Text>
             </View>
-          )}
-        </View>
-      )}
+
+            {item.state === 'Voting' && (
+              hasVoted ? (
+                <View style={s.votedRow}>
+                  <Text style={s.votedText}>✓ You voted on this proposal</Text>
+                </View>
+              ) : (
+                <View style={s.voteRow}>
+                  <TouchableOpacity
+                    style={[s.voteBtn, s.voteBtnFor]}
+                    onPress={() => vote(item.id, true)}
+                    disabled={voting === item.id}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Vote for proposal ${item.id}`}
+                    accessibilityState={{ disabled: voting === item.id }}
+                  >
+                    {voting === item.id
+                      ? <ActivityIndicator color={colors.textPrimary} size="small" />
+                      : <Text style={s.voteBtnText}>Vote For</Text>}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[s.voteBtn, s.voteBtnAgainst]}
+                    onPress={() => vote(item.id, false)}
+                    disabled={voting === item.id}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Vote against proposal ${item.id}`}
+                    accessibilityState={{ disabled: voting === item.id }}
+                  >
+                    <Text style={s.voteBtnText}>Vote Against</Text>
+                  </TouchableOpacity>
+                </View>
+              )
+            )}
+          </View>
+        );
+      }}
     />
   );
 }
@@ -137,4 +216,6 @@ const s = StyleSheet.create({
   voteBtnFor: { backgroundColor: '#166534' },
   voteBtnAgainst: { backgroundColor: '#7f1d1d' },
   voteBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
+  votedRow: { paddingVertical: 10, alignItems: 'center', backgroundColor: colors.border, borderRadius: 10 },
+  votedText: { color: colors.success, fontWeight: '600', fontSize: 14 },
 });

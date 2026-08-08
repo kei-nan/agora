@@ -44,6 +44,21 @@ interface BudgetState {
   allocations: Record<number, number>;
 }
 
+/**
+ * pallet-voting's `allocate_budget` (pallets/pallet-voting/src/lib.rs) charges
+ * quadratically on the *total* votes set for a category, refunding/charging
+ * only the delta against whatever was already allocated there this epoch —
+ * not the full N² every time. Mirrors that math here so the live preview
+ * (and the pre-submit balance check below) matches what the chain will
+ * actually do, rather than a simplified "N² always debited" model that would
+ * misfire for anyone adjusting an existing allocation.
+ */
+function computeAllocationCost(count: number, oldVotes: number): { cost: number; delta: number } {
+  const oldCost = oldVotes * oldVotes;
+  const cost = count * count;
+  return { cost, delta: Math.max(0, cost - oldCost) };
+}
+
 export default function VoteScreen() {
   const [state, setState] = useState<BudgetState | null>(null);
   const [loading, setLoading] = useState(true);
@@ -109,6 +124,21 @@ export default function VoteScreen() {
       Alert.alert('Invalid amount', 'Enter a whole number of votes (0 or more).');
       return;
     }
+    // Belt-and-suspenders: the Allocate button is already disabled once the
+    // live preview below shows this would overspend, but check again here
+    // too in case state has moved since the last render (e.g. balance
+    // changed from another device) rather than relying solely on the UI
+    // being in sync.
+    const oldVotes = state?.allocations[categoryId] ?? 0;
+    const { cost, delta } = computeAllocationCost(count, oldVotes);
+    const balance = state?.balance ?? 0;
+    if (delta > balance) {
+      Alert.alert(
+        'Not enough budget tokens',
+        `Setting this category to ${count} votes costs ${cost} tokens total (${delta} more than your current allocation here) — your balance is only ${balance}.`,
+      );
+      return;
+    }
     setAllocating(categoryId);
     try {
       const { keypair } = await getSigningKeypair();
@@ -156,30 +186,65 @@ export default function VoteScreen() {
             title={state?.claimed ? 'Already Claimed' : 'Claim Budget Tokens'}
             onPress={handleClaim}
             disabled={!state?.epoch || state?.claimed}
+            accessibilityLabel={state?.claimed ? 'Budget tokens already claimed' : `Claim budget tokens for fiscal year ${state?.epoch ?? 0}`}
           />
         )}
       </View>
 
-      {BUDGET_CATEGORIES.map((cat) => (
-        <View key={cat.id} style={styles.card}>
-          <Text style={styles.cardTitle}>{cat.name}</Text>
-          <Text style={styles.currentText}>Current: {state?.allocations[cat.id] ?? 0} votes</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="Vote count"
-            placeholderTextColor={colors.textMuted}
-            keyboardType="numeric"
-            value={voteCounts[cat.id]}
-            onChangeText={(text) => setVoteCounts((prev) => ({ ...prev, [cat.id]: text }))}
-            accessibilityLabel={`Vote count for ${cat.name}`}
-          />
-          {allocating === cat.id ? (
-            <ActivityIndicator color={colors.accent} />
-          ) : (
-            <Button title="Allocate" onPress={() => handleAllocate(cat.id)} />
-          )}
-        </View>
-      ))}
+      {BUDGET_CATEGORIES.map((cat) => {
+        const rawCount = voteCounts[cat.id] ?? '';
+        const parsed = parseInt(rawCount, 10);
+        const count = !isNaN(parsed) && parsed >= 0 ? parsed : 0;
+        const oldVotes = state?.allocations[cat.id] ?? 0;
+        const balance = state?.balance ?? 0;
+        const { cost, delta } = computeAllocationCost(count, oldVotes);
+        const overBudget = delta > balance;
+
+        return (
+          <View key={cat.id} style={styles.card}>
+            <Text style={styles.cardTitle}>{cat.name}</Text>
+            <Text style={styles.currentText}>Current: {oldVotes} votes</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Vote count"
+              placeholderTextColor={colors.textMuted}
+              keyboardType="numeric"
+              value={voteCounts[cat.id]}
+              onChangeText={(text) => setVoteCounts((prev) => ({ ...prev, [cat.id]: text }))}
+              accessibilityLabel={`Vote count for ${cat.name}`}
+            />
+            <Text
+              style={[styles.costText, overBudget && styles.costTextWarning]}
+              accessibilityLabel={
+                `Allocating ${count} votes to ${cat.name} costs ${cost} tokens in total`
+                + (delta > 0 ? `, ${delta} more than your current balance` : oldVotes > count ? `, refunding ${(oldVotes * oldVotes) - cost} tokens` : '')
+              }
+            >
+              Cost: {count}² = {cost} tokens
+              {delta > 0
+                ? ` (${delta} more from your balance)`
+                : oldVotes > count
+                  ? ` (refunds ${(oldVotes * oldVotes) - cost})`
+                  : ''}
+            </Text>
+            {overBudget && (
+              <Text style={styles.warningText} accessibilityRole="alert">
+                Exceeds your balance of {balance} tokens.
+              </Text>
+            )}
+            {allocating === cat.id ? (
+              <ActivityIndicator color={colors.accent} />
+            ) : (
+              <Button
+                title="Allocate"
+                onPress={() => handleAllocate(cat.id)}
+                disabled={overBudget}
+                accessibilityLabel={`Allocate ${count} votes to ${cat.name}${overBudget ? ', exceeds balance' : ''}`}
+              />
+            )}
+          </View>
+        );
+      })}
     </ScrollView>
   );
 }
@@ -209,4 +274,7 @@ const styles = StyleSheet.create({
     padding: 10,
     color: colors.textPrimary,
   },
+  costText: { fontSize: 12, color: colors.textSecondary },
+  costTextWarning: { color: colors.warning, fontWeight: '600' },
+  warningText: { fontSize: 12, color: colors.danger, fontWeight: '600' },
 });

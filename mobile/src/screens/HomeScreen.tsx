@@ -70,13 +70,27 @@ export default function HomeScreen() {
       <TouchableOpacity
         style={s.statusCard}
         activeOpacity={1}
-        onLongPress={() => {
+        // This long-press only ever calls setRegistered(false) — it clears
+        // citizenState.ts's local UI-convenience cache (see the comment on
+        // that cache above), nothing on-chain. It can't actually
+        // "deregister" a real citizen: the very next time this screen
+        // regains focus, useFocusEffect above re-queries isCitizen() from
+        // the chain and overwrites the cache right back to 'registered' if
+        // that's still true on-chain. So its only real effect is letting a
+        // developer force the unregistered-citizen UI path (e.g. to check
+        // Quick access's locked-card state) without a second device/account.
+        // That makes it a debug tool, not a user-facing feature, and an
+        // undocumented gesture is a bad way to expose even a debug tool —
+        // hence gating it behind __DEV__ (same pattern RegisterScreen.tsx
+        // uses for its test-passport button) rather than making it a real
+        // always-on affordance.
+        onLongPress={__DEV__ ? () => {
           if (citizenStatus !== 'registered') return;
-          Alert.alert('Reset registration?', 'This will clear your citizen status for this session.', [
+          Alert.alert('Reset registration? (dev only)', 'This clears your local citizen-status cache for this session. It does not change anything on-chain.', [
             { text: 'Cancel', style: 'cancel' },
             { text: 'Reset', style: 'destructive', onPress: () => { setRegistered(false); setCitizenStatus('unregistered'); } },
           ]);
-        }}
+        } : undefined}
       >
         {citizenStatus === 'checking' ? (
           <ActivityIndicator color={colors.accent} />
@@ -84,6 +98,7 @@ export default function HomeScreen() {
           <>
             <Text style={s.statusBadge}>✓ Registered citizen</Text>
             <Text style={s.statusSub}>Your passport identity is active on-chain</Text>
+            {__DEV__ && <Text style={s.devHint}>Long-press to reset local status (dev only)</Text>}
           </>
         ) : (
           <>
@@ -162,6 +177,7 @@ const s = StyleSheet.create({
   statusBadge: { fontSize: 16, fontWeight: '700', color: colors.success, marginBottom: 4 },
   notRegistered: { color: colors.warning },
   statusSub: { fontSize: 13, color: colors.textMuted },
+  devHint: { fontSize: 11, color: colors.textFaint, marginTop: 8, fontStyle: 'italic' },
   registerBtn: {
     marginTop: 14,
     backgroundColor: colors.accent,
