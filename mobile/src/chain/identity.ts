@@ -6,13 +6,17 @@
  * Passport NFC scan + on-device ZKPassport ZK proof generation is NOT
  * implemented yet (RegisterScreen.tsx still has the scan/liveness/proving
  * steps stubbed out with TODOs; see `zkProving.ts` for the proving seam that
- * exists in place of a real native prover). Consequently getSigningKeypair()
- * below derives a DEV-ONLY keypair from a fixed, publicly-known mnemonic
- * instead of a hardware-backed key — this is not fit for anything but local
- * development against a --dev chain, matching how the rest of this codebase
- * marks dev/passthrough pieces (e.g. PassthroughMACIVerifier in
- * runtime/src/configs/mod.rs). Real key custody must live in iOS Secure
- * Enclave / Android Keystore per CLAUDE.md's Identity System section.
+ * exists in place of a real native prover). That's a separate gap from
+ * *signing key custody*, which this module owns: `getSigningKeypair()` below
+ * now sources its `KeyringPair` from `keystoreWallet.ts` (Android Keystore-
+ * wrapped seed, see that module and `../native/keystoreSigner.ts` for the
+ * honest accounting of what "hardware-backed" covers) whenever that's
+ * available — real signing key custody, not the old dev mnemonic. The
+ * `DEV_ONLY_MNEMONIC` path below still exists, but only as a `__DEV__`-gated
+ * fallback for when the Keystore module isn't available (e.g. iOS, which has
+ * no equivalent yet, or a JS-only tooling context with no native module
+ * linked) — see `resolveSigningKeypair()`. It is unreachable whenever
+ * `__DEV__` is false, i.e. in any release build, regardless of platform.
  *
  * # The three identity extrinsics, and why their shapes are all here
  *
@@ -46,34 +50,65 @@ import { Keyring } from '@polkadot/keyring';
 import { KeyringPair } from '@polkadot/keyring/types';
 import { blake2AsHex, cryptoWaitReady } from '@polkadot/util-crypto';
 import { getApi } from './api';
+import { getOrCreateKeystoreKeypair } from './keystoreWallet';
+import { isKeystoreSigningAvailable } from '../native/keystoreSigner';
 import { assertValidPublicInputs } from './proofEncoding';
 import { submitExtrinsic } from './submitExtrinsic';
 
-// DEV-ONLY — this is the well-known Substrate test mnemonic. Every install of
-// this build derives the SAME keypair from it. It exists purely so the
-// already-wired chain-calling code (voting.ts, constitution.ts, courts.ts,
-// governance.ts) has a real KeyringPair with a working .sign() to exercise
-// end-to-end before hardware-backed key custody exists. Never use this for
-// anything beyond a local --dev chain.
+// DEV-ONLY — this is the well-known Substrate test mnemonic. Every install
+// that hits this path derives the SAME keypair from it. It exists purely as
+// a `__DEV__`-gated fallback (see `resolveSigningKeypair` below) for when the
+// real Android Keystore-backed path (`keystoreWallet.ts`) isn't available —
+// e.g. iOS, which has no equivalent native module yet, or a JS-only tooling
+// context. Never reachable when `__DEV__` is false: `resolveSigningKeypair`
+// throws instead of falling back to this in that case. Never use this for
+// anything beyond local development against a --dev chain.
 const DEV_ONLY_MNEMONIC =
   'bottom drive obey lake curtain smoke basket hold race lonely fit walk';
 
-let _pairPromise: Promise<KeyringPair> | null = null;
+let _devPairPromise: Promise<KeyringPair> | null = null;
 
 function devKeyringPair(): Promise<KeyringPair> {
-  if (!_pairPromise) {
-    _pairPromise = (async () => {
+  if (!_devPairPromise) {
+    _devPairPromise = (async () => {
       await cryptoWaitReady();
       const keyring = new Keyring({ type: 'sr25519', ss58Format: 42 });
       return keyring.addFromUri(DEV_ONLY_MNEMONIC, { name: 'agora-dev' });
     })();
   }
-  return _pairPromise;
+  return _devPairPromise;
 }
 
 /**
- * Returns a real, working KeyringPair (DEV-ONLY — see module doc) plus a
- * nullifier hash.
+ * Picks the real signing keypair: the Android Keystore-backed one
+ * (`keystoreWallet.ts`) whenever it's available — which takes priority even
+ * in a `__DEV__` build, so dev/prod parity holds on any real Android device
+ * — falling back to the `DEV_ONLY_MNEMONIC` keypair only when it isn't
+ * *and* `__DEV__` is true. Outside of `__DEV__` (any release build, any
+ * platform), an unavailable Keystore path is a hard error, never a silent
+ * fallback to the dev mnemonic — this is the gate that keeps the dev
+ * mnemonic from ever reaching a release build, following the same `__DEV__`
+ * convention `api.ts`'s `getApi()` and `RegisterScreen.tsx`'s test-passport
+ * button already use elsewhere in this app.
+ */
+async function resolveSigningKeypair(): Promise<KeyringPair> {
+  if (isKeystoreSigningAvailable()) {
+    return getOrCreateKeystoreKeypair();
+  }
+  if (__DEV__) {
+    return devKeyringPair();
+  }
+  throw new Error(
+    'resolveSigningKeypair: no hardware-backed signing key is available on this platform/build ' +
+      '(Android Keystore module not linked), and the DEV_ONLY_MNEMONIC fallback is disabled ' +
+      'outside __DEV__. Refusing to sign.',
+  );
+}
+
+/**
+ * Returns a real, working KeyringPair — Android Keystore-backed when
+ * available, a `__DEV__`-only fallback otherwise (see `resolveSigningKeypair`
+ * above) — plus a nullifier hash.
  *
  * The returned `nullifierHash` is a PLACEHOLDER, not a real ZKPassport
  * scoped nullifier. The real one is `scoped_nullifier`, a public input the
@@ -81,12 +116,12 @@ function devKeyringPair(): Promise<KeyringPair> {
  * `ZkPassportOuterPublicInputs.scopedNullifier`), computed on-device during
  * proving — that flow doesn't exist yet (see RegisterScreen.tsx TODOs). The
  * value below is just blake2(keypair.publicKey), so it's deterministic per
- * dev keypair for testing flows like AuthScreen's QR POST body, but it will
- * NOT match whatever CitizenNullifier actually stores on-chain for this
- * address, and must not be treated as a real identity proof.
+ * keypair for testing flows like AuthScreen's QR POST body, but it will NOT
+ * match whatever CitizenNullifier actually stores on-chain for this address,
+ * and must not be treated as a real identity proof.
  */
 export async function getSigningKeypair(): Promise<{ keypair: KeyringPair; nullifierHash: string }> {
-  const keypair = await devKeyringPair();
+  const keypair = await resolveSigningKeypair();
   const nullifierHash = blake2AsHex(keypair.publicKey, 256);
   return { keypair, nullifierHash };
 }
