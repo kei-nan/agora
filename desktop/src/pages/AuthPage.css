@@ -25,6 +25,7 @@
 .qr-wrapper { display: flex; flex-direction: column; align-items: center; gap: 12px; }
 .qr-wrapper svg { border-radius: 8px; background: #fff; padding: 8px; }
 .qr-hint { font-size: 12px; color: var(--text-muted); }
+.qr-countdown { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 
 .auth-btn-large {
   background: var(--accent);

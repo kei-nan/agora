@@ -11,6 +11,7 @@ interface Session {
 interface AuthState {
   session: Session | null;
   qrChallenge: string | null;
+  qrExpiresAt: number | null;
   isGeneratingQr: boolean;
   qrError: string | null;
   callbackPort: number | null;
@@ -21,12 +22,15 @@ interface AuthState {
 const AuthContext = createContext<AuthState>({
   session: null,
   qrChallenge: null,
+  qrExpiresAt: null,
   isGeneratingQr: false,
   qrError: null,
   callbackPort: null,
   requestQr: async () => {},
   logout: () => {},
 });
+
+const QR_TIMEOUT_MS = 5 * 60 * 1000;
 
 function randomPort(): number {
   return 12000 + Math.floor(Math.random() * 1000);
@@ -35,6 +39,7 @@ function randomPort(): number {
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [qrChallenge, setQrChallenge] = useState<string | null>(null);
+  const [qrExpiresAt, setQrExpiresAt] = useState<number | null>(null);
   const [isGeneratingQr, setIsGeneratingQr] = useState(false);
   const [qrError, setQrError] = useState<string | null>(null);
   const [callbackPort, setCallbackPort] = useState<number | null>(null);
@@ -64,6 +69,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const challenge = await invoke<string>("auth_generate_challenge", { port: callbackPort });
       setQrChallenge(challenge);
+      setQrExpiresAt(Date.now() + QR_TIMEOUT_MS);
       setIsGeneratingQr(false);
 
       // Poll for session completion — mobile app POSTs back to local callback server
@@ -82,6 +88,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               setQrError("Identity not registered on-chain. Complete passport registration first.");
             }
             setQrChallenge(null);
+            setQrExpiresAt(null);
             cancelPoll();
           }
         } catch {
@@ -92,8 +99,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // Stop polling after 5 minutes
       timeoutRef.current = setTimeout(() => {
         cancelPoll();
+        setQrError("This code expired after 5 minutes — generate a new one.");
         setQrChallenge(null);
-      }, 5 * 60 * 1000);
+        setQrExpiresAt(null);
+      }, QR_TIMEOUT_MS);
     } catch (err) {
       setQrError(String(err));
       setIsGeneratingQr(false);
@@ -103,11 +112,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     setSession(null);
     setQrChallenge(null);
+    setQrExpiresAt(null);
     setQrError(null);
   }, []);
 
   return (
-    <AuthContext.Provider value={{ session, qrChallenge, isGeneratingQr, qrError, callbackPort, requestQr, logout }}>
+    <AuthContext.Provider
+      value={{ session, qrChallenge, qrExpiresAt, isGeneratingQr, qrError, callbackPort, requestQr, logout }}
+    >
       {children}
     </AuthContext.Provider>
   );

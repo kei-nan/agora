@@ -146,7 +146,27 @@ pub fn twox128_hex(input: &str) -> String {
     h1.write(input.as_bytes());
     let r1 = h1.finish();
 
-    format!("{:016x}{:016x}", r0.to_le(), r1.to_le())
+    // `to_le()` is a no-op on any little-endian host and, even where it isn't, only swaps the
+    // *value* — `{:016x}` then formats that value's hex digits in big-endian order regardless.
+    // Neither step produces the little-endian *byte sequence* TwoX-128 actually needs; that
+    // requires hex-encoding `to_le_bytes()` byte-by-byte instead of formatting the integer.
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&r0.to_le_bytes());
+    bytes.extend_from_slice(&r1.to_le_bytes());
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod twox128_tests {
+    use super::twox128_hex;
+
+    /// `twox128("System")` is a widely-documented reference value across the Substrate
+    /// ecosystem (the `System` pallet's storage-key prefix) — a real known-answer check, not
+    /// an invented one.
+    #[test]
+    fn matches_known_system_pallet_prefix() {
+        assert_eq!(twox128_hex("System"), "26aa394eea5630e07c48ae0c9558cef7");
+    }
 }
 
 /// Returns the "0x"-prefixed 32-byte storage prefix for a pallet + storage item.
