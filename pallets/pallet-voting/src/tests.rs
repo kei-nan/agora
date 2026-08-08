@@ -1349,3 +1349,30 @@ fn create_referendum_internal_fails_on_duplicate_petition() {
         );
     });
 }
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. The
+// binding invariant itself is proven against the real `EnsureLegislatureMotion` origin in
+// pallet-legislature's own suite; here we confirm this pallet's five
+// `LegislatureOrigin`-gated calls never hash to the same value for overlapping raw
+// parameters.
+#[test]
+fn legislature_call_hash_differs_across_constitutional_and_foundational_referenda() {
+    // Both calls take exactly one `[u8; 32]` argument -- the case most likely to collide
+    // without the call-tag domain separator.
+    let constitutional =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(1));
+    let foundational =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_foundational_referendum", hash(1));
+    assert_ne!(constitutional, foundational);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_topic_hashes() {
+    let a =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(1));
+    let b =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(2));
+    assert_ne!(a, b);
+}

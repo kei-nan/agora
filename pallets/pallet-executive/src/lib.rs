@@ -38,8 +38,18 @@ mod tests;
 pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode};
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `LegislatureOrigin` to authorize `tag`'s call with `params`. See
+    /// `pallet_constitution::pallet::legislature_call_hash` for the full rationale.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
 
     // ── Pallet ───────────────────────────────────────────────────────────────────
 
@@ -82,7 +92,12 @@ pub mod pallet {
     pub trait Config: frame_system::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
         /// Origin that may appoint/dismiss ministers. Wire to EnsureLegislatureMotion.
-        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg` so each call site must pass the domain-separated hash of
+        /// its own parameters (see `legislature_call_hash`); the origin then verifies that
+        /// hash against the motion's approved `call_hash`, so a motion passed to authorize
+        /// one call (e.g. `enact_law` in another pallet) can never be replayed to execute
+        /// an unrelated one here (e.g. `appoint_minister`), and vice versa.
+        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
         /// Maximum number of portfolios (cabinet size ceiling).
         #[pallet::constant]
         type MaxPortfolios: Get<u32>;
@@ -275,7 +290,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             name_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-executive::define_portfolio", name_hash),
+            )?;
             let id = NextPortfolioId::<T>::get();
             ensure!(id < T::MaxPortfolios::get(), Error::<T>::PortfolioCapacityReached);
             Portfolios::<T>::insert(id, Portfolio { name_hash });
@@ -291,7 +309,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             who: T::AccountId,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-executive::appoint_prime_minister", who.clone()),
+            )?;
             if let Some(old) = PrimeMinister::<T>::get() {
                 // Invalidate the outgoing PM's pending emergency declaration vote.
                 DeclareVotes::<T>::remove(&old);
@@ -308,7 +329,10 @@ pub mod pallet {
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(6_000, 0))]
         pub fn dismiss_prime_minister(origin: OriginFor<T>) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-executive::dismiss_prime_minister", ()),
+            )?;
             let who = PrimeMinister::<T>::take().ok_or(Error::<T>::NoPrimeMinister)?;
             // Invalidate the dismissed PM's pending emergency declaration vote.
             DeclareVotes::<T>::remove(&who);
@@ -327,7 +351,13 @@ pub mod pallet {
             portfolio_id: u32,
             who: T::AccountId,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-executive::appoint_minister",
+                    (portfolio_id, who.clone()),
+                ),
+            )?;
             ensure!(Portfolios::<T>::contains_key(portfolio_id), Error::<T>::PortfolioNotFound);
 
             // Vacate whoever currently holds this portfolio.
@@ -356,7 +386,10 @@ pub mod pallet {
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn dismiss_minister(origin: OriginFor<T>, portfolio_id: u32) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-executive::dismiss_minister", portfolio_id),
+            )?;
             ensure!(Portfolios::<T>::contains_key(portfolio_id), Error::<T>::PortfolioNotFound);
             let who = PortfolioMinister::<T>::take(portfolio_id)
                 .ok_or(Error::<T>::PortfolioVacant)?;
@@ -447,7 +480,10 @@ pub mod pallet {
         #[pallet::call_index(7)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
         pub fn ratify_emergency(origin: OriginFor<T>) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-executive::ratify_emergency", ()),
+            )?;
             ActiveEmergency::<T>::try_mutate(|maybe| {
                 let info = maybe.as_mut().ok_or(Error::<T>::NoActiveEmergency)?;
                 ensure!(!info.ratified, Error::<T>::AlreadyRatified);

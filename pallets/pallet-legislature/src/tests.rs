@@ -2,7 +2,7 @@ use crate::{
     mock::*, EnsureLegislatureMotion, Error, Event, Members, Motions, MotionVotes, NextMotionId,
     PendingLegislatureApproval,
 };
-use frame_support::{assert_noop, assert_ok, traits::EnsureOrigin};
+use frame_support::{assert_noop, assert_ok, traits::EnsureOriginWithArg};
 use sp_runtime::DispatchError;
 
 const CALL_HASH_A: [u8; 32] = [1u8; 32];
@@ -543,7 +543,7 @@ fn ensure_legislature_motion_succeeds_only_after_motion_passes_for_proposer() {
 
         // No pending approval yet -- a member's signed origin is rejected.
         let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin).is_err());
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_err());
 
         assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
         assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
@@ -553,19 +553,45 @@ fn ensure_legislature_motion_succeeds_only_after_motion_passes_for_proposer() {
         // A different member (not the proposer) must not be able to consume
         // the token, even though they are an enrolled member.
         let other_origin: RuntimeOrigin = RuntimeOrigin::signed(2);
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(other_origin).is_err());
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(other_origin, &CALL_HASH_A).is_err());
         // Token must still be present -- the failed attempt above must not consume it.
         assert!(PendingLegislatureApproval::<Test>::get().is_some());
 
-        // The proposer's origin succeeds and yields the passed call_hash.
+        // The proposer's origin succeeds when it presents the hash the motion approved.
         let proposer_origin: RuntimeOrigin = RuntimeOrigin::signed(1);
-        let success = EnsureLegislatureMotion::<Test>::try_origin(proposer_origin)
+        EnsureLegislatureMotion::<Test>::try_origin(proposer_origin, &CALL_HASH_A)
             .expect("proposer origin should be authorized after motion passed");
-        assert_eq!(success, CALL_HASH_A);
 
         // The token is consumed exactly once -- a second attempt fails.
         let proposer_origin_again: RuntimeOrigin = RuntimeOrigin::signed(1);
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(proposer_origin_again).is_err());
+        assert!(
+            EnsureLegislatureMotion::<Test>::try_origin(proposer_origin_again, &CALL_HASH_A)
+                .is_err()
+        );
+        assert!(PendingLegislatureApproval::<Test>::get().is_none());
+    });
+}
+
+/// The core fix for the HIGH-severity hijack: a token approved for one call (A) must not
+/// authorize dispatch of a different call (B), even by the legitimate proposer.
+#[test]
+fn ensure_legislature_motion_rejects_mismatched_call_hash() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        // The proposer presents call B's hash instead of the approved call A's hash.
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_B).is_err());
+
+        // The mismatched attempt must not consume the token -- it's still there, and
+        // still only good for the call it was actually approved for (A).
+        assert_eq!(PendingLegislatureApproval::<Test>::get(), Some((CALL_HASH_A, 1)));
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_ok());
         assert!(PendingLegislatureApproval::<Test>::get().is_none());
     });
 }
@@ -581,7 +607,7 @@ fn ensure_legislature_motion_rejects_non_member() {
 
         // Account 42 is not an enrolled member at all.
         let origin: RuntimeOrigin = RuntimeOrigin::signed(42);
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin).is_err());
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_err());
         // Token remains untouched since a non-member origin can't consume it.
         assert!(PendingLegislatureApproval::<Test>::get().is_some());
     });
@@ -597,6 +623,6 @@ fn ensure_legislature_motion_rejects_root_origin() {
         assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
 
         let origin: RuntimeOrigin = RuntimeOrigin::root();
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin).is_err());
+        assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_err());
     });
 }

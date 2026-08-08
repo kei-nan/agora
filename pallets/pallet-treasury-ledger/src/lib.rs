@@ -4,6 +4,7 @@
 //! Per-department spend caps enforced on every transaction; every expenditure is tagged
 //! with source metadata and triggers audit hooks.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
@@ -29,8 +30,20 @@ pub mod pallet {
 
     use crate::AuditHook as _;
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::CheckedAdd;
+
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `LegislatureOrigin` to authorize `tag`'s call with `params`. See
+    /// `pallet_constitution::pallet::legislature_call_hash` for the full rationale — this is
+    /// the same scheme, duplicated per-pallet so each pallet's Config stays decoupled from
+    /// any one other pallet's crate.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -53,7 +66,11 @@ pub mod pallet {
         /// Origin permitted to allocate department budgets and reset spend counters.
         /// Must be wired to the legislature motion origin so that budget grants require
         /// a passed legislature vote — enforcing the executive/legislature separation.
-        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg` so each call site must pass the domain-separated hash of
+        /// its own parameters (see `legislature_call_hash`); the origin then verifies that
+        /// hash against the motion's approved `call_hash`, so a motion passed to authorize
+        /// one call can never be replayed to execute another.
+        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
     }
 
     /// Department id -> allocated budget (in base units).
@@ -120,7 +137,10 @@ pub mod pallet {
             department_id: u32,
             amount: T::Balance,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-treasury-ledger::allocate_budget", (department_id, amount)),
+            )?;
             DepartmentBudgets::<T>::insert(department_id, amount);
             Self::deposit_event(Event::BudgetAllocated { department_id, amount });
             Ok(())
@@ -134,7 +154,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             department_id: u32,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", department_id),
+            )?;
             DepartmentSpent::<T>::remove(department_id);
             Ok(())
         }

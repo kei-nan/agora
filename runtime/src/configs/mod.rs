@@ -701,8 +701,14 @@ impl pallet_elections::Config for Runtime {
 	type CandidateDeposit = ConstU128<1_000_000_000_000>;
 	type MaxCommissioners = ConstU32<20>;
 	type MaxCandidatesPerElection = ConstU32<100>;
-	/// Hard cap on registered delegates; bounds on_initialize iteration.
+	/// Hard cap on registered delegates.
 	type MaxDelegates = ConstU32<10_000>;
+	/// Bounds on_initialize's per-block delegate sweep (term warnings/expirations,
+	/// break-endings) to a constant amount of work regardless of how many of the up-to-10,000
+	/// `MaxDelegates` are actually registered — a full sweep completes within
+	/// `MaxDelegates / MaxDelegateSweepPerBlock` = 100 blocks (~10-20 min at this chain's
+	/// block time) in the worst case.
+	type MaxDelegateSweepPerBlock = ConstU32<100>;
 	type Currency = Balances;
 	type CitizenChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.

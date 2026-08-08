@@ -113,7 +113,10 @@ impl pallet_identity_zk::Config for Test {
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for suspend/restore and the admin calls.
     type SuspensionOrigin = frame_system::EnsureRoot<u64>;
-    type AdminOrigin = frame_system::EnsureRoot<u64>;
+    // `AsEnsureOriginWithArg` ignores the call-hash argument `AdminOrigin` now requires --
+    // this pallet's own tests exercise this pallet's logic, not the call-hash binding
+    // invariant (covered by pallet-legislature's own test suite).
+    type AdminOrigin = frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type AnchorVerifier = TestAnchorVerifier;
     // Short period so tests can cross a reverification deadline without huge block numbers.
     type ReverificationPeriod = frame_support::traits::ConstU32<10>;

@@ -1,10 +1,31 @@
 //! # Identity Pallet
 //!
-//! ZK passport verification and citizen registry.
-//! Integrates with Rarimo Freedom Tool for biometric passport NFC + ZK proof.
-//! Nullifier = Poseidon2(national_id || country_code) — stable across renewals.
+//! Citizen registry and ZKPassport-based identity verification: biometric passport NFC scan
+//! feeds a ZKPassport Noir/UltraHonk ZK proof (`register_citizen` verifies it via
+//! `T::ZkVerifier`, backed in production by the real bb 5.0.0 UltraHonk pairing check in
+//! `runtime/src/verifier.rs` — see that module's docs for the exact public-input layout).
+//! Replaces the earlier Rarimo Freedom Tool integration, dropped in favor of ZKPassport
+//! (see HANDOFF.md log #65 for why).
+//!
+//! Nullifier = the ZKPassport outer circuit's own `scoped_nullifier` public output — an
+//! identity commitment scoped to `service_scope`/`service_subscope`, stable across passport
+//! renewals. This pallet extracts it directly from the verified proof's public inputs
+//! (`public_inputs[public_inputs.len() - 2]` in `register_citizen`) and checks it against
+//! `NullifierRegistry` for uniqueness; it does not itself compute a nullifier formula (in
+//! particular, **not** `Poseidon2(national_id || country_code)` — that describes this
+//! pallet's separate OPRF identity-anchor derivation below, not the nullifier).
+//!
+//! Registration also requires a second, independent Sybil-resistance check: a mandatory OPRF
+//! identity-anchor, recomputed and checked via `T::AnchorVerifier` against the
+//! governance-approved committee keys in `OprfCommitteeKeys` (see `circuits/oprf-identity-anchor/README.md`
+//! and this file's `AnchorProofVerifier` trait docs for the full design). The on-chain OPRF
+//! committee query/response mailbox (`submit_oprf_query`/`submit_oprf_response`,
+//! `crate::dlog_verify`) is the mechanism committee members use to answer those anchor queries.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
+
+mod dlog_verify;
 
 #[cfg(test)]
 mod mock;
@@ -16,9 +37,18 @@ pub mod pallet {
 
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
-    use frame_support::traits::UnixTime;
+    use frame_support::traits::{EnsureOriginWithArg, UnixTime};
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `AdminOrigin` to authorize `tag`'s call with `params`. See
+    /// `pallet_constitution::pallet::legislature_call_hash` for the full rationale.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -73,20 +103,28 @@ pub mod pallet {
     /// `evaluation` is the committee's blinded OPRF response point — same 64-byte
     /// x-then-y-big-endian layout as `OprfQueryRecord::blinded_query` (see
     /// `oprf-committee-dev/src/oprf.rs`'s `CommitteeEvaluation::response_blinded`).
+    /// `committee_pubkey` is the committee's claimed OPRF public key point for this response
+    /// (same 64-byte layout), used as the Chaum-Pedersen relation's `a = x*G`; it is not
+    /// trusted on its own — `submit_oprf_response` checks `Poseidon2(pubkey.x, pubkey.y)`
+    /// against the governance-approved `OprfCommitteeKeys` entry for the response's
+    /// `(scheme_version, committee_slot)` before the proof is ever checked against it.
     /// `dlog_proof` is the Chaum-Pedersen DLog-equality proof
     /// `oprf-committee-dev/src/dlog.rs` generates/verifies (`dlog::generate` ->
     /// `(e: Fr, s: Fr)`, `dlog::verify(e, s, ...)`): exactly two BN254 scalar field elements,
     /// 32 bytes each, concatenated big-endian as `e || s` — **64 bytes total**. This is the
     /// real serialized size confirmed against that crate's actual types (not an arbitrary
     /// bound); `submit_oprf_response` rejects anything else via `InvalidDlogProofLength`.
-    /// This pallet does not itself verify the Chaum-Pedersen relation (no `DlogVerifier`
-    /// trait exists here — out of scope for this additive change, same boundary as the rest
-    /// of this task): it only stores the proof bytes for the client / a future on-chain
-    /// verifier to check.
+    /// `submit_oprf_response` verifies this relation for real via `crate::dlog_verify` (a
+    /// no_std port of `oprf-committee-dev/src/dlog.rs`, validated against the same upstream
+    /// known-answer vectors — see that module's docs) before ever inserting a record here:
+    /// `evaluation` is checked against the *actual* `blinded_query` on file for the `query_id`
+    /// being answered, which is what binds a response to the specific query it was computed
+    /// for and rules out replaying a valid proof against a different query.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub struct OprfResponseRecord<AccountId> {
         pub responder: AccountId,
         pub evaluation: [u8; 64],
+        pub committee_pubkey: [u8; 64],
         pub dlog_proof: BoundedVec<u8, ConstU32<64>>,
     }
 
@@ -105,7 +143,11 @@ pub mod pallet {
         /// SuspensionOrigin lets governance rotate the allowlist without touching
         /// the court-controlled suspension key. Wired to
         /// `pallet_legislature::EnsureLegislatureMotion` in the runtime.
-        type AdminOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg` so each call site must pass the domain-separated hash of
+        /// its own parameters (see `legislature_call_hash`); the origin then verifies that
+        /// hash against the motion's approved `call_hash`, so a motion passed to authorize
+        /// one call can never be replayed to execute another.
+        type AdminOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
         /// Pluggable OPRF identity-anchor proof verifier (see `AnchorProofVerifier` below):
         /// registration-anchor proofs, reverification/liveness proofs, and cross-scheme
         /// migration-consistency ("dual evaluation") proofs. The real OPRF committee
@@ -489,6 +531,19 @@ pub mod pallet {
         /// field elements, `dlog_e || dlog_s` — see `OprfResponseRecord`'s doc comment for
         /// where that size comes from).
         InvalidDlogProofLength,
+        /// The submitted `committee_pubkey`'s `Poseidon2(x, y)` hash does not match the
+        /// governance-approved `OprfCommitteeKeys` entry for this response's current
+        /// `(OprfSchemeVersion, committee_slot)` — either no key is on file for that slot yet,
+        /// or the caller supplied a public key that isn't the committee's real one.
+        UnrecognizedCommitteePublicKey,
+        /// The Chaum-Pedersen DLog-equality proof failed to verify: either the points/scalars
+        /// were malformed (off-curve, non-canonical encoding, identity, or outside the
+        /// prime-order subgroup), or the relation genuinely doesn't hold — i.e. `evaluation`
+        /// is not a valid OPRF evaluation of this query's `blinded_query` under the secret key
+        /// behind `committee_pubkey`. This also rejects a proof computed for a *different*
+        /// query being replayed against this one, since the relation is checked against this
+        /// query's own on-file `blinded_query`.
+        InvalidDlogProof,
     }
 
     #[pallet::call]
@@ -684,7 +739,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             merkle_root: [u8; 32],
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::add_allowed_merkle_root", merkle_root),
+            )?;
             AllowedMerkleRoots::<T>::insert(merkle_root, true);
             Self::deposit_event(Event::MerkleRootAdded { merkle_root });
             Ok(())
@@ -697,7 +755,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             merkle_root: [u8; 32],
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::remove_allowed_merkle_root", merkle_root),
+            )?;
             AllowedMerkleRoots::<T>::remove(merkle_root);
             Self::deposit_event(Event::MerkleRootRemoved { merkle_root });
             Ok(())
@@ -827,7 +888,10 @@ pub mod pallet {
         #[pallet::call_index(8)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn rotate_oprf_scheme(origin: OriginFor<T>) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::rotate_oprf_scheme", ()),
+            )?;
             let new_version = Self::do_bump_scheme_version()?;
             Self::deposit_event(Event::OprfSchemeRotated { new_version });
             Ok(())
@@ -871,7 +935,13 @@ pub mod pallet {
             slot: u8,
             oprf_pk_hash: [u8; 32],
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-identity::set_oprf_committee_key",
+                    (scheme_version, slot, oprf_pk_hash),
+                ),
+            )?;
             ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
             OprfCommitteeKeys::<T>::insert((scheme_version, slot), oprf_pk_hash);
             Self::deposit_event(Event::OprfCommitteeKeySet { scheme_version, slot });
@@ -887,7 +957,13 @@ pub mod pallet {
             scheme_version: u32,
             slot: u8,
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-identity::remove_oprf_committee_key",
+                    (scheme_version, slot),
+                ),
+            )?;
             ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
             OprfCommitteeKeys::<T>::remove((scheme_version, slot));
             Self::deposit_event(Event::OprfCommitteeKeyRemoved { scheme_version, slot });
@@ -905,7 +981,10 @@ pub mod pallet {
             slot: u8,
             who: T::AccountId,
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::add_committee_member", (slot, who.clone())),
+            )?;
             ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
             CommitteeMembers::<T>::try_mutate(slot, |members| -> DispatchResult {
                 ensure!(!members.contains(&who), Error::<T>::CommitteeMemberAlreadyPresent);
@@ -924,7 +1003,10 @@ pub mod pallet {
             slot: u8,
             who: T::AccountId,
         ) -> DispatchResult {
-            T::AdminOrigin::ensure_origin(origin)?;
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::remove_committee_member", (slot, who.clone())),
+            )?;
             ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
             CommitteeMembers::<T>::try_mutate(slot, |members| -> DispatchResult {
                 let pos = members
@@ -972,14 +1054,23 @@ pub mod pallet {
         /// exactly 64 bytes (see `OprfResponseRecord`'s doc comment); the query exists; it
         /// hasn't expired (`OprfQuerySlaBlocks` blocks from `posted_at`); the caller is on
         /// file in `CommitteeMembers` for that slot; the caller hasn't already responded for
-        /// this `(query_id, committee_slot)` pair.
+        /// this `(query_id, committee_slot)` pair; `committee_pubkey` hashes to the
+        /// governance-approved `OprfCommitteeKeys` entry for `(OprfSchemeVersion, committee_slot)`;
+        /// and finally the Chaum-Pedersen DLog-equality proof (`crate::dlog_verify`) actually
+        /// verifies `evaluation` as a genuine OPRF evaluation of *this query's own*
+        /// `blinded_query` under the secret key behind `committee_pubkey` — which is what
+        /// binds a response to the specific query it was computed for and rejects one
+        /// replayed against a different query, an arbitrary unverifiable value, or a proof
+        /// generated under some other key. The crypto check runs last since it's by far the
+        /// most expensive of these — cheaper checks reject obviously-bad calls first.
         #[pallet::call_index(16)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(Weight::from_parts(200_000, 0))]
         pub fn submit_oprf_response(
             origin: OriginFor<T>,
             query_id: u64,
             committee_slot: u8,
             evaluation: [u8; 64],
+            committee_pubkey: [u8; 64],
             dlog_proof: BoundedVec<u8, ConstU32<64>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
@@ -1003,10 +1094,35 @@ pub mod pallet {
                 Error::<T>::DuplicateResponse
             );
 
+            // The claimed committee public key must be the governance-approved one for this
+            // slot under the current OPRF scheme version — otherwise anyone could submit a
+            // proof valid under a key of their own choosing.
+            let scheme_version = OprfSchemeVersion::<T>::get();
+            let expected_pk_hash = OprfCommitteeKeys::<T>::get((scheme_version, committee_slot))
+                .ok_or(Error::<T>::UnrecognizedCommitteePublicKey)?;
+            ensure!(
+                crate::dlog_verify::hash_committee_pubkey(committee_pubkey) == expected_pk_hash,
+                Error::<T>::UnrecognizedCommitteePublicKey
+            );
+
+            // The real cryptographic check: `evaluation` must be a genuine OPRF evaluation of
+            // *this query's own* `blinded_query` (not a caller-supplied value) under the
+            // secret key behind `committee_pubkey`. Binding to the specific query is implicit
+            // here, not a separate check — see `dlog_verify::verify_oprf_response`'s docs.
+            ensure!(
+                crate::dlog_verify::verify_oprf_response(
+                    committee_pubkey,
+                    query.blinded_query,
+                    evaluation,
+                    &dlog_proof,
+                ),
+                Error::<T>::InvalidDlogProof
+            );
+
             OprfResponses::<T>::insert(
                 query_id,
                 committee_slot,
-                OprfResponseRecord { responder: who.clone(), evaluation, dlog_proof },
+                OprfResponseRecord { responder: who.clone(), evaluation, committee_pubkey, dlog_proof },
             );
             Self::deposit_event(Event::OprfResponseSubmitted {
                 query_id,

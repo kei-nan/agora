@@ -123,7 +123,13 @@ impl pallet_constitution::Config for Test {
 
 	// Root is authorized; any signed origin is not — lets tests drive both the
 	// authorized and unauthorized-origin paths for every privileged call.
-	type LegislatureOrigin = EnsureRoot<u64>;
+	// `AsEnsureOriginWithArg` adapts the plain `EnsureRoot` origin (which only cares
+	// about Root-ness) to the `EnsureOriginWithArg<_, [u8; 32]>` bound `LegislatureOrigin`
+	// now requires, ignoring the call-hash argument. That's intentional: this pallet's own
+	// unit tests exercise this pallet's logic, not the call-hash binding invariant, which
+	// is covered by pallet-legislature's own test suite (the real
+	// `EnsureLegislatureMotion` origin wired in the runtime enforces it for real).
+	type LegislatureOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
 	type RevocationOrigin = EnsureRoot<u64>;
 	type CourtOrigin = EnsureRoot<u64>;
 

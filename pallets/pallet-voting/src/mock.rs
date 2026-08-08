@@ -202,7 +202,11 @@ impl pallet_voting::Config for Test {
     type FoundationalPassageThreshold = ConstU8<FOUNDATIONAL_PASSAGE_THRESHOLD>;
     type LawEnactor = TestLawEnactor;
     type MACITallyVerifier = TestMACITallyVerifier;
-    type LegislatureOrigin = frame_system::EnsureRoot<u64>;
+    // `AsEnsureOriginWithArg` ignores the call-hash argument `LegislatureOrigin` now
+    // requires -- this pallet's own tests exercise this pallet's logic, not the call-hash
+    // binding invariant (covered by pallet-legislature's own test suite).
+    type LegislatureOrigin =
+        frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type MinEpochDurationBlocks = ConstU32<MIN_EPOCH_DURATION>;
     type MaxEpochDurationBlocks = ConstU32<MAX_EPOCH_DURATION>;
 }

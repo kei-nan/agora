@@ -4,10 +4,13 @@
 //! motions. When a motion reaches `PassageThreshold`% ayes after `MotionDurationBlocks`,
 //! anyone can close it. A closed-passed motion emits `MotionPassed` and marks `executed = true`.
 //!
-//! `EnsureLegislatureMotion` is the `LegislatureOrigin` type consumed by pallet-constitution:
-//! it accepts any currently-enrolled member, which is sufficient for dev. In production the
-//! runtime should gate constitution calls behind a custom RuntimeOrigin variant set by
-//! `close_motion`.
+//! `EnsureLegislatureMotion` is the `LegislatureOrigin` type consumed by pallet-constitution
+//! and several other legislature-gated pallets (treasury-ledger, voting, executive, elections,
+//! identity). It implements `EnsureOriginWithArg<RuntimeOrigin, [u8; 32]>`: the caller must
+//! supply the hash of the exact call it is dispatching, and `try_origin` only succeeds if that
+//! hash matches the `call_hash` the passed motion actually approved (see `EnsureLegislatureMotion`'s
+//! own doc comment below for the full contract). This closes a prior HIGH-severity gap where
+//! any passed motion's approval token could be replayed to authorize an unrelated call.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;
@@ -51,33 +54,45 @@ pub mod pallet {
 
     // ── Origin ───────────────────────────────────────────────────────────────────
 
-    /// Origin that passes only when `close_motion` has just passed a motion.
+    /// Origin that passes only when `close_motion` has just passed a motion, *and* the
+    /// caller proves — via the `[u8; 32]` argument required by `EnsureOriginWithArg` — that
+    /// it is dispatching the exact call the motion approved.
     ///
-    /// `close_motion` writes a `PendingLegislatureApproval` token (the passed call_hash) to
-    /// storage. `EnsureLegislatureMotion::try_origin` consumes that token exactly once, so
-    /// each passed motion can authorize exactly one subsequent legislature-gated extrinsic.
-    /// Any signed member origin without a pending approval is rejected.
+    /// `close_motion` writes a `PendingLegislatureApproval` token (the passed `call_hash`,
+    /// paired with the motion's proposer) to storage. `EnsureLegislatureMotion::try_origin`
+    /// consumes that token exactly once, and only if the caller-supplied hash argument
+    /// matches it, so a motion that passed to authorize one call can never be replayed to
+    /// execute a different one — including a different call in a different
+    /// legislature-gated pallet. This is enforced with `EnsureOriginWithArg` (rather than
+    /// plain `EnsureOrigin`) so the check lives inside the origin gate itself: a consuming
+    /// call site cannot forget to verify the token, because there is no path to a
+    /// successful origin without supplying a matching hash. Consuming pallets compute that
+    /// hash from their own call's parameters, domain-separated by a pallet+call tag (see
+    /// e.g. `pallet_constitution`'s `legislature_call_hash` helper) so byte-identical
+    /// parameters can never collide across two different calls.
     pub struct EnsureLegislatureMotion<T>(core::marker::PhantomData<T>);
 
-    impl<T: Config> frame_support::traits::EnsureOrigin<T::RuntimeOrigin>
+    impl<T: Config> frame_support::traits::EnsureOriginWithArg<T::RuntimeOrigin, [u8; 32]>
         for EnsureLegislatureMotion<T>
     {
-        /// The call_hash of the consumed approval token, for off-chain auditability.
-        /// NOTE: the hash is caller-supplied at proposal time; it is not cryptographically
-        /// bound to the dispatched extrinsic — see PendingLegislatureApproval for the
-        /// known limitation and the path to a dispatch-via-motion redesign.
-        type Success = [u8; 32];
-        fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
+        type Success = ();
+        fn try_origin(
+            o: T::RuntimeOrigin,
+            call_hash: &[u8; 32],
+        ) -> Result<Self::Success, T::RuntimeOrigin> {
             use frame_system::RawOrigin;
             match o.clone().into() {
                 Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
                     // Consume the pending approval token only if this member is the
-                    // motion's proposer. Any other member is rejected, preventing a
-                    // hostile member from hijacking the queued action.
-                    if let Some((call_hash, authorized)) = PendingLegislatureApproval::<T>::get() {
-                        if authorized == who {
+                    // motion's proposer *and* the caller's hash matches the hash the
+                    // motion actually passed for. Any other member, or a mismatched
+                    // hash, is rejected — preventing both a hostile member from
+                    // hijacking the queued action and a passed motion for call A from
+                    // being replayed against unrelated call B.
+                    if let Some((approved_hash, authorized)) = PendingLegislatureApproval::<T>::get() {
+                        if authorized == who && approved_hash == *call_hash {
                             PendingLegislatureApproval::<T>::kill();
-                            return Ok(call_hash);
+                            return Ok(());
                         }
                     }
                     Err(o)
@@ -86,10 +101,10 @@ pub mod pallet {
             }
         }
         #[cfg(feature = "runtime-benchmarks")]
-        fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
+        fn try_successful_origin(call_hash: &[u8; 32]) -> Result<T::RuntimeOrigin, ()> {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
             // Plant a token so the benchmark-generated origin validates.
-            PendingLegislatureApproval::<T>::put(([0u8; 32], member.clone()));
+            PendingLegislatureApproval::<T>::put((*call_hash, member.clone()));
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
