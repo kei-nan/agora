@@ -1,0 +1,54 @@
+[workspace]
+# Deliberately its own workspace root, NOT a member of the root repo's Cargo.toml — same
+# reasoning as oprf-committee-dev/Cargo.toml (see its own header comment): this is a
+# standalone deployable component (the off-chain AI-ruling oracle for pallet-courts), not
+# part of the node/runtime build graph, and must never be pulled into it by accident — doing
+# so would drag agora-runtime's whole WASM-builder build graph (and its WASM_BUILD_RUSTFLAGS
+# quirk, see /CLAUDE.md) into a component that has nothing to do with it. The sibling
+# `committee-node/` crate described in this component's own README as "the established
+# pattern to follow" does not exist in this working tree (see README.md's "A note on which
+# tree this was built against") — this Cargo.toml follows the same isolation reasoning
+# oprf-committee-dev/Cargo.toml already documents in this tree, applied to a new component.
+
+[package]
+name = "court-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Off-chain AI-ruling oracle for pallet-courts: polls Cases for CaseStatus::Filed, asks Claude for a Level-0 ruling, publishes the reasoning to IPFS, and submits submit_ai_ruling. See README.md for what is real vs. assumed/untested."
+
+[[bin]]
+name = "court-oracle"
+path = "src/main.rs"
+
+[dependencies]
+# --- chain connectivity: raw JSON-RPC, mirroring desktop/src-tauri/src/rpc.rs — this
+# project's established convention for Rust chain connectivity (no @polkadot/api, which is
+# JS-only; no subxt, a heavier client this project has not adopted anywhere in this tree).
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+twox-hash = "1.6"
+hex = "0.4"
+anyhow = "1"
+
+# --- signing primitives, pinned to the exact version the runtime/node already use (root
+# Cargo.toml: sp-core = 36.1.0) so the sr25519 signing scheme and hash types are byte-for-byte
+# what the real chain expects. Deliberately NOT depending on the agora-runtime crate itself —
+# see the [workspace] comment above.
+sp-core = { version = "36.1.0", default-features = false, features = ["std", "full_crypto"] }
+codec = { version = "3.7.4", package = "parity-scale-codec", features = ["derive"] }
+
+# --- key file decryption (see keystore.rs) — a real, standard passphrase-encryption format
+# (age-encryption.org/v1) rather than storing the oracle's signing seed raw. See keystore.rs's
+# module docs for the honest tamper-resistance caveat this does and does not provide.
+age = "0.10"
+
+# --- IPFS CID math — same crate + version desktop/src-tauri already depends on for CIDv0
+# encoding (see desktop/src-tauri/Cargo.toml), reused here for consistency with the existing
+# on-chain-hash <-> CIDv0 convention `fetch_ipfs_content` already established.
+bs58 = "0.5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

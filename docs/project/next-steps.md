@@ -28,7 +28,7 @@
    - **Ruled out: peer-assisted proof computation**, even with the Light circuit. Common misconception worth recording since it'll come up again: "Light" only removes the PKI-chain constraints from the circuit — it does **not** remove DG1 (biographic data: name, DOB, nationality, passport number) from the witness, since both Light and Full still need to prove things about DG1. A witness is the complete plaintext assignment of every circuit wire; sending it to any peer (Light or Full) leaks the passport data in the clear, worse than trusting a server since a random peer has zero accountability. The real answer to "peer-assisted proving without leaking data" is collaborative/MPC-based SNARK proving (witness secret-shared across non-colluding parties — e.g. "Collaborative zk-SNARKs," Ozdemir & Boneh) — legitimate but a fundamentally different, much heavier proving stack than `rapidsnark`/`witnesscalc` (single-party, no MPC support). Flagged as a real future direction, explicitly out of scope for now.
    - **Still genuinely open, not yet researched/resolved**: (1) NFC chip reading itself — no confirmed off-the-shelf RN library found; still needs BAC key derivation from the MRZ + low-level APDU exchange with the chip. (2) A witness-calculator format mismatch: `passport-zk-circuits`' release bundle ships the classic circom C++ witness generator (`.cpp`/`.dat`), while `@iden3/react-native-circom-witnesscalc` expects the newer graph format (`.wcd`) from a different iden3 tool — need to either compile a `.wcd` graph ourselves from the `.circom` source, or bridge directly against Rarimo's own precompiled approach. (3) Proof encoding: `groth16Prove` returns snarkjs's standard JSON proof format; converting to the compact ark-serialize byte layout `verifier.rs` expects (129 bytes: A/B/C points + variant byte) is real, bounded work, not yet done.
 9. [ ] **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
-10. [ ] **An AI-ruling oracle service** — found 2026-08-04, not previously tracked here.
+10. [PARTIAL] **An AI-ruling oracle service** — found 2026-08-04, not previously tracked here.
     `pallet-courts` has real, tested on-chain machinery to *accept* a ruling
     (`submit_ai_ruling`, gated by a real `OracleOrigin` checking `OracleAccount` storage, not an
     `EnsureRoot` placeholder) but nothing off-chain actually generates a ruling by calling an AI
@@ -36,4 +36,24 @@
     `agent_ask`) is a separate, deliberately read-only citizen Q&A feature over law/proposal
     text — not an autonomous court oracle, and not wired to `submit_ai_ruling` at all. Same shape
     of gap as item 8 (real on-chain acceptance machinery, no real off-chain service behind it).
+    **Update, log #086**: `court-oracle/` is now a real, standalone Rust crate that polls
+    `Courts::Cases` for `CaseStatus::Filed`, builds case-appropriate context from
+    `Constitution::Laws`/`TreasuryLedger`/`PalletAudit` storage, calls Claude for a Level-0
+    ruling (a fresh system prompt, distinct from the desktop app's read-only Q&A feature),
+    publishes the reasoning to IPFS (a new publishing client — none existed in this codebase
+    before), and submits the real 3-argument `submit_ai_ruling(case_id, ruling_hash,
+    model_version)`, reading `CurrentAIModelVersion` fresh from chain each poll cycle.
+    `cargo build`/`cargo test` pass (34 tests, 0 warnings). Also found and fixed, as a real side
+    effect: `desktop/src-tauri/src/rpc.rs`'s `twox128_hex` was computing wrong storage-key
+    hashes on every deployment (confirmed against the standard `twox128("System")` reference
+    vector) — fixed with a regression test. **Still marked PARTIAL, not DONE**: (a) never run
+    against a real chain, Claude API, or IPFS daemon — the live RPC/API/daemon round trips and
+    the full orchestration loop are unit-tested at the pure-logic level only; (b)
+    `Courts::set_oracle_account` (root-only) was never called, so no real chain currently
+    accepts this service's signed calls; (c) a real, unresolved gap: `submit_ai_ruling` alone
+    never enforces anything — it only records `ruling_hash` and starts the appeal clock. The
+    verdict that actually drives enforcement is set only by a separate, still-unscheduled
+    `finalize_ruling(case_id, verdict)` oracle call after the appeal window closes unappealed,
+    which this service does not make. See `court-oracle/README.md` and
+    `docs/project/changelog/086.md` for the full accounting.
 
