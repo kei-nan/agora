@@ -12,16 +12,27 @@
  *
  * This module exists so the rest of the app (`chain/oprfCommittee.ts`) never calls
  * "the wasm module" directly — it calls this interface, so swapping the stub below for
- * a real implementation later touches only this file.
+ * a real implementation touches only this file plus the real implementation itself.
  *
- * **Still stubbed here specifically**: loading and calling the real `.wasm` artifact
- * from React Native (a JS-side Wasm runtime, RN's lack of a built-in `WebAssembly`
- * global on some engines, bridging `oprf_alloc`/`oprf_evaluate_query`/`oprf_dealloc`
- * through it) is genuinely separate work from what `committee-node` needed (a native
- * Rust host via `wasmtime` — straightforward) and was out of scope for this pass. The
- * *interface shape* below has been reconciled against the real ABI even though the
- * implementation behind it hasn't — see `evaluateQuery`'s doc comment for exactly what
- * changed and why.
+ * **A real implementation now exists** — `./wasmCommitteeCrypto.ts`'s
+ * `wasmCommitteeCrypto`, wired in at app startup by `index.js`'s
+ * `setCommitteeCrypto(wasmCommitteeCrypto)` call (changelog #084). It does NOT use a
+ * runtime `WebAssembly.instantiate(...)` call — RN 0.74's default Hermes engine has no
+ * `WebAssembly` global, and the JSC alternative doesn't give a reliably working one
+ * either (JIT'd Wasm disallowed on iOS, disabled outright on `jsc-android`) — instead it
+ * loads a build-time `wasm2js` transpilation of the real compiled module (see
+ * `wasmCommitteeCrypto.ts`'s own doc comment for the full reasoning and
+ * `scripts/build-wasm-core.sh` for how that artifact is produced). `notImplementedCommitteeCrypto`
+ * below is kept as the *default* (nothing installs a real implementation until app
+ * startup explicitly does), and as the shape every implementation — real or
+ * test-fixture — must satisfy; see `evaluateQuery`'s doc comment for the reconciled ABI
+ * shape both implementations follow.
+ *
+ * **What "real" means here, precisely** (see changelog #084 for the full trail): the
+ * `wasm2js`-generated JS is verified byte-identical to the actual Rust
+ * `ffi::evaluate_query` on a real fixture, and passes under Node/Jest in this
+ * environment. It has **not** been run inside an actual Hermes VM on a real phone — no
+ * Android/iOS device, emulator, or simulator exists in this environment to check that.
  */
 
 /**
