@@ -35,7 +35,7 @@ democracy-chain/
 ├── node/                          # chain binary (agora-node)
 ├── runtime/                       # WASM runtime (agora-runtime) — all 11 pallets wired in
 │   ├── assets/
-│   │   ├── vk_zkpassport_outer_count_4.bin  # ZKPassport outer VK — real, 1888 bytes (log #71); pairing backend still stubbed
+│   │   ├── vk_zkpassport_outer_count_4.bin  # ZKPassport outer VK — real, 1888 bytes (log #71); real bb 5.0.0 pairing check since #72
 │   │   ├── vk_sha256.bin          # STALE — Rarimo Groth16 VK, referenced by nothing since #70
 │   │   └── vk_sha1.bin            # STALE — ditto
 │   └── src/

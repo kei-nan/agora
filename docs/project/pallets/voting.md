@@ -18,6 +18,20 @@ Delegation guards:
 - Absolute cap: max 1 000 direct delegators per delegate per topic
 - Percentage cap: delegate's count × 100 must be ≤ `DelegationCap` (33) × `total_citizens`
 
+`Delegations` is only resolved into an actual tally for System 3 (Referenda) below, via
+`finalize_referendum`/`apply_delegated_weight` — a non-voting delegator's weight counts toward
+whichever side their (transitively resolved) delegate voted. It is deliberately **not**
+resolved for MACI (System 1): cross-referencing the plaintext `Delegations` graph against
+opaque MACI commitments would leak exactly the linkage MACI exists to hide. Real
+delegation-aware MACI tallying would have to happen off-chain, inside a MACI coordinator
+service that does not exist yet — see `MACITallyVerifier` below.
+
+`MACITallyVerifier` (checked in `submit_maci_tally`) is `PassthroughMACIVerifier` in
+`dev-mode` (accepts any tally unconditionally — not a security boundary) and
+`FailClosedMACIVerifier` outside it (rejects every tally, since no real MACI circuit verifier
+exists yet) — `submit_maci_tally` is effectively unusable in non-dev builds until a real
+verifier replaces it.
+
 #### System 2 — Quadratic budget voting
 
 Storage:
@@ -45,7 +59,7 @@ Config:
 - `ConstitutionalPassageThreshold = 67` (2/3 supermajority for Structural laws)
 - `FoundationalPassageThreshold = 75` (3/4 supermajority for Foundational laws)
 - `LawEnactor = Runtime` → calls `pallet_constitution::enact_law_internal` with the correct tier
-- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year`, `open_voting_epoch`, `create_constitutional_referendum`, `create_foundational_referendum`)
+- `LegislatureOrigin = EnsureLegislatureMotion<Runtime>` (for `start_fiscal_year`, `submit_maci_tally`, `open_voting_epoch`, `create_constitutional_referendum`, `create_foundational_referendum`) — `EnsureOriginWithArg<_, [u8; 32]>`; each of those calls passes a hash of its own parameters, checked against the specific motion that authorized it, so one passed motion can't be replayed to execute a different call
 
 Calls:
 - `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen; requires active epoch
@@ -57,7 +71,10 @@ Calls:
 
 Internal:
 - `create_referendum_internal(petition_id, topic_hash, tier)` — called by PetitionApprover;
-  sets `end_block` = epoch end if epoch active, else now + ReferendumDurationBlocks
+  always sets `end_block = now + ReferendumDurationBlocks` (the full fixed window,
+  regardless of whether a voting epoch happens to be active), so a referendum created near
+  the end of an epoch still gets adequate voting time — citizens may vote in any overlapping
+  future epoch within that window. There is no epoch-conditional branch in the actual code.
 
 #### System 4 — Swiss-model voting epochs
 

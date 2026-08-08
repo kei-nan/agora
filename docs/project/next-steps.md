@@ -71,4 +71,70 @@
     `finalize_ruling(case_id, verdict)` oracle call after the appeal window closes unappealed,
     which this service does not make. See `court-oracle/README.md` and
     `docs/project/changelog/086.md` for the full accounting.
+11. [DONE] **Multi-agent security review fixes (2026-08-08/09)** — a 7-agent parallel review of
+    the whole repo found several real bugs, landed as reconciled, tested branches
+    (`review-fix/*`), pending merge review:
+    - **CRITICAL**: `PassthroughMACIVerifier` accepted any vote tally unconditionally in every
+      build (not just dev-mode, unlike every other passthrough verifier in this codebase) —
+      any `LegislatureOrigin`-controlled account could enact a law on a fabricated tally. Now
+      gated behind `dev-mode`; a new `FailClosedMACIVerifier` rejects every tally outside it
+      until a real MACI circuit verifier exists.
+    - **CRITICAL**: `pallets/pallet-courts/src/tests.rs` had a brace/`#[test]`-attribute
+      nesting bug (introduced in commit 88608bf) that silently swallowed 12 tests into their
+      neighbors — zero of the AI-governance/`CaseFilingBond` tests were actually executing.
+      Fixed; 25/25 now pass.
+    - **HIGH**: `EnsureLegislatureMotion::try_origin` never bound its approval to the specific
+      call it authorized — any passed legislature motion, on any topic, produced a token
+      usable to execute *any* legislature/`AdminOrigin`-gated call anywhere (appoint a
+      minister with a motion that was voted on to enact an unrelated law, etc.). Converted to
+      `EnsureOriginWithArg<_, [u8; 32]>`; 27 consuming call sites across 7 pallets now pass a
+      domain-separated hash of their own parameters, checked against the specific motion.
+    - **HIGH**: liquid democracy delegation was write-only — `Delegations` was never read by
+      `commit_vote`/`vote_referendum`/`submit_maci_tally`, so delegating a vote had zero
+      effect on any real tally. Now resolved (transitively, per-topic) into MACI-adjacent
+      Referenda tallying in `finalize_referendum`; deliberately still *not* resolved into MACI
+      itself, since cross-referencing the plaintext delegation graph against opaque MACI
+      commitments would leak exactly the linkage MACI exists to hide (real delegation-aware
+      MACI tallying needs an off-chain coordinator service that doesn't exist yet).
+    - **HIGH**: `submit_oprf_response` never verified the Chaum-Pedersen DLog-equality proof
+      accompanying a committee member's OPRF response, or bound it to the specific query —
+      any single roster member could submit an arbitrary, unverifiable response accepted as
+      authoritative. Now verified for real (BabyJubJub curve arithmetic + the `t16` Poseidon2
+      permutation, ported from `oprf-committee-dev`'s existing but unusable-here `std`-only
+      math into a new no_std `dlog_verify.rs`, validated against real upstream known-answer
+      vectors) and bound to its query's own stored `blinded_query`.
+    - **HIGH**: desktop's QR-auth callback parsed but never verified the phone's signature
+      (and served the callback with a CORS wildcard) — any local process that learned the
+      challenge UUID could forge a session. Now verifies a real sr25519 signature (the mobile
+      client's actual scheme — not Ed25519, corrected mid-fix) against the identity's
+      on-chain-registered pubkey; sessions are now real server-side bearer tokens with
+      enforced expiry, not frontend-only state.
+    - **HIGH**: mobile signed everything (including auth and votes) with a hardcoded public
+      dev mnemonic, no Keystore/Secure Enclave code anywhere. Android now has a real
+      Keystore-backed native module encrypting a random per-install seed at rest (not literal
+      in-hardware signing — Android Keystore can't hold an sr25519 key — documented as such);
+      the dev-mnemonic fallback only fires when `__DEV__` and Keystore is unavailable, and
+      throws otherwise. iOS untouched (`ios/` still doesn't exist).
+    - Also closed as part of the same pass: `pallet-elections`' `on_initialize` unbounded
+      full-`Delegates`-table iteration (now a bounded, resumable per-block sweep), and the
+      doc-drift items tracked separately in this pass's docs commit (emergency-council
+      wiring claim recurring in a second file, several stale pallet-doc call signatures, a
+      stale test-count claim, and a couple of self-contradicting status lines).
+    - **Not attempted / explicitly scoped out this pass**: `commit_vote`'s `ensure_signed`
+      sender-anonymity gap (documented as a known limitation on the call itself rather than
+      architecturally reworked); desktop's `chain_submit_extrinsic` command exists but nothing
+      yet produces its input (no phone→desktop signed-arbitrary-call protocol); desktop's
+      `smoldot` dependency remains unwired (confirmed a substantial transport-layer rewrite,
+      not a quick swap, investigated not attempted).
+    - Every fix above was built by a sub-agent working in a harness-provided git worktree that
+      turned out to be cut from a stale branch point 8 commits behind `main` (missing the OPRF
+      mailbox, AI model governance, and several other commits) rather than current `main` — a
+      harness-side issue, not something these agents could see or fix themselves. Two agents
+      (the OPRF-mailbox and docs fixes) detected this themselves and adapted or refused rather
+      than silently producing wrong output against a fictional codebase state; the rest were
+      reconciled by hand afterward, diffed and re-verified against actual current `main`
+      (full pallet test suites + `cargo check -p agora-runtime` with and without `dev-mode`
+      re-run clean post-reconciliation). Flagging this here mainly so a future session doesn't
+      waste time re-discovering it if worktree-isolated sub-agents produce another
+      surprising-looking diff.
 

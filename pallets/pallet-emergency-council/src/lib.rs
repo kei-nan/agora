@@ -62,7 +62,10 @@ pub mod pallet {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
         /// Hard constitutional maximum for an emergency duration in blocks.
-        /// Set to 432_000 (30 days at 6s/block) in runtime.
+        /// Set to 216_000 (30 days at this chain's actual 12s/block time) in runtime — not
+        /// 432_000 (which would be 30 days at 6s/block, this pallet's own stale prior claim).
+        /// See `runtime/src/configs/mod.rs`'s `MaxEmergencyBlocks` doc comment for the full
+        /// correction.
         #[pallet::constant]
         type MaxEmergencyBlocks: Get<u32>;
 

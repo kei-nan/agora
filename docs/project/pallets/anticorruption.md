@@ -29,8 +29,12 @@ Calls:
   emits `ReportReferredToCourts`; investigator then files a case in pallet-courts
 - `add_investigator(account)` / `remove_investigator(account)` — root
 
-ZK verifier: `PassthroughAntiCorruptionZkVerifier` (dev-mode) / `RarimoAntiCorruptionZkVerifier` (prod).
-Production impl reuses the same Rarimo Groth16 BN254 circuit as pallet-identity.
+ZK verifier: `PassthroughAntiCorruptionZkVerifier` (dev-mode) / `ZkPassportAntiCorruptionZkVerifier` (prod).
+Production impl reuses the same ZKPassport UltraHonk outer circuit as pallet-identity
+(`crate::verifier::ZkPassportUltraHonkVerifier`) — not Rarimo/Groth16, which this codebase
+migrated away from. The pallet's own whistleblower-specific circuit is still a different,
+not-yet-built circuit (this binding only keeps the two verification paths consistent in the
+meantime); it also inherits `verifier.rs`'s fail-closed behavior.
 
 Config: `MaxInvestigators = 20`, `AssetDisclosureRenewalBlocks = 5_256_000` (~1 year at 6s/block).
 

@@ -16,22 +16,35 @@ Storage:
 - `CitizenAnchor`: `AccountId` → `(scheme_version, anchor)` — reverse lookup, used by `migrate_oprf_scheme`
 - `ReverificationDeadline`: `AccountId` → `BlockNumber` — periodic re-verification tracking
 - `SelfDeclaredSingleDocument`: `AccountId` → `bool` — self-declaration attestation (courts backstop, see below)
+- `CommitteeMembers`: `slot (0..NUM_COMMITTEES)` → `BoundedVec<AccountId, MaxCommitteeSize>` — OPRF committee roster per slot (changelog #82/#83 founding-phase node architecture)
+- `OprfCommitteeKeys`: `(scheme_version, slot)` → `[u8; 32]` — governance-approved committee public-key hash per slot
+- `NextQueryId` / `PendingOprfQueries`: `query_id` → the on-chain OPRF query mailbox a citizen posts a blinded query to
+- `OprfResponses`: `(query_id, slot)` → `OprfResponseRecord` (evaluation, DLog-equality proof, submitting committee's pubkey) — a committee member's answer to a pending query
 
-Calls:
-- `register_citizen(nullifier, zk_proof [≤4096 bytes], public_inputs [≤16 × [u8;32]], anchor, anchor_proof)`
-  - Verifies ZK proof via `ZkVerifier` trait
-  - Checks passport expiry via `public_inputs[2]` (expirationDate vs current timestamp)
-  - Checks country allowlist via `public_inputs[5/6]` (country_code_hash) — see changelog 065-068 log #67: one chain per country is the decided deployment model, using this same allowlist
-  - Verifies `anchor_proof` via the new `AnchorProofVerifier` trait and rejects if `anchor` already exists under the current `OprfSchemeVersion` in `IdentityAnchorRegistry` — the Sybil-resistance gate (mandatory, not opt-in; see changelog 065-068 log #67 for why, and what was rejected instead)
+Calls (params reflect the pallet's current structure post-#75/#76 restructuring):
+- `register_citizen(zk_proof [≤4096 bytes], public_inputs [≤18 × [u8;32]], anchor, oprf_pk_hashes: [[u8;32]; NUM_COMMITTEES])`
+  - Verifies the ZKPassport outer proof via `ZkVerifier`; the nullifier is *not* a separate
+    argument — it's extracted directly from the proof's own public inputs
+    (`scoped_nullifier`, see the module doc comment)
+  - Checks passport expiry and country allowlist from public inputs, same as before
+  - Requires a mandatory OPRF identity-anchor check (`anchor` + `oprf_pk_hashes`, verified via
+    `AnchorVerifier`) as the Sybil-resistance gate, rejecting if `anchor` already exists under
+    the current `OprfSchemeVersion` in `IdentityAnchorRegistry`
 - `revoke_citizen()` — swap-and-pop, clears suspension
 - `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (EnsureRoot placeholder)
 - `restore_citizen_rights(nullifier)` — `SuspensionOrigin`
-- `add_allowed_merkle_root(root)` / `remove_allowed_merkle_root(root)` — `AdminOrigin` (EnsureRoot placeholder)
-- `reverify_citizen(proof)` — any registered citizen; extends `ReverificationDeadline` via `AnchorProofVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep)
-- `migrate_oprf_scheme(old_anchor_proof, new_anchor_proof, consistency_proof)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own on-file scheme version + 1 (not the global `OprfSchemeVersion` directly — see changelog 065-068 log #68 judgment call 1 for why the literal reading has a real bug)
-- `rotate_oprf_scheme()` — `AdminOrigin`; scheduled-path advance of `OprfSchemeVersion` (the ~4-year cycle from changelog 065-068 log #67)
-- `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin` (currently `EnsureRoot` placeholder — `pallet-emergency-council` doesn't yet export a reusable `EnsureOrigin`, see changelog 065-068 log #68 judgment call 3); out-of-cycle rotation if the current OPRF scheme is suspected broken
+- `add_allowed_merkle_root(root)` / `remove_allowed_merkle_root(root)` — `AdminOrigin`
+- `reverify_citizen(proof)` — any registered citizen; extends `ReverificationDeadline` via `AnchorVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep)
+- `migrate_oprf_scheme(old_anchor_proof, new_anchor_proof, consistency_proof)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own on-file scheme version + 1
+- `rotate_oprf_scheme()` — `AdminOrigin`; scheduled-path advance of `OprfSchemeVersion` (the ~4-year cycle)
+- `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin` (currently `EnsureRoot` placeholder); out-of-cycle rotation if the current OPRF scheme is suspected broken
 - `declare_no_other_passport()` — any registered citizen; records a self-declaration attestation used only as an ex-post basis for a `pallet-courts` `CitizenConduct` case if later found false
+- `set_oprf_committee_key(scheme_version, slot, oprf_pk_hash)` / `remove_oprf_committee_key(scheme_version, slot)` — `AdminOrigin`; governance-approved committee key management
+- `add_committee_member(slot, who)` / `remove_committee_member(slot, who)` — `AdminOrigin`; committee roster management (changelog #82/#83)
+- `submit_oprf_query(blinded_query: [u8; 64])` — any registered citizen; posts a query to the on-chain mailbox for committee members to answer
+- `submit_oprf_response(query_id, committee_slot, evaluation: [u8; 64], committee_pubkey: [u8; 64], dlog_proof)` — must be a member of `committee_slot`'s roster; verifies a Chaum-Pedersen DLog-equality proof binding the response to this specific query and to a `committee_pubkey` matching the governance-approved `OprfCommitteeKeys` entry (see `dlog_verify.rs`) — an unverified, unbound response is rejected, not just accepted-and-trusted
+
+`AdminOrigin`, like `pallet-legislature::EnsureLegislatureMotion` elsewhere, is `EnsureOriginWithArg<_, [u8; 32]>`: each call above passes a domain-separated hash of its own parameters, checked against the specific motion that authorized it, so one passed motion can't be replayed to authorize a different call.
 
 Public helpers:
 - `is_active_citizen(who)` — registered AND no active suspension AND not past `ReverificationDeadline`
