@@ -132,6 +132,7 @@ dependencies = [
  "pallet-constitution",
  "pallet-courts",
  "pallet-elections",
+ "pallet-emergency-council",
  "pallet-executive",
  "pallet-grandpa",
  "pallet-identity-zk",
@@ -6102,6 +6103,7 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-balances",
  "parity-scale-codec",
  "scale-info",
  "sp-core",
@@ -6180,6 +6182,7 @@ dependencies = [
  "frame-support",
  "frame-system",
  "parity-scale-codec",
+ "poseidon2-bn254",
  "scale-info",
  "sp-core",
  "sp-io",

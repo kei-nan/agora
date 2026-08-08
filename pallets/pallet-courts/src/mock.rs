@@ -1,6 +1,6 @@
 use crate as pallet_courts;
 use crate::pallet::{CitizenChecker, CitizenSelector, CitizenSuspender, LawEnforcer, TreasuryEnforcer};
-use frame_support::{derive_impl, traits::ConstU32};
+use frame_support::{derive_impl, traits::{ConstU32, ConstU64}};
 use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
@@ -8,6 +8,11 @@ use std::cell::RefCell;
 type Block = frame_system::mocking::MockBlock<Test>;
 pub type AccountId = u64;
 pub type BlockNumber = u64;
+pub type Balance = u64;
+
+/// Small, deterministic bond amount — mirrors pallet-elections' `CANDIDATE_DEPOSIT` mock
+/// constant (see that pallet's mock.rs).
+pub const CASE_FILING_BOND: Balance = 100;
 
 #[frame_support::runtime]
 mod runtime {
@@ -32,6 +37,9 @@ mod runtime {
 	pub type System = frame_system::Pallet<Test>;
 
 	#[runtime::pallet_index(1)]
+	pub type Balances = pallet_balances::Pallet<Test>;
+
+	#[runtime::pallet_index(2)]
 	pub type Courts = pallet_courts::Pallet<Test>;
 }
 
@@ -39,6 +47,13 @@ mod runtime {
 impl frame_system::Config for Test {
 	type Block = Block;
 	type AccountId = AccountId;
+	type AccountData = pallet_balances::AccountData<Balance>;
+}
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Test {
+	type AccountStore = System;
+	type Balance = Balance;
 }
 
 thread_local! {
@@ -148,12 +163,27 @@ impl pallet_courts::Config for Test {
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;
 	type AutoChallengeAccount = AutoChallengeAccountId;
+	type Currency = Balances;
+	type CaseFilingBond = ConstU64<CASE_FILING_BOND>;
+	type MaxAIGovernanceCouncilSize = ConstU32<10>;
+	// 2/3 supermajority, matching pallet-executive's cabinet threshold in the runtime.
+	type AIModelSupermajorityNumerator = ConstU32<2>;
+	type AIModelSupermajorityDenominator = ConstU32<3>;
 }
 
-// Build genesis storage according to the mock runtime.
+// Build genesis storage according to the mock runtime. Accounts 1..=30 start with a balance
+// comfortably above `CASE_FILING_BOND` (matches the default citizen pool size, see
+// `CITIZEN_COUNT`), so filing/deposit tests don't need per-test funding boilerplate; account
+// 999 is left unfunded for the insufficient-balance case.
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	let mut ext: sp_io::TestExternalities =
-		frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into();
+	let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+	pallet_balances::GenesisConfig::<Test> {
+		balances: (1..=30u64).map(|who| (who, 10_000u64)).collect(),
+		..Default::default()
+	}
+	.assimilate_storage(&mut storage)
+	.unwrap();
+	let mut ext: sp_io::TestExternalities = storage.into();
 	ext.execute_with(|| {
 		reset_mocks();
 		System::set_block_number(1);

@@ -14,6 +14,7 @@ mod tests;
 #[frame_support::pallet]
 pub mod pallet {
 
+    use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
     use frame_support::traits::UnixTime;
     use frame_system::pallet_prelude::*;
@@ -25,6 +26,69 @@ pub mod pallet {
     /// Number of independent OPRF committees (changelog entry 73's 5-committee topology).
     /// Must match `circuits/oprf-identity-anchor/lib/identity-anchor::NUM_COMMITTEES`.
     pub const NUM_COMMITTEES: u8 = 5;
+
+    /// Deterministically assigns which of the `NUM_COMMITTEES` OPRF committees a citizen's
+    /// on-chain mailbox traffic (`PendingOprfQueries`/`OprfResponses`) is routed to
+    /// (changelog entry 82's query/response mailbox design): `Poseidon2(date_of_birth) mod
+    /// NUM_COMMITTEES`. Keyed on date of birth (rather than the never-on-chain-stored
+    /// national ID) so the assignment is stable for a citizen's whole lifetime without
+    /// depending on data this pallet doesn't have. Reuses the already-validated
+    /// `poseidon2-bn254` port (changelog entry 75 — ported line-for-line from
+    /// `noir-lang/noir`'s own blackbox solver) rather than re-deriving Poseidon2.
+    ///
+    /// `date_of_birth` is encoded the same way `current_date` is elsewhere in this pallet
+    /// (see `check_outer_proof_freshness`): the low 8 bytes of a big-endian 32-byte field
+    /// element. The hash digest is then reduced mod `NUM_COMMITTEES` via manual big-endian
+    /// byte-at-a-time modular reduction (`acc = (acc * 256 + byte) mod NUM_COMMITTEES`) —
+    /// this `no_std` pallet has no arbitrary-precision integer dependency, and none is needed
+    /// since the modulus is a small constant.
+    pub fn committee_slot_for(date_of_birth: u64) -> u8 {
+        let mut input = [0u8; 32];
+        input[24..32].copy_from_slice(&date_of_birth.to_be_bytes());
+        let digest = poseidon2_bn254::hash_bytes(&[input]);
+        let modulus = NUM_COMMITTEES as u16;
+        let mut acc: u16 = 0;
+        for byte in digest {
+            acc = (acc * 256 + byte as u16) % modulus;
+        }
+        acc as u8
+    }
+
+    // ── OPRF committee mailbox data types (changelog entry 82) ──────────────────
+
+    /// A citizen's pending blinded OPRF query, posted to the on-chain mailbox in place of a
+    /// relay server (changelog entry 82). `blinded_query` is a BabyJubJub point — 64 bytes,
+    /// two 32-byte big-endian field elements (x then y) — safe to be public because blinding
+    /// hides the underlying identity input (see `oprf-committee-dev/src/oprf.rs`'s
+    /// `blinded_query`). `posted_at` anchors the `OprfQuerySlaBlocks` expiry window checked
+    /// by `submit_oprf_response`.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct OprfQueryRecord<AccountId, BlockNumber> {
+        pub submitter: AccountId,
+        pub blinded_query: [u8; 64],
+        pub posted_at: BlockNumber,
+    }
+
+    /// One committee's OPRF evaluation response to a pending query (changelog entry 82).
+    /// `evaluation` is the committee's blinded OPRF response point — same 64-byte
+    /// x-then-y-big-endian layout as `OprfQueryRecord::blinded_query` (see
+    /// `oprf-committee-dev/src/oprf.rs`'s `CommitteeEvaluation::response_blinded`).
+    /// `dlog_proof` is the Chaum-Pedersen DLog-equality proof
+    /// `oprf-committee-dev/src/dlog.rs` generates/verifies (`dlog::generate` ->
+    /// `(e: Fr, s: Fr)`, `dlog::verify(e, s, ...)`): exactly two BN254 scalar field elements,
+    /// 32 bytes each, concatenated big-endian as `e || s` — **64 bytes total**. This is the
+    /// real serialized size confirmed against that crate's actual types (not an arbitrary
+    /// bound); `submit_oprf_response` rejects anything else via `InvalidDlogProofLength`.
+    /// This pallet does not itself verify the Chaum-Pedersen relation (no `DlogVerifier`
+    /// trait exists here — out of scope for this additive change, same boundary as the rest
+    /// of this task): it only stores the proof bytes for the client / a future on-chain
+    /// verifier to check.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct OprfResponseRecord<AccountId> {
+        pub responder: AccountId,
+        pub evaluation: [u8; 64],
+        pub dlog_proof: BoundedVec<u8, ConstU32<64>>,
+    }
 
     #[pallet::config]
     pub trait Config: frame_system::Config {
@@ -78,6 +142,20 @@ pub mod pallet {
         /// `current_date` against the passport's own expiry, not against "now".
         #[pallet::constant]
         type MaxAnchorProofAge: Get<u64>;
+        /// Maximum number of accounts permitted in a single OPRF committee slot's roster
+        /// (`CommitteeMembers`), changelog entry 82's on-chain query/response mailbox design.
+        /// Set with headroom above the eventual ~35-member committees (changelog entry 73's
+        /// 5-independent-committee governance topology) — e.g. `ConstU32<50>`.
+        #[pallet::constant]
+        type MaxCommitteeSize: Get<u32>;
+        /// Blocks a posted `PendingOprfQueries` entry stays open for committee responses
+        /// before `submit_oprf_response` starts rejecting it as expired (changelog entry
+        /// 82's SLA window). Per that entry's "Still open" section, "~5-7 days" is a
+        /// placeholder pending real pilot telemetry — human committee-member response time is
+        /// fundamentally slower than a server's, compounded by needing enough of each
+        /// committee's members to respond across all `NUM_COMMITTEES` committees.
+        #[pallet::constant]
+        type OprfQuerySlaBlocks: Get<u32>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -261,6 +339,51 @@ pub mod pallet {
     pub type SelfDeclaredSingleDocument<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, bool, ValueQuery>;
 
+    // ── OPRF committee on-chain mailbox (changelog entry 82) ────────────────────
+
+    /// Roster of which accounts belong to which OPRF committee slot (`0..NUM_COMMITTEES`).
+    /// Committee members poll this (off-chain) to confirm they're authorized to answer for a
+    /// given slot, and `submit_oprf_response` checks the caller's account against it
+    /// directly. Governance-gated by the same `AdminOrigin` already used for
+    /// `OprfCommitteeKeys` (see `add_committee_member`/`remove_committee_member`) — mirrors
+    /// that storage's admin-controlled-allowlist pattern rather than inventing a new
+    /// governance mechanism.
+    #[pallet::storage]
+    pub type CommitteeMembers<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        u8,
+        BoundedVec<T::AccountId, T::MaxCommitteeSize>,
+        ValueQuery,
+    >;
+
+    /// A citizen's pending blinded OPRF query, keyed by `query_id` (changelog entry 82's
+    /// on-chain mailbox, replacing a relay server: a citizen posts here via
+    /// `submit_oprf_query`, committee members for the assigned slot
+    /// (`committee_slot_for`) poll it off-chain, and answer via `submit_oprf_response`).
+    #[pallet::storage]
+    pub type PendingOprfQueries<T: Config> =
+        StorageMap<_, Blake2_128Concat, u64, OprfQueryRecord<T::AccountId, BlockNumberFor<T>>>;
+
+    /// Monotonically increasing counter assigning each `submit_oprf_query` call a fresh
+    /// `query_id`.
+    #[pallet::storage]
+    pub type NextQueryId<T: Config> = StorageValue<_, u64, ValueQuery>;
+
+    /// Committee responses to pending OPRF queries, keyed by `(query_id, committee_slot)`.
+    /// Presence of an entry for a given pair is exactly the idempotency guard
+    /// `submit_oprf_response` uses to reject a double-response from the same slot for the
+    /// same query.
+    #[pallet::storage]
+    pub type OprfResponses<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        u64,
+        Blake2_128Concat,
+        u8,
+        OprfResponseRecord<T::AccountId>,
+    >;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -289,6 +412,14 @@ pub mod pallet {
         OprfCommitteeKeySet { scheme_version: u32, slot: u8 },
         /// A governance-approved OPRF committee key was removed.
         OprfCommitteeKeyRemoved { scheme_version: u32, slot: u8 },
+        /// An account was added to an OPRF committee slot's roster (changelog entry 82).
+        CommitteeMemberAdded { slot: u8, who: T::AccountId },
+        /// An account was removed from an OPRF committee slot's roster.
+        CommitteeMemberRemoved { slot: u8, who: T::AccountId },
+        /// A citizen posted a blinded OPRF query to the on-chain mailbox.
+        OprfQuerySubmitted { query_id: u64, submitter: T::AccountId },
+        /// A committee member answered a pending OPRF query for their slot.
+        OprfResponseSubmitted { query_id: u64, committee_slot: u8, responder: T::AccountId },
     }
 
     #[pallet::error]
@@ -336,6 +467,28 @@ pub mod pallet {
         /// the current chain time — an old-but-not-yet-passport-expired proof cannot be
         /// replayed indefinitely.
         AnchorProofStale,
+        /// The account is already present in this committee slot's roster.
+        CommitteeMemberAlreadyPresent,
+        /// The account is not present in this committee slot's roster.
+        CommitteeMemberNotPresent,
+        /// This committee slot's roster is already at `MaxCommitteeSize`.
+        CommitteeRosterFull,
+        /// `NextQueryId` counter would overflow u64::MAX.
+        QueryIdOverflow,
+        /// No pending OPRF query exists for this `query_id` (never submitted, or already
+        /// cleaned up).
+        QueryNotFound,
+        /// This query's `OprfQuerySlaBlocks` response window has passed.
+        QueryExpired,
+        /// The caller is not a registered member of `CommitteeMembers` for the given
+        /// committee slot.
+        NotCommitteeMember,
+        /// This committee slot has already submitted a response for this `query_id`.
+        DuplicateResponse,
+        /// `dlog_proof` was not exactly 64 bytes (two concatenated 32-byte BN254 scalar
+        /// field elements, `dlog_e || dlog_s` — see `OprfResponseRecord`'s doc comment for
+        /// where that size comes from).
+        InvalidDlogProofLength,
     }
 
     #[pallet::call]
@@ -738,6 +891,128 @@ pub mod pallet {
             ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
             OprfCommitteeKeys::<T>::remove((scheme_version, slot));
             Self::deposit_event(Event::OprfCommitteeKeyRemoved { scheme_version, slot });
+            Ok(())
+        }
+
+        /// Add an account to an OPRF committee slot's roster (changelog entry 82's on-chain
+        /// mailbox design). Mirrors `set_oprf_committee_key`'s `AdminOrigin` gating; rejects
+        /// (rather than silently no-oping) a duplicate add or a roster already at
+        /// `MaxCommitteeSize`.
+        #[pallet::call_index(13)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn add_committee_member(
+            origin: OriginFor<T>,
+            slot: u8,
+            who: T::AccountId,
+        ) -> DispatchResult {
+            T::AdminOrigin::ensure_origin(origin)?;
+            ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
+            CommitteeMembers::<T>::try_mutate(slot, |members| -> DispatchResult {
+                ensure!(!members.contains(&who), Error::<T>::CommitteeMemberAlreadyPresent);
+                members.try_push(who.clone()).map_err(|_| Error::<T>::CommitteeRosterFull)?;
+                Ok(())
+            })?;
+            Self::deposit_event(Event::CommitteeMemberAdded { slot, who });
+            Ok(())
+        }
+
+        /// Remove an account from an OPRF committee slot's roster (e.g. member rotation).
+        #[pallet::call_index(14)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn remove_committee_member(
+            origin: OriginFor<T>,
+            slot: u8,
+            who: T::AccountId,
+        ) -> DispatchResult {
+            T::AdminOrigin::ensure_origin(origin)?;
+            ensure!(slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
+            CommitteeMembers::<T>::try_mutate(slot, |members| -> DispatchResult {
+                let pos = members
+                    .iter()
+                    .position(|m| m == &who)
+                    .ok_or(Error::<T>::CommitteeMemberNotPresent)?;
+                members.remove(pos);
+                Ok(())
+            })?;
+            Self::deposit_event(Event::CommitteeMemberRemoved { slot, who });
+            Ok(())
+        }
+
+        /// Post a blinded OPRF query to the on-chain mailbox (changelog entry 82, replacing a
+        /// relay server). Any registered citizen may submit — mirrors
+        /// `declare_no_other_passport`'s `is_citizen` gate. Assigns and emits (via
+        /// `OprfQuerySubmitted`) a fresh `query_id`; committee members for the query's target
+        /// slot (derived off-chain via `committee_slot_for`) poll `PendingOprfQueries` and
+        /// answer with `submit_oprf_response`.
+        #[pallet::call_index(15)]
+        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        pub fn submit_oprf_query(
+            origin: OriginFor<T>,
+            blinded_query: [u8; 64],
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Self::is_citizen(&who), Error::<T>::NotRegistered);
+            let query_id = NextQueryId::<T>::get();
+            let next_id = query_id.checked_add(1).ok_or(Error::<T>::QueryIdOverflow)?;
+            NextQueryId::<T>::put(next_id);
+            PendingOprfQueries::<T>::insert(
+                query_id,
+                OprfQueryRecord {
+                    submitter: who.clone(),
+                    blinded_query,
+                    posted_at: frame_system::Pallet::<T>::block_number(),
+                },
+            );
+            Self::deposit_event(Event::OprfQuerySubmitted { query_id, submitter: who });
+            Ok(())
+        }
+
+        /// A committee member answers a pending OPRF query for their slot (changelog entry
+        /// 82). Checks, in order: `committee_slot` is in `0..NUM_COMMITTEES`; `dlog_proof` is
+        /// exactly 64 bytes (see `OprfResponseRecord`'s doc comment); the query exists; it
+        /// hasn't expired (`OprfQuerySlaBlocks` blocks from `posted_at`); the caller is on
+        /// file in `CommitteeMembers` for that slot; the caller hasn't already responded for
+        /// this `(query_id, committee_slot)` pair.
+        #[pallet::call_index(16)]
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn submit_oprf_response(
+            origin: OriginFor<T>,
+            query_id: u64,
+            committee_slot: u8,
+            evaluation: [u8; 64],
+            dlog_proof: BoundedVec<u8, ConstU32<64>>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(committee_slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
+            ensure!(dlog_proof.len() == 64, Error::<T>::InvalidDlogProofLength);
+
+            let query = PendingOprfQueries::<T>::get(query_id).ok_or(Error::<T>::QueryNotFound)?;
+            let deadline = query
+                .posted_at
+                .saturating_add(BlockNumberFor::<T>::from(T::OprfQuerySlaBlocks::get()));
+            ensure!(
+                frame_system::Pallet::<T>::block_number() <= deadline,
+                Error::<T>::QueryExpired
+            );
+
+            let members = CommitteeMembers::<T>::get(committee_slot);
+            ensure!(members.contains(&who), Error::<T>::NotCommitteeMember);
+
+            ensure!(
+                !OprfResponses::<T>::contains_key(query_id, committee_slot),
+                Error::<T>::DuplicateResponse
+            );
+
+            OprfResponses::<T>::insert(
+                query_id,
+                committee_slot,
+                OprfResponseRecord { responder: who.clone(), evaluation, dlog_proof },
+            );
+            Self::deposit_event(Event::OprfResponseSubmitted {
+                query_id,
+                committee_slot,
+                responder: who,
+            });
             Ok(())
         }
     }

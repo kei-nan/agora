@@ -124,6 +124,12 @@ impl pallet_identity_zk::Config for Test {
     // (see `tests.rs::public_inputs`) stays comfortably inside the window, while still
     // leaving room for a dedicated staleness test to use an obviously-expired one.
     type MaxAnchorProofAge = frame_support::traits::ConstU64<3600>;
+    // Small on purpose: big enough for tests to exercise a full roster plus one rejected
+    // over-capacity add, without needing a large fixture.
+    type MaxCommitteeSize = frame_support::traits::ConstU32<3>;
+    // Short window (mirrors ReverificationPeriod's convention above) so tests can cross an
+    // OPRF query's expiry deadline without huge block numbers.
+    type OprfQuerySlaBlocks = frame_support::traits::ConstU32<10>;
 }
 
 // Build genesis storage according to the mock runtime.

@@ -10,11 +10,30 @@ edition = "2021"
 publish = false
 description = "DEV-ONLY simulator for TaceoLabs/oprf-nr committee evaluation. Not a production OPRF service. See README.md."
 
+# "cdylib" is what makes `cargo build --target wasm32-unknown-unknown` emit a loadable
+# `oprf_committee_dev.wasm` (the C-ABI boundary in `src/ffi.rs`) instead of just an rlib;
+# "rlib" is kept so native `cargo test`/`cargo run --bin ...` and normal Rust-to-Rust use of
+# this crate (the existing Prover.toml-generation binaries) are unaffected.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 ark-bn254 = { version = "0.5.0", default-features = false, features = ["std", "curve"] }
 ark-ff = { version = "0.5.0", default-features = false, features = ["std"] }
 ark-std = { version = "0.5.0", default-features = false, features = ["std"] }
 num-bigint = { version = "0.4", default-features = false, features = ["std", "rand"] }
 num-traits = { version = "0.2", default-features = false, features = ["std"] }
-rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# NOTE: deliberately NOT the "std" feature. rand 0.8's own Cargo.toml enables its
+# "getrandom" feature as part of "std" (std = [..., "getrandom", ...]), and the `getrandom`
+# crate refuses to compile at all for wasm32-unknown-unknown without an explicit backend
+# selected (its lib.rs hits a `compile_error!` for bare wasm32-unknown-unknown — see
+# https://docs.rs/getrandom/#webassembly-support). This crate never sources OS entropy through
+# `rand` (only `StepRng`/`StdRng`, both seeded explicitly from caller-supplied bytes — see
+# `rngs/mod.rs`: `mock` (StepRng) is unconditional, `std_rng` (StdRng) only pulls in
+# `rand_chacha`, no getrandom). Dropping "std" removes the incompatible dependency edge
+# entirely; nothing crypto-related changes.
+rand = { version = "0.8", default-features = false, features = ["std_rng"] }
 hex = { version = "0.4", default-features = false, features = ["alloc", "std"] }
+
+[dev-dependencies]
+wasmi = "1.1.0"

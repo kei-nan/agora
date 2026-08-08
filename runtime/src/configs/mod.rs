@@ -283,6 +283,14 @@ impl pallet_identity_zk::Config for Runtime {
 	/// passport-expired proof (HANDOFF log #75). Placeholder pending real-world timing data,
 	/// same governance-tunable-not-hardcoded spirit as `ReverificationPeriod` above.
 	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
+	/// Room above the eventual ~35-member committees (changelog entry 73's 5-independent-
+	/// committee governance topology) — see `pallet_identity_zk::CommitteeMembers`'s doc
+	/// comment.
+	type MaxCommitteeSize = ConstU32<50>;
+	/// ~6 days at this chain's block time (`DAYS` is block-time-derived, see
+	/// `block_times` above) — changelog entry 82's "~5-7 days" OPRF response SLA, a
+	/// placeholder pending real pilot telemetry per that entry's "Still open" section.
+	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -311,6 +319,10 @@ impl pallet_identity_zk::Config for Runtime {
 	type Now = Timestamp;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MaxCommitteeSize = ConstU32<50>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs.
@@ -480,6 +492,21 @@ impl pallet_courts::Config for Runtime {
 	type JurySeedDelayBlocks = ConstU32<{ 10 * MINUTES }>;
 	/// Zero account used as filer for system-initiated LawChallenge cases.
 	type AutoChallengeAccount = AutoChallengeAccount;
+	type Currency = Balances;
+	/// 1 AGR — same literal `pallet-elections::CandidateDeposit` uses; no evidence anywhere in
+	/// this codebase that court filings should be priced differently from candidate
+	/// registration. `auto_file_case` (system-initiated) never reserves this — see that call's
+	/// own doc comment in `pallets/pallet-courts/src/lib.rs`.
+	type CaseFilingBond = ConstU128<1_000_000_000_000>;
+	/// AI Model Governance Council capped at 35 seats — same order of magnitude as the
+	/// single-committee size used elsewhere in this codebase's OPRF committee governance
+	/// design; no stronger documented reason to pick a different number here.
+	type MaxAIGovernanceCouncilSize = ConstU32<35>;
+	/// 2/3 supermajority required to approve a new AI model version, matching
+	/// CLAUDE.md's "AI model updates require on-chain governance vote (supermajority)"
+	/// and pallet-executive's identical cabinet-emergency threshold below.
+	type AIModelSupermajorityNumerator = ConstU32<2>;
+	type AIModelSupermajorityDenominator = ConstU32<3>;
 }
 
 /// Runtime implements CitizenChecker for pallet-constitution (petition/sign gating).
@@ -622,6 +649,24 @@ impl pallet_elections::Config for Runtime {
 	type DefaultMandatoryBreakBlocks = ConstU32<{ 365 * DAYS }>;
 	/// Warn delegates when 10% of their term remains.
 	type DefaultWarningWindowPct = ConstU8<10>;
+}
+
+// ── Emergency Council ─────────────────────────────────────────────────────────
+
+impl pallet_emergency_council::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// 30 days, constitutional ceiling. The pallet doc comment (and docs/project/pallets/
+	/// emergency-council.md) say "432_000 (30 days at 6s/block)", but this runtime's actual
+	/// block time is 12s (`MILLI_SECS_PER_BLOCK` in `runtime/src/lib.rs`), i.e. `DAYS` = 7_200
+	/// blocks/day, not 14_400. Expressed via `DAYS` (as the rest of this file does for
+	/// wall-clock-denominated constants) rather than a hardcoded literal so it stays correct
+	/// if the block time ever changes; this correctly comes out to 216_000 blocks, not 432_000.
+	type MaxEmergencyBlocks = ConstU32<{ 30 * DAYS }>;
+	/// Council capped at 15 members (docs/project/pallets/emergency-council.md).
+	type MaxCouncilSize = ConstU32<15>;
+	/// 2/3 supermajority required to declare or end an emergency.
+	type SupermajorityNumerator = ConstU32<2>;
+	type SupermajorityDenominator = ConstU32<3>;
 }
 
 // ── Anti-Corruption module ───────────────────────────────────────────────────

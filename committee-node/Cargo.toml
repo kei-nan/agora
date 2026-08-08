@@ -1,0 +1,57 @@
+[workspace]
+# Deliberately its own workspace root, NOT a member of the root repo's Cargo.toml — same
+# reasoning as `oprf-committee-dev/Cargo.toml`: this is a standalone deployable component,
+# not part of the node/runtime build graph, and must never be pulled into it by accident.
+
+[package]
+name = "committee-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Laptop/Raspberry Pi OPRF committee-member orchestration node (changelog #082). See README.md for what is real vs. stubbed/provisional."
+
+[[bin]]
+name = "committee-node"
+path = "src/main.rs"
+
+[dependencies]
+# --- chain connectivity: raw JSON-RPC, mirroring desktop/src-tauri/src/rpc.rs ---
+# (no @polkadot/api-equivalent client library, no subxt — same reasoning the desktop app
+# already documents: this is Rust, and the project's existing convention is a small,
+# hand-rolled JSON-RPC client rather than a heavyweight generic chain client.)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+twox-hash = "1.6"
+hex = "0.4"
+anyhow = "1"
+
+# --- signing primitives, pinned to the SAME version the runtime/node already use (root
+# Cargo.toml: sp-core = 36.1.0) so the sr25519 signing scheme and hash types are
+# byte-for-byte compatible with what the real chain expects. Deliberately NOT depending on
+# the `agora-runtime` crate itself: that would pull the full WASM-builder build graph (and
+# its documented `WASM_BUILD_RUSTFLAGS` quirk, see /CLAUDE.md) into this component's
+# Docker build for no benefit, since the one RuntimeCall variant we actually need
+# (`submit_oprf_response`) doesn't exist in that runtime yet anyway — see extrinsic.rs.
+sp-core = { version = "36.1.0", default-features = false, features = ["std", "full_crypto"] }
+codec = { version = "3.7.4", package = "parity-scale-codec", features = ["derive"] }
+
+# --- Wasm host: loads the (possibly absent/stubbed) crypto-core module ---
+wasmtime = "27"
+
+# --- CSPRNG for the Chaum-Pedersen proof nonce ("seed") the real oprf-committee-dev Wasm ABI
+# requires as a caller-supplied input — the wasm module itself has no OS entropy source on
+# wasm32-unknown-unknown by design (see oprf-committee-dev/src/ffi.rs), so this host, which
+# does have real OS entropy, is exactly where that responsibility belongs. Default features
+# (includes "std_rng"/OsRng) are fine here, unlike inside the wasm module itself.
+rand = "0.8"
+
+# --- key file decryption placeholder (see keystore.rs / README "Key storage") ---
+# `age` (age-encryption.org/v1, the Filippo Valsorda format) chosen over hand-rolling a
+# passphrase scheme: a real, standard, audited format/library, not project-invented
+# crypto. Still explicitly NOT an answer to hardware-backed key custody (see README).
+age = "0.10"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

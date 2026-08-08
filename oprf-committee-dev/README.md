@@ -113,6 +113,18 @@ byte-for-byte. See `docs/project/changelog/078.md` and `081.md` for exact comman
   generation — byte-identical to `generate_anchor_prover_toml`'s recipe — then an
   independently-generated new one) and print a `migrate`/`migrate-disclosure`-shaped
   `Prover.toml`.
+- `src/ffi.rs` — changelog entry 082's wasm packaging: a thin C-ABI wrapper around
+  `oprf::evaluate` only (the real, already-validated committee-evaluation function described
+  above under "What is real here" — not `committee.rs`'s 5-committee dev simulator and not
+  `prover_toml.rs`'s Prover.toml rendering, neither of which this module touches or exposes).
+  This is what compiles to `wasm32-unknown-unknown` (`cargo build --release --target
+  wasm32-unknown-unknown --lib`, enabled by this crate's `[lib] crate-type = ["cdylib",
+  "rlib"]`) so the identical evaluation logic can run inside a Wasm runtime (wasmtime/wasmer)
+  on a committee member's phone, laptop, or Raspberry Pi, per changelog entry 082. See its
+  module-level doc comment for the exact wire format (fixed-width big-endian byte layout) and
+  `tests/wasm_equivalence.rs` for the proof that the compiled `.wasm` produces byte-identical
+  output to the native build. This module changes nothing about this crate's own dev/test-only
+  status — it packages already-real code, it doesn't make the simulator itself production.
 
 ## Reproducing
 

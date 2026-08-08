@@ -34,6 +34,7 @@ pallet-courts.workspace = true
 pallet-constitution.workspace = true
 pallet-legislature.workspace = true
 pallet-elections.workspace = true
+pallet-emergency-council.workspace = true
 pallet-audit.workspace = true
 pallet-anticorruption.workspace = true
 pallet-executive.workspace = true
@@ -91,6 +92,7 @@ std = [
 	"pallet-constitution/std",
 	"pallet-legislature/std",
 	"pallet-elections/std",
+	"pallet-emergency-council/std",
 	"pallet-audit/std",
 	"pallet-anticorruption/std",
 	"pallet-executive/std",
@@ -149,6 +151,7 @@ try-runtime = [
 	"pallet-constitution/try-runtime",
 	"pallet-legislature/try-runtime",
 	"pallet-elections/try-runtime",
+	"pallet-emergency-council/try-runtime",
 	"pallet-audit/try-runtime",
 	"pallet-anticorruption/try-runtime",
 	"pallet-timestamp/try-runtime",

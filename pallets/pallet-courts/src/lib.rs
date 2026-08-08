@@ -15,12 +15,21 @@ mod tests;
 pub mod pallet {
 
     use codec::{Decode, DecodeWithMemTracking, Encode};
-    use frame_support::pallet_prelude::*;
+    use frame_support::{
+        pallet_prelude::*,
+        traits::{Currency, ReservableCurrency},
+    };
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Hash as HashT, Saturating};
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
+
+    // ── Balance type alias ─────────────────────────────────────────────────────
+
+    pub type BalanceOf<T> = <<T as Config>::Currency as Currency<
+        <T as frame_system::Config>::AccountId,
+    >>::Balance;
 
     // ── Cross-pallet enforcement traits ─────────────────────────────────────────
 
@@ -119,6 +128,18 @@ pub mod pallet {
         CitizenConduct { nullifier: [u8; 32], suspension_blocks: Option<u32> },
     }
 
+    /// A governance-approved AI model version, referenced by `submit_ai_ruling`'s
+    /// `model_version` parameter (see `CurrentAIModelVersion` / `AIModelVersions`).
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct ModelInfo<BlockNumber> {
+        /// Hash identifying the approved model — e.g. a hash of the model card, weights
+        /// manifest, or a version string. This pallet is agnostic to what's hashed; it only
+        /// needs a stable, compact, on-chain-comparable identifier for the approved model.
+        pub model_hash: [u8; 32],
+        /// Block at which this version was approved (i.e. reached supermajority).
+        pub approved_at: BlockNumber,
+    }
+
     // ── Config ──────────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -176,6 +197,34 @@ pub mod pallet {
         /// AccountId used as the filer for system-initiated cases (e.g. auto law challenges).
         /// Wire to a well-known zero account or a dedicated pallet account in the runtime.
         type AutoChallengeAccount: Get<Self::AccountId>;
+        /// Currency used to reserve the citizen-filed case bond (`CaseFilingBond`).
+        type Currency: ReservableCurrency<Self::AccountId>;
+        /// Bond reserved from a citizen's account when they call `file_case`, released in
+        /// full once the case reaches a final status (see `auto_finalize`). Mirrors
+        /// pallet-elections' `CandidateDeposit` spam-prevention pattern: instant, free
+        /// Level-0 AI rulings make `file_case` an attractive DoS/spam vector without a cost
+        /// to filing, and this bond gives it one. Defaults to the same 1 AGR pallet-elections
+        /// uses for `CandidateDeposit`, absent any documented reason this pallet should differ.
+        /// System-initiated filings via `auto_file_case` never reserve this bond — see that
+        /// function's doc comment for why.
+        #[pallet::constant]
+        type CaseFilingBond: Get<BalanceOf<Self>>;
+
+        // ── AI model governance (supermajority vote) ────────────────────────────
+        /// Maximum size of the AI Model Governance Council (see `AIGovernanceCouncil`).
+        #[pallet::constant]
+        type MaxAIGovernanceCouncilSize: Get<u32>;
+        /// Numerator of the supermajority fraction required to approve a new AI model
+        /// version via `vote_approve_ai_model` (e.g. 2 for 2/3). Mirrors
+        /// pallet-emergency-council's identical `SupermajorityNumerator`/`Denominator`
+        /// pair — see the doc comment on `vote_approve_ai_model` for why this pallet
+        /// reimplements that pattern locally instead of depending on
+        /// pallet-emergency-council or pallet-legislature directly.
+        #[pallet::constant]
+        type AIModelSupermajorityNumerator: Get<u32>;
+        /// Denominator of the supermajority fraction (e.g. 3 for 2/3).
+        #[pallet::constant]
+        type AIModelSupermajorityDenominator: Get<u32>;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
@@ -225,13 +274,62 @@ pub mod pallet {
     #[pallet::storage]
     pub type OracleAccount<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
+    /// case_id -> bond reserved from the filer by `file_case`. Only ever populated for
+    /// citizen-filed cases — `auto_file_case` (system-initiated) never inserts an entry here,
+    /// since there's no spam risk to price against for a filing the runtime itself triggers.
+    /// Taken (removed) and unreserved in full by `auto_finalize` once the case resolves.
+    #[pallet::storage]
+    pub type CaseBonds<T: Config> = StorageMap<_, Blake2_128Concat, u32, BalanceOf<T>>;
+    // ── AI model governance (supermajority vote) ─────────────────────────────────
+
+    /// Council authorized to vote on which AI model version `submit_ai_ruling` may cite.
+    /// A small, dedicated, root-managed body — mirrors pallet-emergency-council's `Council`
+    /// rather than reusing pallet-legislature's membership or an `EnsureOrigin` from either
+    /// pallet (see the design note on `vote_approve_ai_model`).
+    #[pallet::storage]
+    pub type AIGovernanceCouncil<T: Config> =
+        StorageValue<_, BoundedVec<T::AccountId, T::MaxAIGovernanceCouncilSize>, ValueQuery>;
+
+    /// Which council members have voted to approve the current `PendingAIModelProposal`.
+    /// Reset once a proposal resolves (approved) — mirrors pallet-emergency-council's
+    /// `DeclareVotes`.
+    #[pallet::storage]
+    pub type AIModelApprovalVotes<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, bool, ValueQuery>;
+
+    /// The model_hash locked in by the first vote of the current round, if any. Mirrors
+    /// pallet-emergency-council's `PendingEmergencyProposal`: the first voter's hash is
+    /// authoritative for the round, so a later voter can't switch what's being approved.
+    #[pallet::storage]
+    pub type PendingAIModelProposal<T: Config> = StorageValue<_, [u8; 32], OptionQuery>;
+
+    /// The currently approved AI model version. 0 means no model has ever been approved —
+    /// `submit_ai_ruling` always rejects `model_version == 0` (see `Error::NoApprovedAIModel`).
+    #[pallet::storage]
+    pub type CurrentAIModelVersion<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    /// Full history of approved model versions, keyed by version — kept rather than only
+    /// storing the current one, because `submit_ai_ruling` permanently records which version
+    /// produced each ruling (`AIRulingModelVersion`); without this map that record becomes
+    /// unrecoverable the moment governance approves a newer version. Mirrors the shape of
+    /// pallet-identity's `OprfCommitteeKeys` (versioned map) + `OprfSchemeVersion` (current
+    /// pointer) pattern.
+    #[pallet::storage]
+    pub type AIModelVersions<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, ModelInfo<BlockNumberFor<T>>>;
+
+    /// case_id -> the AI model version that produced its `submit_ai_ruling` call. Populated
+    /// only for cases that actually went through a Level-0 AI ruling.
+    #[pallet::storage]
+    pub type AIRulingModelVersion<T: Config> = StorageMap<_, Blake2_128Concat, u32, u32>;
+
     // ── Events ──────────────────────────────────────────────────────────────────
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
         CaseFiled { case_id: u32, filer: T::AccountId, subject: CaseSubject },
-        AIRulingIssued { case_id: u32, ruling_hash: [u8; 32] },
+        AIRulingIssued { case_id: u32, ruling_hash: [u8; 32], model_version: u32 },
         JurySelected { case_id: u32, jurors: BoundedVec<T::AccountId, ConstU32<21>> },
         AppealFiled { case_id: u32, appellant: T::AccountId },
         RulingFinalized { case_id: u32, verdict: Verdict },
@@ -240,6 +338,12 @@ pub mod pallet {
         RulingEnforced { case_id: u32 },
         JuryVoteCast { case_id: u32, juror: T::AccountId, verdict: Verdict },
         OracleAccountSet { account: T::AccountId },
+        /// A new member was added to the AI Model Governance Council.
+        AIGovernanceMemberAdded { who: T::AccountId },
+        /// A member was removed from the AI Model Governance Council.
+        AIGovernanceMemberRemoved { who: T::AccountId },
+        /// A new AI model version was approved by supermajority vote.
+        AIModelApproved { version: u32, model_hash: [u8; 32] },
     }
 
     // ── Errors ──────────────────────────────────────────────────────────────────
@@ -262,6 +366,22 @@ pub mod pallet {
         /// The jury seed window hasn't fully elapsed yet (or was never requested), so
         /// jury selection can't happen — see `JurySeedDelayBlocks`.
         JurySeedNotReady,
+        /// Filer's free balance is too low to reserve `CaseFilingBond`.
+        InsufficientBalance,
+        /// The caller is not a member of the AI Model Governance Council.
+        NotAIGovernanceCouncilMember,
+        /// This council member has already voted to approve the current proposal.
+        AlreadyVotedForAIModel,
+        /// Cannot add member: AI Model Governance Council is at maximum capacity.
+        AIGovernanceCouncilAtCapacity,
+        /// The account is not in the AI Model Governance Council list.
+        AIGovernanceMemberNotFound,
+        /// The account is already an AI Model Governance Council member.
+        AlreadyAIGovernanceCouncilMember,
+        /// No AI model has ever been approved — `submit_ai_ruling` cannot be called yet.
+        NoApprovedAIModel,
+        /// `model_version` does not match the currently approved AI model version.
+        UnapprovedAIModel,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -270,6 +390,11 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         /// File a new case. Only active (non-suspended) citizens may file.
         /// subject determines what gets auto-enforced on ruling.
+        ///
+        /// Reserves `CaseFilingBond` from the filer as a spam-prevention deposit — instant,
+        /// free Level-0 AI rulings would otherwise make this call a cheap DoS vector against
+        /// a court system meant to carry real judicial weight. The bond is released in full
+        /// once the case reaches a final status; see `auto_finalize`.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn file_case(origin: OriginFor<T>, subject: CaseSubject) -> DispatchResult {
@@ -278,14 +403,26 @@ pub mod pallet {
                 T::CitizenChecker::is_active_citizen(&who),
                 Error::<T>::NotActiveCitizen
             );
+            let bond = T::CaseFilingBond::get();
+            T::Currency::reserve(&who, bond).map_err(|_| Error::<T>::InsufficientBalance)?;
             let id = NextCaseId::<T>::get();
             Cases::<T>::insert(id, (who.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
+            CaseBonds::<T>::insert(id, bond);
             NextCaseId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::CaseFiled { case_id: id, filer: who, subject });
             Ok(())
         }
 
         /// Submit an AI ruling. ruling_hash is the IPFS CID of the full reasoning document.
+        ///
+        /// `model_version` must match `CurrentAIModelVersion` — this is the actual on-chain
+        /// enforcement of CLAUDE.md's "AI model updates require on-chain governance vote
+        /// (supermajority)" claim: a ruling can only be attributed to a model version that
+        /// has actually been approved via `vote_approve_ai_model`. Rejected with
+        /// `Error::NoApprovedAIModel` if no model has ever been approved, or
+        /// `Error::UnapprovedAIModel` if `model_version` doesn't match the current one
+        /// (including a stale, previously-approved-but-since-superseded version).
+        ///
         /// Only callable by the designated AI oracle account (root for now).
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
@@ -293,8 +430,12 @@ pub mod pallet {
             origin: OriginFor<T>,
             case_id: u32,
             ruling_hash: [u8; 32],
+            model_version: u32,
         ) -> DispatchResult {
             T::OracleOrigin::ensure_origin(origin)?;
+            let current_model_version = CurrentAIModelVersion::<T>::get();
+            ensure!(current_model_version != 0, Error::<T>::NoApprovedAIModel);
+            ensure!(model_version == current_model_version, Error::<T>::UnapprovedAIModel);
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let case = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
                 ensure!(case.1 == CaseStatus::Filed, Error::<T>::InvalidStatus);
@@ -303,7 +444,8 @@ pub mod pallet {
                 Ok::<(), DispatchError>(())
             })?;
             AIRulingBlock::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
-            Self::deposit_event(Event::AIRulingIssued { case_id, ruling_hash });
+            AIRulingModelVersion::<T>::insert(case_id, model_version);
+            Self::deposit_event(Event::AIRulingIssued { case_id, ruling_hash, model_version });
             Ok(())
         }
 
@@ -470,6 +612,113 @@ pub mod pallet {
             Self::deposit_event(Event::OracleAccountSet { account });
             Ok(())
         }
+
+        /// Add a member to the AI Model Governance Council. Only root may call this.
+        /// Mirrors pallet-emergency-council's `add_council_member`.
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn add_ai_governance_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
+            ensure_root(origin)?;
+            AIGovernanceCouncil::<T>::try_mutate(|members| {
+                ensure!(!members.contains(&account), Error::<T>::AlreadyAIGovernanceCouncilMember);
+                members.try_push(account.clone()).map_err(|_| Error::<T>::AIGovernanceCouncilAtCapacity)
+            })?;
+            Self::deposit_event(Event::AIGovernanceMemberAdded { who: account });
+            Ok(())
+        }
+
+        /// Remove a member from the AI Model Governance Council. Only root may call this.
+        /// Mirrors pallet-emergency-council's `remove_council_member`.
+        #[pallet::call_index(8)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn remove_ai_governance_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
+            ensure_root(origin)?;
+            AIGovernanceCouncil::<T>::try_mutate(|members| {
+                let pos = members
+                    .iter()
+                    .position(|m| m == &account)
+                    .ok_or(Error::<T>::AIGovernanceMemberNotFound)?;
+                members.remove(pos);
+                Ok::<(), DispatchError>(())
+            })?;
+            // Clear any pending vote from this member to keep state clean, mirroring
+            // pallet-emergency-council's remove_council_member.
+            AIModelApprovalVotes::<T>::remove(&account);
+            Self::deposit_event(Event::AIGovernanceMemberRemoved { who: account });
+            Ok(())
+        }
+
+        /// Vote to approve `model_hash` as the next AI model version. Any AI Model
+        /// Governance Council member may call. When a supermajority of the council has
+        /// voted for the same hash, the vote resolves immediately: `CurrentAIModelVersion`
+        /// is bumped, the approval is recorded in `AIModelVersions`, and the vote state
+        /// resets for the next round.
+        ///
+        /// ## Design note: why a dedicated in-pallet supermajority vote
+        /// CLAUDE.md requires "AI model updates require on-chain governance vote
+        /// (supermajority)". Two existing mechanisms in this codebase were considered and
+        /// rejected in favor of a dedicated, self-contained vote here:
+        ///   - `pallet_legislature::EnsureLegislatureMotion` — reusable across pallets, but
+        ///     its only threshold is `Config::PassageThreshold`, a single pallet-wide
+        ///     *simple* majority (wired to 50 in the runtime). There is no per-motion-kind
+        ///     higher bar to parameterize; giving AI model changes their own threshold would
+        ///     require adding motion-kind-aware thresholds to pallet-legislature itself —
+        ///     well beyond this task's scope of adding the missing primitive to
+        ///     pallet-courts.
+        ///   - `pallet-emergency-council` — has exactly the right shape (small dedicated
+        ///     council + `SupermajorityNumerator`/`Denominator` + vote-until-threshold), but
+        ///     exposes no reusable `EnsureOrigin`: its calls check council membership and
+        ///     tally votes internally rather than through a generic origin type, and it
+        ///     isn't even wired into the runtime yet.
+        /// So this mirrors pallet-emergency-council's own self-contained mechanism instead:
+        /// a dedicated `AIGovernanceCouncil` (root-managed, like `Council`), a per-round
+        /// vote map, and the identical `votes * denominator >= size * numerator` tally,
+        /// evaluated on every vote and resolving the instant the threshold is crossed. This
+        /// is a small, already-proven pattern in this exact codebase — pallet-executive
+        /// independently reimplements the identical Numerator/Denominator Config-constant
+        /// idiom for its own cabinet supermajority — not a new voting scheme invented for
+        /// this feature.
+        #[pallet::call_index(9)]
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn vote_approve_ai_model(origin: OriginFor<T>, model_hash: [u8; 32]) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let council = AIGovernanceCouncil::<T>::get();
+            ensure!(council.contains(&who), Error::<T>::NotAIGovernanceCouncilMember);
+            ensure!(!AIModelApprovalVotes::<T>::get(&who), Error::<T>::AlreadyVotedForAIModel);
+
+            // Lock in the proposed hash from the first vote of the round; a later voter's
+            // differing hash is simply ignored in favor of the agreed-upon one — same
+            // rationale as pallet-emergency-council's `PendingEmergencyProposal`.
+            if PendingAIModelProposal::<T>::get().is_none() {
+                PendingAIModelProposal::<T>::put(model_hash);
+            }
+            let agreed_hash = PendingAIModelProposal::<T>::get().unwrap_or(model_hash);
+
+            AIModelApprovalVotes::<T>::insert(&who, true);
+
+            // Count votes cast so far (including this one, just inserted above).
+            let vote_count = council
+                .iter()
+                .filter(|m| AIModelApprovalVotes::<T>::get(m))
+                .count() as u32;
+
+            if Self::ai_model_supermajority_reached(vote_count, council.len() as u32) {
+                let new_version = CurrentAIModelVersion::<T>::get().saturating_add(1);
+                let now = frame_system::Pallet::<T>::block_number();
+                AIModelVersions::<T>::insert(
+                    new_version,
+                    ModelInfo { model_hash: agreed_hash, approved_at: now },
+                );
+                CurrentAIModelVersion::<T>::put(new_version);
+
+                // Proposal consumed; clear it and reset the vote map for the next round.
+                PendingAIModelProposal::<T>::kill();
+                let _ = AIModelApprovalVotes::<T>::clear(u32::MAX, None);
+
+                Self::deposit_event(Event::AIModelApproved { version: new_version, model_hash: agreed_hash });
+            }
+            Ok(())
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -487,6 +736,16 @@ pub mod pallet {
                 Ok::<(), DispatchError>(())
             })?;
             Rulings::<T>::insert(case_id, verdict.clone());
+            // Release the filing bond, if any, now that the case has reached a final status.
+            // Always released in full regardless of verdict — there's no precedent elsewhere
+            // in this pallet for slashing on a "bad-faith" outcome, and inventing one here
+            // would be guessing at policy rather than following an established pattern (see
+            // the bond-and-release design note on `Config::CaseFilingBond`). Absent for
+            // system-filed cases (`auto_file_case` never inserts a `CaseBonds` entry), so this
+            // is a no-op for those — `take` just returns `None`.
+            if let Some(bond) = CaseBonds::<T>::take(case_id) {
+                T::Currency::unreserve(&case.0, bond);
+            }
             Self::deposit_event(Event::RulingFinalized { case_id, verdict: verdict.clone() });
             // Auto-enforce only on Overturned verdicts — Upheld means "AI was right, no action".
             // For General cases there is no automatic enforcement target by design.
@@ -530,6 +789,14 @@ pub mod pallet {
         /// System-initiated case filing — used by pallet-constitution when a Structural or
         /// Foundational law is enacted, guaranteeing automatic AI review without requiring
         /// a citizen to proactively file a challenge.
+        ///
+        /// Deliberately does NOT reserve `CaseFilingBond` (unlike `file_case`): the bond
+        /// exists to price out spam from citizens choosing to open cases, but this path is
+        /// triggered by the runtime itself (via `AutoChallengeHook`) as a mandatory
+        /// constitutional-review step, not a discretionary citizen action — there's no spam
+        /// vector to defend against here, and charging `T::AutoChallengeAccount` (an
+        /// unsignable well-known account, see that Config item) would just be a pointless
+        /// balance requirement on an account nobody controls.
         pub fn auto_file_case(subject: CaseSubject) -> DispatchResult {
             let filer = T::AutoChallengeAccount::get();
             let id = NextCaseId::<T>::get();
@@ -595,6 +862,17 @@ pub mod pallet {
             }
             ensure!(jurors.len() as u8 == jury_size, Error::<T>::NotEnoughCitizens);
             Ok(jurors)
+        }
+
+        /// Returns true if `votes` meets the configured AI-model supermajority threshold.
+        /// Identical formula to pallet-emergency-council's `supermajority_reached`:
+        /// `votes * AIModelSupermajorityDenominator >= council_size * AIModelSupermajorityNumerator`.
+        fn ai_model_supermajority_reached(votes: u32, council_size: u32) -> bool {
+            if council_size == 0 {
+                return false;
+            }
+            votes.saturating_mul(T::AIModelSupermajorityDenominator::get())
+                >= council_size.saturating_mul(T::AIModelSupermajorityNumerator::get())
         }
     }
 }

@@ -1,0 +1,30 @@
+# Example local-dev compose file — NOT invoked automatically, copy to docker-compose.yml and
+# adjust. Assumes a `--dev` agora-node is already running on the host (see /CLAUDE.md's "Critical
+# Build Command" / "To run the dev chain") and reachable at host.docker.internal:9944.
+#
+# This is for exercising the container locally against a real dev chain (once
+# submit_oprf_response exists there) — it is not a balenaCloud deployment file; see README.md's
+# "Adapting this image for balenaCloud" for that.
+services:
+  committee-node-slot-0:
+    build: .
+    environment:
+      NODE_RPC_URL: "http://host.docker.internal:9944"
+      COMMITTEE_SLOT: "0"
+      KEYS_FILE: "/keys/committee-secrets.age"
+      KEY_PASSPHRASE_FILE: "/run/secrets/committee_passphrase"
+      WASM_MODULE_PATH: "/wasm/oprf-crypto-core.wasm"
+      POLL_INTERVAL_SECS: "10"
+      # Leave ALLOW_STUB_SUBMISSION unset (false) against any chain with real citizens.
+      # ALLOW_STUB_SUBMISSION: "true"
+    volumes:
+      - ./local-dev/committee-secrets.age:/keys/committee-secrets.age:ro
+      - ./local-dev/oprf-crypto-core.wasm:/wasm/oprf-crypto-core.wasm:ro
+    secrets:
+      - committee_passphrase
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+secrets:
+  committee_passphrase:
+    file: ./local-dev/committee-passphrase.txt

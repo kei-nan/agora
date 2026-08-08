@@ -250,6 +250,9 @@ mod runtime {
 	#[runtime::pallet_index(14)]
 	pub type PalletElections = pallet_elections;
 
+	#[runtime::pallet_index(15)]
+	pub type EmergencyCouncil = pallet_emergency_council;
+
 	#[runtime::pallet_index(16)]
 	pub type PalletAudit = pallet_audit;
 
