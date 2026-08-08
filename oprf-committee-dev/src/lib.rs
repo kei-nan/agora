@@ -18,3 +18,4 @@ pub mod oprf;
 pub mod committee;
 pub mod prover_toml;
 pub mod ffi;
+pub mod dkg;
