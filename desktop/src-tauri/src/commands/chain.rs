@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use crate::rpc::{RpcClient, storage_prefix};
 use std::collections::HashMap;
 use std::time::Duration;
+use tauri::State;
 
 const NODE_URL: &str = "http://127.0.0.1:9944";
 
@@ -337,6 +338,78 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
         }
     }
     Ok(false)
+}
+
+/// Looks up the raw AccountId (32 bytes) registered against a nullifier hash in
+/// pallet-identity's `NullifierRegistry`. Returns `None` if the nullifier isn't registered.
+///
+/// For an sr25519-derived account (what the mobile client actually uses — see
+/// `mobile/src/chain/identity.ts`) this AccountId *is* the raw sr25519 public key: Substrate's
+/// `MultiSigner::into_account()` wraps an sr25519/ed25519 public key directly with no hashing,
+/// only an ecdsa key gets blake2-hashed down to 32 bytes. So the 32 bytes returned here are
+/// exactly what `commands::auth::verify_challenge_signature` needs to check a QR-auth callback's
+/// signature against the identity that's actually on file — not whatever pubkey the callback
+/// body claims.
+pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
+    let client = RpcClient::new(NODE_URL);
+    let prefix = storage_prefix("Identity", "NullifierRegistry");
+    let keys = client.get_keys_paged(&prefix).await.map_err(|e| e.to_string())?;
+    // Each key is: 32-byte prefix + 16-byte blake2_128 hash + 32-byte nullifier (Blake2_128Concat),
+    // so the nullifier occupies the last 32 bytes of the key — same layout auth_verify_nullifier
+    // above already relies on.
+    for key_hex in &keys {
+        let key_bytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+        if key_bytes.len() >= 32 && key_bytes[key_bytes.len() - 32..] == nullifier[..] {
+            let value = client.get_storage(key_hex).await.map_err(|e| e.to_string())?;
+            if let Some(val_bytes) = value {
+                if val_bytes.len() == 32 {
+                    let mut account = [0u8; 32];
+                    account.copy_from_slice(&val_bytes);
+                    return Ok(Some(account));
+                }
+            }
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// Forwards an already phone-signed extrinsic to the chain's `author_submitExtrinsic` RPC.
+///
+/// This is deliberately a thin passthrough, not a general transaction-building API: the phone
+/// (never desktop) builds and signs the full SCALE-encoded extrinsic with its hardware-backed
+/// key, matching CLAUDE.md's "Signing any on-chain transaction" staying mobile-only. Desktop's
+/// job is only to (a) confirm the caller holds a valid, non-expired bearer token from the
+/// QR-auth flow (`auth::require_valid_session` — expiry is actually enforced here, not just
+/// shown in the UI) and (b) relay the bytes onward; it never sees or touches a private key.
+///
+/// TODO(protocol — not yet wired to anything): nothing on the phone side produces the input
+/// this command expects. The QR-auth flow only ever carries a signed *challenge string*; there
+/// is no established phone<->desktop channel for "desktop wants to submit call X, please sign
+/// and send it back" — that needs its own round trip (a second QR/deep-link, or some other
+/// transport), plus nonce/mortality negotiation so the phone knows what to sign. That's real
+/// protocol design work beyond this auth fix, and is intentionally left undone here; this
+/// command is only the chain-facing half, ready for whichever phone-side flow is designed next.
+#[tauri::command]
+pub async fn chain_submit_extrinsic(
+    token: String,
+    extrinsic_hex: String,
+    sessions: State<'_, crate::commands::auth::SessionStore>,
+) -> Result<String, String> {
+    crate::commands::auth::require_valid_session(&sessions, &token)?;
+
+    let client = RpcClient::new(NODE_URL);
+    let result = client
+        .call(
+            "author_submitExtrinsic",
+            serde_json::Value::Array(vec![serde_json::Value::String(extrinsic_hex)]),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    result
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "unexpected response from author_submitExtrinsic".to_string())
 }
 
 /// Fetches court rulings, cross-referencing Courts.Cases for IPFS ruling hashes.

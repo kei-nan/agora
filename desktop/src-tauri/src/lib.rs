@@ -2,12 +2,13 @@ mod commands;
 mod rpc;
 
 use commands::{agent, auth, chain};
-use auth::PendingSessions;
+use auth::{PendingSessions, SessionStore};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(PendingSessions::new())
+        .manage(SessionStore::new())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -24,6 +25,7 @@ pub fn run() {
             chain::fetch_legislature_data,
             chain::fetch_elections_data,
             chain::fetch_anticorruption_data,
+            chain::chain_submit_extrinsic,
             auth::auth_generate_challenge,
             auth::auth_poll_session,
             auth::auth_start_callback_server,

@@ -31,6 +31,10 @@ anyhow = "1"
 twox-hash = "1.6"
 hex = "0.4"
 bs58 = "0.5"
+# Verifies the sr25519 signatures the mobile app actually produces (`getSigningKeypair()` in
+# mobile/src/chain/identity.ts uses an sr25519 `@polkadot/keyring` KeyringPair) — see
+# commands/auth.rs's QR-auth callback signature verification.
+schnorrkel = "0.11"
 
 [profile.release]
 panic = "abort"

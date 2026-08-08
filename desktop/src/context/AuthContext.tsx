@@ -6,6 +6,11 @@ import { invoke } from "../lib/invoke";
 interface Session {
   nullifierHash: string;
   expiresAt: number;
+  /** Bearer token for privileged (read+submit) commands. The backend (`SessionStore` in
+   * src-tauri/src/commands/auth.rs) is the actual authority on whether this is still valid —
+   * every privileged command re-checks it server-side, so this being present in frontend state
+   * is not itself proof of anything. */
+  token: string;
 }
 
 interface AuthState {
@@ -72,7 +77,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setQrExpiresAt(Date.now() + QR_TIMEOUT_MS);
       setIsGeneratingQr(false);
 
-      // Poll for session completion — mobile app POSTs back to local callback server
+      // Poll for session completion — mobile app POSTs back to local callback server.
+      // The backend only ever marks a challenge complete after it has independently looked up
+      // the nullifier's registered on-chain pubkey AND verified the phone's signature against
+      // it (commands/auth.rs's `handle_auth_callback`) — an unregistered or unauthenticated
+      // callback is rejected there and the challenge is simply left pending. So by the time
+      // `auth_poll_session` returns a session here, it's already backed by a real, verified
+      // bearer token. The `auth_verify_nullifier` check below is a second, independent
+      // registration check (defense-in-depth, not a substitute for the backend's signature
+      // verification).
       pollRef.current = setInterval(async () => {
         try {
           const sess = await invoke<Session>("auth_poll_session", { challenge });
@@ -115,6 +128,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setQrExpiresAt(null);
     setQrError(null);
   }, []);
+
+  // Actually enforce expiresAt client-side too: the backend's SessionStore is the real
+  // authority (it rejects an expired token on every privileged command regardless of what the
+  // UI shows), but without this the frontend would keep displaying a "logged in" session
+  // indefinitely after expiry until the user happened to trigger a privileged call and got a
+  // rejection. Schedule a timer for the exact expiry moment rather than polling.
+  useEffect(() => {
+    if (!session) return;
+    const msRemaining = session.expiresAt * 1000 - Date.now();
+    if (msRemaining <= 0) {
+      setSession(null);
+      return;
+    }
+    const timer = setTimeout(() => setSession(null), msRemaining);
+    return () => clearTimeout(timer);
+  }, [session]);
 
   return (
     <AuthContext.Provider
