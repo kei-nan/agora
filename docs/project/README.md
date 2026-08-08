@@ -103,6 +103,8 @@ find a specific one, or jump straight to its range file:
 | 69–70 | [069-070.md](changelog/069-070.md) — forked ZKPassport OPRF circuits onto the MRZ personal-number field (`circuits/oprf-identity-anchor/`); reworked the passport verifier + mobile proving pipeline onto ZKPassport/UltraHonk (verifier is fail-closed — no Rust verifier handles bb 5.0.0 proofs yet) |
 | 71 | [071.md](changelog/071.md) — populated `runtime/assets/vk_zkpassport_outer_count_4.bin` with the real `count_4` VK (still fail-closed pending the pairing backend) |
 | 72 | [072.md](changelog/072.md) — implemented the real UltraHonk pairing check against the bb 5.0.0 fork; settled where bb puts the pairing-point object (in the proof, not the public inputs) so the `N+5` layout and `pallet-identity`'s indices are confirmed correct |
+| 82 | [082.md](changelog/082.md) — OPRF committee node architecture for the founding phase: member-hosted phone/laptop/Pi devices, one Wasm-compiled crypto core, on-chain query/response mailbox instead of a relay server; several rejected shortcuts (Redis, Lua, chain-fanout, single-device committees) recorded with reasoning; institutional-operator hybrid considered and set aside |
+| 83 | [083.md](changelog/083.md) — first real implementation of entry 82's design: pallet-identity mailbox primitives, a real `wasm32` build of the OPRF crypto core, a new mobile committee app and a new `committee-node` container component, reconciled against each other (call index, Wasm ABI, `OprfResponses` shape all corrected); also fixed a real `twox128_hex` byte-order bug in the desktop app found as a side effect |
 
 Quick lookup for a specific entry number:
 ```bash

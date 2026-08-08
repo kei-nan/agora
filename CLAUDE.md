@@ -7,7 +7,13 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 ## Current State
 - Ubuntu 24.04 (WSL2), Rust 1.96 stable
 - Chain builds and runs in dev mode
-- **9 pallets** implemented at runtime indices 8–16 (see HANDOFF.md for detail)
+- **11 pallets exist as source, but only 10 are actually wired into the runtime** (see
+  `docs/project/README.md` for detail — `HANDOFF.md` is now just a thin pointer there, split out
+  2026-08-01). `pallet-emergency-council` (meant to be index 15) has real, tested source code but
+  is **not** in `runtime/Cargo.toml`, not configured in `runtime/src/configs/mod.rs`, and not in
+  `construct_runtime!` — confirmed 2026-08-04: the real pallet index sequence jumps straight from
+  14 to 16. The "Emergency Council" branch described below does not currently exist in the
+  compiled chain, contrary to what this file claimed until today.
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
   `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (77 tests); no
@@ -73,8 +79,12 @@ To run the dev chain:
 All enforced by smart contract boundaries:
 - **Legislature**: passes laws, approves budget, votes on referenda
 - **Executive**: executes budget, manages treasury (cannot make laws)
-- **Judiciary**: AI-first courts with human appeal, can invalidate laws (auto-enforced on-chain)
-- **Human Rights Commission**: veto on laws violating protected rights (prevents tyranny of majority)
+- **Judiciary**: AI-first courts with human appeal, can invalidate laws (auto-enforced on-chain).
+  Also the rights-protection backstop: a standalone Human Rights Commission with veto power was
+  the original design but was removed in favor of this — enacting a Structural or Foundational
+  law automatically opens a court challenge (`AutoChallengeHook`) that an AI judge reviews
+  immediately, with the normal human jury appeal path available from there. No separate HRC
+  origin or veto call exists in the codebase.
 - **Emergency Council**: time-locked powers with hard coded sunset clause
 - **Elections Commission**: candidate eligibility, result certification
 - **Anti-Corruption module**: asset disclosure, conflict-of-interest registry, ZK whistleblower
@@ -142,33 +152,60 @@ democracy-chain/
 ├── node/              ← chain binary (agora-node)
 ├── runtime/           ← WASM runtime (agora-runtime)
 ├── pallets/
-│   ├── pallet-identity/          ← citizen registry, ZK proof verification     (index 8)
+│   ├── pallet-identity/          ← citizen registry, ZK proof verification, OPRF mailbox (index 8)
 │   ├── pallet-voting/            ← MACI, liquid democracy, referenda            (index 9)
 │   ├── pallet-treasury-ledger/   ← public budget ledger, audit hook             (index 10)
-│   ├── pallet-courts/            ← AI judge, jury selection, auto-enforcement   (index 11)
-│   ├── pallet-constitution/      ← law ledger, petitions, HRC veto              (index 12)
+│   ├── pallet-courts/            ← AI judge (oracle-accepted), jury selection, auto-enforcement (index 11)
+│   ├── pallet-constitution/      ← law ledger, petitions, auto-challenge to courts (index 12)
 │   ├── pallet-legislature/       ← collective origin for law/budget motions     (index 13)
 │   ├── pallet-elections/         ← Elections Commission, candidates             (index 14)
 │   ├── pallet-emergency-council/ ← time-locked emergency powers, auto-sunset   (index 15)
-│   └── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
-├── circuits/          ← Noir ZK circuits (not yet started)
+│   ├── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
+│   ├── pallet-anticorruption/    ← asset disclosure, conflict registry, ZK whistleblower (index 17)
+│   └── pallet-executive/         ← parliamentary executive/Cabinet               (index 18)
+├── circuits/          ← Noir ZK circuits (oprf-identity-anchor: built, proven against a dev
+│                         simulator, not a real committee — see docs/project/next-steps.md #8)
 ├── mobile/            ← React Native app; android/ real + committed (JS tests pass, no
 │                         JDK/SDK here to build it yet); ios/ not started
+├── committee/         ← separate mobile app for OPRF committee-member duty (changelog #082/#083)
+├── committee-node/    ← laptop/Pi OPRF committee-member container component (changelog #083)
+├── oprf-committee-dev/← OPRF crypto core, real wasm32 build (changelog #083); dev/test only,
+│                         not a real committee
 ├── desktop/           ← Tauri 2 app (functional: chain RPC + Claude AI agent)
 └── CLAUDE.md          ← this file
 ```
 
 ## Remaining Work (in priority order)
-1. **Mobile app** — `android/` native project and its NFC module (`NfcPassportModule.kt`) already exist and are committed; blocked instead on (a) no JDK/Android SDK in this WSL2 environment to actually run `./gradlew assembleDebug` (see changelog #80 for exact versions needed), and (b) ZKPassport Noir circuits for on-device ZK proof generation, still unwired. This is also what gates the **first end-to-end ZK verification test**: `runtime/src/verifier.rs` is complete and verifies real bb 5.0.0 UltraHonk proofs (see `docs/project/zk-verifier.md`), but no genuine ZKPassport `count_4` proof has been through it yet — that needs real passport NFC data
-2. **QR auth (mobile side)** — phone scans desktop QR, signs session token, verifies against chain
-3. **VRF jury randomness** — replace block-hash selection with BABE/SASSAFRAS VRF
-4. **Per-referendum threshold** — supermajority for constitutional-tier laws
-5. **IPFS content fetching** (desktop) — fetch law/proposal text from gateway by on-chain hash
-6. **Batched voting epochs** — Swiss model periodic windows instead of continuous voting
-7. **Anti-Corruption module** — asset disclosure, ZK whistleblower (needs Noir circuits)
-8. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token
 
-See `HANDOFF.md` for full pallet-by-pallet status and completed work log.
+**This list was significantly stale until 2026-08-04 — several items below were already done and
+some real gaps weren't listed at all. `docs/project/next-steps.md` is the actively-maintained,
+authoritative version of this list; treat this section as a summary, not the source of truth.**
+
+1. **OPRF committee service** — the actual blocker for identity registration going live. All of
+   the surrounding machinery is built and tested (governance model, circuits, on-chain mailbox,
+   a real `wasm32` crypto core, a mobile app and a laptop/Pi container for running a node — see
+   changelog #082/#083) but no real committee exists: no DKG ceremony, no founding-group key
+   material, `OprfCommitteeKeys`/`CommitteeMembers` empty. This is also what gates the first
+   genuine end-to-end ZK verification test — `runtime/src/verifier.rs` is complete and verifies
+   real bb 5.0.0 UltraHonk proofs, but no real ZKPassport proof has gone through it yet.
+2. **An AI-ruling oracle service** — `pallet-courts` has real, tested on-chain machinery to
+   *accept* a ruling (`submit_ai_ruling`, a real `OracleOrigin`), but nothing off-chain actually
+   generates one by calling an AI model. The desktop app's existing Claude integration is a
+   separate, read-only citizen Q&A feature, not a court oracle. Not currently tracked in
+   `next-steps.md` — found 2026-08-04, still open.
+3. **Mobile app native build** — `android/` and its NFC module already exist and are committed;
+   blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and
+   (b) the OPRF committee service above, which gates on-device ZK proof generation.
+4. **VRF jury randomness** — deliberately descoped, not simply unstarted: a commit-then-delayed-
+   reveal scheme replaced block-hash selection in `pallet-courts`, closing the worst grinding
+   attack; genuine BABE/SASSAFRAS VRF would need a full consensus swap away from Aura.
+5. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token.
+
+Already done, despite earlier versions of this list still saying otherwise: QR auth (chain-side
+verification), per-referendum foundational/constitutional threshold, IPFS content fetching on
+desktop, batched Swiss-model voting epochs, and the Anti-Corruption module.
+
+See `docs/project/README.md` for full pallet-by-pallet status and the completed-work log.
 
 ## Key References
 - ZKPassport circuits: https://github.com/zkpassport/circuits

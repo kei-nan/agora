@@ -5,14 +5,19 @@
 - `default = ["std", "dev-mode"]`
 - `dev-mode` enables `PassthroughZkVerifier` (accepts all ZK proofs). Strip this feature
   for any testnet/mainnet build. Without it, `runtime/src/verifier.rs` uses the real
-  `RarimoGroth16Verifier`, which rejects all proofs until VK assets are populated.
+  `ZkPassportUltraHonkVerifier` (targets ZKPassport's Noir/UltraHonk `main/outer/count_4`
+  circuit; replaces the former `RarimoGroth16Verifier` — see changelog entry 65). It enforces
+  the proof envelope and public-input layout for real, and the UltraHonk pairing check itself
+  is genuinely performed via `ultrahonk-no-std` (a bb-5.0.0 port) — but no real ZKPassport
+  `count_4` proof has been run through it end-to-end yet. See `docs/project/zk-verifier.md`
+  for the full status.
 
 
 ## Cross-pallet trait wiring (runtime/src/configs/mod.rs)
 
 | Trait | Implemented by | Calls |
 |---|---|---|
-| `ZkProofVerifier` | `PassthroughZkVerifier` (dev) / `RarimoGroth16Verifier` (prod) | ark-groth16 BN254 verify |
+| `ZkProofVerifier` (`pallet_identity_zk`) | `PassthroughZkVerifier` (dev) / `ZkPassportUltraHonkVerifier` (prod) | UltraHonk pairing check via `ultrahonk-no-std` (bb 5.0.0 port) |
 | `CitizenChecker<AccountId>` | `Runtime` | `pallet_identity_zk::is_active_citizen` + `TotalCitizens` |
 | `CitizenSelector<AccountId>` | `Runtime` | `pallet_identity_zk::CitizenIndex` + `TotalCitizens` |
 | `LawEnforcer` | `Runtime` | `pallet_constitution::invalidate_law_internal` |
@@ -25,6 +30,17 @@
 | `MinisterChecker<AccountId>` | `Cabinet` (`pallet_executive::Pallet<Runtime>`) | `MinisterPortfolio::contains_key` + `PrimeMinister` check |
 | `FreshLegislatureChecker<BlockNumber>` | `Runtime` | reads `pallet_elections::LastElectionBlock` |
 | `AutoChallengeHook` | `Runtime` | `pallet_courts::Pallet::<Runtime>::auto_file_case(LawChallenge)` |
+| `ZkProofVerifier` (`pallet_anticorruption`, own trait — distinct from `pallet_identity_zk`'s) | `PassthroughAntiCorruptionZkVerifier` (dev) / `ZkPassportAntiCorruptionZkVerifier` (prod) | dev: always `true`; prod: delegates straight to `pallet_identity_zk`'s `ZkPassportUltraHonkVerifier` (reuses the same ZKPassport outer circuit — the pallet's own whistleblower circuit is still unbuilt, see HANDOFF item 8) |
+| `LegislatureOrigin` (`pallet_executive::Config`) | `pallet_legislature::EnsureLegislatureMotion<Runtime>` | gates `appoint_minister` / `dismiss_minister` / `declare_emergency` / `end_emergency` on a passed legislature motion |
+
+**`pallet-emergency-council` is not wired into the runtime at all yet** — it isn't a dependency
+in `runtime/Cargo.toml`, has no `impl pallet_emergency_council::Config for Runtime` in
+`runtime/src/configs/mod.rs`, and has no `#[runtime::pallet_index(15)]` entry in
+`runtime/src/lib.rs`'s `construct_runtime!` (index 15 is skipped: `pallet-elections` is 14,
+`pallet-audit` is 16). The crate exists standalone under `pallets/pallet-emergency-council/`
+with its own `Config` trait, but there is no cross-pallet trait wiring to document until it's
+actually plugged in. `pallet_identity_zk::Config::EmergencyRotationOrigin` is `EnsureRoot` as a
+placeholder for exactly this reason (see its doc comment in `configs/mod.rs`).
 
 
 ## Full citizen → law pipeline
