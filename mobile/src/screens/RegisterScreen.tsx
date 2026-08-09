@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Alert, Modal, Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
+import { Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
 import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -11,6 +11,7 @@ import {
   TEST_PASSPORT_DG15_BASE64,
   TEST_PASSPORT_SOD_BASE64,
 } from '../chain/__fixtures__/testPassport';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
@@ -80,7 +81,7 @@ export default function RegisterScreen({ navigation }: Props) {
   const [dateOfExpiry, setDateOfExpiry] = useState<Date | null>(null);
   const [activePicker, setActivePicker] = useState<'dob' | 'expiry' | null>(null);
   const [rawPassport, setRawPassport] = useState<RawPassportData | null>(null);
-  const [resultModal, setResultModal] = useState<{ title: string; message: string; devDetails?: string } | null>(null);
+  const { showInfo } = useAppModal();
 
   const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
 
@@ -96,7 +97,7 @@ export default function RegisterScreen({ navigation }: Props) {
 
   async function start(useTestPassport: boolean = false) {
     if (!useTestPassport && Platform.OS !== 'android') {
-      Alert.alert(
+      showInfo(
         'Not available on this device',
         'Passport NFC reading is only implemented for Android so far. See HANDOFF.md item 8.',
       );
@@ -152,20 +153,19 @@ export default function RegisterScreen({ navigation }: Props) {
       );
     } catch (e: any) {
       if (e instanceof NotImplementedError) {
-        setResultModal({
-          title: 'Almost there',
-          message:
-            "Your passport was read and verified successfully. We're still building the last part " +
+        showInfo(
+          'Almost there',
+          "Your passport was read and verified successfully. We're still building the last part " +
             "of the system that turns that into a proof for the chain, so registration can't finish " +
             'in this version yet — please check back in a future update.',
-          devDetails: __DEV__ ? e.message : undefined,
-        });
+          __DEV__ ? e.message : undefined,
+        );
       } else {
-        setResultModal({
-          title: "Registration didn't complete",
-          message: 'Something went wrong while reading or processing your passport. Please try again.',
-          devDetails: __DEV__ ? e.message : undefined,
-        });
+        showInfo(
+          "Registration didn't complete",
+          'Something went wrong while reading or processing your passport. Please try again.',
+          __DEV__ ? e.message : undefined,
+        );
       }
       setStep('idle');
     }
@@ -174,7 +174,6 @@ export default function RegisterScreen({ navigation }: Props) {
   const activeIndex = STEP_ORDER.indexOf(step);
 
   return (
-    <>
     <ScrollView
       style={s.container}
       contentContainerStyle={s.scrollContent}
@@ -315,36 +314,6 @@ export default function RegisterScreen({ navigation }: Props) {
         </View>
       )}
     </ScrollView>
-
-    <Modal
-      visible={resultModal !== null}
-      transparent
-      animationType="fade"
-      onRequestClose={() => setResultModal(null)}
-    >
-      <View style={s.modalBackdrop}>
-        <View style={s.modalCard}>
-          <Text style={s.modalTitle}>{resultModal?.title}</Text>
-          <Text style={s.modalMessage}>{resultModal?.message}</Text>
-          {resultModal?.devDetails && (
-            <>
-              <View style={s.modalDivider} />
-              <Text style={s.modalDevLabel}>DEV DETAILS</Text>
-              <Text style={s.modalDevText}>{resultModal.devDetails}</Text>
-            </>
-          )}
-          <TouchableOpacity
-            style={s.modalBtn}
-            onPress={() => setResultModal(null)}
-            accessibilityRole="button"
-            accessibilityLabel="OK"
-          >
-            <Text style={s.btnText}>OK</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </Modal>
-    </>
   );
 }
 
@@ -361,7 +330,7 @@ const s = StyleSheet.create({
   },
   stepPending: { backgroundColor: colors.border },
   stepActive: { backgroundColor: colors.accent },
-  stepDone: { backgroundColor: '#166534' },
+  stepDone: { backgroundColor: colors.successSolid },
   stepNumText: { color: colors.textPrimary, fontWeight: '700', fontSize: 14 },
   stepText: { flex: 1 },
   stepLabel: { fontSize: 15, fontWeight: '600', color: colors.textMuted, marginBottom: 2 },
@@ -404,32 +373,4 @@ const s = StyleSheet.create({
   mrzHint: { fontSize: 11, color: colors.textDim, lineHeight: 15, marginTop: 10 },
   scanResult: { fontSize: 12, color: colors.success, textAlign: 'center', marginBottom: 12 },
   btnDisabled: { backgroundColor: colors.textFaint },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 24,
-  },
-  modalCard: {
-    width: '100%',
-    maxWidth: 400,
-    backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 24,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  modalTitle: { fontSize: 18, fontWeight: '700', color: colors.textPrimary, marginBottom: 10 },
-  modalMessage: { fontSize: 14, color: '#d1d5db', lineHeight: 20 },
-  modalDivider: { height: 1, backgroundColor: colors.border, marginVertical: 16 },
-  modalDevLabel: { fontSize: 10, fontWeight: '700', color: colors.textMuted, letterSpacing: 0.8, marginBottom: 6 },
-  modalDevText: { fontSize: 12, color: colors.textMuted, lineHeight: 17 },
-  modalBtn: {
-    marginTop: 20,
-    backgroundColor: colors.accent,
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
 });

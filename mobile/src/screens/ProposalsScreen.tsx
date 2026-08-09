@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   FlatList,
   RefreshControl,
   StyleSheet,
@@ -11,6 +10,7 @@ import {
 } from 'react-native';
 import { Proposal, fetchProposals, hasVotedOnReferendum, voteOnReferendum } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 /**
@@ -52,6 +52,7 @@ export default function ProposalsScreen() {
   // Seeded from chain state in load() (see hasVotedOnReferendum) so it
   // reflects votes cast in earlier sessions too, not just this one.
   const [voted, setVoted] = useState<Set<number>>(new Set());
+  const { showInfo, showError, showConfirm } = useAppModal();
 
   const load = useCallback(async () => {
     let data: Proposal[];
@@ -59,7 +60,7 @@ export default function ProposalsScreen() {
       data = await fetchProposals();
       setProposals(data);
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      showError("Couldn't load proposals", e);
       setLoading(false);
       setRefreshing(false);
       return;
@@ -84,24 +85,34 @@ export default function ProposalsScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [showError]);
 
   useEffect(() => { load(); }, [load]);
 
-  async function vote(id: number, inFavor: boolean) {
+  function vote(id: number, inFavor: boolean) {
+    showConfirm({
+      title: inFavor ? 'Vote for this proposal?' : 'Vote against this proposal?',
+      message: `You're about to cast an on-chain vote ${inFavor ? 'for' : 'against'} proposal #${id}. Votes cannot be changed once submitted.`,
+      confirmLabel: inFavor ? 'Vote For' : 'Vote Against',
+      destructive: !inFavor,
+      onConfirm: () => castVote(id, inFavor),
+    });
+  }
+
+  async function castVote(id: number, inFavor: boolean) {
     setVoting(id);
     try {
       const { keypair } = await getSigningKeypair();
       await voteOnReferendum(keypair, id, inFavor);
       setVoted((prev) => new Set(prev).add(id));
-      Alert.alert('Vote cast', `You voted ${inFavor ? 'for' : 'against'} proposal #${id}.`);
+      showInfo('Vote cast', `You voted ${inFavor ? 'for' : 'against'} proposal #${id}.`);
       load();
     } catch (e: any) {
       const rawMessage = e.message ?? String(e);
-      Alert.alert('Vote failed', translateVoteError(rawMessage), [
-        { text: 'OK', style: 'cancel' },
-        { text: 'Details', onPress: () => Alert.alert('Technical details', rawMessage) },
-      ]);
+      // translateVoteError still supplies the specific, per-error-code friendly message;
+      // showError's own devDetails mechanism now covers what the old "Details" button did,
+      // gated to __DEV__ instead of always offered.
+      showError('Vote failed', e, translateVoteError(rawMessage));
     } finally {
       setVoting(null);
     }
@@ -203,7 +214,7 @@ const s = StyleSheet.create({
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
   chips: { flexDirection: 'row', gap: 6 },
   chip: { fontSize: 11, fontWeight: '600', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
-  chipActive: { backgroundColor: '#1a3a1a', color: colors.success },
+  chipActive: { backgroundColor: colors.successBg, color: colors.success },
   chipDone: { backgroundColor: colors.border, color: colors.textSecondary },
   chipConst: { backgroundColor: '#1e1040', color: '#a78bfa' },
   id: { fontSize: 12, color: colors.textMuted },
@@ -213,8 +224,8 @@ const s = StyleSheet.create({
   againstVotes: { color: colors.danger, fontSize: 14, fontWeight: '600' },
   voteRow: { flexDirection: 'row', gap: 10 },
   voteBtn: { flex: 1, paddingVertical: 10, borderRadius: 10, alignItems: 'center' },
-  voteBtnFor: { backgroundColor: '#166534' },
-  voteBtnAgainst: { backgroundColor: '#7f1d1d' },
+  voteBtnFor: { backgroundColor: colors.successSolid },
+  voteBtnAgainst: { backgroundColor: colors.dangerSolid },
   voteBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
   votedRow: { paddingVertical: 10, alignItems: 'center', backgroundColor: colors.border, borderRadius: 10 },
   votedText: { color: colors.success, fontWeight: '600', fontSize: 14 },

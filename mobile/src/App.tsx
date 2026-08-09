@@ -8,6 +8,8 @@ import { enableScreens } from 'react-native-screens';
 
 enableScreens();
 
+import { AppModalProvider } from './components/AppModal';
+import { colors } from './theme';
 import RegisterScreen from './screens/RegisterScreen';
 import HomeScreen from './screens/HomeScreen';
 import ProposalsScreen from './screens/ProposalsScreen';
@@ -43,11 +45,11 @@ function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={{
-        tabBarStyle: { backgroundColor: '#0f1117', borderTopColor: '#1f2937' },
-        tabBarActiveTintColor: '#6C63FF',
-        tabBarInactiveTintColor: '#6b7280',
-        headerStyle: { backgroundColor: '#0f1117' },
-        headerTintColor: '#ffffff',
+        tabBarStyle: { backgroundColor: colors.bg, borderTopColor: colors.border },
+        tabBarActiveTintColor: colors.accent,
+        tabBarInactiveTintColor: colors.textMuted,
+        headerStyle: { backgroundColor: colors.bg },
+        headerTintColor: colors.textPrimary,
       }}
     >
       <Tab.Screen name="Home" component={HomeScreen} options={{ title: 'Agora', headerShown: false }} />
@@ -82,12 +84,13 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+    <AppModalProvider>
     <NavigationContainer ref={navRef}>
       <Stack.Navigator
         screenOptions={{
-          headerStyle: { backgroundColor: '#0f1117' },
-          headerTintColor: '#ffffff',
-          contentStyle: { backgroundColor: '#0f1117' },
+          headerStyle: { backgroundColor: colors.bg },
+          headerTintColor: colors.textPrimary,
+          contentStyle: { backgroundColor: colors.bg },
         }}
       >
         <Stack.Screen name="Main" component={MainTabs} options={{ headerShown: false }} />
@@ -113,6 +116,7 @@ export default function App() {
         />
       </Stack.Navigator>
     </NavigationContainer>
+    </AppModalProvider>
     </SafeAreaProvider>
   );
 }

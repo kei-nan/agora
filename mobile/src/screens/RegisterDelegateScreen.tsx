@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  ActivityIndicator, Alert, ScrollView, StyleSheet,
+  ActivityIndicator, ScrollView, StyleSheet,
   Text, TextInput, TouchableOpacity, View,
 } from 'react-native';
 // TextInput kept for the bio field
@@ -9,6 +9,7 @@ import { RootStackParamList } from '../App';
 import { registerAsDelegate } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { getPassportName } from '../chain/citizenState';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'RegisterDelegate'>;
@@ -18,6 +19,7 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
   const passportName = getPassportName();
   const [bio, setBio] = useState('');
   const [step, setStep] = useState<Step>('idle');
+  const { showError } = useAppModal();
 
   const canSubmit = !!passportName && step === 'idle';
 
@@ -29,7 +31,7 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
       await registerAsDelegate(keypair, passportName, bio.trim());
       setStep('done');
     } catch (e: any) {
-      Alert.alert('Registration failed', e.message);
+      showError('Registration failed', e, 'Your delegate registration could not be submitted. Please try again.');
       setStep('idle');
     }
   }
@@ -127,7 +129,7 @@ const s = StyleSheet.create({
   },
   infoRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   infoIcon: { fontSize: 18, width: 24 },
-  infoText: { fontSize: 13, color: '#d1d5db', flex: 1, lineHeight: 18 },
+  infoText: { fontSize: 13, color: colors.textBody, flex: 1, lineHeight: 18 },
   label: { fontSize: 12, fontWeight: '600', color: colors.textSecondary, textTransform: 'uppercase', letterSpacing: 0.8, marginBottom: 8 },
   optional: { fontWeight: '400', textTransform: 'none', letterSpacing: 0 },
   input: {

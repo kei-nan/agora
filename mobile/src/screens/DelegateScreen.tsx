@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import {
-  Alert, FlatList, StyleSheet, Text,
+  FlatList, StyleSheet, Text,
   TextInput, TouchableOpacity, View,
 } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -8,6 +8,7 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import { fetchDelegateRegistry, DelegateProfile } from '../chain/governance';
 import { getAllDelegations, getRegistered, DelegationEntry } from '../chain/citizenState';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 const TOPICS = ['General', 'Budget', 'Constitutional', 'Foreign Affairs', 'Public Safety'];
@@ -27,14 +28,11 @@ const HELP = {
     'Registering as a delegate makes your verified name publicly visible. You start as Pending and need 50 backers to become Active. You can still vote privately as a citizen — your delegate identity is cryptographically separate.',
 };
 
-function help(title: string, message: string) {
-  Alert.alert(title, message);
-}
-
 function HelpIcon({ title, message }: { title: string; message: string }) {
+  const { showInfo } = useAppModal();
   return (
     <TouchableOpacity
-      onPress={() => help(title, message)}
+      onPress={() => showInfo(title, message)}
       hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
       style={s.helpBtn}
       accessibilityRole="button"
@@ -53,14 +51,15 @@ export default function DelegateScreen() {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const isRegistered = getRegistered();
+  const { showError } = useAppModal();
 
   useFocusEffect(useCallback(() => {
     fetchDelegateRegistry()
       .then(d => setDelegates(d))
-      .catch((e: any) => Alert.alert('Error', e.message))
+      .catch((e: any) => showError("Couldn't load delegates", e))
       .finally(() => setLoading(false));
     setDelegations(getAllDelegations());
-  }, []));
+  }, [showError]));
 
   const activeDelegations = Array.from(delegations.entries());
 
@@ -91,7 +90,7 @@ export default function DelegateScreen() {
         setLoading(true);
         fetchDelegateRegistry()
           .then(d => setDelegates(d))
-          .catch((e: any) => Alert.alert('Error', e.message))
+          .catch((e: any) => showError("Couldn't load delegates", e))
           .finally(() => setLoading(false));
       }}
       ListHeaderComponent={
@@ -307,10 +306,10 @@ const s = StyleSheet.create({
   chevron: { fontSize: 18, color: colors.textMuted, marginLeft: 4 },
 
   warningBanner: {
-    backgroundColor: '#451a03', borderRadius: 10, padding: 12,
-    marginBottom: 12, borderWidth: 1, borderColor: '#92400e',
+    backgroundColor: colors.warningBg, borderRadius: 10, padding: 12,
+    marginBottom: 12, borderWidth: 1, borderColor: colors.warningBorder,
   },
-  warningText: { color: '#fcd34d', fontSize: 13, lineHeight: 18 },
+  warningText: { color: colors.warningTextStrong, fontSize: 13, lineHeight: 18 },
 
   becomeDelegateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 20 },
   becomeBtn: {

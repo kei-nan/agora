@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   FlatList,
   RefreshControl,
   StyleSheet,
@@ -13,6 +12,7 @@ import { useNavigation } from '@react-navigation/native';
 import { Petition, fetchPetitions, fetchReferendumIdForPetition, signPetition } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { getRegistered } from '../chain/citizenState';
+import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 export default function PetitionScreen() {
@@ -31,6 +31,7 @@ export default function PetitionScreen() {
   // (governance.ts) for why "reached threshold" and "referendum exists" are
   // effectively the same moment on-chain.
   const [referendumLinks, setReferendumLinks] = useState<Record<number, number>>({});
+  const { showInfo, showError } = useAppModal();
 
   const load = useCallback(async () => {
     let data: Petition[];
@@ -38,7 +39,7 @@ export default function PetitionScreen() {
       data = await fetchPetitions();
       setPetitions(data);
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      showError("Couldn't load petitions", e);
       setLoading(false);
       setRefreshing(false);
       return;
@@ -65,13 +66,13 @@ export default function PetitionScreen() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [showError]);
 
   useEffect(() => { load(); }, [load]);
 
   async function handleSign(petitionId: number) {
     if (!getRegistered()) {
-      Alert.alert('Not registered', 'You must be a registered citizen to sign petitions.');
+      showInfo('Not registered', 'You must be a registered citizen to sign petitions.');
       return;
     }
     setSigning(petitionId);
@@ -80,7 +81,7 @@ export default function PetitionScreen() {
       await signPetition(keypair, petitionId);
       setSigned(prev => new Set(prev).add(petitionId));
     } catch (e: any) {
-      Alert.alert('Failed to sign', e.message);
+      showError('Failed to sign', e, 'Your signature could not be submitted. Please try again.');
     } finally {
       setSigning(null);
     }
@@ -184,7 +185,7 @@ const s = StyleSheet.create({
   },
   cardHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
   id: { fontSize: 12, color: colors.textDim, fontWeight: '600' },
-  reachedBadge: { backgroundColor: '#052e16', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
+  reachedBadge: { backgroundColor: colors.successBg, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6 },
   reachedText: { fontSize: 11, color: colors.success, fontWeight: '600' },
   title: { fontSize: 16, fontWeight: '700', color: colors.textPrimary, marginBottom: 8, lineHeight: 22 },
   description: { fontSize: 13, color: colors.textSecondary, lineHeight: 19, marginBottom: 14 },

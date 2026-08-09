@@ -41,4 +41,19 @@ export const colors = {
   danger: '#ef4444',
   /** Warning/pending status (e.g. "Pending", term-limit warnings). */
   warning: '#f59e0b',
+
+  /** Body copy on cards/modals — one step brighter than `textSecondary`. */
+  textBody: '#d1d5db',
+  /** Solid success background — buttons/indicators for a completed positive action ("step done", "vote for"). */
+  successSolid: '#166534',
+  /** Subtle success-tinted background for status chips (e.g. "Active" law/proposal, threshold reached). */
+  successBg: '#052e16',
+  /** Solid danger background — buttons for a destructive/negative action (revoke, vote against, remove backing). */
+  dangerSolid: '#7f1d1d',
+  /** Warning banner background. */
+  warningBg: '#451a03',
+  /** Warning banner border; also used for "this will change an existing choice" caution actions. */
+  warningBorder: '#92400e',
+  /** Warning banner text. */
+  warningTextStrong: '#fcd34d',
 } as const;
