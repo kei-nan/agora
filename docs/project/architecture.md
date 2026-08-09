@@ -33,14 +33,17 @@
 | `ZkProofVerifier` (`pallet_anticorruption`, own trait — distinct from `pallet_identity_zk`'s) | `PassthroughAntiCorruptionZkVerifier` (dev) / `ZkPassportAntiCorruptionZkVerifier` (prod) | dev: always `true`; prod: delegates straight to `pallet_identity_zk`'s `ZkPassportUltraHonkVerifier` (reuses the same ZKPassport outer circuit — the pallet's own whistleblower circuit is still unbuilt, see HANDOFF item 8) |
 | `LegislatureOrigin` (`pallet_executive::Config`) | `pallet_legislature::EnsureLegislatureMotion<Runtime>` | gates `appoint_minister` / `dismiss_minister` / `declare_emergency` / `end_emergency` on a passed legislature motion |
 
-**`pallet-emergency-council` is not wired into the runtime at all yet** — it isn't a dependency
-in `runtime/Cargo.toml`, has no `impl pallet_emergency_council::Config for Runtime` in
-`runtime/src/configs/mod.rs`, and has no `#[runtime::pallet_index(15)]` entry in
-`runtime/src/lib.rs`'s `construct_runtime!` (index 15 is skipped: `pallet-elections` is 14,
-`pallet-audit` is 16). The crate exists standalone under `pallets/pallet-emergency-council/`
-with its own `Config` trait, but there is no cross-pallet trait wiring to document until it's
-actually plugged in. `pallet_identity_zk::Config::EmergencyRotationOrigin` is `EnsureRoot` as a
-placeholder for exactly this reason (see its doc comment in `configs/mod.rs`).
+**`pallet-emergency-council` is wired into the runtime** — it's a real dependency in
+`runtime/Cargo.toml`, has a real `impl pallet_emergency_council::Config for Runtime` in
+`runtime/src/configs/mod.rs`, and sits at `#[runtime::pallet_index(15)]` in
+`runtime/src/lib.rs`'s `#[frame_support::runtime]` macro (confirmed by reading the file
+directly). `pallet_identity_zk::Config::EmergencyRotationOrigin` is still `EnsureRoot` as a
+placeholder pending a dedicated collective for mainnet — see its doc comment in
+`configs/mod.rs` — but that's a separate, tracked gap from whether the pallet is wired in at
+all. (This section previously claimed the pallet wasn't wired in; that was stale — this is the
+same false claim CLAUDE.md carried and corrected on 2026-08-08, recurring here in a second
+file. Verify against `runtime/src/lib.rs` directly rather than trusting either doc if it
+matters for what you're doing.)
 
 
 ## Full citizen → law pipeline

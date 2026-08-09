@@ -12,6 +12,12 @@ Storage:
 - `JuryVotes`: `(case_id, AccountId)` → `Verdict`
 - `JuryTally`: `case_id` → `(upheld, overturned)`
 - `OracleAccount`: `Option<AccountId>` — the designated AI oracle account (set by root)
+- `CaseBonds`: `case_id` → `Balance` — the `CaseFilingBond` reserved by `file_case`, released on finalization
+- `AIGovernanceCouncil`: `BoundedVec<AccountId, MaxAIGovernanceCouncilSize>` — root-managed, mirrors `pallet-emergency-council`'s `Council`
+- `CurrentAIModelVersion`: `u32` — the governance-approved model version `submit_ai_ruling` checks against
+- `AIModelVersions`: `u32` → `model_hash` — approved model history
+- `AIRulingModelVersion`: `case_id` → `u32` — which model version ruled on this case
+- `PendingAIModelProposal` / `AIModelApprovalVotes`: in-progress `vote_approve_ai_model` round state
 
 `CaseSubject` enum:
 - `General` — no auto-enforcement
@@ -24,13 +30,25 @@ Jury size routing (enforced in `select_jury`):
 - All other subjects → 7 jurors (Level 1)
 
 Calls:
-- `file_case(subject)` — any active citizen
-- `submit_ai_ruling(case_id, verdict, ipfs_hash)` — `OracleOrigin`
+- `file_case(subject)` — any active citizen; reserves `CaseFilingBond` (released in full once
+  the case reaches a final status) to price the spam risk free Level-0 rulings would otherwise
+  create; `auto_file_case(subject)` (system-initiated, e.g. `AutoChallengeHook`) is the
+  bond-free internal equivalent, not directly callable
+- `submit_ai_ruling(case_id, ruling_hash, model_version)` — `OracleOrigin`; `ruling_hash` is
+  the IPFS CID of the full reasoning document; `model_version` must match
+  `CurrentAIModelVersion` (rejected with `NoApprovedAIModel`/`UnapprovedAIModel` otherwise) —
+  the actual on-chain enforcement of "AI model updates require on-chain governance vote"
 - `appeal_ruling(case_id)` — within 7-day window; triggers `select_jury`
 - `select_jury(case_id, jury_size)` — filer, oracle, or (for system-filed cases) any active citizen; size validated against case subject; only callable once `JurySeedDelayBlocks` blocks have elapsed since `appeal_ruling`
-- `finalize_ruling(case_id)` — `OracleOrigin`; for un-appealed Level 0 cases
+- `finalize_ruling(case_id, verdict)` — `OracleOrigin`; for un-appealed Level 0 cases
 - `cast_jury_vote(case_id, verdict)` — seated juror only; auto-finalizes on majority
 - `set_oracle_account(account)` — root; rotatable without runtime upgrade
+- `add_ai_governance_member(account)` / `remove_ai_governance_member(account)` — root; manages
+  the `AIGovernanceCouncil` roster (mirrors pallet-emergency-council's council management)
+- `vote_approve_ai_model(model_hash)` — AI Model Governance Council member only; resolves
+  immediately once `AIModelSupermajorityNumerator`/`Denominator` of the council has voted for
+  the same hash, bumping `CurrentAIModelVersion` — the supermajority gate `submit_ai_ruling`
+  checks against
 
 TODOs:
 - Real VRF-based jury randomness. Current scheme (see log #52) is a commit-then-delayed-reveal

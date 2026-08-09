@@ -11,7 +11,7 @@ Storage:
 - `EndVotes`: `AccountId` → `bool`
 
 Config:
-- `MaxEmergencyBlocks = 432_000` (30 days at 6s/block — constitutional ceiling)
+- `MaxEmergencyBlocks = 216_000` (30 days at this chain's actual 12s/block time — constitutional ceiling)
 - `SupermajorityNumerator / Denominator = 2/3`
 
 Calls:

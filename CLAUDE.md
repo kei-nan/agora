@@ -17,9 +17,10 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
   if it matters for what you're doing.)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
-  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (77 tests); no
-  JDK/Android SDK in this WSL2 environment yet, so no Gradle build has actually run here —
-  `ios/` still doesn't exist (see `docs/project/apps/mobile.md`, changelog #80)
+  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (140 tests
+  across 11 suites, up from the 77 changelog #80 originally verified); no JDK/Android SDK in
+  this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
+  exist (see `docs/project/apps/mobile.md`, changelog #80)
 
 ## Critical Build Command
 Always build with:
@@ -177,6 +178,8 @@ democracy-chain/
 ├── committee-node/    ← laptop/Pi OPRF committee-member container component (changelog #083)
 ├── oprf-committee-dev/← OPRF crypto core, real wasm32 build (changelog #083); dev/test only,
 │                         not a real committee
+├── court-oracle/      ← AI-ruling oracle service: polls filed cases, calls Claude, publishes
+│                         reasoning to IPFS, submits submit_ai_ruling (changelog #086)
 ├── desktop/           ← Tauri 2 app (functional: chain RPC + Claude AI agent)
 └── CLAUDE.md          ← this file
 ```
