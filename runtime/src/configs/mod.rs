@@ -325,9 +325,15 @@ impl pallet_identity_zk::Config for Runtime {
 	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
 }
 
-/// Passthrough MACI tally verifier — accepts all proofs.
-/// TODO: replace with the real MACI circuit verifier once trusted setup is complete.
+/// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as
+/// `PassthroughZkVerifier`/`PassthroughAntiCorruptionZkVerifier` elsewhere in this file: gated
+/// behind the `dev-mode` feature, so a production build without that feature will fail to
+/// compile here, forcing the choice below (`FailClosedMACIVerifier`) to be replaced with a real
+/// MACI circuit verifier before it can be used to accept a tally in production.
+#[cfg(feature = "dev-mode")]
 pub struct PassthroughMACIVerifier;
+
+#[cfg(feature = "dev-mode")]
 impl pallet_voting::MACITallyVerifier for PassthroughMACIVerifier {
 	fn verify_tally(
 		_proposal_id: u32,
@@ -337,6 +343,76 @@ impl pallet_voting::MACITallyVerifier for PassthroughMACIVerifier {
 		_proof_bytes: &[u8],
 	) -> bool {
 		true
+	}
+}
+
+/// Fail-closed MACI tally verifier for non-`dev-mode` builds.
+///
+/// Unlike `PassthroughAnchorVerifier` (identity-anchor path — left permissive in both build
+/// modes pending the OPRF committee, see its own doc comment), a fabricated MACI tally directly
+/// drives `enact_law` inside `submit_maci_tally` — silently accepting one would let any
+/// `LegislatureOrigin`-controlled account enact a law on fake vote counts. No real MACI circuit
+/// verifier exists yet in this codebase (trusted setup / circuit work not started, see
+/// CLAUDE.md's "Remaining Work"), so rather than inventing a "real" check that doesn't actually
+/// verify anything, this rejects every tally. `submit_maci_tally` is effectively unusable in
+/// non-dev builds until a genuine MACI tally verifier is wired in here to replace it.
+#[cfg(not(feature = "dev-mode"))]
+pub struct FailClosedMACIVerifier;
+
+#[cfg(not(feature = "dev-mode"))]
+impl pallet_voting::MACITallyVerifier for FailClosedMACIVerifier {
+	fn verify_tally(
+		_proposal_id: u32,
+		_yes_votes: u64,
+		_no_votes: u64,
+		_commitment_root: [u8; 32],
+		_proof_bytes: &[u8],
+	) -> bool {
+		false
+	}
+}
+
+/// `cargo test -p agora-runtime` (default features, `dev-mode` on) runs
+/// `dev_mode_passthrough_accepts_anything`; `cargo test -p agora-runtime --no-default-features
+/// --features std` (the shape of a non-dev build) runs
+/// `non_dev_mode_rejects_a_fabricated_tally` — proving a fabricated tally that would previously
+/// have silently passed (unconditional `PassthroughMACIVerifier`) is now rejected outside
+/// dev-mode.
+#[cfg(all(test, feature = "dev-mode"))]
+mod maci_verifier_tests {
+	use super::*;
+	use pallet_voting::MACITallyVerifier;
+
+	#[test]
+	fn dev_mode_passthrough_accepts_anything() {
+		// A garbage "proof" for a fabricated tally — dev-mode's passthrough still accepts it
+		// (expected/documented; dev-mode is explicitly not a security boundary).
+		assert!(PassthroughMACIVerifier::verify_tally(
+			0,
+			1_000_000,
+			0,
+			[0u8; 32],
+			&[0xde, 0xad, 0xbe, 0xef],
+		));
+	}
+}
+
+#[cfg(all(test, not(feature = "dev-mode")))]
+mod maci_verifier_tests {
+	use super::*;
+	use pallet_voting::MACITallyVerifier;
+
+	#[test]
+	fn non_dev_mode_rejects_a_fabricated_tally() {
+		// Same fabricated "proof" as the dev-mode test — must be rejected outside dev-mode,
+		// closing the CRITICAL gap where PassthroughMACIVerifier used to accept it unconditionally.
+		assert!(!FailClosedMACIVerifier::verify_tally(
+			0,
+			1_000_000,
+			0,
+			[0u8; 32],
+			&[0xde, 0xad, 0xbe, 0xef],
+		));
 	}
 }
 
@@ -404,7 +480,13 @@ impl pallet_voting::Config for Runtime {
 	/// 3/4 supermajority required to pass a foundational referendum.
 	type FoundationalPassageThreshold = ConstU8<75>;
 	type LawEnactor = Runtime;
+	/// Dev builds pass every tally through unverified (`PassthroughMACIVerifier`); non-dev
+	/// builds reject every tally until a real MACI circuit verifier replaces
+	/// `FailClosedMACIVerifier`. See both structs' doc comments above.
+	#[cfg(feature = "dev-mode")]
 	type MACITallyVerifier = PassthroughMACIVerifier;
+	#[cfg(not(feature = "dev-mode"))]
+	type MACITallyVerifier = FailClosedMACIVerifier;
 	/// Fiscal year start is a legislature motion — wired to the same origin as
 	/// pallet-constitution's law-enactment gate so budget epochs are on-chain governed.
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
@@ -619,8 +701,14 @@ impl pallet_elections::Config for Runtime {
 	type CandidateDeposit = ConstU128<1_000_000_000_000>;
 	type MaxCommissioners = ConstU32<20>;
 	type MaxCandidatesPerElection = ConstU32<100>;
-	/// Hard cap on registered delegates; bounds on_initialize iteration.
+	/// Hard cap on registered delegates.
 	type MaxDelegates = ConstU32<10_000>;
+	/// Bounds on_initialize's per-block delegate sweep (term warnings/expirations,
+	/// break-endings) to a constant amount of work regardless of how many of the up-to-10,000
+	/// `MaxDelegates` are actually registered — a full sweep completes within
+	/// `MaxDelegates / MaxDelegateSweepPerBlock` = 100 blocks (~10-20 min at this chain's
+	/// block time) in the worst case.
+	type MaxDelegateSweepPerBlock = ConstU32<100>;
 	type Currency = Balances;
 	type CitizenChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.

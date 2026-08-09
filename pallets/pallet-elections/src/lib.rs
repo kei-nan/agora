@@ -48,10 +48,19 @@ pub mod pallet {
     use codec::DecodeWithMemTracking;
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, ReservableCurrency},
+        traits::{Currency, EnsureOriginWithArg, ReservableCurrency},
     };
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Saturating, Zero};
+
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `GovernanceOrigin` to authorize `tag`'s call with `params`. See
+    /// `pallet_constitution::pallet::legislature_call_hash` for the full rationale.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
 
     // ── Balance type alias ─────────────────────────────────────────────────────
 
@@ -154,15 +163,26 @@ pub mod pallet {
         #[pallet::constant]
         type MaxCandidatesPerElection: Get<u32>;
 
-        /// Hard cap on the number of registered delegates (bounds on_initialize iteration).
+        /// Hard cap on the number of registered delegates.
         #[pallet::constant]
         type MaxDelegates: Get<u32>;
+
+        /// Maximum number of `Delegates` entries `on_initialize` examines per block for term
+        /// warnings/expirations and break-endings. Bounds per-block weight to a constant
+        /// regardless of how many delegates are registered (up to `MaxDelegates`), instead of
+        /// scanning the whole map every block — see `DelegateSweepCursor`.
+        #[pallet::constant]
+        type MaxDelegateSweepPerBlock: Get<u32>;
 
         type Currency: ReservableCurrency<Self::AccountId>;
         type CitizenChecker: CitizenChecker<Self::AccountId>;
 
         /// Origin that can change `BackingThreshold` (ordinary supermajority governance).
-        type GovernanceOrigin: EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg` so the call site must pass the domain-separated hash of its
+        /// own parameters (see `legislature_call_hash`); the origin then verifies that hash
+        /// against the motion's approved `call_hash`, so a motion passed to authorize an
+        /// unrelated legislature-gated call elsewhere can never be replayed here.
+        type GovernanceOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
 
         /// Origin that can change constitutional parameters (supermajority + HRC veto).
         type ConstitutionalOrigin: EnsureOrigin<Self::RuntimeOrigin>;
@@ -247,6 +267,15 @@ pub mod pallet {
     #[pallet::storage]
     pub type Delegates<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, DelegateInfo<BlockNumberFor<T>>>;
+
+    /// Resume point for `on_initialize`'s per-block sweep of `Delegates` (term warnings,
+    /// expirations, break-endings): the account *after* which the next block's sweep should
+    /// resume, or `None` to start from the beginning of the map. Set to `None` whenever a
+    /// sweep reaches the end of the map, so the next block wraps back to the start — this
+    /// bounds each block's work to `MaxDelegateSweepPerBlock` entries instead of the whole
+    /// map, while still covering every delegate over a bounded number of blocks.
+    #[pallet::storage]
+    pub type DelegateSweepCursor<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
     /// Number of citizens currently backing each delegate.
     #[pallet::storage]
@@ -456,8 +485,36 @@ pub mod pallet {
             let complement: BlockNumberFor<T> = (100u32.saturating_sub(warning_pct as u32)).into();
             let warning_offset: BlockNumberFor<T> = (term_length / hundred) * complement;
 
-            let delegates: alloc::vec::Vec<_> = Delegates::<T>::iter().collect();
-            for (account, mut info) in delegates {
+            // Bounded sweep: examine at most `MaxDelegateSweepPerBlock` delegates this block,
+            // resuming from wherever the last block's sweep left off (`DelegateSweepCursor`),
+            // instead of iterating every registered delegate unconditionally every block. With
+            // `MaxDelegates` in the thousands, an unbounded full-map scan every block is an
+            // unbounded-weight griefing vector; this caps it to a constant while still covering
+            // every delegate within `MaxDelegates / MaxDelegateSweepPerBlock` blocks.
+            let batch_size = T::MaxDelegateSweepPerBlock::get() as usize;
+            // A misconfigured zero batch size disables the sweep entirely rather than
+            // falling back to an unbounded scan (which is exactly the griefing vector this
+            // is meant to close).
+            if batch_size == 0 {
+                return weight;
+            }
+
+            let cursor = DelegateSweepCursor::<T>::get();
+            weight = weight.saturating_add(T::DbWeight::get().reads(1));
+            let sweep_iter = match &cursor {
+                Some(key) => Delegates::<T>::iter_from_key(key.clone()),
+                None => Delegates::<T>::iter(),
+            };
+
+            let mut examined = 0usize;
+            let mut last_key = None;
+
+            for (account, mut info) in sweep_iter {
+                if examined >= batch_size {
+                    break;
+                }
+                examined += 1;
+                last_key = Some(account.clone());
                 weight = weight.saturating_add(T::DbWeight::get().reads(1));
 
                 match info.status {
@@ -533,6 +590,21 @@ pub mod pallet {
                     }
                     DelegateStatus::Pending => {}
                 }
+            }
+
+            // Fewer than a full batch means the sweep reached the end of the map this
+            // block -- wrap back to the start next block. Otherwise resume right after the
+            // last delegate we examined.
+            if examined < batch_size {
+                if cursor.is_some() {
+                    DelegateSweepCursor::<T>::kill();
+                    weight = weight.saturating_add(T::DbWeight::get().writes(1));
+                }
+            } else {
+                DelegateSweepCursor::<T>::put(
+                    last_key.expect("examined >= batch_size > 0 implies at least one entry seen"),
+                );
+                weight = weight.saturating_add(T::DbWeight::get().writes(1));
             }
 
             weight
@@ -767,7 +839,10 @@ pub mod pallet {
         #[pallet::call_index(10)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn set_backing_threshold(origin: OriginFor<T>, threshold: u32) -> DispatchResult {
-            T::GovernanceOrigin::ensure_origin(origin)?;
+            T::GovernanceOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-elections::set_backing_threshold", threshold),
+            )?;
             ensure!(threshold >= BackingThresholdFloor::<T>::get(), Error::<T>::ThresholdBelowFloor);
             ensure!(threshold <= BackingThresholdCeiling::<T>::get(), Error::<T>::ThresholdAboveCeiling);
             BackingThreshold::<T>::put(threshold);

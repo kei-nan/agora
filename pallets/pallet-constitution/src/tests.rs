@@ -723,3 +723,46 @@ fn revoke_amendment_can_be_called_again_after_new_proposal() {
 		assert_eq!(Laws::<Test>::get(id), Some((LawTier::Structural, LawStatus::Active, 2, h(3))));
 	});
 }
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// These sanity-check the domain-separated hash `LegislatureOrigin`-gated calls compute
+// (see `crate::pallet::legislature_call_hash`). The mock's `LegislatureOrigin` uses
+// `AsEnsureOriginWithArg<EnsureRoot<u64>>`, which ignores the hash argument -- that's
+// deliberate, this pallet's own suite tests this pallet's logic, not the binding
+// invariant itself. The binding invariant (a token approved for call A is rejected when
+// presented against call B's hash) is proven directly against the real
+// `EnsureLegislatureMotion` origin in `pallet_legislature::tests::
+// ensure_legislature_motion_rejects_mismatched_call_hash`. What we check here is the
+// property that origin check actually depends on: that two different calls -- including
+// two different calls *in this pallet* -- never hash to the same value, so a token
+// approved for one could never accidentally satisfy another.
+
+#[test]
+fn legislature_call_hash_differs_across_calls_with_the_same_raw_parameters() {
+	// `enact_law`'s (tier, content_hash) and `propose_constitutional_amendment`'s
+	// (law_id, new_hash) both encode as a small integer/tag followed by a [u8; 32] --
+	// close enough in shape that without domain separation by call tag they could
+	// collide. They must not.
+	let enact_hash =
+		crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Ordinary, h(1)));
+	let amend_hash = crate::pallet::legislature_call_hash(
+		b"pallet-constitution::propose_constitutional_amendment",
+		(0u32, h(1)),
+	);
+	assert_ne!(enact_hash, amend_hash);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_arguments_to_the_same_call() {
+	let hash_a = crate::pallet::legislature_call_hash(b"pallet-constitution::repeal_law", 1u32);
+	let hash_b = crate::pallet::legislature_call_hash(b"pallet-constitution::repeal_law", 2u32);
+	assert_ne!(hash_a, hash_b);
+}
+
+#[test]
+fn legislature_call_hash_is_deterministic() {
+	let a = crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Ordinary, h(1)));
+	let b = crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Ordinary, h(1)));
+	assert_eq!(a, b);
+}

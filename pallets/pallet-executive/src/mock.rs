@@ -40,7 +40,11 @@ impl pallet_executive::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     // Root is authorized (stand-in for EnsureLegislatureMotion); any signed origin is
     // not — lets tests drive both the authorized and unauthorized-origin paths.
-    type LegislatureOrigin = frame_system::EnsureRoot<u64>;
+    // `AsEnsureOriginWithArg` ignores the call-hash argument `LegislatureOrigin` now
+    // requires -- this pallet's own tests exercise this pallet's logic, not the call-hash
+    // binding invariant (covered by pallet-legislature's own test suite).
+    type LegislatureOrigin =
+        frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type MaxPortfolios = ConstU32<5>;
     type MaxEmergencyBlocks = ConstU32<100>;
     type RatificationWindowBlocks = ConstU32<10>;

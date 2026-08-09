@@ -1,10 +1,10 @@
 use crate::{
     mock::*, BackingCount, BackingOf, BackingThreshold, BackingThresholdCeiling,
     BackingThresholdFloor, CandidateCount, Candidates, CandidateStatus, CitizenBackingCount,
-    Commissioners, DelegateInfo, DelegateStatus, Delegates, Elections as ElectionMap,
-    ElectionCycleBlocks, ElectionStatus, Error, Event, LastElectionBlock, LegislatureSeats,
-    MandatoryBreakBlocks, MaxBackingsPerCitizen, MaxConsecutiveTerms, NextElectionId,
-    TermLengthBlocks, WarningWindowPct,
+    Commissioners, DelegateInfo, DelegateStatus, DelegateSweepCursor, Delegates,
+    Elections as ElectionMap, ElectionCycleBlocks, ElectionStatus, Error, Event,
+    LastElectionBlock, LegislatureSeats, MandatoryBreakBlocks, MaxBackingsPerCitizen,
+    MaxConsecutiveTerms, NextElectionId, TermLengthBlocks, WarningWindowPct,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -1111,6 +1111,72 @@ fn on_initialize_ends_break_to_pending_when_below_threshold() {
     });
 }
 
+// ─── on_initialize: bounded delegate sweep (LOW-severity griefing fix) ───────
+//
+// Previously `on_initialize` collected and iterated *every* `Delegates` entry, every block,
+// unconditionally -- with `MaxDelegates` in the thousands in production, that's unbounded
+// per-block weight. The fix bounds each block's sweep to `MaxDelegateSweepPerBlock` entries
+// (10 in this mock) and resumes via `DelegateSweepCursor` on subsequent blocks.
+
+#[test]
+fn on_initialize_sweep_is_bounded_per_block_and_resumes_via_cursor() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        // 12 delegates -- more than MAX_DELEGATE_SWEEP_PER_BLOCK (10) -- each activated by
+        // three dedicated backers (so none of the per-backer/per-delegate caps interact),
+        // all with term_start_block = 1.
+        for d in 1..=12u64 {
+            register_delegate(d);
+            let backer_base = 100 + d * 10;
+            back(backer_base, d);
+            back(backer_base + 1, d);
+            back(backer_base + 2, d);
+            assert_eq!(Delegates::<Test>::get(d).unwrap().status, DelegateStatus::Active);
+        }
+        assert!(DelegateSweepCursor::<Test>::get().is_none());
+
+        // warning_offset = (100 / 100) * (100 - 20) = 80 blocks after term start.
+        System::set_block_number(1 + 80);
+        let _ = Elections::on_initialize(System::block_number());
+
+        let warned_after_first =
+            (1..=12u64).filter(|d| Delegates::<Test>::get(d).unwrap().warning_emitted).count();
+        // The actual fix: at most MAX_DELEGATE_SWEEP_PER_BLOCK delegates get examined in one
+        // block, not all 12 -- before the fix this would already be 12 here.
+        assert_eq!(warned_after_first, MAX_DELEGATE_SWEEP_PER_BLOCK as usize);
+        // A full batch was consumed with more delegates left -- the cursor must be set so the
+        // next block resumes after the last one examined, not from the beginning.
+        assert!(DelegateSweepCursor::<Test>::get().is_some());
+
+        // A second call (same block) resumes from the cursor and finishes the remaining 2.
+        let _ = Elections::on_initialize(System::block_number());
+        let warned_after_second =
+            (1..=12u64).filter(|d| Delegates::<Test>::get(d).unwrap().warning_emitted).count();
+        assert_eq!(warned_after_second, 12);
+        // The sweep reached the end of the map and wrapped back to the start.
+        assert!(DelegateSweepCursor::<Test>::get().is_none());
+    });
+}
+
+#[test]
+fn on_initialize_sweep_wraps_around_when_delegate_count_is_under_the_batch_size() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+
+        System::set_block_number(1 + 80);
+        let _ = Elections::on_initialize(System::block_number());
+
+        // Fewer delegates than the batch size -- the sweep reaches the end of the map in one
+        // call, so the cursor must not be left dangling.
+        assert!(Delegates::<Test>::get(1).unwrap().warning_emitted);
+        assert!(DelegateSweepCursor::<Test>::get().is_none());
+    });
+}
+
 // ─── on_initialize: legislature election cycle ───────────────────────────────
 
 #[test]
@@ -1197,4 +1263,17 @@ fn on_initialize_election_excludes_pending_delegates() {
 
         assert_eq!(seat_calls(), vec![vec![1]]);
     });
+}
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. This
+// pallet has only one `GovernanceOrigin`-gated call, so there's no sibling call to collide
+// with here -- we just confirm different arguments to `set_backing_threshold` hash
+// differently (the property the origin's mismatch check depends on).
+#[test]
+fn legislature_call_hash_differs_for_different_thresholds() {
+    let a = crate::pallet::legislature_call_hash(b"pallet-elections::set_backing_threshold", 3u32);
+    let b = crate::pallet::legislature_call_hash(b"pallet-elections::set_backing_threshold", 4u32);
+    assert_ne!(a, b);
 }

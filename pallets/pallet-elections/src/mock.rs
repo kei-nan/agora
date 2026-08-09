@@ -62,6 +62,11 @@ pub const CANDIDATE_DEPOSIT: Balance = 100;
 pub const MAX_COMMISSIONERS: u32 = 5;
 pub const MAX_CANDIDATES_PER_ELECTION: u32 = 5;
 pub const MAX_DELEGATES: u32 = 20;
+// Comfortably above the delegate counts used by existing sweep-behavior tests (a handful of
+// delegates each), so a single `on_initialize` call still sweeps all of them in those tests.
+// `pagination_*` tests below deliberately register more than this to exercise the
+// multi-block sweep behavior itself.
+pub const MAX_DELEGATE_SWEEP_PER_BLOCK: u32 = 10;
 pub const DEFAULT_LEGISLATURE_SEATS: u32 = 3;
 pub const DEFAULT_ELECTION_CYCLE_BLOCKS: u32 = 20;
 // Deliberately larger than the "5-50 block" rule of thumb: on_initialize computes the term
@@ -125,11 +130,15 @@ impl pallet_elections::Config for Test {
     type MaxCommissioners = ConstU32<MAX_COMMISSIONERS>;
     type MaxCandidatesPerElection = ConstU32<MAX_CANDIDATES_PER_ELECTION>;
     type MaxDelegates = ConstU32<MAX_DELEGATES>;
+    type MaxDelegateSweepPerBlock = ConstU32<MAX_DELEGATE_SWEEP_PER_BLOCK>;
     type Currency = Balances;
     type CitizenChecker = TestCitizenChecker;
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for the governance/constitutional calls.
-    type GovernanceOrigin = EnsureRoot<u64>;
+    // `AsEnsureOriginWithArg` ignores the call-hash argument `GovernanceOrigin` now
+    // requires -- this pallet's own tests exercise this pallet's logic, not the call-hash
+    // binding invariant (covered by pallet-legislature's own test suite).
+    type GovernanceOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
     type ConstitutionalOrigin = EnsureRoot<u64>;
     type LegislatureSeating = TestSeatLegislature;
     type DefaultLegislatureSeats = ConstU32<DEFAULT_LEGISLATURE_SEATS>;

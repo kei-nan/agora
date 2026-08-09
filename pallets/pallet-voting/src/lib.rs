@@ -1,15 +1,42 @@
 //! # Voting Pallet
 //!
-//! Two separate participation systems:
-//! 1. MACI 1p1v — receipt-free anonymous voting for laws and elections.
-//! 2. Budget QV — quadratic budget token allocation for fiscal priorities.
+//! Three participation systems:
+//! 1. MACI 1p1v (`commit_vote` / `submit_maci_tally`) — receipt-free anonymous voting for laws
+//!    and elections. Votes are opaque encrypted commitments keyed by nullifier; the actual
+//!    yes/no tally is computed off-chain and accepted on-chain only alongside a ZK proof
+//!    (`Config::MACITallyVerifier`) attesting it is the correct decryption of those commitments.
+//! 2. Referenda (`vote_referendum` / `finalize_referendum`) — plaintext, directly-signed 1p1v
+//!    voting on a specific referendum, tallied on-chain in `ReferendumTally`.
+//! 3. Budget QV — quadratic budget token allocation for fiscal priorities.
 //!
-//! Liquid democracy delegation applies to system 1 only.
-//! Suspended citizens are excluded from both systems via `Config::CitizenChecker::is_active_citizen`,
-//! checked at the start of every citizen-facing call. Delegations also carry a bounded
-//! `expires_at` ceiling (`MaxDelegationDurationBlocks`), so a suspended citizen's existing
-//! delegation lapses on its own rather than persisting indefinitely.
+//! ## Liquid democracy delegation
+//! `Delegations` is wired into system 2 (Referenda) only: `finalize_referendum` calls
+//! `apply_delegated_weight`, which adds a non-voting delegator's weight to whichever side their
+//! (transitively resolved) delegate voted, if that delegate voted directly. See
+//! `apply_delegated_weight`'s and `topic_id_of`'s doc comments for exactly how, and for the
+//! known "topic" limitation.
+//!
+//! Delegation is deliberately **not** resolved on-chain for system 1 (MACI). MACI's whole point
+//! is that `VoteCommitments` are opaque — an observer should not be able to tell what a
+//! commitment decrypts to, or which encrypted commitments any two accounts' votes have any
+//! relationship to. Cross-referencing the plaintext, publicly-readable `Delegations` graph
+//! (which links real `AccountId`s to each other) against MACI commitments on-chain would leak
+//! exactly the linkage MACI exists to hide — "these N encrypted commitments are all the same
+//! block of delegated voting power" is itself a receipt. Real delegation-aware MACI tallying has
+//! to happen off-chain, inside whatever computes `yes_votes`/`no_votes` before producing the ZK
+//! proof passed to `submit_maci_tally` — i.e. inside a MACI coordinator service, which does not
+//! exist yet in this repo (see `CLAUDE.md`'s "Remaining Work": no real MACI circuit verifier is
+//! wired in either, `MACITallyVerifier` is fail-closed outside `dev-mode` — search
+//! `FailClosedMACIVerifier` in `runtime/src/configs/mod.rs`). Tracked as a follow-up, not
+//! attempted here.
+//!
+//! Suspended citizens are excluded from all systems via `Config::CitizenChecker::is_active_citizen`,
+//! checked at the start of every citizen-facing call (including, for delegated weight, the
+//! delegator — see `apply_delegated_weight`). Delegations also carry a bounded `expires_at`
+//! ceiling (`MaxDelegationDurationBlocks`), so a suspended citizen's existing delegation lapses
+//! on its own rather than persisting indefinitely.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
@@ -23,8 +50,18 @@ pub mod pallet {
 
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `LegislatureOrigin` to authorize `tag`'s call with `params`. See
+    /// `pallet_constitution::pallet::legislature_call_hash` for the full rationale.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -143,10 +180,15 @@ pub mod pallet {
         /// Verifier for MACI tally ZK proofs. Use PassthroughMACIVerifier in dev; wire in the
         /// real MACI verifier once circuit trusted setup is complete.
         type MACITallyVerifier: MACITallyVerifier;
-        /// The origin permitted to start a new fiscal year (open a new budget epoch).
-        /// Wired to the legislature motion origin so only a passed legislature vote
-        /// can open a new fiscal year. Use EnsureRoot during development.
-        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// The origin permitted to start a new fiscal year (open a new budget epoch), submit
+        /// MACI tallies, open voting epochs, and create constitutional/foundational
+        /// referenda directly. Wired to the legislature motion origin so only a passed
+        /// legislature vote can do these. `EnsureOriginWithArg` so each call site must pass
+        /// the domain-separated hash of its own parameters (see `legislature_call_hash`);
+        /// the origin then verifies that hash against the motion's approved `call_hash`, so
+        /// a motion passed to authorize one call can never be replayed to execute another.
+        /// Use EnsureRoot during development.
+        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
         /// Minimum duration of a voting epoch in blocks.
         #[pallet::constant]
         type MinEpochDurationBlocks: Get<u32>;
@@ -240,6 +282,14 @@ pub mod pallet {
     /// Tracks which accounts have voted in which referendum (one vote per citizen).
     #[pallet::storage]
     pub type ReferendumHasVoted<T: Config> =
+        StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool, ValueQuery>;
+
+    /// Records each direct voter's `in_favor` choice: (referendum_id, voter) -> in_favor.
+    /// Only meaningful when `ReferendumHasVoted` is true for the same key. Read by
+    /// `apply_delegated_weight` at finalize time to know which side a delegate's transitive
+    /// delegators' weight should be added to.
+    #[pallet::storage]
+    pub type ReferendumVoteChoice<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool, ValueQuery>;
 
     #[pallet::storage]
@@ -385,6 +435,33 @@ pub mod pallet {
         /// Commit an encrypted vote (MACI commitment). Actual tally done off-chain with ZK proof.
         /// The nullifier is derived from the caller's registered identity — callers cannot supply
         /// an arbitrary nullifier, which enforces 1-person-1-vote.
+        ///
+        /// ## Known sender-anonymity gap
+        /// This call requires `ensure_signed`, so the extrinsic's signing `AccountId` (`who`
+        /// below) is publicly visible on-chain — in the block/extrinsic itself, independent of
+        /// anything this pallet stores. What actually gets *written to pallet storage* is
+        /// already nullifier-scoped, not `who`-scoped (`VoteCommitments` is keyed by
+        /// `(proposal_id, nullifier)`, and `Event::VoteCommitted` only carries the nullifier) —
+        /// but pallet-identity's `CitizenNullifier` storage is a public, permanent map from
+        /// `AccountId -> nullifier`. So anyone watching the chain can join "this signed extrinsic
+        /// came from `AccountId` X" with "X's nullifier is N" (a public lookup) and learn "the
+        /// citizen behind nullifier N participated in proposal P at block B" — i.e. *whether* and
+        /// *when* someone voted is linkable to their real registered identity, even though *what*
+        /// they voted stays hidden inside the encrypted `commitment`. This is weaker than the
+        /// MACI/Semaphore "receipt-free, unlinkable" framing in `CLAUDE.md` implies, which
+        /// expects participation itself to be unlinkable, not just vote content.
+        ///
+        /// A real fix needs the extrinsic to not carry the signer's `AccountId` at all — e.g. an
+        /// unsigned extrinsic validated via a custom `ValidateUnsigned`/`SignedExtension` that
+        /// checks a Semaphore-style ZK group-membership proof instead of a signature, or a
+        /// relayer/mixnet that decouples submission from the signing key. Searched this codebase
+        /// for either pattern before writing this comment: none exists yet. Every other
+        /// citizen-facing extrinsic that also carries similarly sensitive identity material
+        /// (`pallet-identity`'s `register_citizen`, `reverify_citizen`, `migrate_oprf_scheme`) is
+        /// `ensure_signed` too, for the same reason: there's no unsigned/anonymous-submission
+        /// infrastructure anywhere in this repo to reuse. Building one is a genuine architectural
+        /// addition (new transaction-validity logic, new proof type, new client-side flow), not a
+        /// local fix to this call — left as a tracked gap rather than force a partial change here.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn commit_vote(
@@ -508,7 +585,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             tokens_per_citizen: u64,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-voting::start_fiscal_year", tokens_per_citizen),
+            )?;
             let epoch = FiscalYearEpoch::<T>::get().saturating_add(1);
             FiscalYearEpoch::<T>::put(epoch);
             EpochTokenAllocation::<T>::insert(epoch, tokens_per_citizen);
@@ -611,6 +691,7 @@ pub mod pallet {
                 Error::<T>::AlreadyVotedInReferendum
             );
             ReferendumHasVoted::<T>::insert((referendum_id, &who), true);
+            ReferendumVoteChoice::<T>::insert((referendum_id, &who), in_favor);
             ReferendumTally::<T>::mutate(referendum_id, |(yes, no)| {
                 if in_favor { *yes = yes.saturating_add(1); } else { *no = no.saturating_add(1); }
             });
@@ -633,6 +714,15 @@ pub mod pallet {
                 frame_system::Pallet::<T>::block_number() > end_block,
                 Error::<T>::ReferendumStillActive
             );
+            // Resolve liquid-democracy delegation into the tally before reading it. Any citizen
+            // who delegated their vote on this referendum's topic and did NOT vote directly gets
+            // their weight added on top of whichever side their (transitively resolved) delegate
+            // voted, provided that delegate voted directly. Safe to run exactly once here: the
+            // state transition below moves the referendum out of `Voting`, and the `ensure!`
+            // above guarantees finalize_referendum can never re-enter this branch for the same
+            // referendum_id. See `topic_id_of` and `apply_delegated_weight` doc comments.
+            let topic_id = Self::topic_id_of(&topic_hash);
+            Self::apply_delegated_weight(referendum_id, topic_id, end_block);
             let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
             let total = yes_count.saturating_add(no_count);
             let threshold = match tier {
@@ -672,7 +762,13 @@ pub mod pallet {
             commitment_root: [u8; 32],
             proof_bytes: BoundedVec<u8, ConstU32<4096>>,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-voting::submit_maci_tally",
+                    (proposal_id, yes_votes, no_votes, commitment_root, proof_bytes.clone()),
+                ),
+            )?;
             let (end_block, topic_hash, tier) =
                 Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(
@@ -718,7 +814,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             duration_blocks: u32,
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-voting::open_voting_epoch", duration_blocks),
+            )?;
             ensure!(ActiveEpoch::<T>::get().is_none(), Error::<T>::EpochAlreadyActive);
             ensure!(
                 duration_blocks >= T::MinEpochDurationBlocks::get()
@@ -745,7 +844,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             topic_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-voting::create_constitutional_referendum", topic_hash),
+            )?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
             let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
@@ -777,7 +879,10 @@ pub mod pallet {
             origin: OriginFor<T>,
             topic_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-voting::create_foundational_referendum", topic_hash),
+            )?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
             let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
@@ -903,6 +1008,119 @@ pub mod pallet {
                 }
             }
             true
+        }
+
+        /// Derives the liquid-democracy `topic_id` for a proposal/referendum from its
+        /// `topic_hash` (the content hash citizens already pass to `submit_proposal`,
+        /// `create_constitutional_referendum`, `create_foundational_referendum`, and — via
+        /// `PetitionApprover` — petitions).
+        ///
+        /// `Delegations` is keyed by a coarse `topic_id: u32` (e.g. an external "healthcare" /
+        /// "budget" category — see the module doc comment and `DelegationRecord`), but nothing
+        /// upstream of this pallet has ever assigned real category ids: every proposal and
+        /// referendum is only tagged with `topic_hash`, a per-item content hash (the IPFS CID of
+        /// the specific bill/petition text). Introducing a real category taxonomy would mean
+        /// threading a new parameter through `submit_proposal`, both `create_*_referendum` calls,
+        /// and the cross-pallet `PetitionApprover` trait implemented in `pallet-constitution` and
+        /// the runtime — a bigger, multi-pallet change than this pass's scope (wiring
+        /// `Delegations` into the actual tally, which previously had zero effect on any vote
+        /// count). Deriving a stable id from the low 4 bytes of `topic_hash` keeps delegation
+        /// self-contained to this pallet and makes it *functional* (a delegate's vote now counts
+        /// for whoever delegated to them, transitively) — but note the known limitation: two
+        /// referenda that a human would consider the same topic (e.g. two different healthcare
+        /// bills) will not share a `topic_id` unless their hashes happen to collide in those 4
+        /// bytes, so "per-topic" delegation today behaves closer to "per specific proposal
+        /// content" than a durable category a citizen can set once and forget. A real fix needs
+        /// an actual topic taxonomy chosen upstream (by the legislature/petition proposer) —
+        /// tracked as follow-up, not attempted here.
+        pub(crate) fn topic_id_of(topic_hash: &[u8; 32]) -> u32 {
+            u32::from_le_bytes([topic_hash[0], topic_hash[1], topic_hash[2], topic_hash[3]])
+        }
+
+        /// Read-only variant of the chain walk `has_delegation_cycle` performs: follows
+        /// `Delegations` from `who` for up to `MaxDelegationDepth` hops and returns the final
+        /// account the chain bottoms out at (i.e. the first account in the chain with no active
+        /// outgoing delegation on `topic_id`). Returns `who` unchanged if they have no active
+        /// delegation on this topic at all.
+        ///
+        /// A delegation is treated as active only while `reference_block <= record.expires_at`,
+        /// matching `DelegationRecord`'s doc comment ("valid for referenda whose close block ≤
+        /// expires_at") — callers doing referendum tallying should pass the referendum's
+        /// `end_block`, not the current block, so a delegation that was active for the entire
+        /// voting window still counts even if `finalize_referendum` itself is called later, after
+        /// the delegation's `expires_at` has since passed.
+        ///
+        /// Deliberately does **not** mutate storage (unlike `has_delegation_cycle`'s lazy
+        /// cleanup of expired records) so it is safe to call from within a loop over
+        /// `Delegations::<T>::iter()` in `apply_delegated_weight` without disturbing iteration.
+        /// Expired records it walks past are simply left for the normal lazy-cleanup paths
+        /// (`delegate_vote`, `revoke_delegation`, `has_delegation_cycle`) to remove later.
+        fn resolve_delegate_readonly(
+            who: &T::AccountId,
+            topic_id: u32,
+            reference_block: BlockNumberFor<T>,
+        ) -> T::AccountId {
+            let mut current = who.clone();
+            for _ in 0..T::MaxDelegationDepth::get() {
+                match Delegations::<T>::get((current.clone(), topic_id)) {
+                    Some(record) if record.expires_at >= reference_block => {
+                        current = record.delegate;
+                    }
+                    _ => break,
+                }
+            }
+            current
+        }
+
+        /// Adds delegated weight to `ReferendumTally` for `referendum_id` on behalf of every
+        /// citizen who has an active delegation on `topic_id` and did not cast a direct vote on
+        /// this referendum themselves. A direct vote always overrides delegation — only
+        /// non-voting delegators are considered here.
+        ///
+        /// For each such delegator, resolves the delegation chain transitively (via
+        /// `resolve_delegate_readonly`, reusing the same graph/expiry/depth-bound semantics
+        /// `has_delegation_cycle` uses when a delegation is first set) to find the final
+        /// delegate. If that final delegate cast a direct vote on this referendum, the
+        /// delegator's weight is added to whichever side (`in_favor`/`ReferendumVoteChoice`) the
+        /// delegate voted. Delegators who are currently suspended or unregistered are skipped —
+        /// a suspended citizen shouldn't gain representation by proxy any more than they could by
+        /// voting directly (`vote_referendum` already enforces this for direct votes via
+        /// `CitizenChecker`).
+        ///
+        /// Revocation is respected automatically: `revoke_delegation` removes the `Delegations`
+        /// entry outright, so a revoked delegation simply never appears in the iteration below.
+        ///
+        /// Called exactly once per referendum, from `finalize_referendum`, before that call
+        /// transitions the referendum out of `ReferendumState::Voting` — see the `ensure!` guard
+        /// there for why this can't double-apply.
+        fn apply_delegated_weight(referendum_id: u32, topic_id: u32, reference_block: BlockNumberFor<T>) {
+            for ((delegator, rec_topic_id), _record) in Delegations::<T>::iter() {
+                if rec_topic_id != topic_id {
+                    continue;
+                }
+                if !T::CitizenChecker::is_active_citizen(&delegator) {
+                    continue;
+                }
+                // Direct vote always overrides delegation.
+                if ReferendumHasVoted::<T>::get((referendum_id, &delegator)) {
+                    continue;
+                }
+                let final_delegate =
+                    Self::resolve_delegate_readonly(&delegator, topic_id, reference_block);
+                if final_delegate == delegator {
+                    continue; // no active delegation after resolution (e.g. it expired)
+                }
+                if ReferendumHasVoted::<T>::get((referendum_id, &final_delegate)) {
+                    let in_favor = ReferendumVoteChoice::<T>::get((referendum_id, &final_delegate));
+                    ReferendumTally::<T>::mutate(referendum_id, |(yes, no)| {
+                        if in_favor {
+                            *yes = yes.saturating_add(1);
+                        } else {
+                            *no = no.saturating_add(1);
+                        }
+                    });
+                }
+            }
         }
     }
 }

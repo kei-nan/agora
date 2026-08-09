@@ -1,8 +1,9 @@
 use crate::{
-    committee_slot_for, mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex, CitizenNullifier,
-    CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry, NextQueryId,
-    NullifierRegistry, OprfCommitteeKeys, OprfResponses, OprfSchemeVersion, PendingOprfQueries,
-    ReverificationDeadline, SelfDeclaredSingleDocument, SuspendedNullifiers, TotalCitizens,
+    committee_slot_for, dlog_verify, mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex,
+    CitizenNullifier, CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry,
+    NextQueryId, NullifierRegistry, OprfCommitteeKeys, OprfResponses, OprfSchemeVersion,
+    PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument, SuspendedNullifiers,
+    TotalCitizens,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -1401,8 +1402,61 @@ fn remove_committee_member_fails_when_not_present() {
 
 // ─── submit_oprf_query ───────────────────────────────────────────────────────
 
+// Real Chaum-Pedersen known-answer vector, `dlog.nr`'s `test_verify_dlog_equality` — the same
+// vector `crate::dlog_verify`'s own unit tests validate against, and the same one
+// `oprf-committee-dev/src/dlog.rs`'s test uses. Used below to exercise `submit_oprf_response`'s
+// real crypto checks with a proof that actually verifies, not just well-formed-looking bytes.
+const KAT_PK_X: [u8; 32] = [0x23, 0x7b, 0x03, 0x90, 0xc5, 0x70, 0x39, 0xbd, 0xfa, 0xd1, 0x56, 0xe5, 0xda, 0xa7, 0xa2, 0xbb, 0x04, 0x77, 0x65, 0xa7, 0x69, 0x7f, 0xe1, 0xbe, 0x43, 0x37, 0xd8, 0x14, 0x30, 0xd1, 0x6c, 0xa1];
+const KAT_PK_Y: [u8; 32] = [0x1d, 0xbd, 0x0d, 0x37, 0x42, 0xc4, 0x82, 0xa6, 0x55, 0xff, 0xde, 0x62, 0x44, 0xee, 0xbb, 0x9b, 0xb1, 0x6e, 0xa4, 0xdc, 0x9b, 0x81, 0x7f, 0x42, 0x60, 0xd1, 0x46, 0x80, 0x47, 0xc4, 0x58, 0xec];
+const KAT_QUERY_X: [u8; 32] = [0x20, 0x03, 0xf2, 0x72, 0x60, 0xa0, 0xb5, 0xee, 0x81, 0xb8, 0x4f, 0x66, 0xf8, 0xbf, 0x27, 0x61, 0xea, 0x95, 0x57, 0x26, 0x2a, 0x4b, 0xcd, 0x16, 0xdb, 0x5c, 0xa7, 0xab, 0xde, 0xee, 0x18, 0x85];
+const KAT_QUERY_Y: [u8; 32] = [0x1e, 0xb4, 0x5d, 0x38, 0xc9, 0x7f, 0x7e, 0x65, 0xac, 0x1b, 0x76, 0xd2, 0x34, 0xdb, 0x32, 0x37, 0xd2, 0x86, 0x0f, 0x2b, 0x25, 0xc4, 0x3e, 0x02, 0x06, 0x93, 0xef, 0x92, 0xb5, 0xa5, 0xf7, 0x93];
+const KAT_RESPONSE_X: [u8; 32] = [0x0f, 0x37, 0x55, 0xe8, 0xda, 0x35, 0xf8, 0x81, 0xdb, 0xb4, 0x11, 0x14, 0xd5, 0x24, 0x7a, 0xca, 0x13, 0x24, 0x4e, 0x7c, 0x69, 0xca, 0x4f, 0x4f, 0x5a, 0x0b, 0x5c, 0xc3, 0xf1, 0x1f, 0x75, 0x39];
+const KAT_RESPONSE_Y: [u8; 32] = [0x19, 0x39, 0xf8, 0xc6, 0xbd, 0x5c, 0xc7, 0x81, 0xf0, 0xf3, 0x79, 0xdd, 0x31, 0xc1, 0xc8, 0xa3, 0xcd, 0x62, 0xa0, 0x5e, 0x24, 0xb8, 0x85, 0xd8, 0xba, 0x4a, 0xdd, 0xa4, 0xab, 0x0d, 0x19, 0x24];
+const KAT_DLOG_E: [u8; 32] = [0x0c, 0x66, 0xbf, 0x6a, 0xab, 0xed, 0xc2, 0x84, 0x9d, 0x54, 0xcd, 0xd4, 0xdc, 0xb9, 0x1b, 0x62, 0x04, 0xd2, 0x76, 0xe3, 0x2c, 0xed, 0xd6, 0x77, 0x77, 0x90, 0x02, 0xca, 0x83, 0xdc, 0xa5, 0xc2];
+const KAT_DLOG_S: [u8; 32] = [0x02, 0x94, 0xc7, 0x22, 0x55, 0x74, 0xf8, 0xb9, 0x6b, 0x5d, 0xed, 0x86, 0x48, 0xd0, 0x67, 0x53, 0x7d, 0x04, 0xa6, 0x29, 0x17, 0xfb, 0x57, 0x50, 0xe8, 0xb3, 0xdc, 0xed, 0xbe, 0xe0, 0x0c, 0xfe];
+
+/// BabyJubJub generator point — a real, valid, on-curve/in-subgroup point, but a different one
+/// from `KAT_QUERY_*` above. Used as a second query's `blinded_query` to prove a response
+/// bound to one query cannot be replayed against another *real* query point (not just against
+/// malformed bytes).
+const GENERATOR_X: [u8; 32] = [0x0b, 0xb7, 0x7a, 0x6a, 0xd6, 0x3e, 0x73, 0x9b, 0x4e, 0xac, 0xb2, 0xe0, 0x9d, 0x62, 0x77, 0xc1, 0x2a, 0xb8, 0xd8, 0x01, 0x05, 0x34, 0xe0, 0xb6, 0x28, 0x93, 0xf3, 0xf6, 0xbb, 0x95, 0x70, 0x51];
+const GENERATOR_Y: [u8; 32] = [0x25, 0x79, 0x72, 0x03, 0xf7, 0xa0, 0xb2, 0x49, 0x25, 0x57, 0x2e, 0x1c, 0xd1, 0x6b, 0xf9, 0xed, 0xfc, 0xe0, 0x05, 0x1f, 0xb9, 0xe1, 0x33, 0x77, 0x4b, 0x3c, 0x25, 0x7a, 0x87, 0x2d, 0x7d, 0x8b];
+
+fn point64(x: [u8; 32], y: [u8; 32]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[0..32].copy_from_slice(&x);
+    out[32..64].copy_from_slice(&y);
+    out
+}
+
+/// The real committee public key from the KAT vector above.
+fn committee_pubkey() -> [u8; 64] {
+    point64(KAT_PK_X, KAT_PK_Y)
+}
+
+/// A valid Chaum-Pedersen proof (`dlog_e || dlog_s`) that `evaluation()` is a genuine OPRF
+/// evaluation of `blinded_query()` under the secret key behind `committee_pubkey()`.
+fn valid_dlog_proof() -> BoundedVec<u8, ConstU32<64>> {
+    let mut bytes = KAT_DLOG_E.to_vec();
+    bytes.extend_from_slice(&KAT_DLOG_S);
+    BoundedVec::try_from(bytes).unwrap()
+}
+
+/// Governance-approves the *real* `committee_pubkey()` for `slot` under the current
+/// `OprfSchemeVersion` — overwrites whatever `register()`'s `approve_committee_keys` set for
+/// that slot (those are arbitrary placeholder hashes unrelated to any real key pair).
+fn approve_real_committee_pubkey(slot: u8) {
+    let hash = dlog_verify::hash_committee_pubkey(committee_pubkey());
+    assert_ok!(Identity::set_oprf_committee_key(
+        RuntimeOrigin::root(),
+        OprfSchemeVersion::<Test>::get(),
+        slot,
+        hash,
+    ));
+}
+
 fn blinded_query() -> [u8; 64] {
-    [7u8; 64]
+    point64(KAT_QUERY_X, KAT_QUERY_Y)
 }
 
 #[test]
@@ -1454,10 +1508,16 @@ fn submit_oprf_query_increments_query_id_across_submissions() {
 
 // ─── submit_oprf_response ───────────────────────────────────────────────────
 
+/// The real KAT evaluation point, matching `blinded_query()`/`committee_pubkey()`/
+/// `valid_dlog_proof()` above.
 fn evaluation() -> [u8; 64] {
-    [8u8; 64]
+    point64(KAT_RESPONSE_X, KAT_RESPONSE_Y)
 }
 
+/// A well-formed-length but garbage proof — never satisfies the DLEQ relation for any
+/// query/pubkey/evaluation. Used by tests that exercise checks other than proof validity
+/// itself (they fail before the crypto check is even reached), and by the dedicated
+/// "invalid proof is rejected" test.
 fn dlog_proof_64() -> BoundedVec<u8, ConstU32<64>> {
     BoundedVec::try_from(vec![9u8; 64]).unwrap()
 }
@@ -1477,19 +1537,22 @@ fn submit_oprf_response_works() {
         System::set_block_number(1);
         let query_id = setup_pending_query();
         assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
 
         assert_ok!(Identity::submit_oprf_response(
             RuntimeOrigin::signed(42),
             query_id,
             2,
             evaluation(),
-            dlog_proof_64(),
+            committee_pubkey(),
+            valid_dlog_proof(),
         ));
 
         let record = OprfResponses::<Test>::get(query_id, 2).expect("response should exist");
         assert_eq!(record.responder, 42);
         assert_eq!(record.evaluation, evaluation());
-        assert_eq!(record.dlog_proof.into_inner(), vec![9u8; 64]);
+        assert_eq!(record.committee_pubkey, committee_pubkey());
+        assert_eq!(record.dlog_proof.into_inner(), valid_dlog_proof().into_inner());
         System::assert_last_event(
             Event::OprfResponseSubmitted { query_id, committee_slot: 2, responder: 42 }.into(),
         );
@@ -1508,6 +1571,7 @@ fn submit_oprf_response_fails_for_out_of_range_slot() {
                 query_id,
                 5,
                 evaluation(),
+                committee_pubkey(),
                 dlog_proof_64(),
             ),
             Error::<Test>::InvalidCommitteeSlot
@@ -1530,6 +1594,7 @@ fn submit_oprf_response_fails_for_wrong_dlog_proof_length() {
                 query_id,
                 2,
                 evaluation(),
+                committee_pubkey(),
                 short_proof,
             ),
             Error::<Test>::InvalidDlogProofLength
@@ -1549,6 +1614,7 @@ fn submit_oprf_response_fails_for_nonexistent_query() {
                 999,
                 2,
                 evaluation(),
+                committee_pubkey(),
                 dlog_proof_64(),
             ),
             Error::<Test>::QueryNotFound
@@ -1571,6 +1637,7 @@ fn submit_oprf_response_fails_for_member_of_a_different_slot() {
                 query_id,
                 2,
                 evaluation(),
+                committee_pubkey(),
                 dlog_proof_64(),
             ),
             Error::<Test>::NotCommitteeMember
@@ -1590,6 +1657,7 @@ fn submit_oprf_response_fails_for_non_member() {
                 query_id,
                 2,
                 evaluation(),
+                committee_pubkey(),
                 dlog_proof_64(),
             ),
             Error::<Test>::NotCommitteeMember
@@ -1603,12 +1671,14 @@ fn submit_oprf_response_fails_for_double_response() {
         System::set_block_number(1);
         let query_id = setup_pending_query();
         assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
         assert_ok!(Identity::submit_oprf_response(
             RuntimeOrigin::signed(42),
             query_id,
             2,
             evaluation(),
-            dlog_proof_64(),
+            committee_pubkey(),
+            valid_dlog_proof(),
         ));
 
         assert_noop!(
@@ -1617,7 +1687,8 @@ fn submit_oprf_response_fails_for_double_response() {
                 query_id,
                 2,
                 evaluation(),
-                dlog_proof_64(),
+                committee_pubkey(),
+                valid_dlog_proof(),
             ),
             Error::<Test>::DuplicateResponse
         );
@@ -1640,6 +1711,7 @@ fn submit_oprf_response_fails_for_expired_query() {
                 query_id,
                 2,
                 evaluation(),
+                committee_pubkey(),
                 dlog_proof_64(),
             ),
             Error::<Test>::QueryExpired
@@ -1653,6 +1725,7 @@ fn submit_oprf_response_succeeds_at_the_exact_deadline_block() {
         System::set_block_number(1);
         let query_id = setup_pending_query();
         assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
 
         // Deadline is posted_at (1) + OprfQuerySlaBlocks (10) = 11, inclusive.
         System::set_block_number(11);
@@ -1661,7 +1734,206 @@ fn submit_oprf_response_succeeds_at_the_exact_deadline_block() {
             query_id,
             2,
             evaluation(),
-            dlog_proof_64(),
+            committee_pubkey(),
+            valid_dlog_proof(),
         ));
     });
+}
+
+// ─── Real Chaum-Pedersen crypto: proof validity + query binding ────────────────
+
+/// A response with a valid proof (matching pubkey, query, and evaluation) is accepted — the
+/// positive counterpart of the two rejection tests below. Duplicates the assertions in
+/// `submit_oprf_response_works` above deliberately, so this whole trio reads as one group.
+#[test]
+fn submit_oprf_response_accepts_a_genuinely_valid_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
+
+        assert_ok!(Identity::submit_oprf_response(
+            RuntimeOrigin::signed(42),
+            query_id,
+            2,
+            evaluation(),
+            committee_pubkey(),
+            valid_dlog_proof(),
+        ));
+    });
+}
+
+/// An otherwise well-formed (right length, right query, right pubkey-hash-on-file) but
+/// cryptographically bogus proof must be rejected — this is the core fix: previously any
+/// 64-byte blob was accepted with no verification at all.
+#[test]
+fn submit_oprf_response_fails_for_invalid_dlog_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
+
+        assert_noop!(
+            Identity::submit_oprf_response(
+                RuntimeOrigin::signed(42),
+                query_id,
+                2,
+                evaluation(),
+                committee_pubkey(),
+                dlog_proof_64(),
+            ),
+            Error::<Test>::InvalidDlogProof
+        );
+        assert!(OprfResponses::<Test>::get(query_id, 2).is_none());
+    });
+}
+
+/// Flipping a single bit of an otherwise-valid proof must break verification — confirms the
+/// check is a real cryptographic recomputation, not e.g. a length-only or presence-only check.
+#[test]
+fn submit_oprf_response_fails_for_a_single_bit_flip_in_an_otherwise_valid_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
+
+        let mut tampered = valid_dlog_proof().into_inner();
+        tampered[0] ^= 0x01;
+
+        assert_noop!(
+            Identity::submit_oprf_response(
+                RuntimeOrigin::signed(42),
+                query_id,
+                2,
+                evaluation(),
+                committee_pubkey(),
+                BoundedVec::try_from(tampered).unwrap(),
+            ),
+            Error::<Test>::InvalidDlogProof
+        );
+    });
+}
+
+/// A response whose `committee_pubkey` doesn't hash to the governance-approved key on file
+/// (here: no key has been approved for this slot at all) must be rejected, even with an
+/// otherwise-valid proof for that pubkey — a committee member cannot vouch for their own key.
+#[test]
+fn submit_oprf_response_fails_for_unrecognized_committee_pubkey() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        // Deliberately no `approve_real_committee_pubkey(2)` call — `register()` (inside
+        // `setup_pending_query`) already set slot 2's key to an arbitrary unrelated hash via
+        // `approve_committee_keys`, which does not match `committee_pubkey()`'s real hash.
+
+        assert_noop!(
+            Identity::submit_oprf_response(
+                RuntimeOrigin::signed(42),
+                query_id,
+                2,
+                evaluation(),
+                committee_pubkey(),
+                valid_dlog_proof(),
+            ),
+            Error::<Test>::UnrecognizedCommitteePublicKey
+        );
+    });
+}
+
+/// The core query-binding property: a proof that is genuinely valid for query A must be
+/// rejected when submitted against a *different*, real, on-file query B — even though B's
+/// `blinded_query` is itself a perfectly valid subgroup point (the generator), just not the
+/// one this proof was computed for. Without this check, a committee member's single valid
+/// response could be replayed to "answer" every other pending query in the same slot.
+#[test]
+fn submit_oprf_response_fails_when_proof_is_bound_to_a_different_query() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        // Query A: the real KAT query point (`blinded_query()`), via `setup_pending_query`.
+        let query_a = setup_pending_query();
+        // Query B: a second, different, real, on-file query point.
+        assert_ok!(Identity::submit_oprf_query(
+            RuntimeOrigin::signed(1),
+            point64(GENERATOR_X, GENERATOR_Y),
+        ));
+        let query_b = query_a + 1;
+        assert_eq!(
+            PendingOprfQueries::<Test>::get(query_b).unwrap().blinded_query,
+            point64(GENERATOR_X, GENERATOR_Y)
+        );
+
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        approve_real_committee_pubkey(2);
+
+        // The proof/evaluation pair is genuinely valid for query A...
+        assert_ok!(Identity::submit_oprf_response(
+            RuntimeOrigin::signed(42),
+            query_a,
+            2,
+            evaluation(),
+            committee_pubkey(),
+            valid_dlog_proof(),
+        ));
+
+        // ...but replaying the exact same evaluation/proof against query B must fail: the
+        // DLEQ relation is checked against query B's own `blinded_query`, which this proof
+        // was never computed for.
+        assert_noop!(
+            Identity::submit_oprf_response(
+                RuntimeOrigin::signed(42),
+                query_b,
+                2,
+                evaluation(),
+                committee_pubkey(),
+                valid_dlog_proof(),
+            ),
+            Error::<Test>::InvalidDlogProof
+        );
+        assert!(OprfResponses::<Test>::get(query_b, 2).is_none());
+    });
+}
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. The
+// binding invariant itself is proven against the real `EnsureLegislatureMotion` origin in
+// pallet-legislature's own suite; here we confirm this pallet's `AdminOrigin`-gated calls
+// never hash to the same value for overlapping raw parameters -- in particular that a
+// motion approved to add a Merkle root can't double as authorization to set an OPRF
+// committee key, or vice versa.
+#[test]
+fn legislature_call_hash_differs_between_merkle_root_and_committee_key_calls() {
+    let merkle_root =
+        crate::pallet::legislature_call_hash(b"pallet-identity::add_allowed_merkle_root", NULLIFIER_A);
+    let committee_key = crate::pallet::legislature_call_hash(
+        b"pallet-identity::set_oprf_committee_key",
+        (1u32, 0u8, NULLIFIER_A),
+    );
+    assert_ne!(merkle_root, committee_key);
+}
+
+#[test]
+fn legislature_call_hash_differs_between_add_and_remove_merkle_root() {
+    let add =
+        crate::pallet::legislature_call_hash(b"pallet-identity::add_allowed_merkle_root", NULLIFIER_A);
+    let remove =
+        crate::pallet::legislature_call_hash(b"pallet-identity::remove_allowed_merkle_root", NULLIFIER_A);
+    assert_ne!(add, remove);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_committee_slots() {
+    let a = crate::pallet::legislature_call_hash(
+        b"pallet-identity::set_oprf_committee_key",
+        (1u32, 0u8, NULLIFIER_A),
+    );
+    let b = crate::pallet::legislature_call_hash(
+        b"pallet-identity::set_oprf_committee_key",
+        (1u32, 1u8, NULLIFIER_A),
+    );
+    assert_ne!(a, b);
 }

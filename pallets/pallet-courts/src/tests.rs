@@ -313,6 +313,9 @@ fn file_case_reserves_bond_when_filer_can_afford_it() {
 		System::assert_last_event(
 			Event::CaseFiled { case_id, filer: 1, subject: CaseSubject::General }.into(),
 		);
+	});
+}
+
 // ─── AI model governance (supermajority vote) ─────────────────────────────
 
 #[test]
@@ -371,6 +374,10 @@ fn file_case_fails_with_insufficient_balance_and_leaves_no_dangling_reserve() {
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
 		// NextCaseId must not have advanced — the call failed before any state was written.
 		assert_eq!(crate::NextCaseId::<Test>::get(), case_id);
+	});
+}
+
+#[test]
 fn add_ai_governance_member_requires_root() {
 	new_test_ext().execute_with(|| {
 		assert_noop!(
@@ -385,7 +392,8 @@ fn file_case_bond_is_released_when_finalized_without_appeal() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
-		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32]));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
 		assert_eq!(Balances::reserved_balance(1), CASE_FILING_BOND);
 
 		// Let the appeal window (100 blocks in the mock) lapse, then finalize.
@@ -394,6 +402,10 @@ fn file_case_bond_is_released_when_finalized_without_appeal() {
 
 		assert_eq!(Balances::reserved_balance(1), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
 fn vote_approve_ai_model_rejects_double_vote() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(Courts::add_ai_governance_member(RuntimeOrigin::root(), 101));
@@ -441,6 +453,10 @@ fn file_case_bond_is_released_when_jury_finalizes_case() {
 
 		assert_eq!(Balances::reserved_balance(1), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
 fn submit_ai_ruling_rejects_stale_model_version() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
@@ -472,6 +488,10 @@ fn auto_file_case_does_not_reserve_bond() {
 		// succeeded above, and nothing is reserved.
 		assert_eq!(Balances::reserved_balance(filer), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
 fn submit_ai_ruling_succeeds_with_current_approved_version() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();

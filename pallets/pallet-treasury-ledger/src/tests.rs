@@ -462,3 +462,31 @@ fn record_expenditure_succeeds_again_after_unfreeze() {
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
 	});
 }
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. The
+// binding invariant itself (a token approved for call A is rejected against call B's
+// hash) is proven against the real `EnsureLegislatureMotion` origin in
+// pallet-legislature's own suite; here we just confirm this pallet's two
+// `LegislatureOrigin`-gated calls never hash to the same value for overlapping raw
+// parameters, which is the property that invariant depends on.
+#[test]
+fn legislature_call_hash_differs_across_allocate_budget_and_reset_department_spent() {
+	let allocate_hash = crate::pallet::legislature_call_hash(
+		b"pallet-treasury-ledger::allocate_budget",
+		(DEPT, 1_000u128),
+	);
+	let reset_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", DEPT);
+	assert_ne!(allocate_hash, reset_hash);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_department_ids() {
+	let hash_a =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", 1u32);
+	let hash_b =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", 2u32);
+	assert_ne!(hash_a, hash_b);
+}

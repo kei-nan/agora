@@ -788,3 +788,35 @@ fn minister_checker_false_for_unrelated_account() {
         assert!(!<Executive as MinisterChecker<u64>>::is_active_minister(&999));
     });
 }
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. The
+// binding invariant itself is proven against the real `EnsureLegislatureMotion` origin in
+// pallet-legislature's own suite; here we confirm this pallet's `LegislatureOrigin`-gated
+// calls never hash to the same value for overlapping raw parameters -- in particular the
+// scenario the security review called out by name: a motion approved to `appoint_minister`
+// must not double as authorization to `ratify_emergency` (or any other gated call here).
+#[test]
+fn legislature_call_hash_differs_between_appoint_minister_and_ratify_emergency() {
+    let appoint =
+        crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
+    let ratify = crate::pallet::legislature_call_hash(b"pallet-executive::ratify_emergency", ());
+    assert_ne!(appoint, ratify);
+}
+
+#[test]
+fn legislature_call_hash_differs_between_appoint_minister_and_dismiss_minister() {
+    // Same portfolio_id shape as part of the params, different call tag.
+    let appoint =
+        crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
+    let dismiss = crate::pallet::legislature_call_hash(b"pallet-executive::dismiss_minister", 0u32);
+    assert_ne!(appoint, dismiss);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_appointees() {
+    let a = crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
+    let b = crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 2u64));
+    assert_ne!(a, b);
+}

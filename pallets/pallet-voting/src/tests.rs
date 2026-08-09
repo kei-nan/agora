@@ -934,6 +934,147 @@ fn finalize_referendum_foundational_tier_passes_above_threshold() {
     });
 }
 
+// ── liquid democracy delegation resolution (finalize_referendum) ────────────
+//
+// `hash(0)` derives `topic_id` 0 (`u32::from_le_bytes([0, 0, 0, 0])`) via `topic_id_of`, which
+// happens to match the `topic_id` literal (`0`) every `delegate_vote` test above already uses —
+// no coincidence, chosen so delegations set up the usual way line up with these referenda
+// without a separate topic-id computation in every test.
+
+/// Creates a referendum with an explicit `topic_hash` (unlike `make_referendum`, which always
+/// uses `hash(7)`) so delegation topic_id can be made to line up with it deliberately.
+fn make_referendum_with_hash(petition_id: u32, tier: ReferendumTier, topic_hash: [u8; 32]) -> u32 {
+    assert_ok!(Voting::create_referendum_internal(petition_id, topic_hash, tier));
+    NextReferendumId::<Test>::get() - 1
+}
+
+#[test]
+fn finalize_referendum_counts_delegated_weight_for_the_delegate() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        activate_citizen(1); // delegator, never votes directly
+        activate_citizen(2); // delegate, votes directly
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+        // Before finalize, the raw tally only reflects citizen 2's own direct vote.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0));
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // Citizen 1 never voted, but delegated to citizen 2 — their weight now counts too.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (2, 0));
+        let (_, _, _, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Passed);
+    });
+}
+
+#[test]
+fn finalize_referendum_direct_vote_overrides_delegation_no_double_count() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        activate_citizen(1);
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        // Citizen 1 delegated to 2, but still casts their own (opposite) vote directly.
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(1), rid, false));
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // 1 yes (citizen 2) / 1 no (citizen 1's own direct vote) — no delegated weight added on
+        // top, since citizen 1 voted directly.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 1));
+    });
+}
+
+#[test]
+fn finalize_referendum_resolves_transitive_delegation_chain() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        activate_citizen(1);
+        activate_citizen(2);
+        activate_citizen(3);
+        // 1 -> 2 -> 3; only 3 votes directly. MAX_DELEGATION_DEPTH (3) comfortably covers this.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(2), 3, 0, MAX_DELEGATION_DURATION));
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(3), rid, true));
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // Citizen 3's own vote plus both citizen 1 and citizen 2's transitively-resolved weight.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (3, 0));
+    });
+}
+
+#[test]
+fn finalize_referendum_ignores_delegated_weight_when_delegate_never_votes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        activate_citizen(1);
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        // Citizen 2 never calls vote_referendum.
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        assert_eq!(ReferendumTally::<Test>::get(rid), (0, 0));
+        let (_, _, _, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Failed);
+    });
+}
+
+#[test]
+fn finalize_referendum_excludes_delegated_weight_from_suspended_delegator() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        activate_citizen(1);
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        // Citizen 1 is suspended after delegating but before the referendum closes.
+        set_active_citizen(1, false);
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // Only citizen 2's own vote — a suspended citizen doesn't gain representation by proxy.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0));
+    });
+}
+
+#[test]
+fn finalize_referendum_counts_delegation_active_through_referendum_close_even_if_expired_by_finalize_time() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        // end_block = 1 + REFERENDUM_DURATION = 21.
+        activate_citizen(1);
+        activate_citizen(2);
+        // Delegation expires exactly at the referendum's close block (expires_at == end_block),
+        // per DelegationRecord's documented "valid for referenda whose close block <= expires_at".
+        assert_ok!(Voting::delegate_vote(
+            RuntimeOrigin::signed(1),
+            2,
+            0,
+            REFERENDUM_DURATION,
+        ));
+        let expires_at = Delegations::<Test>::get((1u64, 0u32)).unwrap().expires_at;
+        assert_eq!(expires_at, 1 + REFERENDUM_DURATION as u64);
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+        // Call finalize well after the delegation's expires_at has passed (block "now" > 21).
+        System::set_block_number(expires_at + 10);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // Still counted: validity is judged against the referendum's end_block, not the block
+        // finalize_referendum happens to be called at.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (2, 0));
+    });
+}
+
 // ── submit_maci_tally ────────────────────────────────────────────────────────
 
 #[test]
@@ -1207,4 +1348,31 @@ fn create_referendum_internal_fails_on_duplicate_petition() {
             Error::<Test>::ReferendumAlreadyExists
         );
     });
+}
+
+// ── legislature_call_hash (HIGH-severity motion-hijack fix) ────────────────────
+//
+// See the equivalent block in pallet-constitution's tests for the full rationale. The
+// binding invariant itself is proven against the real `EnsureLegislatureMotion` origin in
+// pallet-legislature's own suite; here we confirm this pallet's five
+// `LegislatureOrigin`-gated calls never hash to the same value for overlapping raw
+// parameters.
+#[test]
+fn legislature_call_hash_differs_across_constitutional_and_foundational_referenda() {
+    // Both calls take exactly one `[u8; 32]` argument -- the case most likely to collide
+    // without the call-tag domain separator.
+    let constitutional =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(1));
+    let foundational =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_foundational_referendum", hash(1));
+    assert_ne!(constitutional, foundational);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_different_topic_hashes() {
+    let a =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(1));
+    let b =
+        crate::pallet::legislature_call_hash(b"pallet-voting::create_constitutional_referendum", hash(2));
+    assert_ne!(a, b);
 }

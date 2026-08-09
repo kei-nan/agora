@@ -17,6 +17,7 @@
 //!
 //! Courts may pause any Active law via CourtOrigin.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
@@ -28,6 +29,7 @@ mod tests;
 pub mod pallet {
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
 
@@ -103,6 +105,18 @@ pub mod pallet {
         fn auto_challenge_law(law_id: u32) -> DispatchResult;
     }
 
+    /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
+    /// `EnsureLegislatureMotion` (or any `LegislatureOrigin`) to authorize `tag`'s call with
+    /// `params`. `tag` should uniquely identify the pallet + dispatchable (e.g.
+    /// `b"pallet-constitution::enact_law"`) so that byte-identical parameters passed to a
+    /// different call — in this pallet or another legislature-gated one — never collide.
+    /// Off-chain tooling proposing a motion must compute the hash the same way.
+    pub(crate) fn legislature_call_hash(tag: &'static [u8], params: impl Encode) -> [u8; 32] {
+        let mut preimage = alloc::vec::Vec::from(tag);
+        preimage.extend(params.encode());
+        frame_support::Hashable::blake2_256(&preimage)
+    }
+
     // ── Pallet ───────────────────────────────────────────────────────────────────
 
     #[pallet::pallet]
@@ -116,7 +130,11 @@ pub mod pallet {
 
         // ── Legislature ──────────────────────────────────────────────────────────
         /// Origin representing a passed legislature motion (law enactment + Ordinary amendments).
-        type LegislatureOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg` so each call site is *required* to pass the domain-separated
+        /// hash of its own parameters (see `legislature_call_hash` below) — the origin check
+        /// itself then verifies that hash against the motion's approved `call_hash`, so a
+        /// motion passed to authorize one call can never be replayed to execute another.
+        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
 
         // ── Ordinary amendments ──────────────────────────────────────────────────
         /// Deliberation blocks before an Ordinary amendment can be ratified (may be 0).
@@ -262,7 +280,10 @@ pub mod pallet {
             tier: LawTier,
             content_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::enact_law", (tier.clone(), content_hash)),
+            )?;
             let id = NextLawId::<T>::get();
             Laws::<T>::insert(id, (tier.clone(), LawStatus::Active, 1u32, content_hash));
             NextLawId::<T>::put(id.saturating_add(1));
@@ -298,7 +319,10 @@ pub mod pallet {
             law_id: u32,
             proposed_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::propose_amendment", (law_id, proposed_hash)),
+            )?;
             let law = Laws::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
             ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
             ensure!(law.0 == LawTier::Ordinary, Error::<T>::UseConstitutionalAmendmentCall);
@@ -316,7 +340,10 @@ pub mod pallet {
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn ratify_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::ratify_amendment", law_id),
+            )?;
             let (new_hash, proposed_at) =
                 PendingAmendments::<T>::take(law_id).ok_or(Error::<T>::AmendmentNotFound)?;
             let deliberation =
@@ -402,7 +429,10 @@ pub mod pallet {
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn repeal_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::repeal_law", law_id),
+            )?;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
                 ensure!(law.1 != LawStatus::Repealed, Error::<T>::LawAlreadyRepealed);
@@ -430,7 +460,13 @@ pub mod pallet {
             law_id: u32,
             new_hash: [u8; 32],
         ) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-constitution::propose_constitutional_amendment",
+                    (law_id, new_hash),
+                ),
+            )?;
             let law = Laws::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
             ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
             ensure!(
@@ -481,7 +517,10 @@ pub mod pallet {
         #[pallet::call_index(8)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn reaffirm_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::reaffirm_amendment", law_id),
+            )?;
             ConstitutionalAmendments::<T>::try_mutate(law_id, |maybe_record| {
                 let record =
                     maybe_record.as_mut().ok_or(Error::<T>::ConstitutionalAmendmentNotFound)?;
