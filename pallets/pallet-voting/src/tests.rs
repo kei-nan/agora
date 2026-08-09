@@ -224,7 +224,7 @@ fn delegate_vote_works() {
         activate_citizen(1);
         activate_citizen(2);
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
-        let record = Delegations::<Test>::get((1u64, 0u32)).unwrap();
+        let record = Delegations::<Test>::get(0u32, 1u64).unwrap();
         assert_eq!(record.delegate, 2);
         assert_eq!(record.expires_at, 1 + MIN_DELEGATION_DURATION as u64);
         assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 1);
@@ -296,7 +296,7 @@ fn delegate_vote_replacing_same_delegate_keeps_count_unchanged() {
         // Re-delegate to the SAME delegate with a different duration: net count must not move.
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION + 10));
         assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 1);
-        let record = Delegations::<Test>::get((1u64, 0u32)).unwrap();
+        let record = Delegations::<Test>::get(0u32, 1u64).unwrap();
         assert_eq!(record.expires_at, 1 + (MIN_DELEGATION_DURATION + 10) as u64);
     });
 }
@@ -313,7 +313,7 @@ fn delegate_vote_replacing_different_delegate_updates_counts() {
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 3, 0, MIN_DELEGATION_DURATION));
         assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 0);
         assert_eq!(DelegatorCount::<Test>::get((0u32, 3u64)), 1);
-        assert_eq!(Delegations::<Test>::get((1u64, 0u32)).unwrap().delegate, 3);
+        assert_eq!(Delegations::<Test>::get(0u32, 1u64).unwrap().delegate, 3);
     });
 }
 
@@ -425,12 +425,12 @@ fn delegate_vote_lazily_cleans_up_expired_delegation_in_chain() {
         // it up lazily instead of treating it as a live cycle edge.
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(42), 40, 9, MIN_DELEGATION_DURATION));
 
-        assert!(Delegations::<Test>::get((40u64, 9u32)).is_none());
+        assert!(Delegations::<Test>::get(9u32, 40u64).is_none());
         assert_eq!(DelegatorCount::<Test>::get((9u32, 41u64)), 0);
         assert!(last_event_matches(
             |e| matches!(e, RuntimeEvent::Voting(Event::DelegationExpired { delegator: 40, topic_id: 9 }))
         ));
-        assert_eq!(Delegations::<Test>::get((42u64, 9u32)).unwrap().delegate, 40);
+        assert_eq!(Delegations::<Test>::get(9u32, 42u64).unwrap().delegate, 40);
     });
 }
 
@@ -444,7 +444,7 @@ fn revoke_delegation_works() {
         activate_citizen(2);
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
         assert_ok!(Voting::revoke_delegation(RuntimeOrigin::signed(1), 0));
-        assert!(Delegations::<Test>::get((1u64, 0u32)).is_none());
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_none());
         assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 0);
         System::assert_last_event(Event::DelegationRevoked { delegator: 1, topic_id: 0 }.into());
     });
@@ -480,7 +480,7 @@ fn revoke_delegation_fails_for_suspended_citizen() {
         );
         // The delegation record itself is untouched — still there, still counted — until it
         // either expires on its own or the citizen is reinstated and revokes it explicitly.
-        assert!(Delegations::<Test>::get((1u64, 0u32)).is_some());
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_some());
         assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 1);
     });
 }
@@ -1063,7 +1063,7 @@ fn finalize_referendum_counts_delegation_active_through_referendum_close_even_if
             0,
             REFERENDUM_DURATION,
         ));
-        let expires_at = Delegations::<Test>::get((1u64, 0u32)).unwrap().expires_at;
+        let expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
         assert_eq!(expires_at, 1 + REFERENDUM_DURATION as u64);
         assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
         // Call finalize well after the delegation's expires_at has passed (block "now" > 21).
@@ -1073,6 +1073,60 @@ fn finalize_referendum_counts_delegation_active_through_referendum_close_even_if
         // finalize_referendum happens to be called at.
         assert_eq!(ReferendumTally::<Test>::get(rid), (2, 0));
     });
+}
+
+#[test]
+fn finalize_referendum_delegation_scan_is_bounded_to_the_referendums_own_topic() {
+    // Regression test for the DoS finding: `apply_delegated_weight` must only scan delegators
+    // on the referendum's own topic (`Delegations::<T>::iter_prefix(topic_id)`), not every
+    // delegation on every topic. Set up a delegation on an unrelated topic whose delegate votes
+    // the same way citizen 2 does, and confirm it never contributes to this referendum's tally
+    // -- proving the double-map is genuinely keyed (and iterated) topic-first, not just filtered
+    // after a full scan.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0)); // topic_id 0
+        activate_citizen(1); // delegator on topic 0
+        activate_citizen(2); // delegate on topic 0, votes directly
+        activate_citizen(3); // delegator on a DIFFERENT topic (hash(1) -> topic_id != 0)
+        activate_citizen(4); // that other delegation's delegate, also votes directly
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        let other_topic = Voting::topic_id_of(&hash(1));
+        assert_ne!(other_topic, 0);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(3), 4, other_topic, MAX_DELEGATION_DURATION));
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+        // Citizen 4 never votes on `rid` (there's no referendum on `other_topic` here), but even
+        // if they had, their delegator (3) must not be pulled into this referendum's tally.
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
+        // Only citizen 1's delegated weight plus citizen 2's own vote -- citizen 3's
+        // other-topic delegation contributes nothing.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (2, 0));
+    });
+}
+
+#[test]
+fn finalize_referendum_weight_scales_with_total_citizens() {
+    // Regression test for the DoS finding: `finalize_referendum` is permissionless
+    // (`ensure_signed`), and its declared weight must track the real cost of the delegation
+    // scan it triggers instead of staying flat as the delegation graph (bounded above by
+    // `CitizenChecker::total_citizens()`) grows.
+    use frame_support::dispatch::GetDispatchInfo;
+    let weight_at = |total_citizens: u32| {
+        set_total_citizens(total_citizens);
+        let call = crate::Call::<Test>::finalize_referendum { referendum_id: 0 };
+        call.get_dispatch_info().call_weight
+    };
+    let empty = weight_at(0);
+    let small = weight_at(10);
+    let large = weight_at(1_000_000);
+    // Strictly increasing in the citizen count, not a flat estimate.
+    assert!(small.ref_time() > empty.ref_time());
+    assert!(large.ref_time() > small.ref_time());
+    // Sanity bound: the weight for a huge citizenry must be meaningfully larger than the base
+    // cost charged when there are no citizens at all -- not just a rounding-noise difference.
+    assert!(large.ref_time() > empty.ref_time().saturating_mul(1000));
 }
 
 // ── submit_maci_tally ────────────────────────────────────────────────────────

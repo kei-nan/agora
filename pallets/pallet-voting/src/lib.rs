@@ -210,13 +210,20 @@ pub mod pallet {
     pub type VoteCommitments<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, [u8; 32]), [u8; 32]>;
 
-    /// Per-topic delegation: (delegator, topic_id) -> DelegationRecord.
+    /// Per-topic delegation: (topic_id, delegator) -> DelegationRecord.
     /// Expired records (expires_at < now) are treated as absent and cleaned up lazily.
+    ///
+    /// Keyed topic-first (a `StorageDoubleMap` rather than a single `StorageMap` over the tuple)
+    /// specifically so `apply_delegated_weight` can do `iter_prefix(topic_id)` and only scan the
+    /// delegators relevant to the referendum being finalized, instead of a full-table scan over
+    /// every delegation on every topic. See `apply_delegated_weight`'s doc comment.
     #[pallet::storage]
-    pub type Delegations<T: Config> = StorageMap<
+    pub type Delegations<T: Config> = StorageDoubleMap<
         _,
         Blake2_128Concat,
-        (T::AccountId, u32),
+        u32,
+        Blake2_128Concat,
+        T::AccountId,
         DelegationRecord<T::AccountId, BlockNumberFor<T>>,
     >;
 
@@ -510,7 +517,7 @@ pub mod pallet {
             // We must do all cap checks before touching any storage, otherwise a failed cap
             // check would leave DelegatorCount decremented while the old Delegations record
             // still exists — an inconsistency.
-            let maybe_old = Delegations::<T>::get((who.clone(), topic_id));
+            let maybe_old = Delegations::<T>::get(topic_id, who.clone());
             let replacing_same_delegate =
                 maybe_old.as_ref().map_or(false, |r| r.delegate == delegate);
 
@@ -556,7 +563,8 @@ pub mod pallet {
             let expires_at = now.saturating_add(BlockNumberFor::<T>::from(duration_blocks));
 
             Delegations::<T>::insert(
-                (who.clone(), topic_id),
+                topic_id,
+                who.clone(),
                 DelegationRecord { delegate: delegate.clone(), expires_at },
             );
             Self::deposit_event(Event::DelegationSet { delegator: who, delegate, topic_id, expires_at });
@@ -569,7 +577,7 @@ pub mod pallet {
         pub fn revoke_delegation(origin: OriginFor<T>, topic_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
-            let record = Delegations::<T>::take((who.clone(), topic_id))
+            let record = Delegations::<T>::take(topic_id, who.clone())
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
             DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
             Self::deposit_event(Event::DelegationRevoked { delegator: who, topic_id });
@@ -703,8 +711,34 @@ pub mod pallet {
         /// Finalize a referendum once the voting window has closed.
         /// Anyone may call this. Passes if yes_votes * 100 >= PassageThreshold * total_votes.
         /// On pass, calls LawEnactor to enact the law in pallet-constitution.
+        ///
+        /// Permissionless (`ensure_signed`, callable by anyone), so the declared weight must
+        /// track the real cost of what this call does, not just its own body. It internally
+        /// calls `apply_delegated_weight`, which scans `Delegations::<T>::iter_prefix(topic_id)`
+        /// — bounded to delegators on this referendum's specific topic (see that storage item's
+        /// doc comment), but every registered citizen may hold at most one delegation per topic,
+        /// so that scan can still cost up to `CitizenChecker::total_citizens()` iterations (e.g.
+        /// many distinct delegates, each near `MaxDelegationsPerDelegate`, all delegated-to on
+        /// the same topic). The weight below adds a per-citizen component on top of the flat base
+        /// cost — one flat `Weight::from_parts` estimate per potential delegator, scaled by
+        /// `MaxDelegationDepth` to account for `resolve_delegate_readonly`'s chain walk, matching
+        /// this file's other hand-estimated `Weight::from_parts` literals — so a caller pays
+        /// roughly what the scan actually costs instead of a flat estimate that silently
+        /// under-charges as the delegation graph grows. No formal benchmarking harness exists
+        /// yet in this repo; this is a conservative hand-estimate, not a benchmarked figure.
         #[pallet::call_index(8)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight({
+            // Per-delegator iteration cost: is_active_citizen + ReferendumHasVoted reads, the
+            // resolve_delegate_readonly chain walk (up to MaxDelegationDepth Delegations reads),
+            // plus a final ReferendumHasVoted/ReferendumVoteChoice read and a ReferendumTally
+            // mutate. 1_000 per step is a conservative flat estimate, not a benchmarked figure.
+            let per_delegator_steps =
+                4u64.saturating_add(T::MaxDelegationDepth::get() as u64);
+            let per_delegator = Weight::from_parts(1_000, 0).saturating_mul(per_delegator_steps);
+            let worst_case_delegators = T::CitizenChecker::total_citizens() as u64;
+            Weight::from_parts(20_000, 0)
+                .saturating_add(per_delegator.saturating_mul(worst_case_delegators))
+        })]
         pub fn finalize_referendum(origin: OriginFor<T>, referendum_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
             let (petition_id, topic_hash, end_block, state, tier) =
@@ -985,7 +1019,7 @@ pub mod pallet {
             let now = frame_system::Pallet::<T>::block_number();
             let mut current = delegate.clone();
             for _ in 0..T::MaxDelegationDepth::get() {
-                match Delegations::<T>::get((current.clone(), topic_id)) {
+                match Delegations::<T>::get(topic_id, current.clone()) {
                     Some(record) if record.expires_at >= now => {
                         if record.delegate == *who {
                             return true;
@@ -997,7 +1031,7 @@ pub mod pallet {
                         DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| {
                             *c = c.saturating_sub(1)
                         });
-                        Delegations::<T>::remove((current.clone(), topic_id));
+                        Delegations::<T>::remove(topic_id, current.clone());
                         Self::deposit_event(Event::DelegationExpired {
                             delegator: current,
                             topic_id,
@@ -1052,9 +1086,10 @@ pub mod pallet {
         ///
         /// Deliberately does **not** mutate storage (unlike `has_delegation_cycle`'s lazy
         /// cleanup of expired records) so it is safe to call from within a loop over
-        /// `Delegations::<T>::iter()` in `apply_delegated_weight` without disturbing iteration.
-        /// Expired records it walks past are simply left for the normal lazy-cleanup paths
-        /// (`delegate_vote`, `revoke_delegation`, `has_delegation_cycle`) to remove later.
+        /// `Delegations::<T>::iter_prefix(topic_id)` in `apply_delegated_weight` without
+        /// disturbing iteration. Expired records it walks past are simply left for the normal
+        /// lazy-cleanup paths (`delegate_vote`, `revoke_delegation`, `has_delegation_cycle`) to
+        /// remove later.
         fn resolve_delegate_readonly(
             who: &T::AccountId,
             topic_id: u32,
@@ -1062,7 +1097,7 @@ pub mod pallet {
         ) -> T::AccountId {
             let mut current = who.clone();
             for _ in 0..T::MaxDelegationDepth::get() {
-                match Delegations::<T>::get((current.clone(), topic_id)) {
+                match Delegations::<T>::get(topic_id, current.clone()) {
                     Some(record) if record.expires_at >= reference_block => {
                         current = record.delegate;
                     }
@@ -1093,11 +1128,14 @@ pub mod pallet {
         /// Called exactly once per referendum, from `finalize_referendum`, before that call
         /// transitions the referendum out of `ReferendumState::Voting` — see the `ensure!` guard
         /// there for why this can't double-apply.
+        ///
+        /// Iterates `Delegations::<T>::iter_prefix(topic_id)` rather than the full `Delegations`
+        /// table: `Delegations` is a `StorageDoubleMap` keyed `(topic_id, delegator)` specifically
+        /// so this scan is bounded to delegators on *this* referendum's topic, not every
+        /// delegation on every topic across the whole chain. See `finalize_referendum`'s weight
+        /// annotation for how the declared dispatch weight accounts for this scan's cost.
         fn apply_delegated_weight(referendum_id: u32, topic_id: u32, reference_block: BlockNumberFor<T>) {
-            for ((delegator, rec_topic_id), _record) in Delegations::<T>::iter() {
-                if rec_topic_id != topic_id {
-                    continue;
-                }
+            for (delegator, _record) in Delegations::<T>::iter_prefix(topic_id) {
                 if !T::CitizenChecker::is_active_citizen(&delegator) {
                     continue;
                 }
