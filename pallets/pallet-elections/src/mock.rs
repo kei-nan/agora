@@ -6,7 +6,7 @@ use frame_support::{
 use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 type Block = frame_system::mocking::MockBlock<Test>;
 type Balance = u64;
@@ -22,6 +22,10 @@ type Balance = u64;
 thread_local! {
     static ACTIVE_CITIZENS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
     static SEAT_CALLS: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
+    // Absent entry defaults to `true` (has a current disclosure) so pre-existing tests that
+    // don't care about the disclosure gate don't need to opt in — only tests that specifically
+    // exercise the gate call `set_has_current_disclosure`.
+    static DISCLOSURE_CURRENT: RefCell<BTreeMap<u64, bool>> = RefCell::new(BTreeMap::new());
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or removes them.
@@ -44,6 +48,21 @@ pub struct TestCitizenChecker;
 impl pallet_elections::CitizenChecker<u64> for TestCitizenChecker {
     fn is_active_citizen(who: &u64) -> bool {
         ACTIVE_CITIZENS.with(|c| c.borrow().contains(who))
+    }
+}
+
+/// Sets whether `who` has a current asset disclosure on file (mirrors
+/// pallet-anticorruption's `has_current_disclosure`). Unset accounts default to `true`.
+pub fn set_has_current_disclosure(who: u64, current: bool) {
+    DISCLOSURE_CURRENT.with(|d| {
+        d.borrow_mut().insert(who, current);
+    });
+}
+
+pub struct TestDisclosureChecker;
+impl pallet_elections::DisclosureChecker<u64> for TestDisclosureChecker {
+    fn has_current_disclosure(who: &u64) -> bool {
+        DISCLOSURE_CURRENT.with(|d| d.borrow().get(who).copied().unwrap_or(true))
     }
 }
 
@@ -133,6 +152,7 @@ impl pallet_elections::Config for Test {
     type MaxDelegateSweepPerBlock = ConstU32<MAX_DELEGATE_SWEEP_PER_BLOCK>;
     type Currency = Balances;
     type CitizenChecker = TestCitizenChecker;
+    type DisclosureChecker = TestDisclosureChecker;
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for the governance/constitutional calls.
     // `AsEnsureOriginWithArg` ignores the call-hash argument `GovernanceOrigin` now

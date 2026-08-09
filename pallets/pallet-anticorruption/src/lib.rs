@@ -409,5 +409,18 @@ pub mod pallet {
         fn is_investigator(who: &T::AccountId) -> bool {
             Investigators::<T>::get().contains(who)
         }
+
+        /// True if `who` has an asset declaration on file whose `update_due_at` has not yet
+        /// passed. Used by pallet-elections (via a trait impl in the runtime) to gate candidacy
+        /// on a current disclosure — an account with no disclosure, or one that's gone overdue
+        /// since it was filed, is not current.
+        pub fn has_current_disclosure(who: &T::AccountId) -> bool {
+            match AssetDisclosures::<T>::get(who) {
+                Some(declaration) => {
+                    frame_system::Pallet::<T>::block_number() <= declaration.update_due_at
+                }
+                None => false,
+            }
+        }
     }
 }

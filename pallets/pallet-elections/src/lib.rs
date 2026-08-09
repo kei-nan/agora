@@ -74,6 +74,13 @@ pub mod pallet {
         fn is_active_citizen(who: &AccountId) -> bool;
     }
 
+    /// Checks whether an account has a current (non-overdue) asset disclosure on file in
+    /// pallet-anticorruption. Implemented in the runtime by delegating to
+    /// pallet-anticorruption's `has_current_disclosure`.
+    pub trait DisclosureChecker<AccountId> {
+        fn has_current_disclosure(who: &AccountId) -> bool;
+    }
+
     /// Called by pallet-elections at the end of each election cycle.
     /// The implementation in pallet-legislature replaces the full Members set.
     pub trait SeatLegislature<AccountId> {
@@ -176,6 +183,9 @@ pub mod pallet {
 
         type Currency: ReservableCurrency<Self::AccountId>;
         type CitizenChecker: CitizenChecker<Self::AccountId>;
+
+        /// Gates candidacy on having a current asset disclosure in pallet-anticorruption.
+        type DisclosureChecker: DisclosureChecker<Self::AccountId>;
 
         /// Origin that can change `BackingThreshold` (ordinary supermajority governance).
         /// `EnsureOriginWithArg` so the call site must pass the domain-separated hash of its
@@ -455,6 +465,9 @@ pub mod pallet {
         ElectionCycleBlocksZero,
         /// Election has reached MaxCandidatesPerElection and cannot accept more registrations.
         TooManyCandidates,
+        /// Candidacy requires a current (non-overdue) asset disclosure on file in
+        /// pallet-anticorruption; the caller has none, or theirs has lapsed past its due date.
+        DisclosureRequired,
     }
 
     // ── on_initialize: term warnings, expirations, and legislature elections ───
@@ -673,6 +686,10 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::NotActiveCitizen);
+            ensure!(
+                T::DisclosureChecker::has_current_disclosure(&who),
+                Error::<T>::DisclosureRequired
+            );
             let election = Elections::<T>::get(election_id).ok_or(Error::<T>::ElectionNotFound)?;
             ensure!(election.status == ElectionStatus::Open, Error::<T>::ElectionNotOpen);
             ensure!(!Candidates::<T>::contains_key(election_id, &who), Error::<T>::CandidateAlreadyRegistered);

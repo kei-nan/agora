@@ -16,6 +16,12 @@ Storage:
 
 `ReportStatus` enum: `Pending` → `Flagged` → `UnderInvestigation` → `Cleared` | `ReferredToCourts`
 
+Enforcement: `Pallet::has_current_disclosure(who)` returns `true` only if `who` has an
+`AssetDisclosures` entry whose `update_due_at` has not yet passed. pallet-elections calls this
+(via its `DisclosureChecker` config trait, wired to `Runtime` in `runtime/src/configs/mod.rs`) to
+require a current disclosure before `register_candidate` succeeds — so letting a disclosure lapse
+past its due date blocks future candidacy, not just future disclosures.
+
 Calls:
 - `submit_asset_disclosure(ipfs_hash)` — any signed; mandatory annual renewal
 - `register_conflict(entity_id, conflict_type)` — any signed
