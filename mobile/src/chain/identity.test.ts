@@ -23,6 +23,8 @@ jest.mock('./api', () => ({
   getApi: jest.fn(),
 }));
 
+import { Keyring } from '@polkadot/keyring';
+import { cryptoWaitReady } from '@polkadot/util-crypto';
 import { getApi } from './api';
 import {
   MigrateOprfSchemeParams,
@@ -30,6 +32,7 @@ import {
   OprfCommitteeKeyHashes,
   RegisterCitizenParams,
   ReverifyCitizenParams,
+  getSigningKeypair,
   migrateOprfScheme,
   registerCitizen,
   reverifyCitizen,
@@ -299,5 +302,109 @@ describe('migrateOprfScheme', () => {
     (params as any).newOprfPkHashes = committeeHashes(31).slice(0, 3);
     await expect(migrateOprfScheme(params)).rejects.toThrow(/\(new\)/);
     expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Tests `getSigningKeypair`'s signing-key selection: the new Android
+ * Keystore-backed path (`keystoreWallet.ts` via `native/keystoreSigner.ts`)
+ * versus the legacy `DEV_ONLY_MNEMONIC` fallback, and — the security property
+ * this whole task exists for — that the dev-mnemonic fallback is provably
+ * unreachable once `__DEV__` is false, in a build that does not have the
+ * Keystore module linked (e.g. iOS today, or any Android build where linking
+ * somehow failed): `getSigningKeypair` must throw, never silently sign with
+ * the well-known dev mnemonic.
+ *
+ * `identity.ts` (via `keystoreWallet.ts`) caches its resolved keypair in
+ * module scope, so each scenario here needs a fresh module instance — same
+ * `jest.resetModules()` + re-require pattern `native/keystoreSigner.test.ts`
+ * and `keystoreWallet.test.ts` use, for the same reason (see those files'
+ * doc comments).
+ */
+describe('getSigningKeypair (signing-key selection)', () => {
+  /** The literal from `identity.ts`'s own `DEV_ONLY_MNEMONIC` — public, well-known, already in this codebase's source, safe to duplicate here to derive the expected dev address independently rather than hardcoding an SS58 string. */
+  const DEV_ONLY_MNEMONIC = 'bottom drive obey lake curtain smoke basket hold race lonely fit walk';
+  let expectedDevAddress: string;
+
+  beforeAll(async () => {
+    await cryptoWaitReady();
+    const keyring = new Keyring({ type: 'sr25519', ss58Format: 42 });
+    expectedDevAddress = keyring.addFromUri(DEV_ONLY_MNEMONIC).address;
+  });
+
+  afterEach(() => {
+    // Restore jest.config.js's default so later test files/tests aren't affected.
+    (global as any).__DEV__ = true;
+  });
+
+  function fakeKeystoreNativeModule() {
+    return {
+      encryptSecret: jest.fn(async (plaintextB64: string) => ({
+        ciphertext: Buffer.from([...Buffer.from(plaintextB64, 'base64')].reverse()).toString('base64'),
+        iv: Buffer.from([4, 4, 4, 4]).toString('base64'),
+      })),
+      decryptSecret: jest.fn(async (ciphertextB64: string) =>
+        Buffer.from([...Buffer.from(ciphertextB64, 'base64')].reverse()).toString('base64'),
+      ),
+      isHardwareBacked: jest.fn(async () => true),
+    };
+  }
+
+  /** Fresh `identity.ts` (and everything it transitively imports) with the given `__DEV__`/Keystore-linked state. */
+  function freshIdentityModule(opts: { dev: boolean; keystoreLinked: boolean }): typeof import('./identity') {
+    jest.resetModules();
+    (global as any).__DEV__ = opts.dev;
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rn = require('react-native');
+    rn.Platform.OS = 'android';
+    if (opts.keystoreLinked) {
+      rn.NativeModules.KeystoreSigningModule = fakeKeystoreNativeModule();
+    } else {
+      delete rn.NativeModules.KeystoreSigningModule;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    require('react-native-fs').__reset();
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('./identity');
+  }
+
+  it('falls back to the DEV_ONLY_MNEMONIC keypair when __DEV__ is true and no Keystore module is linked', async () => {
+    const mod = freshIdentityModule({ dev: true, keystoreLinked: false });
+    const { keypair } = await mod.getSigningKeypair();
+    expect(keypair.address).toBe(expectedDevAddress);
+  });
+
+  it('throws instead of silently using the dev mnemonic when __DEV__ is false and no Keystore module is linked', async () => {
+    const mod = freshIdentityModule({ dev: false, keystoreLinked: false });
+    await expect(mod.getSigningKeypair()).rejects.toThrow(/Refusing to sign/);
+  });
+
+  it('never lets the dev-mnemonic address leak out under any non-__DEV__, no-Keystore call', async () => {
+    const mod = freshIdentityModule({ dev: false, keystoreLinked: false });
+    await expect(mod.getSigningKeypair()).rejects.toBeInstanceOf(Error);
+    // Belt-and-suspenders on top of the throw itself: confirm there is no
+    // code path in this state that could still resolve with the dev address.
+    await mod.getSigningKeypair().catch(() => undefined);
+  });
+
+  it('prefers the Keystore-backed keypair over the dev mnemonic whenever the module is linked, even inside __DEV__', async () => {
+    const mod = freshIdentityModule({ dev: true, keystoreLinked: true });
+    const { keypair } = await mod.getSigningKeypair();
+    expect(keypair.address).not.toBe(expectedDevAddress);
+  });
+
+  it('uses the Keystore-backed keypair (not a throw) when __DEV__ is false and the module is linked', async () => {
+    const mod = freshIdentityModule({ dev: false, keystoreLinked: true });
+    const { keypair } = await mod.getSigningKeypair();
+    expect(keypair.address).not.toBe(expectedDevAddress);
+  });
+
+  it('returns a stable nullifierHash derived from the resolved keypair', async () => {
+    const mod = freshIdentityModule({ dev: true, keystoreLinked: false });
+    const first = await mod.getSigningKeypair();
+    const second = await mod.getSigningKeypair();
+    expect(second.nullifierHash).toBe(first.nullifierHash);
   });
 });

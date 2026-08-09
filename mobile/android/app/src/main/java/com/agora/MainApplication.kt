@@ -2,6 +2,7 @@ package com.agora
 
 import android.app.Application
 import com.agora.nfc.NfcPassportPackage
+import com.agora.wallet.KeystoreSigningPackage
 import com.facebook.react.PackageList
 import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
@@ -21,6 +22,7 @@ class MainApplication : Application(), ReactApplication {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
               add(NfcPassportPackage())
+              add(KeystoreSigningPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"
