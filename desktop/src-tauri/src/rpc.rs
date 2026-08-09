@@ -83,20 +83,18 @@ impl RpcClient {
         Ok(all_keys)
     }
 
-    /// Fetch a single storage value by its full hex key. Returns None if the key is absent.
+    /// Fetch a single storage value by its full hex key. Returns `Ok(None)` only when the
+    /// key is genuinely absent on-chain — a transport/RPC failure is propagated as `Err`
+    /// rather than coerced into `Ok(None)`, so callers can't mistake "node unreachable"
+    /// for "key not set".
     pub async fn get_storage(&self, key_hex: &str) -> anyhow::Result<Option<Vec<u8>>> {
         let params = Value::Array(vec![Value::String(key_hex.to_string()), Value::Null]);
-        let result = self.call("state_getStorage", params).await;
-        match result {
-            Ok(v) => {
-                if v.is_null() {
-                    Ok(None)
-                } else {
-                    let hex = v.as_str().unwrap_or("").trim_start_matches("0x").to_string();
-                    Ok(Some(hex::decode(hex)?))
-                }
-            }
-            Err(_) => Ok(None),
+        let v = self.call("state_getStorage", params).await?;
+        if v.is_null() {
+            Ok(None)
+        } else {
+            let hex = v.as_str().unwrap_or("").trim_start_matches("0x").to_string();
+            Ok(Some(hex::decode(hex)?))
         }
     }
 

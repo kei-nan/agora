@@ -78,13 +78,25 @@ pub struct Ruling {
 }
 
 /// Returns the current best and finalized block numbers from the running chain.
+///
+/// Propagates a real error when the node is unreachable rather than coercing failure
+/// into a fake `{best: 0, finalized: 0}` success — that value is indistinguishable from
+/// a genuinely synced chain at genesis, so the frontend needs a real Err to render a
+/// distinct "Disconnected" state (see `ChainContext.tsx` / `ChainStatusBar.tsx`).
 #[tauri::command]
 pub async fn chain_status() -> Result<ChainStatusResponse, String> {
-    let client = RpcClient::new(NODE_URL);
-    match client.chain_block_numbers().await {
-        Ok((best, finalized)) => Ok(ChainStatusResponse { best, finalized }),
-        Err(_) => Ok(ChainStatusResponse { best: 0, finalized: 0 }),
-    }
+    fetch_chain_status(NODE_URL).await
+}
+
+/// Testable core of `chain_status`, parameterized on the node URL so tests can point it
+/// at a definitely-unreachable address instead of the hardcoded dev node port.
+async fn fetch_chain_status(url: &str) -> Result<ChainStatusResponse, String> {
+    let client = RpcClient::new(url);
+    client
+        .chain_block_numbers()
+        .await
+        .map(|(best, finalized)| ChainStatusResponse { best, finalized })
+        .map_err(|e| format!("chain unreachable: {e}"))
 }
 
 /// Fetches active referenda from pallet-voting (Voting.Referenda + Voting.ReferendumTally).
@@ -105,15 +117,21 @@ pub async fn fetch_proposals() -> Result<Vec<Proposal>, String> {
 
     // ── Fetch referendum entries ─────────────────────────────────────────────
     let ref_prefix = storage_prefix("Voting", "Referenda");
-    let ref_keys = client.get_keys_paged(&ref_prefix).await.unwrap_or_default();
+    let ref_keys = client
+        .get_keys_paged(&ref_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     // ── Fetch tallies keyed by referendum_id ─────────────────────────────────
     let tally_prefix = storage_prefix("Voting", "ReferendumTally");
-    let tally_keys = client.get_keys_paged(&tally_prefix).await.unwrap_or_default();
+    let tally_keys = client
+        .get_keys_paged(&tally_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let tally_values = client
         .query_storage_at(&tally_keys)
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     // Build referendum_id → (yes, no) map
     let mut tallies: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -138,7 +156,7 @@ pub async fn fetch_proposals() -> Result<Vec<Proposal>, String> {
     let ref_values = client
         .query_storage_at(&ref_keys)
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     let mut proposals = Vec::new();
     for (key_hex, val_opt) in ref_keys.iter().zip(ref_values.iter()) {
@@ -192,11 +210,17 @@ pub async fn fetch_proposals() -> Result<Vec<Proposal>, String> {
 pub async fn fetch_laws() -> Result<Vec<Law>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Constitution", "Laws");
-    let keys = client.get_keys_paged(&prefix).await.unwrap_or_default();
+    let keys = client
+        .get_keys_paged(&prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     if keys.is_empty() {
         return Ok(vec![]);
     }
-    let values = client.query_storage_at(&keys).await.unwrap_or_default();
+    let values = client
+        .query_storage_at(&keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut laws = Vec::new();
     for (i, (key_hex, val_opt)) in keys.iter().zip(values.iter()).enumerate() {
         if let Some(val_hex) = val_opt {
@@ -237,11 +261,17 @@ pub async fn fetch_laws() -> Result<Vec<Law>, String> {
 pub async fn fetch_treasury() -> Result<Vec<TreasuryEntry>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("TreasuryLedger", "ExpenditureLog");
-    let keys = client.get_keys_paged(&prefix).await.unwrap_or_default();
+    let keys = client
+        .get_keys_paged(&prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     if keys.is_empty() {
         return Ok(vec![]);
     }
-    let values = client.query_storage_at(&keys).await.unwrap_or_default();
+    let values = client
+        .query_storage_at(&keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut entries = Vec::new();
     for (i, val_opt) in values.iter().enumerate() {
         if let Some(val_hex) = val_opt {
@@ -278,11 +308,23 @@ pub async fn fetch_department_budgets() -> Result<Vec<DepartmentBudget>, String>
     let budget_prefix = storage_prefix("TreasuryLedger", "DepartmentBudgets");
     let spent_prefix  = storage_prefix("TreasuryLedger", "DepartmentSpent");
 
-    let budget_keys = client.get_keys_paged(&budget_prefix).await.unwrap_or_default();
-    let spent_keys  = client.get_keys_paged(&spent_prefix).await.unwrap_or_default();
+    let budget_keys = client
+        .get_keys_paged(&budget_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let spent_keys = client
+        .get_keys_paged(&spent_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
-    let budget_vals = client.query_storage_at(&budget_keys).await.unwrap_or_default();
-    let spent_vals  = client.query_storage_at(&spent_keys).await.unwrap_or_default();
+    let budget_vals = client
+        .query_storage_at(&budget_keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let spent_vals = client
+        .query_storage_at(&spent_keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     // Build dept_id → spent map
     let mut spent_map: HashMap<u32, u128> = HashMap::new();
@@ -326,7 +368,10 @@ pub async fn fetch_department_budgets() -> Result<Vec<DepartmentBudget>, String>
 pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Identity", "NullifierRegistry");
-    let keys = client.get_keys_paged(&prefix).await.unwrap_or_default();
+    let keys = client
+        .get_keys_paged(&prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let target = hex::decode(nullifier_hex.trim_start_matches("0x"))
         .map_err(|e| format!("invalid nullifier hex: {e}"))?;
     // Each key is: 32-byte prefix + 16-byte blake2_128 hash + 32-byte nullifier
@@ -427,8 +472,14 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
 
     // ── Fetch Cases for IPFS hash cross-reference ────────────────────────────
     let cases_prefix = storage_prefix("Courts", "Cases");
-    let case_keys = client.get_keys_paged(&cases_prefix).await.unwrap_or_default();
-    let case_values = client.query_storage_at(&case_keys).await.unwrap_or_default();
+    let case_keys = client
+        .get_keys_paged(&cases_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let case_values = client
+        .query_storage_at(&case_keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     // case_id → ipfs_hash (32 bytes, may be all zeros if no ruling hash yet)
     let mut case_ipfs: HashMap<u32, String> = HashMap::new();
@@ -451,11 +502,17 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
 
     // ── Fetch Rulings (final verdicts) ───────────────────────────────────────
     let ruling_prefix = storage_prefix("Courts", "Rulings");
-    let ruling_keys = client.get_keys_paged(&ruling_prefix).await.unwrap_or_default();
+    let ruling_keys = client
+        .get_keys_paged(&ruling_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     if ruling_keys.is_empty() {
         return Ok(vec![]);
     }
-    let ruling_values = client.query_storage_at(&ruling_keys).await.unwrap_or_default();
+    let ruling_values = client
+        .query_storage_at(&ruling_keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
 
     let mut rulings = Vec::new();
     for (key_hex, val_opt) in ruling_keys.iter().zip(ruling_values.iter()) {
@@ -540,7 +597,10 @@ pub async fn fetch_legislature_data() -> Result<LegislatureData, String> {
 
     // ── Members (single StorageValue — key IS the prefix) ────────────────────
     let members_key = storage_prefix("Legislature", "Members");
-    let members_bytes = client.get_storage(&members_key).await.unwrap_or_default();
+    let members_bytes = client
+        .get_storage(&members_key)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut members: Vec<String> = Vec::new();
     if let Some(bytes) = members_bytes {
         let (count, offset) = decode_compact(&bytes);
@@ -555,10 +615,16 @@ pub async fn fetch_legislature_data() -> Result<LegislatureData, String> {
 
     // ── Motions (StorageMap<Blake2_128Concat, u32, Motion>) ──────────────────
     let motions_prefix = storage_prefix("Legislature", "Motions");
-    let motion_keys = client.get_keys_paged(&motions_prefix).await.unwrap_or_default();
+    let motion_keys = client
+        .get_keys_paged(&motions_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut motions: Vec<LegislatureMotion> = Vec::new();
     if !motion_keys.is_empty() {
-        let values = client.query_storage_at(&motion_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&motion_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in motion_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -640,8 +706,14 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
 
     // ── Backing counts keyed by AccountId ─────────────────────────────────────
     let backing_prefix = storage_prefix("PalletElections", "BackingCount");
-    let backing_keys = client.get_keys_paged(&backing_prefix).await.unwrap_or_default();
-    let backing_values = client.query_storage_at(&backing_keys).await.unwrap_or_default();
+    let backing_keys = client
+        .get_keys_paged(&backing_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let backing_values = client
+        .query_storage_at(&backing_keys)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut backing_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for (key_hex, val_opt) in backing_keys.iter().zip(backing_values.iter()) {
         if let Some(val_hex) = val_opt {
@@ -660,10 +732,16 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
 
     // ── Delegates ─────────────────────────────────────────────────────────────
     let delegates_prefix = storage_prefix("PalletElections", "Delegates");
-    let delegate_keys = client.get_keys_paged(&delegates_prefix).await.unwrap_or_default();
+    let delegate_keys = client
+        .get_keys_paged(&delegates_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut delegates: Vec<Delegate> = Vec::new();
     if !delegate_keys.is_empty() {
-        let values = client.query_storage_at(&delegate_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&delegate_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in delegate_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -724,10 +802,16 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
 
     // ── Elections ─────────────────────────────────────────────────────────────
     let elections_prefix = storage_prefix("PalletElections", "Elections");
-    let election_keys = client.get_keys_paged(&elections_prefix).await.unwrap_or_default();
+    let election_keys = client
+        .get_keys_paged(&elections_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut elections: Vec<ElectionEntry> = Vec::new();
     if !election_keys.is_empty() {
-        let values = client.query_storage_at(&election_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&election_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in election_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -831,10 +915,16 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
 
     // ── Asset disclosures ─────────────────────────────────────────────────────
     let disclosures_prefix = storage_prefix("PalletAntiCorruption", "AssetDisclosures");
-    let disclosure_keys = client.get_keys_paged(&disclosures_prefix).await.unwrap_or_default();
+    let disclosure_keys = client
+        .get_keys_paged(&disclosures_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut asset_disclosures: Vec<AssetDisclosure> = Vec::new();
     if !disclosure_keys.is_empty() {
-        let values = client.query_storage_at(&disclosure_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&disclosure_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in disclosure_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -859,10 +949,16 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
 
     // ── Conflict-of-interest registry ────────────────────────────────────────
     let conflicts_prefix = storage_prefix("PalletAntiCorruption", "ConflictRegistry");
-    let conflict_keys = client.get_keys_paged(&conflicts_prefix).await.unwrap_or_default();
+    let conflict_keys = client
+        .get_keys_paged(&conflicts_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
     if !conflict_keys.is_empty() {
-        let values = client.query_storage_at(&conflict_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&conflict_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in conflict_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -899,10 +995,16 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
 
     // ── Whistleblower reports ────────────────────────────────────────────────
     let reports_prefix = storage_prefix("PalletAntiCorruption", "WhistleblowerReports");
-    let report_keys = client.get_keys_paged(&reports_prefix).await.unwrap_or_default();
+    let report_keys = client
+        .get_keys_paged(&reports_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let mut reports: Vec<WhistleblowerReport> = Vec::new();
     if !report_keys.is_empty() {
-        let values = client.query_storage_at(&report_keys).await.unwrap_or_default();
+        let values = client
+            .query_storage_at(&report_keys)
+            .await
+            .map_err(|e| format!("chain unreachable: {e}"))?;
         for (key_hex, val_opt) in report_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -934,7 +1036,10 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
 
     // ── Investigator count (StorageValue<BoundedVec<AccountId, MaxInvestigators>>) ──
     let investigators_key = storage_prefix("PalletAntiCorruption", "Investigators");
-    let investigators_bytes = client.get_storage(&investigators_key).await.unwrap_or_default();
+    let investigators_bytes = client
+        .get_storage(&investigators_key)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
     let investigator_count = investigators_bytes
         .map(|bytes| decode_compact(&bytes).0)
         .unwrap_or(0);
@@ -1002,5 +1107,30 @@ fn format_agr(planck: u128) -> String {
         // Show up to 4 decimal places
         let frac4 = frac / (UNIT / 10_000);
         format!("{whole}.{frac4:04} AGR")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding 1: `chain_status` must surface a real error — not a fake
+    /// `{best: 0, finalized: 0}` success — when the node is unreachable. Port 1 is
+    /// reserved/unused and connections to it are refused immediately and deterministically,
+    /// so this doesn't depend on anything actually running (or not running) locally.
+    #[tokio::test]
+    async fn chain_status_surfaces_disconnected_state_not_fake_success() {
+        let result = fetch_chain_status("http://127.0.0.1:1").await;
+        assert!(
+            result.is_err(),
+            "expected an Err distinct from a fake {{best: 0, finalized: 0}} success when unreachable"
+        );
+    }
+
+    #[test]
+    fn format_agr_formats_whole_and_fractional_amounts() {
+        assert_eq!(format_agr(0), "0 AGR");
+        assert_eq!(format_agr(1_000_000_000_000), "1 AGR");
+        assert_eq!(format_agr(1_500_000_000_000), "1.5000 AGR");
     }
 }
