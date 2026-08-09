@@ -81,7 +81,11 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
 - On-device face match (Apple Vision iOS / MobileFaceNet Android)
 - Liveness detection (blink/turn)
 - ZK proof generated on device — nothing leaves the phone
-- Nullifier = Poseidon2(national_id || country_code) — stable across passport renewals
+- Vote nullifier = ZKPassport's own `scoped_nullifier` circuit output, extracted verbatim from
+  the outer proof's public inputs (see `runtime/src/verifier.rs`) — not a value this codebase
+  computes itself. A related but distinct value, the OPRF *identity-anchor* used for Sybil
+  resistance, is `Poseidon2(DS_IDENTITY_INPUT, personal_number, issuing_country)` (see
+  `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`) — do not conflate the two
 - Passport must be valid at registration AND at vote time
 - Recovery = re-scan valid passport
 - Passport-only for v1 (country allowlist — some countries lack stable national ID in NFC chip)
@@ -136,7 +140,12 @@ Runs without a server — connects directly to the chain and optionally to a clo
 
 ### Stack
 - **Tauri 2** — Rust backend, React/TS frontend, ships as a small native binary (~10MB)
-- **smoldot** light client embedded — syncs to chain p2p, no full node required
+- Currently connects via plain JSON-RPC (`reqwest`) to a locally-running full node at a
+  hardcoded `http://127.0.0.1:9944` (`desktop/src-tauri/src/commands/chain.rs`) — run
+  `agora-node --dev` (or similar) alongside the desktop app. An embedded **smoldot** light
+  client, so citizens don't need to run a full node themselves, is the intended long-term
+  architecture — `smoldot` and `@polkadot/api` are already listed in `desktop/package.json` —
+  but that integration has not been built yet: zero smoldot usage anywhere in the Rust code.
 - **IPFS** — fetches law/proposal content by on-chain hash (via gateway or local node)
 
 ### Authentication
