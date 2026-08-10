@@ -9,13 +9,13 @@ const STATUS_LABELS: Record<string, string> = {
 };
 
 export default function ChainStatusBar() {
-  const { status, bestBlock, finalizedBlock } = useChain();
+  const { status, bestBlock, finalizedBlock, error } = useChain();
 
   return (
-    <div className={`chain-status-bar status-${status}`}>
+    <div className={`chain-status-bar status-${status}`} title={status === "error" ? error ?? undefined : undefined}>
       <span className="status-dot" />
       <span className="status-label">{STATUS_LABELS[status]}</span>
-      {bestBlock != null && (
+      {status === "ready" && bestBlock != null && (
         <>
           <span className="status-sep">·</span>
           <span className="status-blocks">

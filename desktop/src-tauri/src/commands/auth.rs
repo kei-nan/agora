@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::State;
@@ -29,10 +30,24 @@ pub struct Session {
     pub token: String,
 }
 
-/// Shared session store: challenge UUID → completed Session (None while pending).
+/// A QR-auth challenge slot: pending until the mobile app POSTs back a completed `Session`.
+#[derive(Clone)]
+struct ChallengeEntry {
+    /// Unix timestamp the challenge was generated at — used to enforce `CHALLENGE_TTL_SECS`.
+    created_at: u64,
+    session: Option<Session>,
+}
+
+/// How long an unconfirmed QR challenge stays valid. Must match the frontend's own
+/// 5-minute QR timeout (`AuthContext.tsx`'s `requestQr` — `setTimeout(..., 5 * 60 * 1000)`)
+/// so the server-side cutoff and the UI cutoff agree. This is enforced here, not just in
+/// the frontend, so a late POST to the callback server can't complete a stale challenge.
+const CHALLENGE_TTL_SECS: u64 = 5 * 60;
+
+/// Shared session store: challenge UUID → challenge/session state.
 /// Wrapped in Arc so the background callback server can update it without unsafe.
 #[derive(Clone)]
-pub struct PendingSessions(pub Arc<Mutex<HashMap<String, Option<Session>>>>);
+pub struct PendingSessions(Arc<Mutex<HashMap<String, ChallengeEntry>>>);
 
 impl PendingSessions {
     pub fn new() -> Self {
@@ -64,9 +79,13 @@ impl SessionStore {
 /// expired or unknown token is rejected here, not merely flagged in the UI. Returns the
 /// session's nullifier hash on success.
 pub fn require_valid_session(store: &SessionStore, token: &str) -> Result<String, String> {
-    let map = store.0.lock().map_err(|e| e.to_string())?;
+    let mut map = store.0.lock().map_err(|e| e.to_string())?;
+    let now = unix_now();
+    // Opportunistic prune: bearer-token sessions past expiry are dropped on every check,
+    // rather than accumulating for the process lifetime the way PendingSessions used to.
+    map.retain(|_, record| record.expires_at > now);
     match map.get(token) {
-        Some(record) if record.expires_at > unix_now() => Ok(record.nullifier_hash.clone()),
+        Some(record) if record.expires_at > now => Ok(record.nullifier_hash.clone()),
         Some(_) => Err("session expired".into()),
         None => Err("invalid or unknown session token".into()),
     }
@@ -85,6 +104,44 @@ struct AuthCallback {
     signature: String,
 }
 
+/// Removes entries that are no longer useful: pending challenges older than
+/// `CHALLENGE_TTL_SECS` (never completed in time) and completed sessions whose bearer
+/// token (`expires_at`) has already passed. Without this the map grows for the lifetime
+/// of the process, since nothing else ever removes a completed/expired entry.
+fn prune_expired_at(map: &mut HashMap<String, ChallengeEntry>, now: u64) {
+    map.retain(|_, entry| match &entry.session {
+        Some(session) => session.expires_at > now,
+        None => now.saturating_sub(entry.created_at) < CHALLENGE_TTL_SECS,
+    });
+}
+
+fn prune_expired(map: &mut HashMap<String, ChallengeEntry>) {
+    prune_expired_at(map, unix_now());
+}
+
+/// Attempts to mark `challenge` complete with `session`, honoring `CHALLENGE_TTL_SECS`.
+/// This is the server-side enforcement the frontend's own 5-minute UI timeout can't
+/// provide on its own — a late POST from the mobile app for a challenge that's aged out
+/// (or that doesn't exist, or that was already completed) is rejected here rather than
+/// silently accepted.
+fn complete_challenge_at(
+    map: &mut HashMap<String, ChallengeEntry>,
+    challenge: String,
+    session: Session,
+    now: u64,
+) -> Result<(), &'static str> {
+    prune_expired_at(map, now);
+    match map.entry(challenge) {
+        Entry::Occupied(mut o) if o.get().session.is_none() => {
+            let created_at = o.get().created_at;
+            o.insert(ChallengeEntry { created_at, session: Some(session) });
+            Ok(())
+        }
+        Entry::Occupied(_) => Err("already_completed"),
+        Entry::Vacant(_) => Err("expired_or_unknown"),
+    }
+}
+
 /// Generate a one-time challenge and return the QR deep-link URL.
 ///
 /// URL: `democracychain://auth?challenge=<uuid>&callback=http://127.0.0.1:<port>/auth`
@@ -99,24 +156,28 @@ pub async fn auth_generate_challenge(
     let deep_link = format!(
         "democracychain://auth?challenge={challenge}&callback=http://127.0.0.1:{port}/auth"
     );
-    state
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .insert(challenge, None);
+    let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    prune_expired(&mut map);
+    map.insert(challenge, ChallengeEntry { created_at: unix_now(), session: None });
     Ok(deep_link)
 }
 
 /// Poll for a completed auth session. Returns "pending" error if the phone hasn't responded yet.
+/// Returns "unknown challenge" both for a challenge id that never existed and for one that
+/// has aged out past `CHALLENGE_TTL_SECS` and been pruned — the frontend already stops
+/// polling on its own 5-minute timeout, so this is purely a server-side backstop.
 #[tauri::command]
 pub async fn auth_poll_session(
     challenge: String,
     state: State<'_, PendingSessions>,
 ) -> Result<Session, String> {
-    let map = state.0.lock().map_err(|e| e.to_string())?;
+    let mut map = state.0.lock().map_err(|e| e.to_string())?;
+    prune_expired(&mut map);
     match map.get(&challenge) {
-        Some(Some(session)) => Ok(session.clone()),
-        Some(None) => Err("pending".into()),
+        Some(entry) => match &entry.session {
+            Some(session) => Ok(session.clone()),
+            None => Err("pending".into()),
+        },
         None => Err("unknown challenge".into()),
     }
 }
@@ -143,7 +204,7 @@ pub async fn auth_start_callback_server(
 
 async fn run_callback_server(
     port: u16,
-    sessions: Arc<Mutex<HashMap<String, Option<Session>>>>,
+    sessions: Arc<Mutex<HashMap<String, ChallengeEntry>>>,
     session_store: Arc<Mutex<HashMap<String, SessionRecord>>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -206,10 +267,13 @@ async fn run_callback_server(
 /// `session_store`. This is the actual security boundary for the QR-auth flow: a session is
 /// only ever created after `verify_challenge_signature` succeeds against the public key
 /// on-chain for `nullifier_hash` (fetched independently via `chain::lookup_registered_account`,
-/// never trusted from the request body).
+/// never trusted from the request body). The final bookkeeping step goes through
+/// `complete_challenge_at`, which enforces `CHALLENGE_TTL_SECS` and rejects a double-completion
+/// server-side — a late callback that slips past the early `challenge_known` check (e.g. because
+/// the chain lookup above took a while) still can't complete an aged-out challenge.
 async fn handle_auth_callback(
     cb: AuthCallback,
-    sessions: &Arc<Mutex<HashMap<String, Option<Session>>>>,
+    sessions: &Arc<Mutex<HashMap<String, ChallengeEntry>>>,
     session_store: &Arc<Mutex<HashMap<String, SessionRecord>>>,
 ) -> (&'static str, String) {
     let challenge_known = sessions
@@ -274,15 +338,26 @@ async fn handle_auth_callback(
     let store_lock = session_store.lock();
     match (sessions_lock, store_lock) {
         (Ok(mut map), Ok(mut store)) => {
-            map.insert(cb.challenge, Some(session));
-            store.insert(
-                token,
-                SessionRecord {
-                    nullifier_hash: cb.nullifier_hash,
-                    expires_at,
-                },
-            );
-            ("200 OK", "{\"ok\":true}".into())
+            match complete_challenge_at(&mut map, cb.challenge.clone(), session, unix_now()) {
+                Ok(()) => {
+                    store.insert(
+                        token,
+                        SessionRecord {
+                            nullifier_hash: cb.nullifier_hash,
+                            expires_at,
+                        },
+                    );
+                    ("200 OK", "{\"ok\":true}".into())
+                }
+                Err("already_completed") => (
+                    "409 Conflict",
+                    "{\"error\":\"challenge already completed\"}".into(),
+                ),
+                Err(_) => (
+                    "410 Gone",
+                    "{\"error\":\"unknown or expired challenge\"}".into(),
+                ),
+            }
         }
         _ => (
             "500 Internal Server Error",
@@ -422,5 +497,89 @@ mod signature_tests {
             require_valid_session(&store, "live-token").unwrap(),
             "0xabc"
         );
+    }
+}
+
+#[cfg(test)]
+mod pruning_tests {
+    use super::*;
+
+    fn mk_entry(created_at: u64, session: Option<Session>) -> ChallengeEntry {
+        ChallengeEntry { created_at, session }
+    }
+
+    fn mk_session(expires_at: u64) -> Session {
+        Session {
+            nullifier_hash: "0xabc123".to_string(),
+            expires_at,
+            token: "test-token".to_string(),
+        }
+    }
+
+    /// Finding 2, pruning: a pending challenge older than `CHALLENGE_TTL_SECS` is removed,
+    /// while a still-fresh one is kept.
+    #[test]
+    fn prune_removes_stale_pending_challenge_but_keeps_fresh_one() {
+        let mut map = HashMap::new();
+        map.insert("stale".to_string(), mk_entry(0, None));
+        map.insert("fresh".to_string(), mk_entry(800, None)); // age 200s < TTL at now=1000
+
+        prune_expired_at(&mut map, 1000);
+
+        assert!(!map.contains_key("stale"), "challenge past CHALLENGE_TTL_SECS should be pruned");
+        assert!(map.contains_key("fresh"), "challenge still within CHALLENGE_TTL_SECS should survive");
+    }
+
+    /// Finding 2, pruning: a completed session past its bearer-token `expires_at` is
+    /// removed, while a still-valid completed session is kept.
+    #[test]
+    fn prune_removes_expired_completed_session_but_keeps_valid_one() {
+        let mut map = HashMap::new();
+        map.insert("old".to_string(), mk_entry(100, Some(mk_session(500))));
+        map.insert("current".to_string(), mk_entry(100, Some(mk_session(2000))));
+
+        prune_expired_at(&mut map, 1000);
+
+        assert!(!map.contains_key("old"), "session past its expires_at should be pruned");
+        assert!(map.contains_key("current"), "session still before its expires_at should survive");
+    }
+
+    /// Finding 2, expiry enforcement: a challenge that was never completed and has aged
+    /// past `CHALLENGE_TTL_SECS` must be rejected if someone tries to complete it late —
+    /// this is exactly the gap the frontend's own 5-minute timeout can't close on its own.
+    #[test]
+    fn late_completion_of_expired_challenge_is_rejected() {
+        let mut map = HashMap::new();
+        map.insert("chal".to_string(), mk_entry(0, None)); // created at t=0
+
+        // Attempt completion at t=1000, well past the 300s TTL.
+        let result = complete_challenge_at(&mut map, "chal".to_string(), mk_session(99_999), 1000);
+
+        assert_eq!(result, Err("expired_or_unknown"));
+        assert!(!map.contains_key("chal"), "expired challenge should have been pruned in the process");
+    }
+
+    /// Sanity check: completion within the TTL window still works.
+    #[test]
+    fn timely_completion_of_fresh_challenge_succeeds() {
+        let mut map = HashMap::new();
+        map.insert("chal".to_string(), mk_entry(100, None));
+
+        let result = complete_challenge_at(&mut map, "chal".to_string(), mk_session(99_999), 150);
+
+        assert_eq!(result, Ok(()));
+        assert!(map.get("chal").unwrap().session.is_some());
+    }
+
+    /// A second completion attempt on an already-completed challenge must not silently
+    /// overwrite the first session.
+    #[test]
+    fn double_completion_is_rejected() {
+        let mut map = HashMap::new();
+        map.insert("chal".to_string(), mk_entry(100, Some(mk_session(99_999))));
+
+        let result = complete_challenge_at(&mut map, "chal".to_string(), mk_session(99_999), 150);
+
+        assert_eq!(result, Err("already_completed"));
     }
 }
