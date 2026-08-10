@@ -30,7 +30,18 @@ WASM_BUILD_RUSTFLAGS="-C link-arg=--allow-undefined" cargo build --release
 This env var is also in . Without it, the WASM runtime build fails due to a
 substrate-wasm-builder 26.0.1 incompatibility with Rust 1.84+.
 
-To run the dev chain:
+This command now produces a **real build**: `runtime/Cargo.toml`'s `dev-mode` feature (which
+gates always-succeed passthrough verifiers — `PassthroughZkVerifier`, `PassthroughAnchorVerifier`,
+the MACI passthrough tally verifier, `PassthroughAntiCorruptionZkVerifier`) was removed from
+`default` (fixed 2026-08-09; it used to silently ship fake crypto by default even though the
+command above never disabled default features). If you need fast local iteration with those
+always-accepting passthrough verifiers instead of real cryptographic ones, opt in explicitly:
+```bash
+WASM_BUILD_RUSTFLAGS="-C link-arg=--allow-undefined" cargo build --release --features dev-mode
+```
+
+To run the dev chain (does **not** require the `dev-mode` feature — `--dev` only selects a
+runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/ZK-related):
 ```bash
 ./target/release/agora-node --dev --tmp
 ```
