@@ -5,10 +5,12 @@
 #### System 1 — MACI 1p1v (proposals and elections)
 
 Storage:
-- `Proposals`: `proposal_id` → `end_block`
+- `Proposals`: `proposal_id` → `(end_block, topic_hash [u8;32], ReferendumTier)`
 - `VoteCommitments`: `(proposal_id, nullifier)` → `commitment` (MACI-encrypted)
-- `MACITallies`: `proposal_id` → `(yes_votes, no_votes, commitment_root)`
-- `Delegations`: `(AccountId, topic_id)` → `delegate AccountId`  (per-topic)
+- `ProposalResults`: `proposal_id` → `(yes_votes, no_votes, commitment_root)`
+- `Delegations`: `(topic_id, AccountId)` → `DelegationRecord { delegate: AccountId, expires_at: BlockNumber }`
+  (per-topic; a `StorageDoubleMap` keyed topic-first so tallying can scan just one topic's
+  delegators via `iter_prefix(topic_id)` instead of the whole table)
 - `DelegatorCount`: `(topic_id, AccountId)` → `u32`
 
 Calls: `submit_proposal`, `commit_vote`, `submit_maci_tally`, `delegate_vote(delegate, topic_id)`, `revoke_delegation(topic_id)`
