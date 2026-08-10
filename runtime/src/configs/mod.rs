@@ -718,6 +718,14 @@ impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 	}
 }
 
+/// Runtime implements pallet_elections::DisclosureChecker by delegating to
+/// pallet-anticorruption — candidacy requires a current (non-overdue) asset disclosure.
+impl pallet_elections::DisclosureChecker<AccountId> for Runtime {
+	fn has_current_disclosure(who: &AccountId) -> bool {
+		pallet_anticorruption::Pallet::<Runtime>::has_current_disclosure(who)
+	}
+}
+
 impl pallet_elections::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type CandidateDeposit = ConstU128<1_000_000_000_000>;
@@ -733,6 +741,7 @@ impl pallet_elections::Config for Runtime {
 	type MaxDelegateSweepPerBlock = ConstU32<100>;
 	type Currency = Balances;
 	type CitizenChecker = Runtime;
+	type DisclosureChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.
 	type GovernanceOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// Constitutional parameters require EnsureRoot for now. Production should wire this to

@@ -86,6 +86,38 @@ fn submit_asset_disclosure_upserts_on_second_submission() {
     });
 }
 
+#[test]
+fn has_current_disclosure_false_when_none_on_file() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert!(!AntiCorruption::has_current_disclosure(&1));
+    });
+}
+
+#[test]
+fn has_current_disclosure_true_before_due_date() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(AntiCorruption::submit_asset_disclosure(RuntimeOrigin::signed(1), [5u8; 32]));
+
+        // update_due_at = 1 + RENEWAL_BLOCKS; still current right up to and including that block.
+        System::set_block_number(1 + RENEWAL_BLOCKS as u64);
+        assert!(AntiCorruption::has_current_disclosure(&1));
+    });
+}
+
+#[test]
+fn has_current_disclosure_false_once_past_due_date() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(AntiCorruption::submit_asset_disclosure(RuntimeOrigin::signed(1), [5u8; 32]));
+
+        // One block past update_due_at: the disclosure has lapsed.
+        System::set_block_number(1 + RENEWAL_BLOCKS as u64 + 1);
+        assert!(!AntiCorruption::has_current_disclosure(&1));
+    });
+}
+
 // ─── register_conflict / clear_conflict ─────────────────────────────────────
 
 #[test]

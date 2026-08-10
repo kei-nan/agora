@@ -18,7 +18,12 @@ Storage:
 Calls:
 - `add_commissioner(account)` / `remove_commissioner(account)` — root
 - `create_election(office, start_block, end_block)` — root or commissioner
-- `register_candidate(election_id, profile_ipfs_hash)` — active citizen; reserves 1 AGR deposit
+- `register_candidate(election_id, profile_ipfs_hash)` — active citizen; reserves 1 AGR deposit;
+  also requires a current (non-overdue) asset disclosure on file in pallet-anticorruption (see
+  `Config::DisclosureChecker`, backed by pallet-anticorruption's `has_current_disclosure`) — a
+  citizen with no disclosure, or whose disclosure has lapsed past its renewal due date, cannot
+  register as a candidate. This is checked once at registration only; it does not retroactively
+  affect already-certified candidates or seated officials if their disclosure later lapses.
 - `certify_candidate(election_id, candidate)` — commissioner only
 - `submit_results(election_id, winner, results_ipfs_hash)` — commissioner only
 - `certify_results(election_id)` — commissioner only; unreserves all candidate deposits

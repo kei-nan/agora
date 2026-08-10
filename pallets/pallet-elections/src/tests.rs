@@ -338,6 +338,38 @@ fn register_candidate_beyond_max_candidates_per_election_is_rejected() {
     });
 }
 
+#[test]
+fn register_candidate_fails_when_no_current_disclosure() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_commissioner(1);
+        let id = create_election(1);
+        set_active_citizen(2, true);
+        set_has_current_disclosure(2, false);
+
+        assert_noop!(
+            Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(1)),
+            Error::<Test>::DisclosureRequired
+        );
+        assert_eq!(Balances::reserved_balance(2), 0);
+        assert!(Candidates::<Test>::get(id, 2).is_none());
+    });
+}
+
+#[test]
+fn register_candidate_succeeds_with_current_disclosure() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_commissioner(1);
+        let id = create_election(1);
+        set_active_citizen(2, true);
+        set_has_current_disclosure(2, true);
+
+        assert_ok!(Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(1)));
+        assert!(Candidates::<Test>::get(id, 2).is_some());
+    });
+}
+
 // ─── certify_candidate ───────────────────────────────────────────────────────
 
 #[test]
