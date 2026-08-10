@@ -55,7 +55,8 @@ parameter_types! {
 	pub const BlockHashCount: BlockNumber = 2400;
 	pub const Version: RuntimeVersion = VERSION;
 
-	/// We allow for 2 seconds of compute with a 6 second average block time.
+	/// We allow for 2 seconds of compute with this chain's 12 second average block time
+	/// (`MILLI_SECS_PER_BLOCK` in `runtime/src/lib.rs`).
 	pub RuntimeBlockWeights: BlockWeights = BlockWeights::with_sensible_defaults(
 		Weight::from_parts(2u64 * WEIGHT_REF_TIME_PER_SECOND, u64::MAX),
 		NORMAL_DISPATCH_RATIO,
@@ -216,12 +217,14 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 }
 
 /// Passthrough OPRF identity-anchor verifier: accepts any registration/reverification/
-/// migration proof. Unlike `PassthroughZkVerifier`, this is NOT gated behind `dev-mode` — no
-/// real OPRF-circuit verifier crate exists yet at all (the OPRF committee work tracked in
-/// HANDOFF log #67/#68 hasn't started), so there is nothing for a non-dev-mode build to force
-/// in its place the way `ZkVerifier` forces `ZkPassportUltraHonkVerifier`. This must be replaced
-/// before the identity-anchor check provides any real Sybil-resistance guarantee — it
-/// currently provides none, in either build mode.
+/// migration proof. Only wired in for the `dev-mode` `pallet_identity_zk::Config` impl below
+/// (this struct itself isn't `#[cfg]`-gated so it stays available to reference from doc comments
+/// / tests in both build modes, but it is only ever assigned to `type AnchorVerifier` inside the
+/// `#[cfg(feature = "dev-mode")]` impl). The non-dev-mode impl wires in the real
+/// `crate::anchor_verifier::Poseidon2AnchorVerifier` instead, which genuinely recomputes the
+/// Poseidon2 `param_commitment` against the already-verified outer proof (HANDOFF log #75/#76) —
+/// see that type's doc comment for the full trail. So this stub provides no Sybil-resistance
+/// guarantee only in dev-mode builds, not in both build modes.
 pub struct PassthroughAnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
@@ -267,9 +270,10 @@ impl pallet_identity_zk::Config for Runtime {
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet.
 	type AnchorVerifier = PassthroughAnchorVerifier;
-	/// Placeholder cadence (~1 year at 6s/block) pending the human decision flagged as open in
-	/// HANDOFF log #67 (whether the liveness re-verification cadence should be shorter than
-	/// the 4-year OPRF-rotation cycle). Governance-tunable, not hardcoded logic.
+	/// Placeholder cadence (~1 year — `DAYS` is block-time-derived, so this stays accurate
+	/// regardless of block time) pending the human decision flagged as open in HANDOFF log #67
+	/// (whether the liveness re-verification cadence should be shorter than the 4-year
+	/// OPRF-rotation cycle). Governance-tunable, not hardcoded logic.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
 	/// No dedicated `EnsureOrigin` exists yet on `pallet-emergency-council` (it gates its own
 	/// calls via council-membership + supermajority-vote checks internally, not via a
@@ -296,11 +300,12 @@ impl pallet_identity_zk::Config for Runtime {
 #[cfg(not(feature = "dev-mode"))]
 impl pallet_identity_zk::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	/// Real ZKPassport UltraHonk verifier (replaces the dropped Rarimo Groth16 one).
-	/// Currently fail-closed: it enforces the envelope and public-input layout for real,
-	/// but rejects every proof because no Rust UltraHonk verifier can handle the bb 5.0.0
-	/// proof format ZKPassport's circuits produce. See `crate::verifier`'s module docs for
-	/// the experiment that established that, and what would unblock it.
+	/// Real ZKPassport UltraHonk verifier (replaces the dropped Rarimo Groth16 one). Performs a
+	/// genuine bb 5.0.0 UltraHonk pairing check via `ultrahonk-no-std` (changelog #72) — its own
+	/// test suite proves real proofs verify (`verifies_a_real_bb5_zk_proof`) and mutated ones are
+	/// rejected. What's still outstanding is only that no real end-to-end ZKPassport proof has
+	/// been run through it yet (gated on the OPRF committee, see `docs/project/next-steps.md`),
+	/// not a missing pairing check. See `crate::verifier`'s module docs for the full detail.
 	type ZkVerifier = crate::verifier::ZkPassportUltraHonkVerifier;
 	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
 	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
@@ -372,12 +377,11 @@ impl pallet_voting::MACITallyVerifier for FailClosedMACIVerifier {
 	}
 }
 
-/// `cargo test -p agora-runtime` (default features, `dev-mode` on) runs
-/// `dev_mode_passthrough_accepts_anything`; `cargo test -p agora-runtime --no-default-features
-/// --features std` (the shape of a non-dev build) runs
-/// `non_dev_mode_rejects_a_fabricated_tally` — proving a fabricated tally that would previously
-/// have silently passed (unconditional `PassthroughMACIVerifier`) is now rejected outside
-/// dev-mode.
+/// `cargo test -p agora-runtime --features dev-mode` runs `dev_mode_passthrough_accepts_anything`;
+/// `cargo test -p agora-runtime` (default features — `dev-mode` is no longer one of them, see
+/// `runtime/Cargo.toml`) runs `non_dev_mode_rejects_a_fabricated_tally` — proving a fabricated
+/// tally that would previously have silently passed (unconditional `PassthroughMACIVerifier`) is
+/// now rejected outside dev-mode.
 #[cfg(all(test, feature = "dev-mode"))]
 mod maci_verifier_tests {
 	use super::*;
@@ -678,9 +682,14 @@ impl pallet_executive::Config for Runtime {
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// Maximum 20 cabinet portfolios.
 	type MaxPortfolios = ConstU32<20>;
-	/// 30 days at 6s/block — constitutional ceiling on emergency duration.
-	type MaxEmergencyBlocks = ConstU32<432_000>;
-	/// Legislature has 72 hours (at 6s/block) to ratify after cabinet declares emergency.
+	/// 30 days, constitutional ceiling on emergency duration. Expressed via `DAYS` (block-time-
+	/// derived, see `pallet_emergency_council::Config::MaxEmergencyBlocks` below for the sibling
+	/// fix and full rationale) rather than a hardcoded literal, so it can't silently drift out of
+	/// sync with `MILLI_SECS_PER_BLOCK` again — a bare `432_000` here was previously "30 days at
+	/// 6s/block" but this runtime's actual block time is 12s, making that literal a 60-day cap.
+	type MaxEmergencyBlocks = ConstU32<{ 30 * DAYS }>;
+	/// Legislature has 72 hours to ratify after cabinet declares emergency (`DAYS` is block-time-
+	/// derived, so this stays correct regardless of block time).
 	type RatificationWindowBlocks = ConstU32<{ 3 * DAYS }>;
 	/// 2/3 cabinet supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
@@ -777,8 +786,11 @@ impl pallet_anticorruption::Config for Runtime {
 	type ZkVerifier = PassthroughAntiCorruptionZkVerifier;
 	/// Up to 20 designated investigators.
 	type MaxInvestigators = ConstU32<20>;
-	/// Asset disclosures must be renewed every ~1 year (5_256_000 blocks at 6s/block).
-	type AssetDisclosureRenewalBlocks = ConstU32<5_256_000>;
+	/// Asset disclosures must be renewed every ~1 year. Expressed via `DAYS` (block-time-derived)
+	/// rather than a hardcoded literal — a bare `5_256_000` here was previously "~1 year at
+	/// 6s/block", but this runtime's actual block time is 12s, making that literal ~2 years,
+	/// contradicting docs/project/pallets/anticorruption.md's "mandatory annual renewal" claim.
+	type AssetDisclosureRenewalBlocks = ConstU32<{ 365 * DAYS }>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -803,5 +815,6 @@ impl pallet_anticorruption::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type ZkVerifier = ZkPassportAntiCorruptionZkVerifier;
 	type MaxInvestigators = ConstU32<20>;
-	type AssetDisclosureRenewalBlocks = ConstU32<5_256_000>;
+	/// See the `dev-mode` impl above for the block-time rationale.
+	type AssetDisclosureRenewalBlocks = ConstU32<{ 365 * DAYS }>;
 }

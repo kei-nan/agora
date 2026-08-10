@@ -64,11 +64,16 @@ ultrahonk-no-std.workspace = true
 substrate-wasm-builder = { optional = true, workspace = true, default-features = true }
 
 [features]
-# dev-mode: enables PassthroughZkVerifier (accepts all ZK proofs). Must be disabled before
-# any testnet/mainnet deployment. A production build without this feature will fail to compile
-# until a real UltraHonk verifier is wired into pallet_identity_zk::Config (see
-# runtime/src/verifier.rs's ZkPassportUltraHonkVerifier and its `ultrahonk` module).
-default = ["std", "dev-mode"]
+# dev-mode: enables PassthroughZkVerifier and other always-succeed passthrough verifiers
+# (accepts all ZK proofs unconditionally). Must be disabled before any testnet/mainnet
+# deployment. NOT a default feature: the plain `cargo build --release` documented in CLAUDE.md
+# builds this crate with the real verifiers (`runtime/src/verifier.rs`'s
+# ZkPassportUltraHonkVerifier, `runtime/src/anchor_verifier.rs`'s Poseidon2AnchorVerifier, and
+# friends) — it compiles and runs fine without dev-mode; the dev chain (`--dev --tmp`) does not
+# require this feature either, since its genesis preset only touches balances/aura/grandpa/sudo,
+# not identity/ZK state. Pass `--features dev-mode` explicitly for local iteration that needs
+# fast, always-accepting passthrough verifiers instead of real cryptographic ones.
+default = ["std"]
 dev-mode = []
 std = [
 	"codec/std",

@@ -2,9 +2,11 @@
 
 ## Runtime features
 
-- `default = ["std", "dev-mode"]`
-- `dev-mode` enables `PassthroughZkVerifier` (accepts all ZK proofs). Strip this feature
-  for any testnet/mainnet build. Without it, `runtime/src/verifier.rs` uses the real
+- `default = ["std"]` (fixed 2026-08-09 — `dev-mode` used to be a default feature too, which
+  meant the documented `cargo build --release` command silently shipped passthrough verifiers)
+- `dev-mode` enables `PassthroughZkVerifier` (accepts all ZK proofs). It is opt-in only
+  (`--features dev-mode`); strip it (i.e. just don't pass it) for any testnet/mainnet build.
+  Without it, `runtime/src/verifier.rs` uses the real
   `ZkPassportUltraHonkVerifier` (targets ZKPassport's Noir/UltraHonk `main/outer/count_4`
   circuit; replaces the former `RarimoGroth16Verifier` — see changelog entry 65). It enforces
   the proof envelope and public-input layout for real, and the UltraHonk pairing check itself

@@ -36,5 +36,7 @@ migrated away from. The pallet's own whistleblower-specific circuit is still a d
 not-yet-built circuit (this binding only keeps the two verification paths consistent in the
 meantime); it also inherits `verifier.rs`'s fail-closed behavior.
 
-Config: `MaxInvestigators = 20`, `AssetDisclosureRenewalBlocks = 5_256_000` (~1 year at 6s/block).
+Config: `MaxInvestigators = 20`, `AssetDisclosureRenewalBlocks = 2_628_000` (~1 year at this chain's
+actual 12s/block time — previously documented as `5_256_000`, which was ~1 year at a stale 6s/block
+assumption and worked out to ~2 years at the real block time).
 

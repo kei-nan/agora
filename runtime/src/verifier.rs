@@ -6,9 +6,11 @@
 //! so both the proof bytes and the public-input layout are completely different.
 //!
 //! Only compiled when the `dev-mode` feature is absent. In dev-mode, `configs/mod.rs`
-//! uses `PassthroughZkVerifier` instead. Note `dev-mode` is a *default* feature of the
-//! runtime crate, so a plain `cargo check --workspace` does not compile this file — use
-//! `cargo check -p agora-runtime --no-default-features --features std`.
+//! uses `PassthroughZkVerifier` instead. `dev-mode` is no longer a *default* feature of the
+//! runtime crate (fixed 2026-08-09 — it used to be, silently shipping passthrough verifiers in
+//! the documented build), so a plain `cargo check --workspace` / `cargo check -p agora-runtime`
+//! now compiles this file. Pass `--features dev-mode` explicitly to compile `PassthroughZkVerifier`
+//! instead for local iteration.
 //!
 //! # Current status: real pairing check, backed by `ultrahonk-no-std`
 //!
