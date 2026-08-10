@@ -37,6 +37,16 @@ pub enum CaseSubject {
 /// derive is needed; `type CaseRecord = (...)` documents the field meaning for callers.
 pub type CaseRecord = (AccountId32, CaseStatus, Option<[u8; 32]>, CaseSubject);
 
+/// Mirrors `pallet_courts::pallet::Verdict`. Variant order matches exactly (SCALE encodes enums
+/// by variant index). Needed on the write side too: `finalize_ruling(case_id, verdict)` takes
+/// this as an explicit argument (the pallet does not record a verdict on submit_ai_ruling — see
+/// README.md's "A real gap found" section), so `extrinsic::FinalizeRuling` encodes one of these.
+#[derive(Clone, Debug, PartialEq, Decode, Encode)]
+pub enum Verdict {
+    Upheld,
+    Overturned,
+}
+
 // ── pallet-constitution (pallets/pallet-constitution/src/lib.rs, this working tree) ─────────
 
 /// Mirrors `pallet_constitution::pallet::LawTier`.
@@ -170,6 +180,20 @@ mod tests {
             let encoded = status.encode();
             let decoded = CaseStatus::decode(&mut &encoded[..]).expect("decode failed");
             assert_eq!(status, decoded);
+        }
+    }
+
+    /// `Verdict`'s variant order (Upheld = 0, Overturned = 1) is load-bearing for
+    /// `finalize_ruling`'s call encoding — confirm it round-trips and that the encoded
+    /// discriminant matches `pallets/pallet-courts/src/lib.rs`'s declaration order exactly.
+    #[test]
+    fn verdict_variants_round_trip_with_expected_discriminant() {
+        assert_eq!(Verdict::Upheld.encode(), vec![0u8]);
+        assert_eq!(Verdict::Overturned.encode(), vec![1u8]);
+        for verdict in [Verdict::Upheld, Verdict::Overturned] {
+            let encoded = verdict.encode();
+            let decoded = Verdict::decode(&mut &encoded[..]).expect("decode failed");
+            assert_eq!(verdict, decoded);
         }
     }
 }

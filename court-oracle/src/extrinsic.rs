@@ -58,6 +58,7 @@ use codec::{Compact, Encode};
 use sp_core::crypto::{AccountId32, Pair as _, Ss58Codec};
 use sp_core::{blake2_256, sr25519};
 
+use crate::cases::Verdict;
 use crate::rpc::RpcClient;
 
 /// Transaction format version 4, signed bit set (`0x84`).
@@ -78,14 +79,61 @@ pub struct SubmitAiRuling {
     pub model_version: u32,
 }
 
+/// Arguments to `pallet-courts::finalize_ruling(case_id, verdict)` — the no-appeal-path call
+/// that applies an AI ruling's verdict once the appeal window has closed unappealed (see
+/// `Cases`/`AIRulingBlock` in `pallets/pallet-courts/src/lib.rs`, `#[pallet::call_index(4)]`).
+/// Gated by the same `T::OracleOrigin` as `submit_ai_ruling` — see this pallet's
+/// `EnsureOracle`, which checks the signer against `OracleAccount` storage — so this crate's
+/// existing oracle signing key (already used for `submit_ai_ruling`) is also the correct signer
+/// here; no separate key or origin is needed.
+pub struct FinalizeRuling {
+    pub case_id: u32,
+    pub verdict: Verdict,
+}
+
+/// Encodes just the `[pallet_index, call_index] ++ arguments` portion of a call — the part
+/// specific to which extrinsic is being built. Implemented per call type so `build_signed` can
+/// stay call-agnostic (envelope construction, signing, and submission are identical regardless
+/// of which pallet-courts call is inside).
+pub trait CourtsCall {
+    fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8>;
+}
+
+impl CourtsCall for SubmitAiRuling {
+    fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8> {
+        // [pallet_index, call_index] ++ case_id ++ ruling_hash ++ model_version
+        let mut call_bytes = Vec::new();
+        call_bytes.push(pallet_index);
+        call_bytes.push(call_index);
+        call_bytes.extend(self.case_id.encode());
+        call_bytes.extend(self.ruling_hash); // fixed-size array: raw bytes, no length prefix
+        call_bytes.extend(self.model_version.encode());
+        call_bytes
+    }
+}
+
+impl CourtsCall for FinalizeRuling {
+    fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8> {
+        // [pallet_index, call_index] ++ case_id ++ verdict (single-byte enum discriminant)
+        let mut call_bytes = Vec::new();
+        call_bytes.push(pallet_index);
+        call_bytes.push(call_index);
+        call_bytes.extend(self.case_id.encode());
+        call_bytes.extend(self.verdict.encode());
+        call_bytes
+    }
+}
+
 /// Builds, signs, and hex-encodes the extrinsic. Returns the "0x"-prefixed hex string ready for
-/// `author_submitExtrinsic`.
-pub async fn build_signed(
+/// `author_submitExtrinsic`. Generic over `CourtsCall` so both `submit_ai_ruling` and
+/// `finalize_ruling` share this one envelope/signing implementation — the two calls differ only
+/// in their call-bytes encoding.
+pub async fn build_signed<C: CourtsCall>(
     rpc: &RpcClient,
     seed: &[u8; 32],
     pallet_index: u8,
     call_index: u8,
-    call: SubmitAiRuling,
+    call: C,
 ) -> anyhow::Result<String> {
     let pair = sr25519::Pair::from_seed(seed);
     let account_id = AccountId32::from(pair.public().to_raw());
@@ -94,13 +142,7 @@ pub async fn build_signed(
     let genesis_hash = rpc.get_block_hash(0).await?;
     let nonce = rpc.next_account_index(&account_id.to_ss58check()).await?;
 
-    // --- call: [pallet_index, call_index] ++ case_id ++ ruling_hash ++ model_version
-    let mut call_bytes = Vec::new();
-    call_bytes.push(pallet_index);
-    call_bytes.push(call_index);
-    call_bytes.extend(call.case_id.encode());
-    call_bytes.extend(call.ruling_hash); // fixed-size array: raw bytes, no length prefix
-    call_bytes.extend(call.model_version.encode());
+    let call_bytes = call.encode_call_bytes(pallet_index, call_index);
 
     // --- extra (the bytes physically present in the extrinsic body)
     let mut extra_bytes = Vec::new();
@@ -158,21 +200,12 @@ mod tests {
     /// layout matches what `pallet-courts::submit_ai_ruling(case_id: u32, ruling_hash: [u8;
     /// 32], model_version: u32)` expects to decode — pallet_index, call_index, then case_id as
     /// a plain (non-compact) little-endian u32, then the 32 raw hash bytes with no length
-    /// prefix (fixed-size array), then model_version as a plain little-endian u32.
+    /// prefix (fixed-size array), then model_version as a plain little-endian u32. Exercises the
+    /// real `CourtsCall::encode_call_bytes` implementation, not a hand-duplicated copy.
     #[test]
     fn call_bytes_layout_matches_submit_ai_ruling_signature() {
-        let pallet_index = 11u8;
-        let call_index = 1u8;
-        let case_id: u32 = 42;
-        let ruling_hash = [7u8; 32];
-        let model_version: u32 = 3;
-
-        let mut call_bytes = Vec::new();
-        call_bytes.push(pallet_index);
-        call_bytes.push(call_index);
-        call_bytes.extend(case_id.encode());
-        call_bytes.extend(ruling_hash);
-        call_bytes.extend(model_version.encode());
+        let call = SubmitAiRuling { case_id: 42, ruling_hash: [7u8; 32], model_version: 3 };
+        let call_bytes = call.encode_call_bytes(11, 1);
 
         assert_eq!(call_bytes.len(), 2 + 4 + 32 + 4);
         assert_eq!(call_bytes[0], 11);
@@ -180,5 +213,24 @@ mod tests {
         assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
         assert_eq!(&call_bytes[6..38], &[7u8; 32]);
         assert_eq!(&call_bytes[38..42], &3u32.to_le_bytes());
+    }
+
+    /// Same idea for `pallet-courts::finalize_ruling(case_id: u32, verdict: Verdict)` —
+    /// pallet_index, call_index, case_id as a plain little-endian u32, then the verdict as a
+    /// single-byte enum discriminant (Upheld = 0, Overturned = 1 — see `cases::Verdict`).
+    #[test]
+    fn call_bytes_layout_matches_finalize_ruling_signature() {
+        let call = FinalizeRuling { case_id: 42, verdict: Verdict::Overturned };
+        let call_bytes = call.encode_call_bytes(11, 4);
+
+        assert_eq!(call_bytes.len(), 2 + 4 + 1);
+        assert_eq!(call_bytes[0], 11);
+        assert_eq!(call_bytes[1], 4);
+        assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
+        assert_eq!(call_bytes[6], 1); // Overturned's discriminant
+
+        let call = FinalizeRuling { case_id: 7, verdict: Verdict::Upheld };
+        let call_bytes = call.encode_call_bytes(11, 4);
+        assert_eq!(call_bytes[6], 0); // Upheld's discriminant
     }
 }

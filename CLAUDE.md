@@ -203,12 +203,15 @@ authoritative version of this list; treat this section as a summary, not the sou
    service that polls filed cases, builds context from chain storage, calls Claude for a
    ruling, publishes reasoning to IPFS, and submits `submit_ai_ruling`. The desktop app's
    existing Claude integration remains a separate, read-only citizen Q&A feature, not this.
-   Still PARTIAL, not done: never run against a real chain/Claude API/IPFS daemon (unit-tested
-   at the pure-logic level only); `Courts::set_oracle_account` has never been called on a real
-   chain; and the service does not yet schedule `finalize_ruling` after an appeal window closes
-   unappealed, so a submitted ruling currently starts the appeal clock but nothing ever finalizes
-   it. See `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full
-   accounting.
+   `court-oracle` now also schedules `finalize_ruling`: it polls cases in `AIRulingIssued`
+   status, and once the current block passes `AIRulingBlock[case_id] + AppealWindowBlocks` with
+   no appeal filed (status still `AIRulingIssued`, not moved to `InJuryAppeal`), it recovers the
+   verdict from the ruling document it originally published to IPFS and submits
+   `finalize_ruling`, signed by the same oracle key `submit_ai_ruling` already uses (both calls
+   share the same `OracleOrigin` gate). Still PARTIAL, not done: never run against a real
+   chain/Claude API/IPFS daemon (unit-tested at the pure-logic level only, 47/47 passing); and
+   `Courts::set_oracle_account` has never been called on a real chain. See
+   `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full accounting.
 3. **Mobile app native build** — `android/` and its NFC module already exist and are committed;
    blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and
    (b) the OPRF committee service above, which gates on-device ZK proof generation.

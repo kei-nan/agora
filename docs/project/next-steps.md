@@ -61,16 +61,23 @@
     `cargo build`/`cargo test` pass (34 tests, 0 warnings). Also found and fixed, as a real side
     effect: `desktop/src-tauri/src/rpc.rs`'s `twox128_hex` was computing wrong storage-key
     hashes on every deployment (confirmed against the standard `twox128("System")` reference
-    vector) — fixed with a regression test. **Still marked PARTIAL, not DONE**: (a) never run
+    vector) — fixed with a regression test. **Update (`review-fix/court-oracle-finalize-
+    scheduling`)**: the `finalize_ruling` gap below is closed. `poll_once` now has a second
+    branch for cases in `CaseStatus::AIRulingIssued`: once the current block passes
+    `AIRulingBlock[case_id] + AppealWindowBlocks` with no appeal filed (status still
+    `AIRulingIssued`, not moved to `InJuryAppeal` by `appeal_ruling`), it recovers the verdict
+    from the ruling document originally published to IPFS (`submit_ai_ruling` never records a
+    verdict on-chain, only `ruling_hash`) and submits `finalize_ruling(case_id, verdict)`, signed
+    by the same oracle key `submit_ai_ruling` already uses — both calls share the same
+    `T::OracleOrigin` gate (`EnsureOracle`), so no separate signer/origin was needed.
+    `cargo test` now passes 47/47 (13 new tests: `should_finalize`'s appeal-window/status gating,
+    `parse_verdict_from_ruling_document`'s parsing, `Verdict`'s SCALE round-trip, and the
+    `finalize_ruling` call-byte layout). **Still marked PARTIAL, not DONE**: (a) never run
     against a real chain, Claude API, or IPFS daemon — the live RPC/API/daemon round trips and
-    the full orchestration loop are unit-tested at the pure-logic level only; (b)
-    `Courts::set_oracle_account` (root-only) was never called, so no real chain currently
-    accepts this service's signed calls; (c) a real, unresolved gap: `submit_ai_ruling` alone
-    never enforces anything — it only records `ruling_hash` and starts the appeal clock. The
-    verdict that actually drives enforcement is set only by a separate, still-unscheduled
-    `finalize_ruling(case_id, verdict)` oracle call after the appeal window closes unappealed,
-    which this service does not make. See `court-oracle/README.md` and
-    `docs/project/changelog/086.md` for the full accounting.
+    the full orchestration loop (both branches, and `fetch_ruling_verdict`'s gateway fetch) are
+    unit-tested at the pure-logic level only; (b) `Courts::set_oracle_account` (root-only) was
+    never called, so no real chain currently accepts this service's signed calls. See
+    `court-oracle/README.md` and `docs/project/changelog/086.md` for the full accounting.
 11. [DONE] **Multi-agent security review fixes (2026-08-08/09)** — a 7-agent parallel review of
     the whole repo found several real bugs, landed as reconciled, tested branches
     (`review-fix/*`), pending merge review:

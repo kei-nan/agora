@@ -24,6 +24,7 @@
 //! This file uses `to_le_bytes()` + byte-by-byte hex encoding, which matches the known vector.
 
 use anyhow::Context;
+use codec::Decode;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,6 +185,19 @@ impl RpcClient {
         let params = Value::Array(vec![Value::String(ss58_or_hex_account.to_string())]);
         let result = self.call("system_accountNextIndex", params).await?;
         result.as_u64().map(|n| n as u32).context("system_accountNextIndex did not return a number")
+    }
+
+    /// Reads `frame_system::Number` (`System::Number`, a plain `StorageValue<BlockNumber,
+    /// ValueQuery>`) — the current best block height. Used by the finalize-scheduling poll
+    /// branch to check whether a case's appeal deadline has passed. `BlockNumber = u32` in this
+    /// runtime (`runtime/src/lib.rs`). A missing entry (shouldn't happen post-genesis, but
+    /// `ValueQuery`'s own default is 0) is treated as block 0 — the same fail-safe direction as
+    /// everywhere else in this crate: it can only make a deadline look further away than it
+    /// really is, never trigger an early `finalize_ruling` attempt.
+    pub async fn get_current_block_number(&self) -> anyhow::Result<u32> {
+        let key = storage_prefix("System", "Number");
+        let Some(bytes) = self.get_storage(&key).await? else { return Ok(0) };
+        Ok(u32::decode(&mut &bytes[..]).unwrap_or(0))
     }
 
     /// Submits a fully-encoded, signed extrinsic (hex, "0x"-prefixed) via

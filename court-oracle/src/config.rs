@@ -32,6 +32,24 @@ pub struct Config {
     /// `vote_approve_ai_model`) — `main.rs` fetches that value fresh from chain before every
     /// submission rather than caching or guessing it.
     pub submit_ai_ruling_call_index: u8,
+    /// `finalize_ruling`'s call index within pallet-courts. `#[pallet::call_index(4)]` in
+    /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
+    /// real call is `finalize_ruling(case_id: u32, verdict: Verdict)`, gated by the *same*
+    /// `T::OracleOrigin` as `submit_ai_ruling` (see `EnsureOracle`), and additionally requires
+    /// `Cases[case_id].status == AIRulingIssued` and the current block to be strictly past
+    /// `AIRulingBlock[case_id] + AppealWindowBlocks` — i.e. the appeal window has closed with no
+    /// `appeal_ruling` call in between (an appeal moves status to `InJuryAppeal`, which this
+    /// call's own `ensure!` rejects with `InvalidStatus`).
+    pub finalize_ruling_call_index: u8,
+    /// `pallet-courts`'s `AppealWindowBlocks` config constant — how many blocks after
+    /// `submit_ai_ruling` a case may still be appealed. `ConstU32<{ 7 * DAYS }>` in
+    /// `runtime/src/configs/mod.rs`, and `DAYS` (`runtime/src/lib.rs`) resolves to `7_200`
+    /// blocks at this runtime's 12-second block time, so `7 * DAYS = 50_400` — confirmed by
+    /// reading both files, not guessed. Used client-side only to decide *when it's worth
+    /// attempting* `finalize_ruling`; the chain enforces the real deadline independently via
+    /// `AIRulingBlock`, so a wrong value here only costs a wasted/rejected extrinsic, never an
+    /// early finalize.
+    pub appeal_window_blocks: u32,
     /// Note on what's deliberately NOT a config field here: `pallet-constitution`,
     /// `pallet-treasury-ledger`, and `pallet-audit`'s runtime pallet *indices* (12, 10, 16)
     /// are not needed anywhere in this service — storage-key hashing is keyed by each
@@ -91,6 +109,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
 
+        let finalize_ruling_call_index: u8 = std::env::var("FINALIZE_RULING_CALL_INDEX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+
+        let appeal_window_blocks: u32 = std::env::var("APPEAL_WINDOW_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_400);
+
         let ipfs_api_url = std::env::var("IPFS_API_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:5001".to_string());
 
@@ -107,6 +135,8 @@ impl Config {
             poll_interval_secs,
             courts_pallet_index,
             submit_ai_ruling_call_index,
+            finalize_ruling_call_index,
+            appeal_window_blocks,
             ipfs_api_url,
             claude_model,
             dry_run,
