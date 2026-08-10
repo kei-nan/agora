@@ -24,5 +24,11 @@ passed to allocate one department's budget can't be replayed to reset another's 
 
 After every `record_expenditure`, calls `T::AuditHook::on_expenditure(...)` → pallet-audit inserts a `Pending` audit entry.
 
-Internal: `freeze_department_internal(department_id)` — called by courts enforcement (no origin check, courts are pre-authorized)
+Internal (no origin check; not dispatchable, only reachable via runtime-wired traits):
+- `freeze_department_internal(department_id)` — called by pallet-courts (`TreasuryEnforcer`) on
+  an illegal-treasury-activity ruling, and by pallet-audit (`TreasuryFreezer`) when an
+  expenditure is flagged or disputed
+- `unfreeze_department_internal(department_id)` — called by pallet-audit (`TreasuryFreezer`)
+  once all open flags/disputes against a department are resolved; idempotent. (The root-only
+  `unfreeze_department` dispatchable remains the path for lifting a court-ordered freeze.)
 

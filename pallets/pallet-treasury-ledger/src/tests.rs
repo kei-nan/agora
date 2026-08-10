@@ -490,3 +490,51 @@ fn legislature_call_hash_differs_for_different_department_ids() {
 		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", 2u32);
 	assert_ne!(hash_a, hash_b);
 }
+
+// ---------------------------------------------------------------------
+// unfreeze_department_internal (used by pallet-audit's TreasuryFreezer wiring)
+// ---------------------------------------------------------------------
+
+#[test]
+fn unfreeze_department_internal_clears_frozen_and_emits_event() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert!(FrozenDepartments::<Test>::get(DEPT));
+
+		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
+
+		assert!(!FrozenDepartments::<Test>::get(DEPT));
+		System::assert_last_event(Event::DepartmentUnfrozen { department_id: DEPT }.into());
+	});
+}
+
+#[test]
+fn unfreeze_department_internal_is_idempotent_when_not_frozen() {
+	new_test_ext().execute_with(|| {
+		// No prior freeze — must not panic or emit a spurious event.
+		System::set_block_number(1);
+		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
+		assert!(!FrozenDepartments::<Test>::get(DEPT));
+		assert!(System::events().is_empty());
+	});
+}
+
+#[test]
+fn record_expenditure_succeeds_again_after_unfreeze_department_internal() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_noop!(
+			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A),
+			Error::<Test>::DepartmentFrozen
+		);
+
+		// This is the path pallet-audit's TreasuryFreezer wiring uses (as opposed to the
+		// root-only `unfreeze_department` dispatchable).
+		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
+
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
+		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
+	});
+}

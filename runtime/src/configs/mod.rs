@@ -500,10 +500,23 @@ impl pallet_voting::Config for Runtime {
 /// The canonical `PalletAudit` alias for `construct_runtime!` lives in `runtime/src/lib.rs`.
 type PalletAuditImpl = pallet_audit::Pallet<Runtime>;
 
+/// Runtime implements pallet-audit's `TreasuryFreezer` by calling pallet-treasury-ledger's
+/// internal freeze/unfreeze functions — mirrors `TreasuryEnforcer` below, which pallet-courts
+/// uses for the same underlying `FrozenDepartments` storage.
+impl pallet_audit::TreasuryFreezer for Runtime {
+	fn freeze_department(department_id: u32) -> sp_runtime::DispatchResult {
+		pallet_treasury_ledger::Pallet::<Runtime>::freeze_department_internal(department_id)
+	}
+	fn unfreeze_department(department_id: u32) -> sp_runtime::DispatchResult {
+		pallet_treasury_ledger::Pallet::<Runtime>::unfreeze_department_internal(department_id)
+	}
+}
+
 impl pallet_audit::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	/// At most 10 registered auditors.
 	type MaxAuditors = ConstU32<10>;
+	type TreasuryFreezer = Runtime;
 }
 
 impl pallet_treasury_ledger::Config for Runtime {
