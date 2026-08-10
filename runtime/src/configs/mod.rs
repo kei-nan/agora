@@ -501,14 +501,17 @@ impl pallet_voting::Config for Runtime {
 type PalletAuditImpl = pallet_audit::Pallet<Runtime>;
 
 /// Runtime implements pallet-audit's `TreasuryFreezer` by calling pallet-treasury-ledger's
-/// internal freeze/unfreeze functions — mirrors `TreasuryEnforcer` below, which pallet-courts
-/// uses for the same underlying `FrozenDepartments` storage.
+/// audit-specific internal freeze/unfreeze functions — deliberately the `audit_*` pair, not
+/// the plain `freeze_department_internal`/`unfreeze_department_internal` that `TreasuryEnforcer`
+/// below uses for pallet-courts. The two authorities now write to independent storage axes
+/// (`AuditFrozenDepartments` vs. `CourtFrozenDepartments`) so pallet-audit resolving its own
+/// flags can never silently lift a pallet-courts freeze, and vice versa.
 impl pallet_audit::TreasuryFreezer for Runtime {
 	fn freeze_department(department_id: u32) -> sp_runtime::DispatchResult {
-		pallet_treasury_ledger::Pallet::<Runtime>::freeze_department_internal(department_id)
+		pallet_treasury_ledger::Pallet::<Runtime>::audit_freeze_department_internal(department_id)
 	}
 	fn unfreeze_department(department_id: u32) -> sp_runtime::DispatchResult {
-		pallet_treasury_ledger::Pallet::<Runtime>::unfreeze_department_internal(department_id)
+		pallet_treasury_ledger::Pallet::<Runtime>::audit_unfreeze_department_internal(department_id)
 	}
 }
 
@@ -552,7 +555,9 @@ impl pallet_courts::LawEnforcer for Runtime {
 	}
 }
 
-/// Runtime implements TreasuryEnforcer by calling pallet-treasury-ledger's internal function.
+/// Runtime implements TreasuryEnforcer by calling pallet-treasury-ledger's court-specific
+/// internal function (`freeze_department_internal`, writing `CourtFrozenDepartments` — the
+/// axis pallet-audit's `TreasuryFreezer` wiring above never touches).
 impl pallet_courts::TreasuryEnforcer for Runtime {
 	fn freeze_department(department_id: u32) -> sp_runtime::DispatchResult {
 		pallet_treasury_ledger::Pallet::<Runtime>::freeze_department_internal(department_id)
