@@ -49,6 +49,10 @@ democracy-chain/
 ├── circuits/
 │   └── oprf-identity-anchor/      # forked ZKPassport OPRF circuits (Noir) — see changelog #69
 ├── mobile/                        # React Native + Android native project (android/ generated)
+├── committee/                     # separate mobile app for OPRF committee-member duty (changelog #082/#083)
+├── committee-node/                # laptop/Pi OPRF committee-member container component (changelog #083)
+├── oprf-committee-dev/            # OPRF crypto core, real wasm32 build (changelog #083); dev/test only, not a real committee
+├── court-oracle/                  # AI-ruling oracle service: polls filed cases, calls Claude, publishes reasoning to IPFS, submits submit_ai_ruling (changelog #086)
 ├── desktop/                       # Tauri 2 app — wired to real chain RPC + Claude AI agent
 ├── CLAUDE.md
 └── HANDOFF.md                     # thin pointer into docs/project/
@@ -67,7 +71,7 @@ Build is clean. Next available pallet index: **19**.
 | Mobile app (React Native) | [apps/mobile.md](apps/mobile.md) |
 | Remaining work, prioritized | [next-steps.md](next-steps.md) |
 | External docs/repos referenced throughout | [references.md](references.md) |
-| Historical "completed work" log (72 entries, chronological, append-only) | [changelog/](changelog/) — chunked by entry range, see below |
+| Historical "completed work" log (86 entries as of this writing, chronological, append-only — see `changelog/` for the current highest entry) | [changelog/](changelog/) — chunked by entry range, see below |
 
 ### Pallets (`pallets/`)
 
