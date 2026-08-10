@@ -67,8 +67,12 @@ To run the dev chain:
 
 ## Identity System
 - Biometric passport NFC scan on mobile (custom JMRTD/NFCPassportReader native modules; ZKPassport Noir circuits for the ZK proof, see HANDOFF.md log #65)
-- On-device face match (Apple Vision iOS / MobileFaceNet Android)
-- Liveness detection (blink/turn)
+- On-device face match (Apple Vision iOS / MobileFaceNet Android) — **NOT YET IMPLEMENTED**:
+  `RegisterScreen.tsx`'s registration flow has only a `// TODO: await FaceMatch.verify(...)`
+  where this would go; no `FaceMatch` module or MobileFaceNet/Apple Vision code exists anywhere
+  in `mobile/` (see `docs/project/next-steps.md` item 12)
+- Liveness detection (blink/turn) — **NOT YET IMPLEMENTED**, same gap as face match above:
+  registration currently proceeds straight from NFC scan to ZK proving with no liveness gate
 - ZK proof generated on device — nothing leaves the phone
 - Nullifier = Poseidon2(national_id || country_code) — stable across passport renewals
 - Passport must be valid at registration AND at vote time
@@ -115,9 +119,15 @@ All enforced by smart contract boundaries:
 ## Mobile App
 - React Native (iOS + Android)
 - Custom native modules (JMRTD/Android, NFCPassportReader/iOS) for NFC passport reading; ZKPassport Noir/UltraHonk circuits for ZK proof generation (see HANDOFF.md log #65 — replaces the earlier Rarimo/circom integration)
-- On-device face match (Apple Vision / MobileFaceNet via TFLite)
+- On-device face match (Apple Vision / MobileFaceNet via TFLite) — **not yet implemented**, see
+  Identity System section below
 - @polkadot/api for Substrate chain interaction
-- Wallet stored in iOS Secure Enclave / Android Keystore
+- Wallet's Sr25519 signing key is encrypted at rest using a non-exportable, hardware-backed key
+  (Android Keystore / iOS Secure Enclave); Android Keystore has no native Sr25519 support, so the
+  seed is decrypted into app memory transiently to sign — full hardware-backed signing isolation
+  is not yet possible on Android without a curve-conversion redesign. iOS has no wallet code at
+  all yet (`ios/` doesn't exist, see Current State above), so this is Android-only in practice
+  today.
 
 ## Desktop App
 Standalone native desktop app (laptop/PC) for citizens to browse and engage with the system.
@@ -216,6 +226,11 @@ authoritative version of this list; treat this section as a summary, not the sou
    reveal scheme replaced block-hash selection in `pallet-courts`, closing the worst grinding
    attack; genuine BABE/SASSAFRAS VRF would need a full consensus swap away from Aura.
 5. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token.
+6. **On-device face match + liveness detection** — listed in the Identity System section above
+   as architectural intent but not built at all: `RegisterScreen.tsx` has only a
+   `// TODO: await FaceMatch.verify(...)` where this would go, no `FaceMatch`/MobileFaceNet/Apple
+   Vision code exists in `mobile/`, and registration currently proceeds from NFC scan straight to
+   ZK proving with no biometric gate. See `docs/project/next-steps.md` item 12.
 
 Already done, despite earlier versions of this list still saying otherwise: QR auth (chain-side
 verification), per-referendum foundational/constitutional threshold, IPFS content fetching on

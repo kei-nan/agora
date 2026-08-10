@@ -137,4 +137,17 @@
       re-run clean post-reconciliation). Flagging this here mainly so a future session doesn't
       waste time re-discovering it if worktree-isolated sub-agents produce another
       surprising-looking diff.
+12. [ ] **On-device face match + liveness detection** — found 2026-08-10 during a docs-drift
+    review, not previously tracked here. CLAUDE.md's Identity System section lists "On-device
+    face match (Apple Vision iOS / MobileFaceNet Android)" and "Liveness detection (blink/turn)"
+    as if built; neither exists in any form. `mobile/src/screens/RegisterScreen.tsx`'s
+    registration flow sets `setStep('liveness')` then immediately hits
+    `// TODO: await FaceMatch.verify(scan.faceImage);` and moves on to `setStep('proving')` —
+    no liveness check (blink/turn) runs, no face-image comparison against the passport's DG2
+    photo happens, on-device or otherwise. No `FaceMatch` module, MobileFaceNet TFLite model, or
+    Apple Vision integration exists anywhere in `mobile/`. Registration currently proceeds from
+    a completed NFC scan straight to ZK proving with no biometric liveness/match gate at all.
+    Scope: an Android TFLite MobileFaceNet pipeline plus a liveness (blink/turn) check wired
+    into `RegisterScreen.tsx` before the `proving` step; iOS has no equivalent yet since
+    `ios/` itself doesn't exist. Not started.
 
