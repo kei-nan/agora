@@ -33,7 +33,7 @@
 | `FreshLegislatureChecker<BlockNumber>` | `Runtime` | reads `pallet_elections::LastElectionBlock` |
 | `AutoChallengeHook` | `Runtime` | `pallet_courts::Pallet::<Runtime>::auto_file_case(LawChallenge)` |
 | `ZkProofVerifier` (`pallet_anticorruption`, own trait — distinct from `pallet_identity_zk`'s) | `PassthroughAntiCorruptionZkVerifier` (dev) / `ZkPassportAntiCorruptionZkVerifier` (prod) | dev: always `true`; prod: delegates straight to `pallet_identity_zk`'s `ZkPassportUltraHonkVerifier` (reuses the same ZKPassport outer circuit — the pallet's own whistleblower circuit is still unbuilt, see HANDOFF item 8) |
-| `LegislatureOrigin` (`pallet_executive::Config`) | `pallet_legislature::EnsureLegislatureMotion<Runtime>` | gates `appoint_minister` / `dismiss_minister` / `declare_emergency` / `end_emergency` on a passed legislature motion |
+| `LegislatureOrigin` (`pallet_executive::Config`) | `pallet_legislature::EnsureLegislatureMotion<Runtime>` | gates `define_portfolio` / `appoint_prime_minister` / `dismiss_prime_minister` / `appoint_minister` / `dismiss_minister` on a passed legislature motion. **Not** the Cabinet's emergency-declaration calls: `vote_declare_emergency` / `vote_end_emergency` / `retract_emergency_vote` are gated by `is_cabinet_member` instead — the legislature only ratifies an already-active emergency after the fact, via the separately-`LegislatureOrigin`-gated `ratify_emergency` (see `docs/project/pallets/executive.md`) |
 
 **`pallet-emergency-council` is wired into the runtime** — it's a real dependency in
 `runtime/Cargo.toml`, has a real `impl pallet_emergency_council::Config for Runtime` in

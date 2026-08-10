@@ -14,7 +14,9 @@ Storage:
 - `NextPortfolioId`: `u32`
 
 Config: `LegislatureOrigin = EnsureLegislatureMotion<Runtime>`, `MaxPortfolios = 20`,
-`MaxEmergencyBlocks = 432_000`, `RatificationWindowBlocks = 3 * DAYS`,
+`MaxEmergencyBlocks = 30 * DAYS` (= 216,000 blocks at this chain's real 12s/block time —
+previously a hardcoded `432_000`, which was 30 days at a stale 6s/block assumption and
+actually enforced a 60-day cap; fixed 2026-08-09), `RatificationWindowBlocks = 3 * DAYS`,
 `SupermajorityNumerator/Denominator = 2/3`
 
 Portfolio/PM calls (all `LegislatureOrigin` except `resign`):
