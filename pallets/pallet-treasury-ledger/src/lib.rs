@@ -248,11 +248,25 @@ pub mod pallet {
     }
 
     impl<T: Config> Pallet<T> {
-        /// Called by pallet-courts when a ruling finds illegal treasury activity.
-        /// Cross-pallet internal call — no origin check needed here; courts are pre-authorized.
+        /// Called by pallet-courts when a ruling finds illegal treasury activity, and by
+        /// pallet-audit (via `T::TreasuryFreezer`) when an expenditure is flagged or disputed.
+        /// Cross-pallet internal call — no origin check needed here; callers are pre-authorized
+        /// via runtime wiring, not exposed as a dispatchable.
         pub fn freeze_department_internal(department_id: u32) -> DispatchResult {
             FrozenDepartments::<T>::insert(department_id, true);
             Self::deposit_event(Event::DepartmentFrozen { department_id });
+            Ok(())
+        }
+
+        /// Called by pallet-audit (via `T::TreasuryFreezer`) once all open flags/disputes
+        /// against a department have been resolved. Unlike the `unfreeze_department`
+        /// dispatchable (root-only, for court-ordered freezes), this is a cross-pallet
+        /// internal call — no origin check needed; callers are pre-authorized via runtime
+        /// wiring. Idempotent: does nothing if the department wasn't frozen.
+        pub fn unfreeze_department_internal(department_id: u32) -> DispatchResult {
+            if FrozenDepartments::<T>::take(department_id) {
+                Self::deposit_event(Event::DepartmentUnfrozen { department_id });
+            }
             Ok(())
         }
     }

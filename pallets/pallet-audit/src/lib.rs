@@ -9,13 +9,22 @@
 //!
 //! ## Audit lifecycle
 //! ```text
-//! Pending → Cleared   (auditor finds it compliant)
-//! Pending → Flagged   (auditor finds it irregular; reason stored)
-//! Flagged → Disputed  (escalated to formal dispute)
+//! Pending → Cleared             (auditor finds it compliant)
+//! Pending → Flagged             (auditor finds it irregular; reason stored)
+//! Flagged → Disputed            (escalated to formal dispute)
+//! Flagged/Disputed → Cleared    (resolved in the department's favor, via resolve_entry)
 //! ```
 //! Only these transitions are valid. Notably:
 //! - `Disputed` cannot be downgraded back to `Flagged`.
 //! - `Pending` cannot jump directly to `Disputed` (must go through `Flagged`).
+//!
+//! ## Treasury enforcement
+//! Flagging or disputing an entry (`flag_entry` / a Flagged entry escalated by
+//! `dispute_entry`) freezes that expenditure's department in `pallet-treasury-ledger` via
+//! `T::TreasuryFreezer` — further `record_expenditure` calls for that department fail while
+//! frozen. Each department tracks its own open-flag count (`OpenFlags`): the department stays
+//! frozen as long as at least one Flagged/Disputed entry against it remains unresolved, and is
+//! only unfrozen once `resolve_entry` clears the last one.
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
@@ -59,6 +68,16 @@ pub mod pallet {
         pub flagged_by: Option<AccountId>,
     }
 
+    // ── Cross-pallet enforcement trait ────────────────────────────────────────────
+
+    /// Implemented by the runtime to call pallet-treasury-ledger's
+    /// `freeze_department_internal` / `unfreeze_department_internal`. Mirrors the
+    /// `TreasuryEnforcer` trait pallet-courts uses for the same purpose.
+    pub trait TreasuryFreezer {
+        fn freeze_department(department_id: u32) -> DispatchResult;
+        fn unfreeze_department(department_id: u32) -> DispatchResult;
+    }
+
     // ── Pallet ─────────────────────────────────────────────────────────────────
 
     #[pallet::pallet]
@@ -70,6 +89,9 @@ pub mod pallet {
         /// Maximum number of registered auditors.
         #[pallet::constant]
         type MaxAuditors: Get<u32>;
+        /// Freezes/unfreezes a department in pallet-treasury-ledger when this pallet opens
+        /// or fully resolves flags/disputes against it.
+        type TreasuryFreezer: TreasuryFreezer;
     }
 
     // ── Storage ────────────────────────────────────────────────────────────────
@@ -83,6 +105,13 @@ pub mod pallet {
     #[pallet::storage]
     pub type Auditors<T: Config> =
         StorageValue<_, BoundedVec<T::AccountId, T::MaxAuditors>, ValueQuery>;
+
+    /// Count of currently-open (Flagged or Disputed) entries per department. Drives the
+    /// `TreasuryFreezer` calls: a department is frozen while this is nonzero, and unfrozen
+    /// only when it drops back to zero — so one department with multiple open flags/disputes
+    /// stays frozen until every one of them is resolved.
+    #[pallet::storage]
+    pub type OpenFlags<T: Config> = StorageMap<_, Blake2_128Concat, u32, u32, ValueQuery>;
 
     // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -99,6 +128,9 @@ pub mod pallet {
         EntryFlagged { index: u64, by: T::AccountId, reason: [u8; 32] },
         /// An expenditure entry was escalated to disputed status.
         EntryDisputed { index: u64 },
+        /// A previously Flagged or Disputed entry was resolved (in the department's favor)
+        /// and marked Cleared.
+        EntryResolved { index: u64, by: T::AccountId },
         /// An audit report covering a time period was submitted on-chain.
         AuditReportSubmitted { period_hash: [u8; 32] },
     }
@@ -123,6 +155,8 @@ pub mod pallet {
         EntryAlreadyFlagged,
         /// flag_entry cannot downgrade a Disputed entry.
         EntryAlreadyDisputed,
+        /// resolve_entry requires the entry to currently be Flagged or Disputed.
+        EntryNotOpen,
     }
 
     // ── Calls ──────────────────────────────────────────────────────────────────
@@ -186,7 +220,7 @@ pub mod pallet {
             reason_hash: [u8; 32],
         ) -> DispatchResult {
             let who = Self::ensure_auditor(origin)?;
-            AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
+            let dept_id = AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
                 let entry = maybe_entry.as_mut().ok_or(Error::<T>::EntryNotFound)?;
                 match entry.status {
                     AuditStatus::Pending => {}
@@ -197,8 +231,18 @@ pub mod pallet {
                 entry.status = AuditStatus::Flagged;
                 entry.flag_reason = Some(reason_hash);
                 entry.flagged_by = Some(who.clone());
-                Ok::<_, DispatchError>(())
+                Ok::<_, DispatchError>(entry.dept_id)
             })?;
+            // First open flag/dispute against this department freezes it in
+            // pallet-treasury-ledger. Further flags on the same department (or other
+            // entries in the same department) just add to the open count.
+            let open = OpenFlags::<T>::mutate(dept_id, |count| {
+                *count = count.saturating_add(1);
+                *count
+            });
+            if open == 1 {
+                T::TreasuryFreezer::freeze_department(dept_id)?;
+            }
             Self::deposit_event(Event::EntryFlagged {
                 index: expenditure_index,
                 by: who,
@@ -221,6 +265,35 @@ pub mod pallet {
                 Ok::<_, DispatchError>(())
             })?;
             Self::deposit_event(Event::EntryDisputed { index: expenditure_index });
+            Ok(())
+        }
+
+        /// Resolve a Flagged or Disputed entry in the department's favor, marking it
+        /// Cleared. Auditor only. Decrements the department's open-flag count; once that
+        /// count reaches zero (no other open flags/disputes remain against the department),
+        /// the department is unfrozen in pallet-treasury-ledger. If other flags/disputes
+        /// are still open against the same department, it stays frozen.
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        pub fn resolve_entry(origin: OriginFor<T>, expenditure_index: u64) -> DispatchResult {
+            let who = Self::ensure_auditor(origin)?;
+            let dept_id = AuditLog::<T>::try_mutate(expenditure_index, |maybe_entry| {
+                let entry = maybe_entry.as_mut().ok_or(Error::<T>::EntryNotFound)?;
+                ensure!(
+                    entry.status == AuditStatus::Flagged || entry.status == AuditStatus::Disputed,
+                    Error::<T>::EntryNotOpen
+                );
+                entry.status = AuditStatus::Cleared;
+                Ok::<_, DispatchError>(entry.dept_id)
+            })?;
+            let open = OpenFlags::<T>::mutate(dept_id, |count| {
+                *count = count.saturating_sub(1);
+                *count
+            });
+            if open == 0 {
+                T::TreasuryFreezer::unfreeze_department(dept_id)?;
+            }
+            Self::deposit_event(Event::EntryResolved { index: expenditure_index, by: who });
             Ok(())
         }
 
