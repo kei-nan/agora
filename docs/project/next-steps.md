@@ -1,6 +1,12 @@
 # Next steps (remaining work)
 
-1. [DONE] **VK assets** — real 424-byte Rarimo Groth16 BN254 VKs in `runtime/assets/`
+1. [DONE, SUPERSEDED] **VK assets** — this originally referred to real 424-byte Rarimo Groth16
+   BN254 VKs in `runtime/assets/`. Those are gone: the Rarimo→ZKPassport migration (log #65,
+   see item 8 below) replaced them, and `runtime/assets/` now contains only
+   `vk_zkpassport_outer_count_4.bin` (ZKPassport's UltraHonk `outer/count_4` verification key;
+   `docs/project/zk-verifier.md` documents the old `vk_sha1.bin`/`vk_sha256.bin` as deleted).
+   Still accurate as a checkpoint: a real VK asset matching the currently-used verifier
+   (`runtime/src/verifier.rs`) is present and wired.
 2. [DONE] **Mobile app native init** — `android/` generated; JS/TS complete; iOS deferred (WSL2)
 3. [DONE] **QR auth — chain verification** — `auth_verify_nullifier` scans NullifierRegistry on-chain
 4. [DONE] **pallet-executive (Cabinet)** — parliamentary executive, incompatibility rule, `EnsureExecutiveMinister`

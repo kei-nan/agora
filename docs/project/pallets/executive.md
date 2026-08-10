@@ -13,9 +13,11 @@ Storage:
 - `MinisterPortfolio`: `AccountId` → `portfolio_id` (enables O(1) is_active_minister)
 - `NextPortfolioId`: `u32`
 
-Config: `LegislatureOrigin = EnsureLegislatureMotion<Runtime>`, `MaxPortfolios = 20`
+Config: `LegislatureOrigin = EnsureLegislatureMotion<Runtime>`, `MaxPortfolios = 20`,
+`MaxEmergencyBlocks = 432_000`, `RatificationWindowBlocks = 3 * DAYS`,
+`SupermajorityNumerator/Denominator = 2/3`
 
-Calls (all `LegislatureOrigin` except `resign`):
+Portfolio/PM calls (all `LegislatureOrigin` except `resign`):
 - `define_portfolio(name_hash)` — creates a new named cabinet portfolio
 - `appoint_prime_minister(who)` — installs PM; auto-dismisses old PM if any
 - `dismiss_prime_minister()` — removes current PM
@@ -28,4 +30,28 @@ Calls (all `LegislatureOrigin` except `resign`):
 Implements `MinisterChecker<AccountId>` from pallet-legislature: `is_active_minister(who)` returns true
 if the account holds a portfolio OR is the PM. This is the cross-pallet trait that enforces the
 incompatibility rule without circular dependencies.
+
+### Emergency powers (a second, separate mechanism from `pallet-emergency-council`)
+
+The Cabinet has its own time-limited emergency-declaration mechanism, distinct from and
+independent of `pallet-emergency-council`. **The legislature does not gate the initial
+declaration** — only `ratify_emergency` (after the fact) uses `LegislatureOrigin`; declaring
+and ending an emergency are both cabinet-only actions:
+
+- `vote_declare_emergency(reason_hash, duration_blocks)` — **`is_cabinet_member` (any minister
+  or the PM), not `LegislatureOrigin`**. First voter's `reason_hash`/`duration_blocks` (clamped
+  to `MaxEmergencyBlocks`) lock in the proposal; once a 2/3 cabinet supermajority has voted,
+  `ActiveEmergency` is set and the legislature's `RatificationWindowBlocks` clock starts.
+- `ratify_emergency()` — **`LegislatureOrigin`**. The legislature ratifies (or, by inaction,
+  lets it lapse) an already-active emergency; it does not pre-approve the declaration.
+- `vote_end_emergency()` — **`is_cabinet_member`**. Cabinet supermajority vote clears
+  `ActiveEmergency` early (independent of whether it was ratified).
+- `retract_emergency_vote()` — **`is_cabinet_member`**. Withdraws a cabinet member's own
+  pending declare-vote before the emergency activates.
+
+Design intent: the executive declares under time pressure without waiting on the legislature;
+the legislature's role is to ratify after the fact or let the declaration lapse, and it can
+also vote (via ordinary cabinet-supermajority mechanics) to end an emergency early. Do not
+confuse this with `pallet-emergency-council`'s time-locked powers, which are a separate pallet
+with its own sunset clause.
 
