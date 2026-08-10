@@ -106,6 +106,14 @@ pub mod pallet {
         /// Delegation is valid for referenda whose close block ≤ expires_at.
         /// After this block the record is treated as absent and cleaned up lazily.
         pub expires_at: BlockNumber,
+        /// The weight this delegation edge contributed to its resolved terminal delegate's
+        /// `DelegatedWeight` entry at the moment it was created (this delegator's own vote,
+        /// plus whatever weight this delegator had itself accumulated as a terminal delegate
+        /// for others before delegating onward). Snapshotted here — rather than recomputed —
+        /// so `revoke_delegation` and lazy expiry cleanup can remove *exactly* this amount
+        /// later without drift. See `DelegatedWeight`'s doc comment for why it can't simply be
+        /// recomputed at removal time.
+        pub resolved_weight: u32,
     }
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
@@ -223,6 +231,26 @@ pub mod pallet {
     /// Number of direct delegators per (topic_id, delegate).
     #[pallet::storage]
     pub type DelegatorCount<T: Config> =
+        StorageMap<_, Blake2_128Concat, (u32, T::AccountId), u32, ValueQuery>;
+
+    /// Per-topic, transitively-resolved voting weight currently anchored at an account —
+    /// i.e. how many citizens' votes would be credited to this account if it cast a direct
+    /// vote, counting whole delegation chains that terminate here, not just direct fan-in.
+    ///
+    /// Invariant: any account with an active outgoing delegation on this topic always has 0
+    /// here — its incoming weight is immediately re-attributed to whatever it resolves to
+    /// instead, so only current *terminal* delegates ever carry a nonzero balance. Maintained
+    /// incrementally by `delegate_vote`, `revoke_delegation`, and `has_delegation_cycle`'s
+    /// lazy expiry cleanup — see `delegate_vote`'s doc comment for exactly how, and for the
+    /// one documented case (an intermediate delegate re-delegating to a *different* target)
+    /// this bookkeeping cannot perfectly follow.
+    ///
+    /// Used solely to enforce `DelegationCap` at delegation time. The actual vote tally in
+    /// `apply_delegated_weight` never reads this — it always re-resolves the real
+    /// `Delegations` graph fresh from scratch, so tallying correctness never depends on this
+    /// cache staying perfectly accurate.
+    #[pallet::storage]
+    pub type DelegatedWeight<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), u32, ValueQuery>;
 
     /// Next proposal id counter.
@@ -486,6 +514,32 @@ pub mod pallet {
         /// `duration_blocks` must be within [MinDelegationDurationBlocks, MaxDelegationDurationBlocks].
         /// Replaces any existing (including expired) delegation for that topic.
         /// The delegation is valid for any referendum whose close block ≤ (now + duration_blocks).
+        ///
+        /// ## DelegationCap enforcement is against *transitively resolved* weight
+        /// `DelegationCap` bounds the percentage of total voting power any single delegate may
+        /// end up holding once chains are followed to their end — not just how many people
+        /// delegate to them directly (see `DelegatedWeight`'s doc comment). So this call:
+        /// 1. Walks forward from `delegate` (bounded by `MaxDelegationDepth`, same as
+        ///    `resolve_delegate_readonly`) to find the terminal delegate this new edge would
+        ///    ultimately route `who`'s vote to.
+        /// 2. Computes what `who` is bringing to that terminal: `who`'s own vote, plus — if
+        ///    `who` is currently itself a terminal delegate for others — all of the weight
+        ///    already resolving to `who` (read from `DelegatedWeight`, an O(1) lookup; nobody
+        ///    else's weight can be sitting "behind" `who` without already being reflected
+        ///    there, see the invariant in `DelegatedWeight`'s doc comment).
+        /// 3. Rejects the delegation if the terminal's resulting total would exceed the cap.
+        ///
+        /// This keeps the whole cost bounded by `MaxDelegationDepth` (two bounded forward
+        /// walks plus O(1) storage reads) rather than rescanning every delegation on-chain, and
+        /// it keeps the invariant "no delegate exceeds the cap" true for every edge that is
+        /// itself being added or moved. The one gap this does **not** close: if an
+        /// *intermediate* delegate later re-delegates to a *different* new target (not
+        /// touching `who`'s own edge at all), the weight `who` contributed upstream of that
+        /// intermediate is not re-walked and moved to the intermediate's new terminal — see
+        /// `DelegatedWeight`'s doc comment for why that would require tracking per-hop subtree
+        /// weight (a much larger change) rather than per-terminal totals. That gap can only
+        /// ever make this check *too permissive* in that one specific scenario, never let a
+        /// cap violation go undetected on the edge actually being submitted here.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn delegate_vote(
@@ -527,37 +581,73 @@ pub mod pallet {
                 new_count <= T::MaxDelegationsPerDelegate::get(),
                 Error::<T>::DelegationCapExceeded
             );
-            let total = T::CitizenChecker::total_citizens();
-            if total > 0 {
-                // Use u64 to avoid overflow: DelegationCap * total can exceed u32::MAX
-                // for large citizenries (e.g. cap=50, total=100M → 5B overflows u32).
-                ensure!(
-                    (new_count as u64).saturating_mul(100)
-                        <= (T::DelegationCap::get() as u64).saturating_mul(total as u64),
-                    Error::<T>::DelegationCapExceeded
-                );
-            }
+
+            let now = frame_system::Pallet::<T>::block_number();
+
+            // The weight to record against the (possibly new) resolved terminal for this edge.
+            // When replacing the same delegate, nothing about the resolved chain or its weight
+            // changes (only expires_at does) — carry the existing snapshot forward unchanged
+            // rather than recomputing, since `who`'s own `DelegatedWeight` bucket is already 0
+            // (they have had an active outgoing delegation the whole time) and would otherwise
+            // make it look like this edge only ever carried weight 1.
+            let resolved_weight = if replacing_same_delegate {
+                maybe_old.as_ref().expect("replacing_same_delegate implies Some").resolved_weight
+            } else {
+                // `who`'s own contribution to whichever terminal this edge resolves to: their
+                // own vote, plus (only if `who` is currently itself a terminal delegate for
+                // others) whatever weight has already accumulated behind them.
+                let who_weight = 1u32.saturating_add(DelegatedWeight::<T>::get((topic_id, &who)));
+                // Where the NEW edge would ultimately route weight to. Cycle detection above
+                // already guarantees `who` cannot appear anywhere in this chain.
+                let new_terminal = Self::resolve_delegate_readonly(&delegate, topic_id, now);
+                let total = T::CitizenChecker::total_citizens();
+                if total > 0 {
+                    let projected =
+                        DelegatedWeight::<T>::get((topic_id, &new_terminal)).saturating_add(who_weight);
+                    // Use u64 to avoid overflow: DelegationCap * total can exceed u32::MAX
+                    // for large citizenries (e.g. cap=50, total=100M → 5B overflows u32).
+                    ensure!(
+                        (projected as u64).saturating_mul(100)
+                            <= (T::DelegationCap::get() as u64).saturating_mul(total as u64),
+                        Error::<T>::DelegationCapExceeded
+                    );
+                }
+                DelegatedWeight::<T>::mutate((topic_id, &new_terminal), |w| {
+                    *w = w.saturating_add(who_weight)
+                });
+                who_weight
+            };
 
             // All checks passed. Now perform state mutations atomically.
             // When replacing_same_delegate is true the net count is unchanged, so we must
             // skip BOTH the decrement (old) and the insert (new) to avoid a -1 drift.
-            if let Some(old_record) = maybe_old {
+            if let Some(old_record) = &maybe_old {
                 if old_record.delegate != delegate {
                     DelegatorCount::<T>::mutate((topic_id, &old_record.delegate), |c| {
                         *c = c.saturating_sub(1)
+                    });
+                    // Move the weight this delegation used to carry away from wherever the
+                    // OLD chain resolved to.
+                    let old_terminal =
+                        Self::resolve_delegate_readonly(&old_record.delegate, topic_id, now);
+                    DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
+                        *w = w.saturating_sub(old_record.resolved_weight)
                     });
                 }
             }
             if !replacing_same_delegate {
                 DelegatorCount::<T>::insert((topic_id, &delegate), new_count);
             }
+            // `who` now has an active outgoing delegation (whether new or replaced), so any
+            // weight that had accumulated at `who` as a terminal has just been forwarded above
+            // — `who` itself must go back to 0, preserving DelegatedWeight's invariant.
+            DelegatedWeight::<T>::remove((topic_id, &who));
 
-            let now = frame_system::Pallet::<T>::block_number();
             let expires_at = now.saturating_add(BlockNumberFor::<T>::from(duration_blocks));
 
             Delegations::<T>::insert(
                 (who.clone(), topic_id),
-                DelegationRecord { delegate: delegate.clone(), expires_at },
+                DelegationRecord { delegate: delegate.clone(), expires_at, resolved_weight },
             );
             Self::deposit_event(Event::DelegationSet { delegator: who, delegate, topic_id, expires_at });
             Ok(())
@@ -572,6 +662,17 @@ pub mod pallet {
             let record = Delegations::<T>::take((who.clone(), topic_id))
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
             DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
+            // Move the weight this delegation carried back from wherever it resolved to
+            // onto `who` themselves — they are a terminal delegate again now that they have
+            // no outgoing delegation on this topic.
+            let now = frame_system::Pallet::<T>::block_number();
+            let old_terminal = Self::resolve_delegate_readonly(&record.delegate, topic_id, now);
+            DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
+                *w = w.saturating_sub(record.resolved_weight)
+            });
+            DelegatedWeight::<T>::mutate((topic_id, &who), |w| {
+                *w = w.saturating_add(record.resolved_weight)
+            });
             Self::deposit_event(Event::DelegationRevoked { delegator: who, topic_id });
             Ok(())
         }
@@ -993,7 +1094,18 @@ pub mod pallet {
                         current = record.delegate;
                     }
                     Some(record) => {
-                        // Expired — clean up lazily.
+                        // Expired — clean up lazily, including moving the weight this edge
+                        // carried back onto `current` (which becomes a terminal delegate again)
+                        // from wherever the now-invalid chain used to resolve to. Mirrors what
+                        // `revoke_delegation` does for an explicit revoke.
+                        let old_terminal =
+                            Self::resolve_delegate_readonly(&record.delegate, topic_id, now);
+                        DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
+                            *w = w.saturating_sub(record.resolved_weight)
+                        });
+                        DelegatedWeight::<T>::mutate((topic_id, &current), |w| {
+                            *w = w.saturating_add(record.resolved_weight)
+                        });
                         DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| {
                             *c = c.saturating_sub(1)
                         });
