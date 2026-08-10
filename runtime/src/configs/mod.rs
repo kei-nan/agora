@@ -216,12 +216,12 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 }
 
 /// Passthrough OPRF identity-anchor verifier: accepts any registration/reverification/
-/// migration proof. Unlike `PassthroughZkVerifier`, this is NOT gated behind `dev-mode` — no
-/// real OPRF-circuit verifier crate exists yet at all (the OPRF committee work tracked in
-/// HANDOFF log #67/#68 hasn't started), so there is nothing for a non-dev-mode build to force
-/// in its place the way `ZkVerifier` forces `ZkPassportUltraHonkVerifier`. This must be replaced
-/// before the identity-anchor check provides any real Sybil-resistance guarantee — it
-/// currently provides none, in either build mode.
+/// migration proof. Unlike `PassthroughZkVerifier`, this struct itself is NOT `#[cfg]`-gated
+/// behind `dev-mode` — it compiles in both build modes — but it is only actually wired in as
+/// `AnchorVerifier` for the `dev-mode` `Config` impl below. The non-`dev-mode` impl uses the
+/// real `crate::anchor_verifier::Poseidon2AnchorVerifier` instead (see its doc comment for what
+/// it verifies), so this passthrough provides zero Sybil-resistance guarantee only in dev-mode
+/// builds, not in both build modes.
 pub struct PassthroughAnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
@@ -348,13 +348,14 @@ impl pallet_voting::MACITallyVerifier for PassthroughMACIVerifier {
 
 /// Fail-closed MACI tally verifier for non-`dev-mode` builds.
 ///
-/// Unlike `PassthroughAnchorVerifier` (identity-anchor path — left permissive in both build
-/// modes pending the OPRF committee, see its own doc comment), a fabricated MACI tally directly
-/// drives `enact_law` inside `submit_maci_tally` — silently accepting one would let any
-/// `LegislatureOrigin`-controlled account enact a law on fake vote counts. No real MACI circuit
-/// verifier exists yet in this codebase (trusted setup / circuit work not started, see
-/// CLAUDE.md's "Remaining Work"), so rather than inventing a "real" check that doesn't actually
-/// verify anything, this rejects every tally. `submit_maci_tally` is effectively unusable in
+/// Unlike the identity-anchor path (`PassthroughAnchorVerifier` is dev-mode-only; non-dev-mode
+/// already uses the real `crate::anchor_verifier::Poseidon2AnchorVerifier`, see its own doc
+/// comment), no real MACI circuit verifier exists yet at all, so there's nothing to force in
+/// place of a passthrough here. A fabricated MACI tally directly drives `enact_law` inside
+/// `submit_maci_tally` — silently accepting one would let any `LegislatureOrigin`-controlled
+/// account enact a law on fake vote counts. Rather than inventing a "real" check that doesn't
+/// actually verify anything (trusted setup / circuit work not started, see CLAUDE.md's
+/// "Remaining Work"), this rejects every tally. `submit_maci_tally` is effectively unusable in
 /// non-dev builds until a genuine MACI tally verifier is wired in here to replace it.
 #[cfg(not(feature = "dev-mode"))]
 pub struct FailClosedMACIVerifier;
