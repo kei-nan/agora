@@ -344,6 +344,19 @@ Toolchain — already installed on the dev machine; do not reinstall:
   circuits were last exercised end-to-end under 0.82.2 per entry 69, but `bb write_vk` for all
   four circuits was reconfirmed working under 5.0.0 in entry 74).
 
+The `--workspace` flag on each command below is load-bearing, not decoration: this workspace's
+`Nargo.toml` sets `default-member = "anchor"`, which has no `#[test]`s of its own, so a bare
+`nargo test` run from this directory silently reports "Running 0 test functions" instead of
+erroring — it's *not* telling you the tests are broken, just that it only ran the default
+member. The real 15 tests live in `lib/identity-anchor` and only run with `--workspace` (or by
+`cd`ing into `lib/identity-anchor` directly, or `--package identity_anchor`). We keep
+`default-member = "anchor"` rather than removing it, because removing it also changes the
+default scope of `nargo compile`/`nargo info`/`nargo execute` (they'd default to all 5 bin
+packages instead of just `anchor`), which is a bigger behavior change than this note is worth
+fixing via workspace restructuring. `default-member` also only accepts a single package path in
+this nargo version (1.0.0-beta.22), not an array, so listing both `anchor` and
+`lib/identity-anchor` as co-defaults isn't an option either.
+
 ```bash
 cd circuits/oprf-identity-anchor
 

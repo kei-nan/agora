@@ -353,13 +353,14 @@ impl pallet_voting::MACITallyVerifier for PassthroughMACIVerifier {
 
 /// Fail-closed MACI tally verifier for non-`dev-mode` builds.
 ///
-/// Unlike `PassthroughAnchorVerifier` (identity-anchor path — left permissive in both build
-/// modes pending the OPRF committee, see its own doc comment), a fabricated MACI tally directly
-/// drives `enact_law` inside `submit_maci_tally` — silently accepting one would let any
-/// `LegislatureOrigin`-controlled account enact a law on fake vote counts. No real MACI circuit
-/// verifier exists yet in this codebase (trusted setup / circuit work not started, see
-/// CLAUDE.md's "Remaining Work"), so rather than inventing a "real" check that doesn't actually
-/// verify anything, this rejects every tally. `submit_maci_tally` is effectively unusable in
+/// Unlike the identity-anchor path (`PassthroughAnchorVerifier` is dev-mode-only; non-dev-mode
+/// already uses the real `crate::anchor_verifier::Poseidon2AnchorVerifier`, see its own doc
+/// comment), no real MACI circuit verifier exists yet at all, so there's nothing to force in
+/// place of a passthrough here. A fabricated MACI tally directly drives `enact_law` inside
+/// `submit_maci_tally` — silently accepting one would let any `LegislatureOrigin`-controlled
+/// account enact a law on fake vote counts. Rather than inventing a "real" check that doesn't
+/// actually verify anything (trusted setup / circuit work not started, see CLAUDE.md's
+/// "Remaining Work"), this rejects every tally. `submit_maci_tally` is effectively unusable in
 /// non-dev builds until a genuine MACI tally verifier is wired in here to replace it.
 #[cfg(not(feature = "dev-mode"))]
 pub struct FailClosedMACIVerifier;

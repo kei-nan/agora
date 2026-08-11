@@ -431,8 +431,8 @@ pub mod pallet {
                 Error::<T>::InvalidProposalDuration
             );
             let id = NextProposalId::<T>::get();
-            let ends_at = frame_system::Pallet::<T>::block_number() +
-                BlockNumberFor::<T>::from(duration_blocks);
+            let ends_at = frame_system::Pallet::<T>::block_number()
+                .saturating_add(BlockNumberFor::<T>::from(duration_blocks));
             Proposals::<T>::insert(id, (ends_at, topic_hash, tier.clone()));
             NextProposalId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::ProposalCreated { id, ends_at, topic_hash, tier });
@@ -859,7 +859,7 @@ pub mod pallet {
                 Error::<T>::InvalidEpochDuration
             );
             let now = frame_system::Pallet::<T>::block_number();
-            let end = now + BlockNumberFor::<T>::from(duration_blocks);
+            let end = now.saturating_add(BlockNumberFor::<T>::from(duration_blocks));
             ActiveEpoch::<T>::put((now, end));
             let epoch = EpochNumber::<T>::get().saturating_add(1);
             EpochNumber::<T>::put(epoch);
@@ -884,7 +884,7 @@ pub mod pallet {
             )?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
+            let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Constitutional),
@@ -919,7 +919,7 @@ pub mod pallet {
             )?;
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
-            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
+            let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Foundational),
@@ -991,7 +991,7 @@ pub mod pallet {
             // Always give the referendum a full ReferendumDurationBlocks window so that
             // a referendum created near the end of an epoch still has adequate voting time.
             // Citizens may vote in any overlapping future epoch within the window.
-            let ends_at = now + BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get());
+            let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
             Referenda::<T>::insert(
                 id,
                 (petition_id, topic_hash, ends_at, ReferendumState::Voting, tier.clone()),

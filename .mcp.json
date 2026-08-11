@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "${HOME}/.local/bin/github-mcp-server",
+      "args": ["stdio", "--oauth-client-id", "Ov23liHkM3dW6dWVK7EJ"]
+    },
+    "noir": {
+      "command": "npx",
+      "args": ["noir-mcp-server@latest"]
+    }
+  }
+}
