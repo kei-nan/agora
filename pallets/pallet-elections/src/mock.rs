@@ -151,6 +151,18 @@ impl pallet_elections::Config for Test {
     type DefaultMaxConsecutiveTerms = ConstU32<DEFAULT_MAX_CONSECUTIVE_TERMS>;
     type DefaultMandatoryBreakBlocks = ConstU32<DEFAULT_MANDATORY_BREAK_BLOCKS>;
     type DefaultWarningWindowPct = ConstU8<DEFAULT_WARNING_WINDOW_PCT>;
+    type WeightInfo = ();
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = TestBenchmarkHelper;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct TestBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_elections::BenchmarkHelper<u64> for TestBenchmarkHelper {
+    fn make_active_citizen(who: &u64) {
+        set_active_citizen(*who, true);
+    }
 }
 
 // Build genesis storage according to the mock runtime. Accounts 1..=10 start with a

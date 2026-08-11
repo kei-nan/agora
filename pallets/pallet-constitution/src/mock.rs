@@ -80,6 +80,23 @@ impl PetitionApprover for TestPetitionApprover {
 	}
 }
 
+#[cfg(feature = "runtime-benchmarks")]
+pub struct TestBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_constitution::BenchmarkHelper<u64> for TestBenchmarkHelper {
+	fn make_active_citizen(who: &u64) {
+		ACTIVE_CITIZENS.with(|c| {
+			let mut list = c.borrow_mut();
+			if !list.contains(who) {
+				list.push(*who);
+			}
+		});
+	}
+	fn make_legislature_fresh() {
+		set_fresh_legislature(true);
+	}
+}
+
 // ── Config constants (small values for fast, deterministic tests) ──────────────
 
 pub const ORDINARY_DELIBERATION_BLOCKS: u32 = 5;
@@ -143,6 +160,9 @@ impl pallet_constitution::Config for Test {
 	type CitizenChecker = TestCitizenChecker;
 
 	type AutoChallengeHook = TestAutoChallengeHook;
+	type WeightInfo = ();
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = TestBenchmarkHelper;
 }
 
 // Build genesis storage according to the mock runtime, resetting all thread-local

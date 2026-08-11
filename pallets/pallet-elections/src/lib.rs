@@ -43,6 +43,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
+
 #[frame_support::pallet]
 pub mod pallet {
     use codec::DecodeWithMemTracking;
@@ -52,6 +57,7 @@ pub mod pallet {
     };
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Saturating, Zero};
+    use crate::weights::WeightInfo;
 
     /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
     /// `GovernanceOrigin` to authorize `tag`'s call with `params`. See
@@ -78,6 +84,17 @@ pub mod pallet {
     /// The implementation in pallet-legislature replaces the full Members set.
     pub trait SeatLegislature<AccountId> {
         fn replace_members(winners: alloc::vec::Vec<AccountId>) -> DispatchResult;
+    }
+
+    /// Benchmark-only hook: makes an account satisfy `CitizenChecker::is_active_citizen` for
+    /// extrinsics gated on citizen status (`register_candidate`, `register_as_delegate`,
+    /// `back_delegate`). Real citizen registration goes through pallet-identity-zk's full
+    /// ZK-proof flow, which a generic pallet-elections benchmark has no way to drive directly —
+    /// this hook lets each runtime (or test mock) short-circuit that for benchmarking purposes
+    /// only. See `weights.rs`'s module doc comment for which implementations wire this up.
+    #[cfg(feature = "runtime-benchmarks")]
+    pub trait BenchmarkHelper<AccountId> {
+        fn make_active_citizen(who: &AccountId);
     }
 
     // ── Data types: Elections Commission ──────────────────────────────────────
@@ -231,6 +248,13 @@ pub mod pallet {
         /// Genesis default for the warning window as a percentage of the term (1–50 %).
         #[pallet::constant]
         type DefaultWarningWindowPct: Get<u8>;
+
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
+
+        /// See `BenchmarkHelper`'s doc comment.
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: BenchmarkHelper<Self::AccountId>;
     }
 
     // ── Storage: Elections Commission ──────────────────────────────────────────
@@ -618,7 +642,7 @@ pub mod pallet {
         // ── Elections Commission ───────────────────────────────────────────────
 
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::add_commissioner())]
         pub fn add_commissioner(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Commissioners::<T>::try_mutate(|commissioners| {
@@ -630,7 +654,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::remove_commissioner())]
         pub fn remove_commissioner(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Commissioners::<T>::try_mutate(|commissioners| {
@@ -643,7 +667,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::create_election())]
         pub fn create_election(
             origin: OriginFor<T>,
             office: BoundedVec<u8, ConstU32<64>>,
@@ -665,7 +689,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        #[pallet::weight(T::WeightInfo::register_candidate())]
         pub fn register_candidate(
             origin: OriginFor<T>,
             election_id: u32,
@@ -689,7 +713,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::certify_candidate())]
         pub fn certify_candidate(
             origin: OriginFor<T>, election_id: u32, candidate: T::AccountId,
         ) -> DispatchResult {
@@ -706,7 +730,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(5)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::submit_results())]
         pub fn submit_results(
             origin: OriginFor<T>, election_id: u32, winner: T::AccountId,
             results_ipfs_hash: [u8; 32],
@@ -726,7 +750,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(6)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::certify_results())]
         pub fn certify_results(origin: OriginFor<T>, election_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             Self::ensure_commissioner_account(&who)?;
@@ -754,7 +778,7 @@ pub mod pallet {
         // ── Delegate registry ──────────────────────────────────────────────────
 
         #[pallet::call_index(7)]
-        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        #[pallet::weight(T::WeightInfo::register_as_delegate())]
         pub fn register_as_delegate(
             origin: OriginFor<T>,
             display_name: BoundedVec<u8, ConstU32<64>>,
@@ -779,7 +803,7 @@ pub mod pallet {
         /// Back a delegate. Each citizen may back at most `MaxBackingsPerCitizen` delegates.
         /// If this backing pushes the delegate to or above the threshold, they become Active.
         #[pallet::call_index(8)]
-        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        #[pallet::weight(T::WeightInfo::back_delegate())]
         pub fn back_delegate(origin: OriginFor<T>, delegate: T::AccountId) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::NotActiveCitizen);
@@ -809,7 +833,7 @@ pub mod pallet {
 
         /// Remove backing from a delegate. Frees one slot in the citizen's backing allowance.
         #[pallet::call_index(9)]
-        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        #[pallet::weight(T::WeightInfo::remove_backing())]
         pub fn remove_backing(origin: OriginFor<T>, delegate: T::AccountId) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(BackingOf::<T>::contains_key(&who, &delegate), Error::<T>::NotBacking);
@@ -837,7 +861,7 @@ pub mod pallet {
         // ── Governance: ordinary supermajority ────────────────────────────────
 
         #[pallet::call_index(10)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_backing_threshold())]
         pub fn set_backing_threshold(origin: OriginFor<T>, threshold: u32) -> DispatchResult {
             T::GovernanceOrigin::ensure_origin(
                 origin,
@@ -853,7 +877,7 @@ pub mod pallet {
         // ── Governance: constitutional supermajority ──────────────────────────
 
         #[pallet::call_index(11)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_backing_bounds())]
         pub fn set_backing_bounds(origin: OriginFor<T>, floor: u32, ceiling: u32) -> DispatchResult {
             T::ConstitutionalOrigin::ensure_origin(origin)?;
             ensure!(floor <= ceiling, Error::<T>::FloorExceedsCeiling);
@@ -867,7 +891,7 @@ pub mod pallet {
         }
 
         #[pallet::call_index(12)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_term_params())]
         pub fn set_term_params(
             origin: OriginFor<T>,
             term_length: BlockNumberFor<T>,
@@ -889,7 +913,7 @@ pub mod pallet {
 
         /// Update constitutional election parameters. Any field left as None is unchanged.
         #[pallet::call_index(13)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::set_election_params())]
         pub fn set_election_params(
             origin: OriginFor<T>,
             seats: Option<u32>,

@@ -16,12 +16,18 @@
 //! - `duration_blocks` is clamped to `MaxEmergencyBlocks` (the constitutional ceiling).
 //! - Supermajority threshold: `votes * SupermajorityDenominator >= council_size * SupermajorityNumerator`.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
 
 #[frame_support::pallet]
 pub mod pallet {
@@ -30,6 +36,7 @@ pub mod pallet {
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+    use crate::weights::WeightInfo;
 
     // ── EmergencyInfo struct ─────────────────────────────────────────────────
 
@@ -80,6 +87,8 @@ pub mod pallet {
         /// Denominator of the supermajority fraction (e.g. 3 for 2/3).
         #[pallet::constant]
         type SupermajorityDenominator: Get<u32>;
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────
@@ -179,7 +188,7 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         /// Add a member to the Emergency Council. Root only.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::add_council_member())]
         pub fn add_council_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Council::<T>::try_mutate(|members| {
@@ -192,7 +201,7 @@ pub mod pallet {
 
         /// Remove a member from the Emergency Council. Root only.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::remove_council_member())]
         pub fn remove_council_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Council::<T>::try_mutate(|members| {
@@ -216,7 +225,7 @@ pub mod pallet {
         /// When a supermajority of council members have voted, the emergency activates
         /// and all DeclareVotes / EndVotes are reset.
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::vote_declare_emergency())]
         pub fn vote_declare_emergency(
             origin: OriginFor<T>,
             reason_hash: [u8; 32],
@@ -274,7 +283,7 @@ pub mod pallet {
         ///
         /// When a supermajority is reached, the emergency is cleared immediately.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::vote_end_emergency())]
         pub fn vote_end_emergency(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let council = Council::<T>::get();

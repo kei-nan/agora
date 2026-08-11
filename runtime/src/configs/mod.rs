@@ -655,8 +655,33 @@ impl pallet_constitution::Config for Runtime {
 	/// Courts origin for invalidate_law (manual override). The auto-enforcement path
 	/// uses invalidate_law_internal via the LawEnforcer trait.
 	type CourtOrigin = pallet_courts::EnsureOracle<Runtime>;
+	type WeightInfo = pallet_constitution::weights::SubstrateWeight<Runtime>;
+	/// `submit_petition`/`sign_petition`/`reaffirm_amendment` benchmarks need a way to mark an
+	/// account as an active citizen and to fast-forward `FreshLegislatureChecker` — this runtime
+	/// has no such hook yet (would need an equivalent benchmark-only entry point on
+	/// pallet-identity-zk/pallet-elections), so those three benchmarks will fail if actually run
+	/// via `benchmark pallet` against this runtime until that hook exists. See
+	/// `pallet_constitution::benchmarking`'s module doc comment.
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = RuntimeBenchmarkHelper;
 }
 
+/// No-op `BenchmarkHelper` for pallets whose benchmarks need cross-pallet citizen/election state
+/// this runtime has no benchmark-only hook for yet (see doc comments on the `Config` impls that
+/// use it). Running `benchmark pallet` against a real built runtime will fail exactly the
+/// extrinsics that depend on these methods, not silently produce wrong numbers — documented
+/// rather than papered over.
+#[cfg(feature = "runtime-benchmarks")]
+pub struct RuntimeBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_constitution::BenchmarkHelper<AccountId> for RuntimeBenchmarkHelper {
+	fn make_active_citizen(_who: &AccountId) {}
+	fn make_legislature_fresh() {}
+}
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_elections::BenchmarkHelper<AccountId> for RuntimeBenchmarkHelper {
+	fn make_active_citizen(_who: &AccountId) {}
+}
 
 impl pallet_legislature::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -668,6 +693,7 @@ impl pallet_legislature::Config for Runtime {
 	type PassageThreshold = ConstU8<50>;
 	/// Active ministers are blocked from legislature votes (incompatibility rule).
 	type MinisterChecker = Cabinet;
+	type WeightInfo = pallet_legislature::weights::SubstrateWeight<Runtime>;
 }
 
 // ── Parliamentary Executive ──────────────────────────────────────────────────
@@ -685,6 +711,7 @@ impl pallet_executive::Config for Runtime {
 	/// 2/3 cabinet supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
 	type SupermajorityDenominator = ConstU32<3>;
+	type WeightInfo = pallet_executive::weights::SubstrateWeight<Runtime>;
 }
 
 // ── Elections Commission ─────────────────────────────────────────────────────
@@ -737,6 +764,11 @@ impl pallet_elections::Config for Runtime {
 	type DefaultMandatoryBreakBlocks = ConstU32<{ 365 * DAYS }>;
 	/// Warn delegates when 10% of their term remains.
 	type DefaultWarningWindowPct = ConstU8<10>;
+	type WeightInfo = pallet_elections::weights::SubstrateWeight<Runtime>;
+	/// See `RuntimeBenchmarkHelper`'s doc comment (defined above, next to
+	/// `pallet_constitution::Config`'s `BenchmarkHelper` wiring).
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = RuntimeBenchmarkHelper;
 }
 
 // ── Emergency Council ─────────────────────────────────────────────────────────
@@ -755,6 +787,7 @@ impl pallet_emergency_council::Config for Runtime {
 	/// 2/3 supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
 	type SupermajorityDenominator = ConstU32<3>;
+	type WeightInfo = pallet_emergency_council::weights::SubstrateWeight<Runtime>;
 }
 
 // ── Anti-Corruption module ───────────────────────────────────────────────────

@@ -25,6 +25,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
+
 #[frame_support::pallet]
 pub mod pallet {
     use codec::DecodeWithMemTracking;
@@ -32,6 +37,7 @@ pub mod pallet {
     use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+    use crate::weights::WeightInfo;
 
     // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -105,6 +111,21 @@ pub mod pallet {
         fn auto_challenge_law(law_id: u32) -> DispatchResult;
     }
 
+    /// Benchmark-only hook: makes an account satisfy `CitizenChecker::is_active_citizen` for
+    /// extrinsics gated on citizen status (`submit_petition`, `sign_petition`). Real citizen
+    /// registration goes through pallet-identity-zk's full ZK-proof flow, which a generic
+    /// pallet-constitution benchmark has no way to drive directly — this hook lets each
+    /// runtime (or test mock) short-circuit that for benchmarking purposes only. See
+    /// `weights.rs`'s module doc comment for which implementations actually wire this up.
+    #[cfg(feature = "runtime-benchmarks")]
+    pub trait BenchmarkHelper<AccountId> {
+        fn make_active_citizen(who: &AccountId);
+        /// Makes `FreshLegislatureChecker::has_election_occurred_since` return `true`, for
+        /// benchmarking `reaffirm_amendment` (real state is normally pallet-elections'
+        /// `LastElectionBlock`, which a generic pallet-constitution benchmark can't set).
+        fn make_legislature_fresh();
+    }
+
     /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
     /// `EnsureLegislatureMotion` (or any `LegislatureOrigin`) to authorize `tag`'s call with
     /// `params`. `tag` should uniquely identify the pallet + dispatchable (e.g.
@@ -172,6 +193,13 @@ pub mod pallet {
         // ── Courts ───────────────────────────────────────────────────────────────
         /// Origin permitted to pause a law via court ruling.
         type CourtOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
+
+        /// See `BenchmarkHelper`'s doc comment.
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: BenchmarkHelper<Self::AccountId>;
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────────
@@ -274,7 +302,7 @@ pub mod pallet {
         /// Enact a new law. Requires LegislatureOrigin.
         /// For Structural/Foundational laws the runtime should wire a higher-threshold legislature origin.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::enact_law())]
         pub fn enact_law(
             origin: OriginFor<T>,
             tier: LawTier,
@@ -297,7 +325,7 @@ pub mod pallet {
 
         /// Pause a law on court invalidation ruling.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(6_000, 0))]
+        #[pallet::weight(T::WeightInfo::invalidate_law())]
         pub fn invalidate_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::CourtOrigin::ensure_origin(origin)?;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
@@ -313,7 +341,7 @@ pub mod pallet {
         /// Propose an amendment to an Ordinary law. Starts the deliberation clock.
         /// For Structural/Foundational laws use propose_constitutional_amendment.
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::propose_amendment())]
         pub fn propose_amendment(
             origin: OriginFor<T>,
             law_id: u32,
@@ -338,7 +366,7 @@ pub mod pallet {
 
         /// Ratify an Ordinary law amendment after its deliberation period expires.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::ratify_amendment())]
         pub fn ratify_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -371,7 +399,7 @@ pub mod pallet {
         /// Submit a new petition. topic_hash is the IPFS CID of the petition text.
         /// The proposer is automatically recorded as the first signer (count starts at 1).
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::submit_petition())]
         pub fn submit_petition(origin: OriginFor<T>, topic_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
@@ -395,7 +423,7 @@ pub mod pallet {
         /// Sign an existing petition. Each account may sign once.
         /// Crossing PetitionThreshold auto-creates an Ordinary referendum.
         #[pallet::call_index(5)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::sign_petition())]
         pub fn sign_petition(origin: OriginFor<T>, petition_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
@@ -427,7 +455,7 @@ pub mod pallet {
         /// Repeal a law entirely. Terminal — cannot be re-enacted under the same id.
         /// Cleans up any pending Ordinary or Constitutional amendments for this law.
         #[pallet::call_index(6)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::repeal_law())]
         pub fn repeal_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -454,7 +482,7 @@ pub mod pallet {
         /// grows as the amendment matures (30% Provisional / 35% Confirmed / 40% Entrenched),
         /// enforced externally by the RevocationOrigin's collective configuration.
         #[pallet::call_index(7)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::propose_constitutional_amendment())]
         pub fn propose_constitutional_amendment(
             origin: OriginFor<T>,
             law_id: u32,
@@ -515,7 +543,7 @@ pub mod pallet {
         /// Must be called by a legislature that held at least one election after the proposal block.
         /// Advances the amendment from Provisional → Confirmed.
         #[pallet::call_index(8)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::reaffirm_amendment())]
         pub fn reaffirm_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -555,7 +583,7 @@ pub mod pallet {
         /// Permissionless — anyone may call once
         /// now >= proposed_at + ProvisioningPeriodBlocks + ConfirmationPeriodBlocks.
         #[pallet::call_index(9)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::advance_to_entrenched())]
         pub fn advance_to_entrenched(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
             ConstitutionalAmendments::<T>::try_mutate(law_id, |maybe_record| {
@@ -590,7 +618,7 @@ pub mod pallet {
         ///   Confirmed   → 35% of legislature
         ///   Entrenched  → 40% of legislature + citizen referendum
         #[pallet::call_index(10)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::revoke_amendment())]
         pub fn revoke_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::RevocationOrigin::ensure_origin(origin)?;
             let record = ConstitutionalAmendments::<T>::take(law_id)

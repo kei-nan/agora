@@ -20,6 +20,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
+
 #[frame_support::pallet]
 pub mod pallet {
 
@@ -27,6 +32,7 @@ pub mod pallet {
     use frame_support::pallet_prelude::*;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+    use crate::weights::WeightInfo;
 
     // ── Motion struct ────────────────────────────────────────────────────────────
 
@@ -134,6 +140,8 @@ pub mod pallet {
         /// Checks whether a member is an active executive minister.
         /// Ministers are blocked from voting on motions (incompatibility rule).
         type MinisterChecker: MinisterChecker<Self::AccountId>;
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────────
@@ -218,7 +226,7 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         /// Add a member to the legislature. Root-only (bootstrapping; replaced by elections later).
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::add_member())]
         pub fn add_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Members::<T>::try_mutate(|members| {
@@ -231,7 +239,7 @@ pub mod pallet {
 
         /// Remove a member from the legislature. Root-only.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::remove_member())]
         pub fn remove_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             Members::<T>::try_mutate(|members| {
@@ -248,7 +256,7 @@ pub mod pallet {
         /// The proposer's aye is recorded immediately (ayes starts at 1).
         /// Active executive ministers may not propose motions (incompatibility rule).
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        #[pallet::weight(T::WeightInfo::propose_motion())]
         pub fn propose_motion(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotAMember);
@@ -282,7 +290,7 @@ pub mod pallet {
 
         /// Cast a vote on an open motion. Only enrolled members; one vote per member.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::vote_motion())]
         pub fn vote_motion(
             origin: OriginFor<T>,
             motion_id: u32,
@@ -322,7 +330,7 @@ pub mod pallet {
         /// Anyone may call this. If ayes * 100 >= PassageThreshold * total_members,
         /// the motion is marked executed and `MotionPassed` is emitted; otherwise `MotionFailed`.
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::close_motion())]
         pub fn close_motion(origin: OriginFor<T>, motion_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
 

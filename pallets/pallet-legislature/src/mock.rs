@@ -74,6 +74,7 @@ impl pallet_legislature::Config for Test {
     type MotionDurationBlocks = frame_support::traits::ConstU32<MOTION_DURATION>;
     type PassageThreshold = frame_support::traits::ConstU8<PASSAGE_THRESHOLD>;
     type MinisterChecker = TestMinisterChecker;
+    type WeightInfo = ();
 }
 
 // Build genesis storage according to the mock runtime.
