@@ -91,9 +91,30 @@ pub mod pallet {
     #[pallet::storage]
     pub type NextExpenditureIndex<T: Config> = StorageValue<_, u64, ValueQuery>;
 
-    /// Departments frozen by court ruling — no expenditures allowed while frozen.
+    /// Departments frozen by a court ruling (via `T::TreasuryEnforcer`, called from
+    /// pallet-courts) — no expenditures allowed while frozen.
+    ///
+    /// Kept independent of `AuditFrozenDepartments` below: these are two independent freeze
+    /// authorities sharing one department namespace, and each authority must only ever be able
+    /// to clear its own freeze — not the other's. This is a deliberate split (not the original
+    /// shape): a single shared `FrozenDepartments` bool used to let pallet-audit's
+    /// `resolve_entry` silently lift a still-unresolved court-ordered freeze (or vice versa)
+    /// whenever its own open-flag count happened to return to zero. See `is_frozen` for the
+    /// combined check `record_expenditure` actually uses.
+    ///
+    /// pallet-courts' `TreasuryEnforcer` trait exposes only `freeze_department` — no unfreeze —
+    /// so a court-ordered freeze is terminal until root's `unfreeze_department` dispatchable
+    /// clears it (see that call's doc comment for why root clears both axes at once).
     #[pallet::storage]
-    pub type FrozenDepartments<T: Config> =
+    pub type CourtFrozenDepartments<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, bool, ValueQuery>;
+
+    /// Departments frozen by pallet-audit (via `T::TreasuryFreezer`), driven by pallet-audit's
+    /// own `OpenFlags` counter: set on the first open flag/dispute against a department,
+    /// cleared once `resolve_entry` brings that counter back to zero. Independent of
+    /// `CourtFrozenDepartments` for the same reason described there.
+    #[pallet::storage]
+    pub type AuditFrozenDepartments<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, bool, ValueQuery>;
 
     /// Per-department authorized spender. Only this account may call record_expenditure for that department.
@@ -176,7 +197,7 @@ pub mod pallet {
             let authorized = DepartmentSpenders::<T>::get(department_id)
                 .ok_or(Error::<T>::DepartmentHasNoSpender)?;
             ensure!(authorized == who, Error::<T>::NotAuthorizedSpender);
-            ensure!(!FrozenDepartments::<T>::get(department_id), Error::<T>::DepartmentFrozen);
+            ensure!(!Self::is_frozen(department_id), Error::<T>::DepartmentFrozen);
             let budget = DepartmentBudgets::<T>::get(department_id);
             let spent = DepartmentSpent::<T>::get(department_id);
             let new_spent = spent.checked_add(&amount).ok_or(Error::<T>::Overflow)?;
@@ -229,7 +250,22 @@ pub mod pallet {
         }
 
         /// Unfreeze a previously frozen department. Root only.
-        /// Called after an appeal overturns a treasury court ruling, or after remediation.
+        ///
+        /// Clears BOTH freeze axes (`CourtFrozenDepartments` and `AuditFrozenDepartments`)
+        /// unconditionally, rather than picking one. This is a deliberate design choice, not
+        /// an oversight: root already holds full trusted-override authority elsewhere in this
+        /// codebase (e.g. the emergency council's sunset-gated powers), and a partial clear
+        /// here would recreate exactly the silent-desync failure mode the two-axis split
+        /// exists to prevent — an operator calling this dispatchable expecting "the department
+        /// can spend again" but leaving a leftover flag on the axis they didn't know about,
+        /// with `record_expenditure` still failing for no visible reason. A root operator
+        /// invoking this call is presumed to have already confirmed remediation on whichever
+        /// side(s) actually needed it (e.g. via governance record or off-chain process) before
+        /// reaching for the one manual override that exists. It is not meant to replace either
+        /// authority's own everyday path: pallet-courts has no unfreeze path at all (a
+        /// court-ordered freeze is terminal by design — see `CourtFrozenDepartments`), and
+        /// pallet-audit clears its own axis automatically via `audit_unfreeze_department_internal`
+        /// as `resolve_entry` brings `OpenFlags` back to zero.
         #[pallet::call_index(5)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn unfreeze_department(
@@ -237,35 +273,62 @@ pub mod pallet {
             department_id: u32,
         ) -> DispatchResult {
             ensure_root(origin)?;
-            ensure!(
-                FrozenDepartments::<T>::get(department_id),
-                Error::<T>::DepartmentNotFrozen
-            );
-            FrozenDepartments::<T>::remove(department_id);
+            ensure!(Self::is_frozen(department_id), Error::<T>::DepartmentNotFrozen);
+            CourtFrozenDepartments::<T>::remove(department_id);
+            AuditFrozenDepartments::<T>::remove(department_id);
             Self::deposit_event(Event::DepartmentUnfrozen { department_id });
             Ok(())
         }
     }
 
     impl<T: Config> Pallet<T> {
-        /// Called by pallet-courts when a ruling finds illegal treasury activity, and by
-        /// pallet-audit (via `T::TreasuryFreezer`) when an expenditure is flagged or disputed.
-        /// Cross-pallet internal call — no origin check needed here; callers are pre-authorized
-        /// via runtime wiring, not exposed as a dispatchable.
+        /// True if `department_id` is frozen under either axis — a court-ordered freeze
+        /// (`CourtFrozenDepartments`) or an audit-driven freeze (`AuditFrozenDepartments`).
+        /// `record_expenditure` must check this combined state, not either flag alone, so that
+        /// one authority resolving its own freeze can never silently lift the other's.
+        pub fn is_frozen(department_id: u32) -> bool {
+            CourtFrozenDepartments::<T>::get(department_id)
+                || AuditFrozenDepartments::<T>::get(department_id)
+        }
+
+        /// Called by pallet-courts (via `T::TreasuryEnforcer`) when a ruling finds illegal
+        /// treasury activity. Sets the court-freeze axis only (`CourtFrozenDepartments`) —
+        /// independent of pallet-audit's flag/dispute axis, so pallet-audit later resolving
+        /// its own open flags (`audit_unfreeze_department_internal`) can never silently lift a
+        /// court-ordered freeze. Cross-pallet internal call — no origin check needed here;
+        /// callers are pre-authorized via runtime wiring, not exposed as a dispatchable.
         pub fn freeze_department_internal(department_id: u32) -> DispatchResult {
-            FrozenDepartments::<T>::insert(department_id, true);
+            CourtFrozenDepartments::<T>::insert(department_id, true);
             Self::deposit_event(Event::DepartmentFrozen { department_id });
             Ok(())
         }
 
-        /// Called by pallet-audit (via `T::TreasuryFreezer`) once all open flags/disputes
-        /// against a department have been resolved. Unlike the `unfreeze_department`
-        /// dispatchable (root-only, for court-ordered freezes), this is a cross-pallet
-        /// internal call — no origin check needed; callers are pre-authorized via runtime
-        /// wiring. Idempotent: does nothing if the department wasn't frozen.
-        pub fn unfreeze_department_internal(department_id: u32) -> DispatchResult {
-            if FrozenDepartments::<T>::take(department_id) {
-                Self::deposit_event(Event::DepartmentUnfrozen { department_id });
+        /// Called by pallet-audit (via `T::TreasuryFreezer`) when its own `OpenFlags` counter
+        /// for a department goes from 0 to nonzero (first open flag/dispute against it). Sets
+        /// the audit-freeze axis only (`AuditFrozenDepartments`) — independent of
+        /// `CourtFrozenDepartments`, for the same reason described on that storage item.
+        /// Cross-pallet internal call — no origin check needed; callers are pre-authorized via
+        /// runtime wiring, not exposed as a dispatchable.
+        pub fn audit_freeze_department_internal(department_id: u32) -> DispatchResult {
+            AuditFrozenDepartments::<T>::insert(department_id, true);
+            Self::deposit_event(Event::DepartmentFrozen { department_id });
+            Ok(())
+        }
+
+        /// Called by pallet-audit (via `T::TreasuryFreezer`) once its own `OpenFlags` counter
+        /// for a department returns to zero — every open flag/dispute against it resolved via
+        /// `resolve_entry`. Clears the audit-freeze axis only. If the department is still
+        /// frozen under `CourtFrozenDepartments` it remains frozen overall —
+        /// `record_expenditure` checks the combined state via `is_frozen`, and the
+        /// `DepartmentUnfrozen` event below is only emitted once the department is actually
+        /// spendable again, so observers never see a misleading "unfrozen" event while the
+        /// court axis still blocks spending. Idempotent: does nothing if the audit axis wasn't
+        /// set.
+        pub fn audit_unfreeze_department_internal(department_id: u32) -> DispatchResult {
+            if AuditFrozenDepartments::<T>::take(department_id) {
+                if !CourtFrozenDepartments::<T>::get(department_id) {
+                    Self::deposit_event(Event::DepartmentUnfrozen { department_id });
+                }
             }
             Ok(())
         }

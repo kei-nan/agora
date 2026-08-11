@@ -1,6 +1,6 @@
 use crate::{
-	mock::*, DepartmentBudgets, DepartmentSpenders, DepartmentSpent, Error, Event,
-	ExpenditureLog, FrozenDepartments, NextExpenditureIndex,
+	mock::*, AuditFrozenDepartments, CourtFrozenDepartments, DepartmentBudgets,
+	DepartmentSpenders, DepartmentSpent, Error, Event, ExpenditureLog, NextExpenditureIndex,
 };
 use frame_support::{assert_noop, assert_ok};
 
@@ -413,7 +413,8 @@ fn record_expenditure_budget_check_uses_post_transaction_total_not_pre_transacti
 fn freeze_department_internal_sets_frozen_and_emits_event() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
-		assert!(FrozenDepartments::<Test>::get(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
 		System::assert_last_event(Event::DepartmentFrozen { department_id: DEPT }.into());
 	});
 }
@@ -423,7 +424,7 @@ fn unfreeze_department_works_for_root() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
 		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
-		assert!(!FrozenDepartments::<Test>::get(DEPT));
+		assert!(!CourtFrozenDepartments::<Test>::get(DEPT));
 		System::assert_last_event(Event::DepartmentUnfrozen { department_id: DEPT }.into());
 	});
 }
@@ -436,7 +437,7 @@ fn unfreeze_department_fails_for_non_root() {
 			TreasuryLedger::unfreeze_department(signed(SPENDER), DEPT),
 			sp_runtime::DispatchError::BadOrigin
 		);
-		assert!(FrozenDepartments::<Test>::get(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
 	});
 }
 
@@ -460,6 +461,113 @@ fn record_expenditure_succeeds_again_after_unfreeze() {
 
 		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
+	});
+}
+
+// ---------------------------------------------------------------------
+// cross-authority independence (the bug this fix addresses)
+//
+// Regression coverage for the original bug: a single shared `FrozenDepartments` bool let
+// pallet-audit's unfreeze path clear a still-open pallet-courts freeze (and vice versa)
+// whenever the *other* authority's own state happened to clear. `CourtFrozenDepartments` and
+// `AuditFrozenDepartments` are now independent axes; `is_frozen`/`record_expenditure` check
+// the OR of both.
+// ---------------------------------------------------------------------
+
+#[test]
+fn audit_unfreeze_does_not_lift_a_still_open_court_freeze() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+
+		// pallet-courts freezes the department for an unresolved ruling.
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		// pallet-audit independently opens (and then fully resolves) its own flag against the
+		// same department — simulating flag_entry followed by resolve_entry bringing
+		// OpenFlags back to zero.
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+
+		// The court-ordered freeze must still be in effect: audit resolving its own last flag
+		// must NOT silently lift it.
+		assert!(crate::Pallet::<Test>::is_frozen(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
+		assert_noop!(
+			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A),
+			Error::<Test>::DepartmentFrozen
+		);
+
+		// Only the root override clears the remaining (court) axis.
+		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+		assert!(!crate::Pallet::<Test>::is_frozen(DEPT));
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
+	});
+}
+
+#[test]
+fn court_freeze_does_not_get_lifted_by_audit_unfreeze_when_audit_never_froze() {
+	// A department frozen only by pallet-courts (audit axis never set) must stay frozen if
+	// pallet-audit's unfreeze path is invoked for unrelated reasons (idempotent no-op on an
+	// axis that was never set).
+	new_test_ext().execute_with(|| {
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+		assert!(crate::Pallet::<Test>::is_frozen(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+	});
+}
+
+#[test]
+fn court_freeze_never_auto_clears_from_audit_side_even_after_many_audit_cycles() {
+	// The reverse direction proven directly: pallet-audit freezing and unfreezing its own
+	// axis repeatedly must never touch CourtFrozenDepartments.
+	new_test_ext().execute_with(|| {
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		for _ in 0..3 {
+			assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+			assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+		}
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+		assert!(crate::Pallet::<Test>::is_frozen(DEPT));
+	});
+}
+
+#[test]
+fn audit_freeze_alone_blocks_expenditure_and_audit_unfreeze_alone_clears_it() {
+	// Sanity check that the audit-only axis (no court freeze involved) still works exactly as
+	// before the split: freeze blocks spending, unfreeze (last flag resolved) restores it.
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+		assert_noop!(
+			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A),
+			Error::<Test>::DepartmentFrozen
+		);
+
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
+		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
+	});
+}
+
+#[test]
+fn unfreeze_department_dispatchable_clears_both_axes() {
+	// Root's manual override is an explicit full clear (documented design choice on
+	// `unfreeze_department`), not a per-axis clear.
+	new_test_ext().execute_with(|| {
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+		assert!(AuditFrozenDepartments::<Test>::get(DEPT));
+
+		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+
+		assert!(!CourtFrozenDepartments::<Test>::get(DEPT));
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
+		assert!(!crate::Pallet::<Test>::is_frozen(DEPT));
 	});
 }
 
@@ -492,39 +600,60 @@ fn legislature_call_hash_differs_for_different_department_ids() {
 }
 
 // ---------------------------------------------------------------------
-// unfreeze_department_internal (used by pallet-audit's TreasuryFreezer wiring)
+// audit_freeze_department_internal / audit_unfreeze_department_internal
+// (used by pallet-audit's TreasuryFreezer wiring)
 // ---------------------------------------------------------------------
 
 #[test]
-fn unfreeze_department_internal_clears_frozen_and_emits_event() {
+fn audit_unfreeze_department_internal_clears_frozen_and_emits_event() {
 	new_test_ext().execute_with(|| {
-		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
-		assert!(FrozenDepartments::<Test>::get(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+		assert!(AuditFrozenDepartments::<Test>::get(DEPT));
 
-		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
 
-		assert!(!FrozenDepartments::<Test>::get(DEPT));
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
 		System::assert_last_event(Event::DepartmentUnfrozen { department_id: DEPT }.into());
 	});
 }
 
 #[test]
-fn unfreeze_department_internal_is_idempotent_when_not_frozen() {
+fn audit_unfreeze_department_internal_is_idempotent_when_not_frozen() {
 	new_test_ext().execute_with(|| {
 		// No prior freeze — must not panic or emit a spurious event.
 		System::set_block_number(1);
-		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
-		assert!(!FrozenDepartments::<Test>::get(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
 		assert!(System::events().is_empty());
 	});
 }
 
 #[test]
-fn record_expenditure_succeeds_again_after_unfreeze_department_internal() {
+fn audit_unfreeze_department_internal_emits_no_event_while_court_freeze_still_active() {
+	// If the court axis is still set, the department is NOT actually unfrozen overall — the
+	// event must not claim otherwise, even though the audit axis itself did clear.
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
+		let events_before = System::events().len();
+
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
+
+		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+		// No new event: the department is still frozen overall (court axis), so no
+		// `DepartmentUnfrozen` should be emitted.
+		assert_eq!(System::events().len(), events_before);
+	});
+}
+
+#[test]
+fn record_expenditure_succeeds_again_after_audit_unfreeze_department_internal() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
-		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_freeze_department_internal(DEPT));
 		assert_noop!(
 			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A),
 			Error::<Test>::DepartmentFrozen
@@ -532,7 +661,7 @@ fn record_expenditure_succeeds_again_after_unfreeze_department_internal() {
 
 		// This is the path pallet-audit's TreasuryFreezer wiring uses (as opposed to the
 		// root-only `unfreeze_department` dispatchable).
-		assert_ok!(crate::Pallet::<Test>::unfreeze_department_internal(DEPT));
+		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
 
 		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);

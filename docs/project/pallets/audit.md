@@ -24,10 +24,20 @@ Calls:
 Treasury enforcement: flagging or disputing an entry actually freezes that expenditure's
 department in pallet-treasury-ledger (further `record_expenditure` calls for that department
 fail) via a `T::TreasuryFreezer` associated type, implemented in `runtime/src/configs/mod.rs` by
-calling `pallet_treasury_ledger::Pallet::<Runtime>::freeze_department_internal` /
-`unfreeze_department_internal` — the same `FrozenDepartments` storage pallet-courts freezes via
-its own `TreasuryEnforcer` trait. A per-department `OpenFlags` counter tracks how many
-Flagged/Disputed entries are still open against it, so the department only unfreezes once
-`resolve_entry` clears the last one — resolving one of several open flags/disputes does not
-unfreeze it while others remain.
+calling `pallet_treasury_ledger::Pallet::<Runtime>::audit_freeze_department_internal` /
+`audit_unfreeze_department_internal`. A per-department `OpenFlags` counter tracks how many
+Flagged/Disputed entries are still open against it, so pallet-audit's own axis
+(`AuditFrozenDepartments`) only unfreezes once `resolve_entry` clears the last one — resolving
+one of several open flags/disputes does not unfreeze it while others remain.
+
+**Independent from pallet-courts' freeze.** pallet-treasury-ledger tracks pallet-audit's freezes
+and pallet-courts' freezes (via its own `TreasuryEnforcer` trait) in two separate storage items —
+`AuditFrozenDepartments` and `CourtFrozenDepartments` — not one shared flag. A department is
+blocked from spending while *either* is set. This means: if pallet-courts has also frozen a
+department for an unresolved ruling, `resolve_entry` clearing pallet-audit's last open flag does
+**not** lift the department's freeze overall — the court-ordered freeze remains until cleared by
+pallet-treasury-ledger's root-only `unfreeze_department` dispatchable (which clears both axes at
+once). This was previously a single shared boolean, which let either authority silently clear
+the other's freeze; see pallet-treasury-ledger's `CourtFrozenDepartments`/`AuditFrozenDepartments`
+doc comments for the full rationale.
 
