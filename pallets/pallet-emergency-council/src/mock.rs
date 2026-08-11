@@ -49,6 +49,7 @@ impl pallet_emergency_council::Config for Test {
     type MaxCouncilSize = ConstU32<MAX_COUNCIL_SIZE>;
     type SupermajorityNumerator = ConstU32<SUPERMAJORITY_NUMERATOR>;
     type SupermajorityDenominator = ConstU32<SUPERMAJORITY_DENOMINATOR>;
+    type WeightInfo = ();
 }
 
 // Build genesis storage according to the mock runtime.

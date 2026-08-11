@@ -50,6 +50,7 @@ impl pallet_executive::Config for Test {
     type RatificationWindowBlocks = ConstU32<10>;
     type SupermajorityNumerator = ConstU32<2>;
     type SupermajorityDenominator = ConstU32<3>;
+    type WeightInfo = ();
 }
 
 // Build genesis storage according to the mock runtime.

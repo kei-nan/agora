@@ -6088,6 +6088,7 @@ dependencies = [
 name = "pallet-constitution"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "parity-scale-codec",
@@ -6115,6 +6116,7 @@ dependencies = [
 name = "pallet-elections"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "pallet-balances",
@@ -6129,6 +6131,7 @@ dependencies = [
 name = "pallet-emergency-council"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "parity-scale-codec",
@@ -6142,6 +6145,7 @@ dependencies = [
 name = "pallet-executive"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "pallet-legislature",
@@ -6196,6 +6200,7 @@ dependencies = [
 name = "pallet-legislature"
 version = "0.1.0"
 dependencies = [
+ "frame-benchmarking",
  "frame-support",
  "frame-system",
  "pallet-elections",

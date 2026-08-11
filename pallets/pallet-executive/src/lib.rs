@@ -34,6 +34,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
+
 #[frame_support::pallet]
 pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode};
@@ -41,6 +46,7 @@ pub mod pallet {
     use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+    use crate::weights::WeightInfo;
 
     /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
     /// `LegislatureOrigin` to authorize `tag`'s call with `params`. See
@@ -115,6 +121,8 @@ pub mod pallet {
         /// Denominator of the cabinet supermajority (e.g. 3 for 2/3).
         #[pallet::constant]
         type SupermajorityDenominator: Get<u32>;
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
     }
 
     // ── Types ────────────────────────────────────────────────────────────────────
@@ -285,7 +293,7 @@ pub mod pallet {
         /// Define a new cabinet portfolio. LegislatureOrigin only.
         /// name_hash is the IPFS CID of the portfolio's terms of reference.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::define_portfolio())]
         pub fn define_portfolio(
             origin: OriginFor<T>,
             name_hash: [u8; 32],
@@ -304,7 +312,7 @@ pub mod pallet {
 
         /// Appoint a Prime Minister. LegislatureOrigin only.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::appoint_prime_minister())]
         pub fn appoint_prime_minister(
             origin: OriginFor<T>,
             who: T::AccountId,
@@ -327,7 +335,7 @@ pub mod pallet {
 
         /// Dismiss the Prime Minister. LegislatureOrigin only.
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(6_000, 0))]
+        #[pallet::weight(T::WeightInfo::dismiss_prime_minister())]
         pub fn dismiss_prime_minister(origin: OriginFor<T>) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -345,7 +353,7 @@ pub mod pallet {
         /// If the portfolio is already occupied, the previous holder is automatically dismissed.
         /// If the incoming account already holds a different portfolio, they are vacated first.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::appoint_minister())]
         pub fn appoint_minister(
             origin: OriginFor<T>,
             portfolio_id: u32,
@@ -384,7 +392,7 @@ pub mod pallet {
 
         /// Dismiss the minister currently holding a portfolio. LegislatureOrigin only.
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::dismiss_minister())]
         pub fn dismiss_minister(origin: OriginFor<T>, portfolio_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -402,7 +410,7 @@ pub mod pallet {
 
         /// Resign from one's own portfolio. Any active minister may call this.
         #[pallet::call_index(5)]
-        #[pallet::weight(Weight::from_parts(6_000, 0))]
+        #[pallet::weight(T::WeightInfo::resign())]
         pub fn resign(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let portfolio_id =
@@ -420,7 +428,7 @@ pub mod pallet {
         /// of the cabinet has voted, the emergency activates and the legislature has
         /// `RatificationWindowBlocks` to ratify it or it lapses automatically.
         #[pallet::call_index(6)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::vote_declare_emergency())]
         pub fn vote_declare_emergency(
             origin: OriginFor<T>,
             reason_hash: [u8; 32],
@@ -478,7 +486,7 @@ pub mod pallet {
         /// Must be called within `RatificationWindowBlocks` of the emergency being declared.
         /// Once ratified, the emergency remains active until `expires_at` or early termination.
         #[pallet::call_index(7)]
-        #[pallet::weight(Weight::from_parts(12_000, 0))]
+        #[pallet::weight(T::WeightInfo::ratify_emergency())]
         pub fn ratify_emergency(origin: OriginFor<T>) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
@@ -500,7 +508,7 @@ pub mod pallet {
         ///
         /// When a cabinet supermajority votes to end, the emergency is cleared immediately.
         #[pallet::call_index(8)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        #[pallet::weight(T::WeightInfo::vote_end_emergency())]
         pub fn vote_end_emergency(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_cabinet_member(&who), Error::<T>::NotCabinetMember);
@@ -528,7 +536,7 @@ pub mod pallet {
         /// Allows a cabinet member to withdraw their vote before the emergency activates.
         /// Once `ActiveEmergency` is set this is no longer possible.
         #[pallet::call_index(9)]
-        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        #[pallet::weight(T::WeightInfo::retract_emergency_vote())]
         pub fn retract_emergency_vote(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_cabinet_member(&who), Error::<T>::NotCabinetMember);

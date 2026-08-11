@@ -31,4 +31,9 @@ frame_benchmarking::define_benchmarks!(
 	[pallet_timestamp, Timestamp]
 	[pallet_sudo, Sudo]
 	[pallet_template, Template]
+	[pallet_constitution, Constitution]
+	[pallet_legislature, Legislature]
+	[pallet_elections, PalletElections]
+	[pallet_emergency_council, EmergencyCouncil]
+	[pallet_executive, Cabinet]
 );
