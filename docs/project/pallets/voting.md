@@ -8,17 +8,34 @@ Storage:
 - `Proposals`: `proposal_id` → `(end_block, topic_hash [u8;32], ReferendumTier)`
 - `VoteCommitments`: `(proposal_id, nullifier)` → `commitment` (MACI-encrypted)
 - `ProposalResults`: `proposal_id` → `(yes_votes, no_votes, commitment_root)`
-- `Delegations`: `(topic_id, AccountId)` → `DelegationRecord { delegate: AccountId, expires_at: BlockNumber }`
-  (per-topic; a `StorageDoubleMap` keyed topic-first so tallying can scan just one topic's
-  delegators via `iter_prefix(topic_id)` instead of the whole table)
-- `DelegatorCount`: `(topic_id, AccountId)` → `u32`
+- `Delegations`: `topic_id` → `AccountId` → `DelegationRecord { delegate, expires_at, resolved_weight }`
+  (a `StorageDoubleMap` keyed topic-first so `apply_delegated_weight` can scan just one topic's
+  delegators via `iter_prefix(topic_id)` instead of the whole table — see that function's doc
+  comment)
+- `DelegatorCount`: `(topic_id, AccountId)` → `u32` (direct fan-in only, feeds the absolute cap)
+- `DelegatedWeight`: `(topic_id, AccountId)` → `u32` — transitively-resolved weight currently
+  delegated *to* this account (not counting the account's own vote), feeds the percentage cap
 
 Calls: `submit_proposal`, `commit_vote`, `submit_maci_tally`, `delegate_vote(delegate, topic_id)`, `revoke_delegation(topic_id)`
 
 Delegation guards:
 - Cycle detection: walks chain up to `MaxDelegationDepth` (10) hops; treats depth-exhaustion as cycle
 - Absolute cap: max 1 000 direct delegators per delegate per topic
-- Percentage cap: delegate's count × 100 must be ≤ `DelegationCap` (33) × `total_citizens`
+- Percentage cap: bounds *transitively resolved* weight, not just direct fan-in (fixed — see
+  changelog). At `delegate_vote` time, the pallet walks forward from the new `delegate` (bounded
+  by `MaxDelegationDepth`) to find the terminal delegate the chain would resolve to, and checks
+  `DelegatedWeight[terminal] + who's own contribution` (the delegator's own vote, plus whatever
+  was already delegated to them if they were themselves a terminal) against
+  `DelegationCap (33) × total_citizens`. `DelegatedWeight` is maintained incrementally by
+  `delegate_vote`, `revoke_delegation`, and the lazy expired-delegation cleanup inside
+  `has_delegation_cycle` — but it is only used for this cap check; `apply_delegated_weight`
+  always re-resolves the real `Delegations` graph fresh, so tally correctness never depends on
+  it. Known gap: if an *intermediate* delegate later re-delegates to a different target without
+  the delegator whose chain runs through them ever touching their own edge, the weight that was
+  upstream of that intermediate isn't re-walked onto the new terminal — this can only make a
+  later check on that stale terminal too permissive, never let the cap-violating edge itself go
+  undetected. See `DelegatedWeight`'s doc comment in `pallets/pallet-voting/src/lib.rs` for the
+  full reasoning.
 
 `Delegations` is only resolved into an actual tally for System 3 (Referenda) below, via
 `finalize_referendum`/`apply_delegated_weight` — a non-voting delegator's weight counts toward

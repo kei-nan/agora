@@ -1,6 +1,6 @@
 use crate::{
-    mock::*, ActiveEpoch, BudgetBalance, CategoryVotes, CitizenClaimedEpoch, DelegatorCount,
-    Delegations, EpochNumber, EpochTokenAllocation, Error, Event, FiscalYearEpoch,
+    mock::*, ActiveEpoch, BudgetBalance, CategoryVotes, CitizenClaimedEpoch, DelegatedWeight,
+    DelegatorCount, Delegations, EpochNumber, EpochTokenAllocation, Error, Event, FiscalYearEpoch,
     NextProposalId, NextReferendumId, PetitionReferendum, ProposalResults, Proposals,
     ReferendumHasVoted, ReferendumState, ReferendumTally, ReferendumTier, Referenda,
     VoteCommitments,
@@ -366,6 +366,168 @@ fn delegate_vote_fails_percentage_cap() {
             Voting::delegate_vote(RuntimeOrigin::signed(5), 100, 0, MIN_DELEGATION_DURATION),
             Error::<Test>::DelegationCapExceeded
         );
+    });
+}
+
+/// Reproduces the exact bug this fix closes: `DelegationCap` bounds *transitively resolved*
+/// weight, not just direct fan-in. Mirrors the chain built in
+/// `finalize_referendum_resolves_transitive_delegation_chain` (1 -> 2 -> 3) but with
+/// `total_citizens` set so the fully-resolved chain weight (2, once citizen 2 forwards their
+/// own vote plus citizen 1's) exceeds the 40% cap of a 4-citizen electorate (cap allows at
+/// most weight 1 there). The OLD check only looked at citizen 3's direct fan-in from citizen
+/// 2 alone (count 1, comfortably under any reasonable cap) and would have let this through,
+/// leaving citizen 3 holding 2 of 4 votes (50%) once the chain resolved at finalize time.
+#[test]
+fn delegate_vote_fails_percentage_cap_on_second_hop_of_transitive_chain() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(4);
+        activate_citizen(1);
+        activate_citizen(2);
+        activate_citizen(3);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(2), 3, 0, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+        // Rejected atomically: citizen 2's own delegation state is untouched.
+        assert!(Delegations::<Test>::get(0u32, 2u64).is_none());
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 0);
+    });
+}
+
+/// The scenario described in the bug report: several *independently* under-the-cap chains
+/// funnel into a shared final delegate, whose combined transitively-resolved weight then
+/// exceeds the cap even though no single hop's direct fan-in ever looked large. DelegationCap
+/// = 40%, total_citizens = 10 -> cap allows at most weight 4 per delegate. Three branches,
+/// each a leaf citizen delegating to their own hub (hub's own resolved weight once it
+/// forwards: itself + the one leaf = 2, well under the cap on its own), all then delegate to
+/// a shared `Final`. The OLD check only saw Final's direct fan-in (the 3 hubs, count 3) against
+/// the cap's count-equivalent and would have let all three through, leaving Final holding
+/// 6 of 10 votes (60%) once every chain resolved — well past the 40% cap.
+#[test]
+fn delegate_vote_fails_percentage_cap_via_combined_transitive_chains() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        for (leaf, hub) in [(201u64, 202u64), (203, 204), (205, 206)] {
+            activate_citizen(leaf);
+            activate_citizen(hub);
+            assert_ok!(Voting::delegate_vote(
+                RuntimeOrigin::signed(leaf),
+                hub,
+                0,
+                MIN_DELEGATION_DURATION
+            ));
+        }
+        activate_citizen(300); // shared final delegate
+
+        // First two hubs funnel into Final: 2 + 2 = 4, exactly at the cap.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(202), 300, 0, MIN_DELEGATION_DURATION));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(204), 300, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 4);
+
+        // The third hub would push Final to 6/10 = 60%, well past the 40% cap.
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(206), 300, 0, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+        assert!(Delegations::<Test>::get(0u32, 206u64).is_none());
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 4);
+
+        // A brand new citizen delegating straight to Final is equally rejected: Final is
+        // already at the cap via the transitive chains alone.
+        activate_citizen(400);
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(400), 300, 0, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+    });
+}
+
+/// A legitimate transitive chain that stays under the cap must still work — the fix must not
+/// over-reject. Companion to `finalize_referendum_resolves_transitive_delegation_chain`, which
+/// leaves `total_citizens` at 0 (cap skipped entirely); this variant turns the cap on and
+/// confirms the same chain still succeeds and still tallies correctly at finalize time.
+#[test]
+fn delegate_vote_transitive_chain_under_cap_succeeds() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10); // cap allows up to weight 4
+        activate_citizen(1);
+        activate_citizen(2);
+        activate_citizen(3);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(2), 3, 0, MIN_DELEGATION_DURATION));
+        // `DelegatedWeight` counts weight delegated *to* the terminal (citizens 1 and 2's own
+        // votes), not the terminal's own vote — mirrors DelegatorCount's pre-existing
+        // definition (a delegate's own vote was never counted toward its own cap either).
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 2);
+    });
+}
+
+/// Revoking a delegation must move its weight back onto the revoking citizen, not just drop
+/// it — otherwise repeated delegate/revoke cycles would leak weight out of `DelegatedWeight`
+/// and eventually make the cap too permissive (weight vanishing) or impossible to satisfy
+/// (weight stuck at a stale terminal forever).
+#[test]
+fn revoke_delegation_restores_weight_to_the_revoking_citizen() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(1);
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 1u64)), 0);
+        assert_ok!(Voting::revoke_delegation(RuntimeOrigin::signed(1), 0));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 0);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 1u64)), 1);
+    });
+}
+
+/// Re-delegating to a different delegate must move the weight, not duplicate or drop it.
+#[test]
+fn delegate_vote_replacing_different_delegate_moves_weight() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(1);
+        activate_citizen(2);
+        activate_citizen(3);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 3, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 0);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 1);
+    });
+}
+
+/// Lazy expiry cleanup (triggered from within `has_delegation_cycle` when walking a
+/// prospective new chain) must restore weight to the account whose expired delegation was
+/// removed, exactly like an explicit `revoke_delegation` does — otherwise an expired link
+/// would leave its weight stranded at a terminal it no longer actually resolves to.
+#[test]
+fn delegate_vote_lazy_expiry_cleanup_restores_weight() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(40); // A
+        activate_citizen(41); // B
+        activate_citizen(42); // C
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(40), 41, 9, MIN_DELEGATION_DURATION)); // A -> B, expires at 6
+        assert_eq!(DelegatedWeight::<Test>::get((9u32, 41u64)), 1);
+
+        System::set_block_number(10); // past expiry (6)
+        // C delegates to A. Walking the chain from A finds A's own (expired) record and cleans
+        // it up, which must also move the weight it carried back onto A.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(42), 40, 9, MIN_DELEGATION_DURATION));
+
+        assert_eq!(DelegatedWeight::<Test>::get((9u32, 41u64)), 0);
+        // A is a terminal again (own weight 1) plus C's new delegation to A (weight 1) = 2.
+        assert_eq!(DelegatedWeight::<Test>::get((9u32, 40u64)), 2);
     });
 }
 
@@ -1005,6 +1167,33 @@ fn finalize_referendum_resolves_transitive_delegation_chain() {
         System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
         assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
         // Citizen 3's own vote plus both citizen 1 and citizen 2's transitively-resolved weight.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (3, 0));
+    });
+}
+
+/// Same 1 -> 2 -> 3 chain as `finalize_referendum_resolves_transitive_delegation_chain`, but
+/// with `total_citizens` set so `DelegationCap` is actually in force and the chain's fully
+/// resolved weight (3) sits comfortably under it (cap allows up to weight 4 out of 10
+/// citizens). Confirms the cap fix doesn't regress a legitimate transitive chain: both hops
+/// are accepted and the final tally still resolves the whole chain onto citizen 3's vote.
+#[test]
+fn finalize_referendum_resolves_transitive_delegation_chain_within_cap() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0));
+        set_total_citizens(10);
+        activate_citizen(1);
+        activate_citizen(2);
+        activate_citizen(3);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(2), 3, 0, MAX_DELEGATION_DURATION));
+        // Delegated-in weight only (citizens 1 and 2's own votes) — citizen 3's own vote is
+        // added separately by vote_referendum/finalize_referendum below.
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 2);
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(3), rid, true));
+        System::set_block_number(1 + REFERENDUM_DURATION as u64 + 1);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(9), rid));
         assert_eq!(ReferendumTally::<Test>::get(rid), (3, 0));
     });
 }
