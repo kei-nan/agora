@@ -21,7 +21,7 @@ use num_bigint::BigUint;
 
 /// Recomputes the Fiat-Shamir challenge exactly as `dlog.nr`'s `verify_dlog_equality` does:
 /// `Poseidon2_t16([ds_dlog, a.x,a.y, b.x,b.y, c.x,c.y, G.x,G.y, r1.x,r1.y, r2.x,r2.y, 0,0,0])[1]`.
-fn challenge(
+pub(crate) fn challenge(
     ds_dlog: Fr,
     a: &Point,
     b: &Point,

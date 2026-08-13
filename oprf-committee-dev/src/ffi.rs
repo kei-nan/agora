@@ -48,6 +48,8 @@
 
 use crate::babyjubjub::Point;
 use crate::oprf;
+use crate::scalar;
+use crate::threshold;
 use ark_bn254::Fr;
 use ark_ff::{BigInteger, PrimeField};
 use num_bigint::BigUint;
@@ -174,6 +176,167 @@ pub unsafe extern "C" fn oprf_evaluate_query(
     match evaluate_query(input) {
         Ok(out) => {
             core::ptr::copy_nonoverlapping(out.as_ptr(), output_ptr, OUTPUT_LEN);
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+// ── Threshold (Option B) round 1 / round 2 — extends the same portable core to the genuine
+// `t`-of-`n` protocol in `threshold.rs`, keeping the sensitive, secret-touching computation
+// (this module) wasm-portable across phone/laptop/Pi exactly as `oprf_evaluate_query` above
+// already is, per changelog #082's "one crypto core" decision. See
+// `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`.
+//
+// The public-data-only aggregation math (`threshold::binding_factor`/`lagrange_coefficient`/
+// `combined_challenge`/`aggregate_nonce_commitments`) deliberately does NOT get an FFI
+// wrapper here: it touches no secret material (every input is already-public, already-posted
+// chain data), so unlike this file's other functions it carries none of the "must be
+// wasm-portable to avoid reimplementing sensitive logic per-platform" motivation — a native
+// caller (e.g. `committee-node`, never itself wasm-compiled) can call those functions
+// directly as an ordinary Rust dependency. Only what genuinely needs the member's secret share
+// lives behind this C-ABI boundary.
+
+/// `sk || b_q.x || b_q.y || seed` — round 1's input is exactly [`INPUT_LEN`] minus the
+/// `ds_dlog` field [`oprf_evaluate_query`] needs (round 1 computes no proof yet, so no domain
+/// separator is needed here): `sk`, the blinded query point, and 32 bytes of host-supplied
+/// entropy.
+pub const ROUND1_INPUT_LEN: usize = FIELD_LEN * 4;
+/// `r_i.x/y || d_g.x/y || d_q.x/y || e_g.x/y || e_q.x/y` — five BabyJubJub points.
+pub const ROUND1_OUTPUT_LEN: usize = FIELD_LEN * 10;
+
+/// Round 1 of the threshold protocol (`threshold::round1`, called with this member's own
+/// share as `s_i`): computes the partial evaluation and both FROST-style nonce-commitment
+/// pairs. **Deliberately does not return the raw nonces `(d, e)`** — the host only needs to
+/// remember the 32-byte `seed` it supplied (not the derived secret nonces) to regenerate the
+/// identical nonces for round 2 via [`oprf_round2_response`], the same "seed is the state"
+/// pattern [`oprf_evaluate_query`] already uses for its own Chaum-Pedersen nonce. Reusing the
+/// *same* seed for two different queries would be the round-1/2 analogue of nonce reuse — as
+/// catastrophic here as it is for the single-prover case — so a fresh seed is required per
+/// query, exactly as documented at module level for `oprf_evaluate_query`.
+pub fn round1(input: &[u8]) -> Result<[u8; ROUND1_OUTPUT_LEN], i32> {
+    if input.len() != ROUND1_INPUT_LEN {
+        return Err(ERR_BAD_INPUT_LEN);
+    }
+    let sk = BigUint::from_bytes_be(&input[0..32]);
+    if sk == BigUint::from(0u32) {
+        return Err(ERR_ZERO_SECRET_KEY);
+    }
+    let b_q = Point::new(field_from_be(&input[32..64]), field_from_be(&input[64..96]));
+    if !b_q.is_on_curve() {
+        return Err(ERR_BLINDED_QUERY_NOT_ON_CURVE);
+    }
+    if !b_q.check_sub_group() {
+        return Err(ERR_BLINDED_QUERY_NOT_IN_SUBGROUP);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&input[96..128]);
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
+
+    // `index` is bookkeeping-only inside `threshold::round1` (never used in the arithmetic
+    // itself, only echoed back into the returned struct) — the real index this member's
+    // response is filed under is the caller's own `CommitteeMembers` roster position
+    // (see `threshold.rs`'s module docs and `committee-node`'s config), not anything computed
+    // here, so `0` is a safe placeholder.
+    let (commitment, _nonces) = threshold::round1(&mut rng, 0, &sk, &b_q);
+
+    let mut out = [0u8; ROUND1_OUTPUT_LEN];
+    out[0..32].copy_from_slice(&field_to_be(&commitment.r_i.x));
+    out[32..64].copy_from_slice(&field_to_be(&commitment.r_i.y));
+    out[64..96].copy_from_slice(&field_to_be(&commitment.d_g.x));
+    out[96..128].copy_from_slice(&field_to_be(&commitment.d_g.y));
+    out[128..160].copy_from_slice(&field_to_be(&commitment.d_q.x));
+    out[160..192].copy_from_slice(&field_to_be(&commitment.d_q.y));
+    out[192..224].copy_from_slice(&field_to_be(&commitment.e_g.x));
+    out[224..256].copy_from_slice(&field_to_be(&commitment.e_g.y));
+    out[256..288].copy_from_slice(&field_to_be(&commitment.e_q.x));
+    out[288..320].copy_from_slice(&field_to_be(&commitment.e_q.y));
+    Ok(out)
+}
+
+/// # Safety
+/// Same contract as [`oprf_evaluate_query`]: `input_ptr`/`output_ptr` must be valid for
+/// `input_len`/`output_len` bytes respectively, non-aliasing, for the call's duration.
+#[no_mangle]
+pub unsafe extern "C" fn oprf_round1(
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_len: usize,
+) -> i32 {
+    if output_len != ROUND1_OUTPUT_LEN {
+        return ERR_BAD_OUTPUT_LEN;
+    }
+    let input = core::slice::from_raw_parts(input_ptr, input_len);
+    match round1(input) {
+        Ok(out) => {
+            core::ptr::copy_nonoverlapping(out.as_ptr(), output_ptr, ROUND1_OUTPUT_LEN);
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// `sk || seed || rho_i || lambda_i || e` — the same `seed` supplied to [`oprf_round1`] (to
+/// regenerate the identical nonces), this member's own binding factor and Lagrange
+/// coefficient (both computed by the caller from already-public chain data via
+/// `threshold::binding_factor`/`lagrange_coefficient` — see this file's module docs for why
+/// those aren't behind this FFI boundary), and the shared challenge `e`
+/// (`threshold::combined_challenge`, likewise computed by the caller).
+pub const ROUND2_INPUT_LEN: usize = FIELD_LEN * 5;
+/// `z_i` — one BN254 scalar field element.
+pub const ROUND2_OUTPUT_LEN: usize = FIELD_LEN;
+
+/// Round 2: regenerates this member's nonces from `seed` (identical draw order to
+/// [`round1`], so this **must** be called with the exact same seed used for the matching
+/// `oprf_round1` call on this query — a mismatched seed silently produces a `z_i` that will
+/// simply fail to combine into a valid proof, not a detectable error here) and computes the
+/// response scalar (`threshold::round2_response`).
+pub fn round2_response(input: &[u8]) -> Result<[u8; ROUND2_OUTPUT_LEN], i32> {
+    if input.len() != ROUND2_INPUT_LEN {
+        return Err(ERR_BAD_INPUT_LEN);
+    }
+    let sk = BigUint::from_bytes_be(&input[0..32]);
+    if sk == BigUint::from(0u32) {
+        return Err(ERR_ZERO_SECRET_KEY);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&input[32..64]);
+    let mut rng = rand::rngs::StdRng::from_seed(seed);
+    // Identical draw order to `threshold::round1`'s internal `d` then `e` — see that
+    // function's body. Kept as two direct `random_nonzero` calls here (rather than a shared
+    // helper) so this file's dependency on `threshold::round1`'s exact internal draw order is
+    // visible at the call site, not hidden behind an abstraction; the cross-check test below
+    // (`round1_then_round2_produce_a_verifiable_combined_proof`) fails immediately if the two
+    // ever drift apart.
+    let d = scalar::random_nonzero(&mut rng);
+    let e_nonce = scalar::random_nonzero(&mut rng);
+    let nonces = threshold::Round1Nonces { d, e: e_nonce };
+
+    let rho_i = field_from_be(&input[64..96]);
+    let lambda_i = scalar::from_field(&field_from_be(&input[96..128]));
+    let e_challenge = field_from_be(&input[128..160]);
+
+    let z_i = threshold::round2_response(&nonces, &sk, rho_i, &lambda_i, e_challenge);
+    Ok(field_to_be(&z_i))
+}
+
+/// # Safety
+/// Same contract as [`oprf_evaluate_query`].
+#[no_mangle]
+pub unsafe extern "C" fn oprf_round2_response(
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_len: usize,
+) -> i32 {
+    if output_len != ROUND2_OUTPUT_LEN {
+        return ERR_BAD_OUTPUT_LEN;
+    }
+    let input = core::slice::from_raw_parts(input_ptr, input_len);
+    match round2_response(input) {
+        Ok(out) => {
+            core::ptr::copy_nonoverlapping(out.as_ptr(), output_ptr, ROUND2_OUTPUT_LEN);
             0
         }
         Err(code) => code,
@@ -331,5 +494,147 @@ mod tests {
             assert!(slice.iter().all(|&b| b == 0xAB));
             oprf_dealloc(ptr, 160);
         }
+    }
+
+    // ── Threshold round 1 / round 2 ──────────────────────────────────────────────────────
+
+    fn round1_input(sk: &BigUint, b_q: &Point, seed: [u8; 32]) -> [u8; ROUND1_INPUT_LEN] {
+        let mut input = [0u8; ROUND1_INPUT_LEN];
+        let sk_bytes = sk.to_bytes_be();
+        input[32 - sk_bytes.len()..32].copy_from_slice(&sk_bytes);
+        input[32..64].copy_from_slice(&field_to_be(&b_q.x));
+        input[64..96].copy_from_slice(&field_to_be(&b_q.y));
+        input[96..128].copy_from_slice(&seed);
+        input
+    }
+
+    #[test]
+    fn round1_rejects_wrong_input_length() {
+        assert_eq!(round1(&vec![0u8; ROUND1_INPUT_LEN - 1]), Err(ERR_BAD_INPUT_LEN));
+    }
+
+    #[test]
+    fn round1_rejects_zero_secret_key() {
+        let b_q = oprf::blinded_query(&BigUint::from(4242u64), fe("777"));
+        let input = round1_input(&BigUint::from(0u64), &b_q, [1u8; 32]);
+        assert_eq!(round1(&input), Err(ERR_ZERO_SECRET_KEY));
+    }
+
+    #[test]
+    fn round1_matches_direct_threshold_call() {
+        let b_q = oprf::blinded_query(&BigUint::from(4242u64), fe("777"));
+        let sk = BigUint::from(999999937u64);
+        let seed = [3u8; 32];
+        let input = round1_input(&sk, &b_q, seed);
+
+        let out = round1(&input).expect("valid fixture must succeed");
+
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
+        let (direct, _) = threshold::round1(&mut rng, 0, &sk, &b_q);
+
+        assert_eq!(&out[0..32], &field_to_be(&direct.r_i.x));
+        assert_eq!(&out[32..64], &field_to_be(&direct.r_i.y));
+        assert_eq!(&out[64..96], &field_to_be(&direct.d_g.x));
+        assert_eq!(&out[96..128], &field_to_be(&direct.d_g.y));
+        assert_eq!(&out[128..160], &field_to_be(&direct.d_q.x));
+        assert_eq!(&out[160..192], &field_to_be(&direct.d_q.y));
+        assert_eq!(&out[192..224], &field_to_be(&direct.e_g.x));
+        assert_eq!(&out[224..256], &field_to_be(&direct.e_g.y));
+        assert_eq!(&out[256..288], &field_to_be(&direct.e_q.x));
+        assert_eq!(&out[288..320], &field_to_be(&direct.e_q.y));
+    }
+
+    /// The single most important test in this file: drives a genuine 3-of-5 threshold
+    /// evaluation **entirely through the FFI functions** (the exact code path
+    /// `committee-node`'s wasm host calls), for a query point and shares consistent with a
+    /// real `dkg.rs` ceremony, and confirms the resulting combined proof passes the same
+    /// unmodified `dlog::verify` that `threshold.rs`'s own tests already validated against
+    /// the real Noir `oprf-nr` dependency. If this passes, the wasm ABI faithfully exposes
+    /// the already-proven protocol — not just a native Rust reimplementation of it.
+    #[test]
+    fn round1_then_round2_ffi_calls_produce_a_verifiable_combined_proof() {
+        use crate::dkg;
+        let mut rng = rand::rngs::mock::StepRng::new(11, 13);
+        let ds_dlog = fe("1523098184080632582082867317389990410064981862");
+
+        let n = 5;
+        let t = 3;
+        let q = Point::generator().scalar_mul(&BigUint::from(20260813u64));
+
+        let polys: Vec<dkg::Polynomial> = (0..n).map(|_| dkg::Polynomial::random(t, &mut rng)).collect();
+        let firsts: Vec<Point> = polys.iter().map(|p| dkg::commit(p)[0]).collect();
+        let group_pk = dkg::group_public_key(&firsts);
+        let shares: Vec<BigUint> = (1..=n as u64)
+            .map(|i| {
+                let received: Vec<BigUint> = polys.iter().map(|p| p.eval(i)).collect();
+                dkg::combine_received_shares(&received)
+            })
+            .collect();
+
+        let participants: Vec<u64> = vec![1, 2, 3];
+        let seeds: Vec<[u8; 32]> = vec![[10u8; 32], [20u8; 32], [30u8; 32]];
+
+        // Round 1, via the FFI entry point, for each participant.
+        let mut round1_msgs = Vec::new();
+        for (&i, &seed) in participants.iter().zip(seeds.iter()) {
+            let s_i = &shares[(i - 1) as usize];
+            let input = round1_input(s_i, &q, seed);
+            let out = round1(&input).expect("round1 FFI call must succeed");
+            round1_msgs.push(threshold::Round1Commitment {
+                index: i,
+                r_i: Point::new(field_from_be(&out[0..32]), field_from_be(&out[32..64])),
+                d_g: Point::new(field_from_be(&out[64..96]), field_from_be(&out[96..128])),
+                d_q: Point::new(field_from_be(&out[128..160]), field_from_be(&out[160..192])),
+                e_g: Point::new(field_from_be(&out[192..224]), field_from_be(&out[224..256])),
+                e_q: Point::new(field_from_be(&out[256..288]), field_from_be(&out[288..320])),
+            });
+        }
+
+        // Aggregation (binding factors, combined evaluation, aggregated nonce commitments,
+        // shared challenge) — public-data-only, computed natively, exactly as a real caller
+        // like `committee-node` would per this file's module docs.
+        let rhos: Vec<(u64, Fr)> = participants
+            .iter()
+            .map(|&i| (i, threshold::binding_factor(i, &round1_msgs, &q)))
+            .collect();
+        let (d_g, d_q) = threshold::aggregate_nonce_commitments(&round1_msgs, &rhos);
+        let r = threshold::combine_evaluations(&round1_msgs);
+        let e = threshold::combined_challenge(&group_pk, &q, &r, &d_g, &d_q, ds_dlog);
+
+        // Round 2, via the FFI entry point, for each participant.
+        let mut responses = Vec::new();
+        for (&i, &seed) in participants.iter().zip(seeds.iter()) {
+            let s_i = &shares[(i - 1) as usize];
+            let rho_i = rhos.iter().find(|(idx, _)| *idx == i).unwrap().1;
+            let lambda_i = threshold::lagrange_coefficient(i, &participants);
+
+            let mut input = [0u8; ROUND2_INPUT_LEN];
+            let sk_bytes = s_i.to_bytes_be();
+            input[32 - sk_bytes.len()..32].copy_from_slice(&sk_bytes);
+            input[32..64].copy_from_slice(&seed);
+            input[64..96].copy_from_slice(&field_to_be(&rho_i));
+            input[96..128].copy_from_slice(&field_to_be(&scalar::to_field(&lambda_i)));
+            input[128..160].copy_from_slice(&field_to_be(&e));
+
+            let out = round2_response(&input).expect("round2 FFI call must succeed");
+            responses.push(field_from_be(&out));
+        }
+
+        let z = threshold::combine_responses(&responses);
+        assert!(
+            dlog::verify(e, z, &group_pk, &q, &r, ds_dlog),
+            "combined proof produced entirely via the wasm FFI boundary must verify"
+        );
+    }
+
+    #[test]
+    fn round2_response_rejects_wrong_input_length() {
+        assert_eq!(round2_response(&vec![0u8; ROUND2_INPUT_LEN - 1]), Err(ERR_BAD_INPUT_LEN));
+    }
+
+    #[test]
+    fn round2_response_rejects_zero_secret_key() {
+        let input = [0u8; ROUND2_INPUT_LEN];
+        assert_eq!(round2_response(&input), Err(ERR_ZERO_SECRET_KEY));
     }
 }

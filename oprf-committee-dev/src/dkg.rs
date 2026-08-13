@@ -20,12 +20,14 @@
 //! committee's key across members") unspecified — `committee.rs`'s own doc comment flags this
 //! exact gap: "this crate gives each committee one flat secret scalar" instead of a real
 //! threshold split. This module is the threshold split entry 73 presumed but didn't specify:
-//! classic Shamir/Feldman `t`-of-`n` secret sharing IS the right primitive for *that* layer
-//! (confirmed against `pallets/pallet-identity`'s actual `submit_oprf_response`, which accepts
-//! a single response record per `(query_id, committee_slot)` pair from any one roster member —
-//! consistent with "the committee, however it internally reached agreement, publishes one
-//! evaluation under one public key," which is exactly what a completed Shamir/Feldman DKG
-//! produces: one group public key, `n` individually-meaningless-alone shares). It is a
+//! classic Shamir/Feldman `t`-of-`n` secret sharing IS the right primitive for *that* layer.
+//! **Update**: the gap this paragraph originally described (`pallet-identity` only ever
+//! accepting one flat response per query+slot, so nothing downstream could actually consume a
+//! genuine share) is now closed — see `threshold.rs` in this crate for the real `t`-of-`n`
+//! evaluation protocol built on top of this module's DKG primitives, and
+//! `pallets/pallet-identity`'s `submit_oprf_round1`/`submit_oprf_round2` for the on-chain
+//! mailbox that now hosts it (`docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`).
+//! It is a
 //! *different* mechanism from entry 73's "hashed summation," not a competing one: hashed
 //! summation combines 5 different committees' full outputs; this module is how members
 //! *within* one of those 5 committees jointly hold that one committee's key in the first

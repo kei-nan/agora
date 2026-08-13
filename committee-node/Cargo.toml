@@ -55,3 +55,20 @@ age = "0.10"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- threshold (Option B) public-data aggregation math ---
+# Binding factors, Lagrange coefficients, the shared challenge, and nonce-commitment
+# aggregation touch no secret material — every input is already-public, already-posted chain
+# data — so unlike the sensitive per-member evaluation (kept wasm-portable in `wasm_host.rs`,
+# see `oprf-committee-dev/src/ffi.rs`'s module docs for why that boundary exists at all), this
+# math has no reason to go through the wasm ABI. `oprf-committee-dev` already builds and tests
+# natively (it is not wasm-only — `wasm32-unknown-unknown` is one of its two build targets, see
+# its own Cargo.toml `[lib] crate-type`), so this is an ordinary path dependency, not a new
+# category of thing this crate does. Still deliberately NOT part of committee-node's own
+# workspace (see the `[workspace]` comment above) — same standalone-component reasoning.
+oprf-committee-dev = { path = "../oprf-committee-dev" }
+# Needed only to name `ark_bn254::Fr` explicitly when collecting per-participant binding
+# factors for `threshold::aggregate_nonce_commitments` — same version `oprf-committee-dev`
+# itself pins, so there is exactly one copy of this type in the dependency graph, not two
+# potentially-incompatible ones.
+ark-bn254 = { version = "0.5.0", default-features = false, features = ["std", "curve"] }

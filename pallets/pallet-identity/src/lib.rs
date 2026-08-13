@@ -19,13 +19,16 @@
 //! identity-anchor, recomputed and checked via `T::AnchorVerifier` against the
 //! governance-approved committee keys in `OprfCommitteeKeys` (see `circuits/oprf-identity-anchor/README.md`
 //! and this file's `AnchorProofVerifier` trait docs for the full design). The on-chain OPRF
-//! committee query/response mailbox (`submit_oprf_query`/`submit_oprf_response`,
-//! `crate::dlog_verify`) is the mechanism committee members use to answer those anchor queries.
+//! committee mailbox (`submit_oprf_query`/`submit_oprf_round1`/`submit_oprf_round2`) is the
+//! two-round, genuine-threshold mechanism committee members use to jointly answer those
+//! anchor queries (`docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`
+//! — "Option B") — this pallet performs no cryptographic verification of their submissions
+//! itself; see `OprfRound1Commitment`'s doc comment for why, and
+//! `oprf-committee-dev/src/threshold.rs` for the protocol and its own on-chain-independent
+//! verification against a real Noir dependency.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;
-
-mod dlog_verify;
 
 #[cfg(test)]
 mod mock;
@@ -58,7 +61,7 @@ pub mod pallet {
     pub const NUM_COMMITTEES: u8 = 5;
 
     /// Deterministically assigns which of the `NUM_COMMITTEES` OPRF committees a citizen's
-    /// on-chain mailbox traffic (`PendingOprfQueries`/`OprfResponses`) is routed to
+    /// on-chain mailbox traffic (`PendingOprfQueries`/`OprfRound1Commitments`) is routed to
     /// (changelog entry 82's query/response mailbox design): `Poseidon2(date_of_birth) mod
     /// NUM_COMMITTEES`. Keyed on date of birth (rather than the never-on-chain-stored
     /// national ID) so the assignment is stable for a citizen's whole lifetime without
@@ -91,7 +94,7 @@ pub mod pallet {
     /// two 32-byte big-endian field elements (x then y) — safe to be public because blinding
     /// hides the underlying identity input (see `oprf-committee-dev/src/oprf.rs`'s
     /// `blinded_query`). `posted_at` anchors the `OprfQuerySlaBlocks` expiry window checked
-    /// by `submit_oprf_response`.
+    /// by `submit_oprf_round1`.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub struct OprfQueryRecord<AccountId, BlockNumber> {
         pub submitter: AccountId,
@@ -99,33 +102,54 @@ pub mod pallet {
         pub posted_at: BlockNumber,
     }
 
-    /// One committee's OPRF evaluation response to a pending query (changelog entry 82).
-    /// `evaluation` is the committee's blinded OPRF response point — same 64-byte
-    /// x-then-y-big-endian layout as `OprfQueryRecord::blinded_query` (see
-    /// `oprf-committee-dev/src/oprf.rs`'s `CommitteeEvaluation::response_blinded`).
-    /// `committee_pubkey` is the committee's claimed OPRF public key point for this response
-    /// (same 64-byte layout), used as the Chaum-Pedersen relation's `a = x*G`; it is not
-    /// trusted on its own — `submit_oprf_response` checks `Poseidon2(pubkey.x, pubkey.y)`
-    /// against the governance-approved `OprfCommitteeKeys` entry for the response's
-    /// `(scheme_version, committee_slot)` before the proof is ever checked against it.
-    /// `dlog_proof` is the Chaum-Pedersen DLog-equality proof
-    /// `oprf-committee-dev/src/dlog.rs` generates/verifies (`dlog::generate` ->
-    /// `(e: Fr, s: Fr)`, `dlog::verify(e, s, ...)`): exactly two BN254 scalar field elements,
-    /// 32 bytes each, concatenated big-endian as `e || s` — **64 bytes total**. This is the
-    /// real serialized size confirmed against that crate's actual types (not an arbitrary
-    /// bound); `submit_oprf_response` rejects anything else via `InvalidDlogProofLength`.
-    /// `submit_oprf_response` verifies this relation for real via `crate::dlog_verify` (a
-    /// no_std port of `oprf-committee-dev/src/dlog.rs`, validated against the same upstream
-    /// known-answer vectors — see that module's docs) before ever inserting a record here:
-    /// `evaluation` is checked against the *actual* `blinded_query` on file for the `query_id`
-    /// being answered, which is what binds a response to the specific query it was computed
-    /// for and rules out replaying a valid proof against a different query.
+    /// One committee member's round-1 broadcast toward a genuine `t`-of-`n` threshold
+    /// evaluation of a pending query — the "Option B" design in
+    /// `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`,
+    /// replacing the single-response-wins design this struct's doc comment used to describe
+    /// (see that document's "The problem this closes" for exactly why: under the old design
+    /// any *one* member's server was fully and permanently sufficient to answer for its whole
+    /// committee, which is not the threshold property changelog #073 specified).
+    ///
+    /// `r_i` is member `index`'s **partial** OPRF evaluation `s_i · Q` under their own Feldman
+    /// share, not the full secret. `(d_g, d_q)`/`(e_g, e_q)` are two FROST-style nonce
+    /// commitment pairs (`d_i·G, d_i·Q` and `e_i·G, e_i·Q`) — two nonces, not one, specifically
+    /// to support the round-2 binding factor that defends against the Drijvers et al. rogue-
+    /// nonce attack on naive two-round Schnorr-family aggregation (see
+    /// `oprf-committee-dev/src/threshold.rs`'s module docs for the full protocol and why a
+    /// single-nonce version was rejected). All five fields are BabyJubJub points, 64-byte
+    /// x-then-y-big-endian, same layout `OprfQueryRecord::blinded_query` already uses.
+    ///
+    /// This pallet performs **no cryptographic verification** of these fields — only
+    /// structural checks (`submit_oprf_round1`: registered member, no double submission, set
+    /// not already at `OprfThreshold`). The combined proof's correctness is checked exactly
+    /// where OPRF proofs have always been checked: client-side, when a citizen's device
+    /// assembles the `anchor`/`disclosure` circuit witness from a locked set's round-1/round-2
+    /// data (via `oprf-committee-dev::threshold`'s combination functions) and the resulting ZK
+    /// proof is verified by `register_citizen`. A member submitting fabricated data makes the
+    /// eventual combination fail — not individually identified or penalized by this pallet;
+    /// "identifiable abort" for threshold Sigma protocols is a real, separate, harder problem
+    /// this implementation does not attempt (see doc 11).
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
-    pub struct OprfResponseRecord<AccountId> {
-        pub responder: AccountId,
-        pub evaluation: [u8; 64],
-        pub committee_pubkey: [u8; 64],
-        pub dlog_proof: BoundedVec<u8, ConstU32<64>>,
+    pub struct OprfRound1Commitment<AccountId> {
+        pub member: AccountId,
+        pub r_i: [u8; 64],
+        pub d_g: [u8; 64],
+        pub d_q: [u8; 64],
+        pub e_g: [u8; 64],
+        pub e_q: [u8; 64],
+    }
+
+    /// One committee member's round-2 response, submitted only after round 1's qualifying set
+    /// has locked (exactly `OprfThreshold` round-1 commitments exist) and only by a member of
+    /// that locked set (`submit_oprf_round2`). `z_i` is a single BN254 scalar field element —
+    /// `oprf-committee-dev/src/threshold.rs::round2_response`'s output — which combines
+    /// (summed across the locked set, `oprf-committee-dev::threshold::combine_responses`) into
+    /// the final proof's `dlog_s`. Like round 1, no cryptographic check happens here; see
+    /// `OprfRound1Commitment`'s doc comment for why.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct OprfRound2Response<AccountId> {
+        pub member: AccountId,
+        pub z_i: [u8; 32],
     }
 
     #[pallet::config]
@@ -191,13 +215,24 @@ pub mod pallet {
         #[pallet::constant]
         type MaxCommitteeSize: Get<u32>;
         /// Blocks a posted `PendingOprfQueries` entry stays open for committee responses
-        /// before `submit_oprf_response` starts rejecting it as expired (changelog entry
+        /// before `submit_oprf_round1`/`submit_oprf_round2` start rejecting it as expired
+        /// (changelog entry
         /// 82's SLA window). Per that entry's "Still open" section, "~5-7 days" is a
         /// placeholder pending real pilot telemetry — human committee-member response time is
         /// fundamentally slower than a server's, compounded by needing enough of each
         /// committee's members to respond across all `NUM_COMMITTEES` committees.
         #[pallet::constant]
         type OprfQuerySlaBlocks: Get<u32>;
+        /// The Shamir/Feldman reconstruction threshold `t`: how many distinct committee
+        /// members' round-1 commitments lock a query's qualifying set (`submit_oprf_round1`)
+        /// before round 2 opens. Doc 11's own placeholder caveat applies here directly:
+        /// changelog #073 specified "~12-of-35" for the eventual full-scale committees and
+        /// "6-of-7" for founding groups, but no real committee has been sized yet — set this
+        /// per deployment, e.g. `ConstU32<3>` for development/testing (matches
+        /// `oprf-committee-dev::threshold`'s own test coverage at 3-of-5, 6-of-7, and 2-of-2).
+        /// Must be `<= MaxCommitteeSize` for any slot expected to actually reach quorum.
+        #[pallet::constant]
+        type OprfThreshold: Get<u32>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -385,8 +420,8 @@ pub mod pallet {
 
     /// Roster of which accounts belong to which OPRF committee slot (`0..NUM_COMMITTEES`).
     /// Committee members poll this (off-chain) to confirm they're authorized to answer for a
-    /// given slot, and `submit_oprf_response` checks the caller's account against it
-    /// directly. Governance-gated by the same `AdminOrigin` already used for
+    /// given slot, and `submit_oprf_round1`/`submit_oprf_round2` check the caller's account
+    /// against it directly. Governance-gated by the same `AdminOrigin` already used for
     /// `OprfCommitteeKeys` (see `add_committee_member`/`remove_committee_member`) — mirrors
     /// that storage's admin-controlled-allowlist pattern rather than inventing a new
     /// governance mechanism.
@@ -402,7 +437,8 @@ pub mod pallet {
     /// A citizen's pending blinded OPRF query, keyed by `query_id` (changelog entry 82's
     /// on-chain mailbox, replacing a relay server: a citizen posts here via
     /// `submit_oprf_query`, committee members for the assigned slot
-    /// (`committee_slot_for`) poll it off-chain, and answer via `submit_oprf_response`).
+    /// (`committee_slot_for`) poll it off-chain, and answer via
+    /// `submit_oprf_round1`/`submit_oprf_round2`).
     #[pallet::storage]
     pub type PendingOprfQueries<T: Config> =
         StorageMap<_, Blake2_128Concat, u64, OprfQueryRecord<T::AccountId, BlockNumberFor<T>>>;
@@ -412,18 +448,35 @@ pub mod pallet {
     #[pallet::storage]
     pub type NextQueryId<T: Config> = StorageValue<_, u64, ValueQuery>;
 
-    /// Committee responses to pending OPRF queries, keyed by `(query_id, committee_slot)`.
-    /// Presence of an entry for a given pair is exactly the idempotency guard
-    /// `submit_oprf_response` uses to reject a double-response from the same slot for the
-    /// same query.
+    /// Round-1 commitments toward a `(query_id, committee_slot)`'s threshold evaluation, in
+    /// submission order, `ValueQuery` (empty `BoundedVec` when nothing has been submitted yet
+    /// — simpler than `Option` here since "no entry" and "empty vec" mean the same thing and
+    /// every read site would otherwise have to unwrap-or-default anyway). Reaching exactly
+    /// `T::OprfThreshold` entries **locks** the qualifying set: `submit_oprf_round1` rejects
+    /// any further submission for that pair (`OprfRound1SetLocked`), and `submit_oprf_round2`
+    /// requires this to already be at that length before accepting anything.
     #[pallet::storage]
-    pub type OprfResponses<T: Config> = StorageDoubleMap<
+    pub type OprfRound1Commitments<T: Config> = StorageDoubleMap<
         _,
         Blake2_128Concat,
         u64,
         Blake2_128Concat,
         u8,
-        OprfResponseRecord<T::AccountId>,
+        BoundedVec<OprfRound1Commitment<T::AccountId>, T::OprfThreshold>,
+        ValueQuery,
+    >;
+
+    /// Round-2 responses, same shape and locking pattern as
+    /// [`OprfRound1Commitments`] — see `submit_oprf_round2`.
+    #[pallet::storage]
+    pub type OprfRound2Responses<T: Config> = StorageDoubleMap<
+        _,
+        Blake2_128Concat,
+        u64,
+        Blake2_128Concat,
+        u8,
+        BoundedVec<OprfRound2Response<T::AccountId>, T::OprfThreshold>,
+        ValueQuery,
     >;
 
     #[pallet::event]
@@ -460,8 +513,14 @@ pub mod pallet {
         CommitteeMemberRemoved { slot: u8, who: T::AccountId },
         /// A citizen posted a blinded OPRF query to the on-chain mailbox.
         OprfQuerySubmitted { query_id: u64, submitter: T::AccountId },
-        /// A committee member answered a pending OPRF query for their slot.
-        OprfResponseSubmitted { query_id: u64, committee_slot: u8, responder: T::AccountId },
+        /// A committee member submitted their round-1 threshold-evaluation commitment for a
+        /// pending query (Option B, doc 11).
+        OprfRound1Submitted { query_id: u64, committee_slot: u8, member: T::AccountId },
+        /// A `(query_id, committee_slot)`'s round-1 qualifying set reached `OprfThreshold`
+        /// distinct members and locked — round 2 is now open for exactly this set.
+        OprfRound1SetLocked { query_id: u64, committee_slot: u8 },
+        /// A member of an already-locked round-1 set submitted their round-2 response.
+        OprfRound2Submitted { query_id: u64, committee_slot: u8, member: T::AccountId },
     }
 
     #[pallet::error]
@@ -525,25 +584,21 @@ pub mod pallet {
         /// The caller is not a registered member of `CommitteeMembers` for the given
         /// committee slot.
         NotCommitteeMember,
-        /// This committee slot has already submitted a response for this `query_id`.
+        /// The caller already submitted a round-1 or round-2 message for this
+        /// `(query_id, committee_slot)`.
         DuplicateResponse,
-        /// `dlog_proof` was not exactly 64 bytes (two concatenated 32-byte BN254 scalar
-        /// field elements, `dlog_e || dlog_s` — see `OprfResponseRecord`'s doc comment for
-        /// where that size comes from).
-        InvalidDlogProofLength,
-        /// The submitted `committee_pubkey`'s `Poseidon2(x, y)` hash does not match the
-        /// governance-approved `OprfCommitteeKeys` entry for this response's current
-        /// `(OprfSchemeVersion, committee_slot)` — either no key is on file for that slot yet,
-        /// or the caller supplied a public key that isn't the committee's real one.
-        UnrecognizedCommitteePublicKey,
-        /// The Chaum-Pedersen DLog-equality proof failed to verify: either the points/scalars
-        /// were malformed (off-curve, non-canonical encoding, identity, or outside the
-        /// prime-order subgroup), or the relation genuinely doesn't hold — i.e. `evaluation`
-        /// is not a valid OPRF evaluation of this query's `blinded_query` under the secret key
-        /// behind `committee_pubkey`. This also rejects a proof computed for a *different*
-        /// query being replayed against this one, since the relation is checked against this
-        /// query's own on-file `blinded_query`.
-        InvalidDlogProof,
+        /// `submit_oprf_round1`: this `(query_id, committee_slot)`'s qualifying set already
+        /// has `OprfThreshold` members — no further round-1 submissions are accepted (a
+        /// correct client should watch for `OprfRound1SetLocked` and retry against a fresh
+        /// query if it arrives too late to join).
+        OprfRound1SetLocked,
+        /// `submit_oprf_round2`: this `(query_id, committee_slot)`'s round-1 set has not yet
+        /// reached `OprfThreshold` members — round 2 is not open yet.
+        OprfRound1NotLocked,
+        /// `submit_oprf_round2`: the caller did not submit an accepted round-1 commitment for
+        /// this `(query_id, committee_slot)`, so they are not part of its (now locked)
+        /// qualifying set and may not submit a round-2 response for it.
+        NotInLockedSet,
     }
 
     #[pallet::call]
@@ -1049,33 +1104,32 @@ pub mod pallet {
             Ok(())
         }
 
-        /// A committee member answers a pending OPRF query for their slot (changelog entry
-        /// 82). Checks, in order: `committee_slot` is in `0..NUM_COMMITTEES`; `dlog_proof` is
-        /// exactly 64 bytes (see `OprfResponseRecord`'s doc comment); the query exists; it
-        /// hasn't expired (`OprfQuerySlaBlocks` blocks from `posted_at`); the caller is on
-        /// file in `CommitteeMembers` for that slot; the caller hasn't already responded for
-        /// this `(query_id, committee_slot)` pair; `committee_pubkey` hashes to the
-        /// governance-approved `OprfCommitteeKeys` entry for `(OprfSchemeVersion, committee_slot)`;
-        /// and finally the Chaum-Pedersen DLog-equality proof (`crate::dlog_verify`) actually
-        /// verifies `evaluation` as a genuine OPRF evaluation of *this query's own*
-        /// `blinded_query` under the secret key behind `committee_pubkey` — which is what
-        /// binds a response to the specific query it was computed for and rejects one
-        /// replayed against a different query, an arbitrary unverifiable value, or a proof
-        /// generated under some other key. The crypto check runs last since it's by far the
-        /// most expensive of these — cheaper checks reject obviously-bad calls first.
+        /// Round 1 of a genuine `t`-of-`n` threshold OPRF evaluation (Option B, doc 11): a
+        /// committee member broadcasts their partial evaluation of a pending query plus
+        /// FROST-style nonce commitments (see `OprfRound1Commitment`'s doc comment for the
+        /// field-by-field meaning and `oprf-committee-dev/src/threshold.rs` for the full
+        /// protocol). Checks, in order: slot valid; query exists and hasn't expired; caller is
+        /// on file in `CommitteeMembers` for that slot; the qualifying set isn't already at
+        /// `OprfThreshold`; the caller hasn't already submitted for this pair. Performs **no**
+        /// cryptographic verification of the submitted points — see `OprfRound1Commitment`'s
+        /// doc comment for why that's a deliberate, documented scope boundary, not an
+        /// oversight. Once this is the `OprfThreshold`-th accepted commitment for this pair,
+        /// the qualifying set locks (`OprfRound1SetLocked`) and no further round-1 submissions
+        /// are accepted for it.
         #[pallet::call_index(16)]
-        #[pallet::weight(Weight::from_parts(200_000, 0))]
-        pub fn submit_oprf_response(
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn submit_oprf_round1(
             origin: OriginFor<T>,
             query_id: u64,
             committee_slot: u8,
-            evaluation: [u8; 64],
-            committee_pubkey: [u8; 64],
-            dlog_proof: BoundedVec<u8, ConstU32<64>>,
+            r_i: [u8; 64],
+            d_g: [u8; 64],
+            d_q: [u8; 64],
+            e_g: [u8; 64],
+            e_q: [u8; 64],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(committee_slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
-            ensure!(dlog_proof.len() == 64, Error::<T>::InvalidDlogProofLength);
 
             let query = PendingOprfQueries::<T>::get(query_id).ok_or(Error::<T>::QueryNotFound)?;
             let deadline = query
@@ -1089,46 +1143,77 @@ pub mod pallet {
             let members = CommitteeMembers::<T>::get(committee_slot);
             ensure!(members.contains(&who), Error::<T>::NotCommitteeMember);
 
-            ensure!(
-                !OprfResponses::<T>::contains_key(query_id, committee_slot),
-                Error::<T>::DuplicateResponse
-            );
-
-            // The claimed committee public key must be the governance-approved one for this
-            // slot under the current OPRF scheme version — otherwise anyone could submit a
-            // proof valid under a key of their own choosing.
-            let scheme_version = OprfSchemeVersion::<T>::get();
-            let expected_pk_hash = OprfCommitteeKeys::<T>::get((scheme_version, committee_slot))
-                .ok_or(Error::<T>::UnrecognizedCommitteePublicKey)?;
-            ensure!(
-                crate::dlog_verify::hash_committee_pubkey(committee_pubkey) == expected_pk_hash,
-                Error::<T>::UnrecognizedCommitteePublicKey
-            );
-
-            // The real cryptographic check: `evaluation` must be a genuine OPRF evaluation of
-            // *this query's own* `blinded_query` (not a caller-supplied value) under the
-            // secret key behind `committee_pubkey`. Binding to the specific query is implicit
-            // here, not a separate check — see `dlog_verify::verify_oprf_response`'s docs.
-            ensure!(
-                crate::dlog_verify::verify_oprf_response(
-                    committee_pubkey,
-                    query.blinded_query,
-                    evaluation,
-                    &dlog_proof,
-                ),
-                Error::<T>::InvalidDlogProof
-            );
-
-            OprfResponses::<T>::insert(
+            let locked = OprfRound1Commitments::<T>::try_mutate(
                 query_id,
                 committee_slot,
-                OprfResponseRecord { responder: who.clone(), evaluation, committee_pubkey, dlog_proof },
+                |commitments| -> Result<bool, DispatchError> {
+                    ensure!(
+                        (commitments.len() as u32) < T::OprfThreshold::get(),
+                        Error::<T>::OprfRound1SetLocked
+                    );
+                    ensure!(
+                        !commitments.iter().any(|c| c.member == who),
+                        Error::<T>::DuplicateResponse
+                    );
+                    commitments
+                        .try_push(OprfRound1Commitment { member: who.clone(), r_i, d_g, d_q, e_g, e_q })
+                        .map_err(|_| Error::<T>::OprfRound1SetLocked)?;
+                    Ok((commitments.len() as u32) == T::OprfThreshold::get())
+                },
+            )?;
+
+            Self::deposit_event(Event::OprfRound1Submitted { query_id, committee_slot, member: who });
+            if locked {
+                Self::deposit_event(Event::OprfRound1SetLocked { query_id, committee_slot });
+            }
+            Ok(())
+        }
+
+        /// Round 2: a member of an already-locked round-1 qualifying set submits their
+        /// response scalar (`OprfRound2Response::z_i` —
+        /// `oprf-committee-dev::threshold::round2_response`'s output). Requires round 1 to
+        /// already be locked (exactly `OprfThreshold` commitments) and the caller to be one of
+        /// its members. No cryptographic verification here either — see
+        /// `OprfRound1Commitment`'s doc comment; the same scope boundary applies to round 2.
+        /// Once every member of the locked set has submitted, the citizen's own client
+        /// combines the round-1/round-2 data into the final proof
+        /// (`oprf-committee-dev::threshold::combine_evaluations`/`combine_responses`) exactly
+        /// as it already assembles every other part of the registration witness — this pallet
+        /// does not compute or store that combination itself.
+        #[pallet::call_index(17)]
+        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        pub fn submit_oprf_round2(
+            origin: OriginFor<T>,
+            query_id: u64,
+            committee_slot: u8,
+            z_i: [u8; 32],
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(committee_slot < NUM_COMMITTEES, Error::<T>::InvalidCommitteeSlot);
+
+            let round1 = OprfRound1Commitments::<T>::get(query_id, committee_slot);
+            ensure!(
+                (round1.len() as u32) == T::OprfThreshold::get(),
+                Error::<T>::OprfRound1NotLocked
             );
-            Self::deposit_event(Event::OprfResponseSubmitted {
+            ensure!(round1.iter().any(|c| c.member == who), Error::<T>::NotInLockedSet);
+
+            OprfRound2Responses::<T>::try_mutate(
                 query_id,
                 committee_slot,
-                responder: who,
-            });
+                |responses| -> DispatchResult {
+                    ensure!(
+                        !responses.iter().any(|r| r.member == who),
+                        Error::<T>::DuplicateResponse
+                    );
+                    responses
+                        .try_push(OprfRound2Response { member: who.clone(), z_i })
+                        .map_err(|_| Error::<T>::OprfRound1SetLocked)?;
+                    Ok(())
+                },
+            )?;
+
+            Self::deposit_event(Event::OprfRound2Submitted { query_id, committee_slot, member: who });
             Ok(())
         }
     }

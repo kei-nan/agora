@@ -133,6 +133,9 @@ impl pallet_identity_zk::Config for Test {
     // Short window (mirrors ReverificationPeriod's convention above) so tests can cross an
     // OPRF query's expiry deadline without huge block numbers.
     type OprfQuerySlaBlocks = frame_support::traits::ConstU32<10>;
+    // Strictly less than MaxCommitteeSize (3) so tests can distinguish "set locked at
+    // threshold" from "roster physically full" as two different conditions.
+    type OprfThreshold = frame_support::traits::ConstU32<2>;
 }
 
 // Build genesis storage according to the mock runtime.

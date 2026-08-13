@@ -295,6 +295,11 @@ impl pallet_identity_zk::Config for Runtime {
 	/// `block_times` above) — changelog entry 82's "~5-7 days" OPRF response SLA, a
 	/// placeholder pending real pilot telemetry per that entry's "Still open" section.
 	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
+	/// Changelog entry 73's stated "~12-of-35 (1/3)" threshold for the eventual full-scale
+	/// committees — same placeholder caveat as that entry's own numbers pending real
+	/// committee sizing (see `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`).
+	/// Must stay `<= MaxCommitteeSize` above.
+	type OprfThreshold = ConstU32<12>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -328,6 +333,8 @@ impl pallet_identity_zk::Config for Runtime {
 	type MaxCommitteeSize = ConstU32<50>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type OprfThreshold = ConstU32<12>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as

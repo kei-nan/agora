@@ -27,6 +27,61 @@ matches the known vector (see its test). This meant `desktop/src-tauri/src/rpc.r
 (`fetch_proposals`/`fetch_laws`/`fetch_treasury`/etc.) — was silently computing wrong storage
 keys on any little-endian host, returning empty results instead of erroring. **`desktop/src-tauri/src/rpc.rs` has since been fixed with the same `to_le_bytes()`-based approach and a regression test against the same known vector** — this was not a hypothetical, it was confirmed and corrected.
 
+## Option B: genuine threshold evaluation — implemented end to end
+
+`docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md` records a
+real gap this component's original design shared with the rest of the project: every committee
+member held an identical copy of the whole secret (not a real share), and the mailbox accepted
+the *first* response and stopped — meaning any single member's server was already fully
+sufficient to answer for its whole committee. That's now fixed at every layer, including this
+component's own orchestration loop:
+
+- **`oprf-committee-dev`** has a real, tested 2-round threshold protocol (`src/threshold.rs`) —
+  genuine Feldman shares, FROST-adapted nonce commitments and binding factors, Lagrange
+  combination — with a combined proof confirmed to pass the *actual, unmodified* Noir
+  `verify_dlog_equality` from the real `oprf-nr` dependency, not just this crate's own Rust
+  port of it. The wasm ABI exports `oprf_round1`/`oprf_round2_response` alongside the original
+  `oprf_evaluate_query`, confirmed present in the compiled `wasm32-unknown-unknown` artifact
+  and confirmed to reproduce a verifiable combined proof **driven entirely through the FFI
+  boundary** (`ffi.rs`'s `round1_then_round2_ffi_calls_produce_a_verifiable_combined_proof`
+  test).
+- **`pallet-identity`** replaced `submit_oprf_response`/`OprfResponses` (single response,
+  first-wins) with `submit_oprf_round1`/`submit_oprf_round2` and
+  `OprfRound1Commitments`/`OprfRound2Responses` — a real two-round bulletin board, purely
+  structural on-chain (no cryptographic verification happens in the pallet itself; see
+  `OprfRound1Commitment`'s doc comment in `pallets/pallet-identity/src/lib.rs` for why that's
+  a deliberate scope boundary, not an oversight — the combination is verified where OPRF
+  proofs have always been verified, client-side at `register_citizen`).
+- **This component's orchestration loop is wired up to all of it.** `src/main.rs` polls
+  `PendingOprfQueries` exactly as before, and for each one not yet fully answered: attempts
+  `submit_oprf_round1` if it hasn't yet (fresh per-query nonce seed, held in memory — see
+  `QueryProgress` in `main.rs`); once its own round-1 entry is visible on-chain, attempts
+  `submit_oprf_round2` — fetching the current qualifying set (`rpc.rs`'s
+  `get_oprf_round1_commitments`), translating each participant's `AccountId` to a DKG party
+  index via their position in the `CommitteeMembers[slot]` roster (`fetch_committee_roster`),
+  computing this member's binding factor, Lagrange coefficient, and the shared challenge
+  natively (`oprf-committee-dev::threshold`, now a real path dependency of this crate — see
+  Cargo.toml's comment on why that math doesn't need the wasm boundary the secret-touching
+  computation uses), and submitting. **This node has no reliable way to know when
+  `OprfThreshold` has actually been reached** (a pallet constant, not a storage value) — so it
+  simply attempts round 2 once its own round-1 entry is visible, and treats the pallet's own
+  `OprfRound1NotLocked` rejection as "not ready, retry next poll," the same pattern round 1
+  already uses for `OprfRound1SetLocked`. 34/34 tests pass, zero-warning build.
+- **New config**: `MEMBER_INDEX` (this node's 1-based `CommitteeMembers[slot]` roster position
+  — the DKG party index; getting it wrong fails silently downstream, see its doc comment) and
+  `GROUP_PUBKEY_HEX` (this committee's group public key, needed to compute the shared
+  challenge — not derivable from chain state alone, since `OprfCommitteeKeys` stores only a
+  hash of it; see `Config::group_pubkey`'s doc comment for the full reasoning and why this is,
+  for now, a deployment-time constant every member must be given independently at ceremony
+  time).
+
+**What's still honestly unverified, not silently claimed working:** nothing here has run
+against a real chain or inside a real 2-round exchange with other real nodes — no chain is
+running in this environment, and no real committee or DKG ceremony exists yet (see "Still
+open" below). The transaction-extension assumptions this file's module docs already flagged as
+best-effort are unchanged. Treat this as a specification that compiles and passes its own unit
+tests, not as empirically proven against a live multi-party exchange.
+
 ## What's real here
 
 - **The JSON-RPC chain client** (`src/rpc.rs`) — a real, working port of
@@ -35,15 +90,16 @@ keys on any little-endian host, returning empty results instead of erroring. **`
   pattern this project already uses for chain connectivity in Rust — no `@polkadot/api`
   (JS-only), no `subxt` (a heavier client this project hasn't adopted anywhere else).
 - **The orchestration loop** (`src/main.rs`): poll `PendingOprfQueries`, decode each pending
-  query, call into the crypto core, build+sign+submit `submit_oprf_response` for anything not
-  already responded to this run, on a configurable interval.
+  query, drive it through the two-round threshold protocol (`submit_oprf_round1` then
+  `submit_oprf_round2` — see the "Option B" section above), on a configurable interval.
 - **Extrinsic construction and signing** (`src/extrinsic.rs`): a real, hand-encoded
   `UncheckedExtrinsic`, sr25519-signed with `sp-core` pinned to the exact version
   (`36.1.0`) the runtime itself uses, so the signing scheme is byte-for-byte what the chain
   expects. The *envelope* (nonce, era, spec/tx version, genesis hash, the `TxExtension` tuple
   shape) is transcribed directly from `runtime/src/lib.rs` and is solid; the *call itself*
-  (pallet index / call index / argument layout for `submit_oprf_response`) is provisional — see
-  below.
+  (pallet index, call indices 16/17, argument layout for `submit_oprf_round1`/`round2`) is
+  checked against the real, current pallet source (see the "Option B" section) but — like the
+  rest of this file's transaction-extension assumptions — never confirmed against a live chain.
 - **The Wasm loading path** (`src/wasm_host.rs`): real `wasmtime` module loading and invocation,
   used whenever a `.wasm` file is actually present at `WASM_MODULE_PATH`.
 - **Key file decryption** (`src/keystore.rs`): a real `age` (age-encryption.org/v1) passphrase
@@ -152,7 +208,25 @@ key custody for member-hosted devices (stock Raspberry Pi has no secure boot / h
 trust — see that changelog entry's own reasoning). Solving that is a hardware/procurement
 question out of scope for this component, by the same task instruction that produced it.
 
-## Adapting this image for balenaCloud
+## Cloud deployment for institutional operators
+
+The founding-phase model is moving from citizen-hosted phones/laptops/Pis (this section's
+original target) to **5 independent committees of ~8-15 named institutions each** — see
+`docs/project/research/oprf-alternatives/00-index.md`. For that model, **`deploy/` is the current
+path**: `deploy/README.md` is a step-by-step runbook, `deploy/harden-host.sh` and
+`deploy/docker-compose.prod.yml` implement the Tier 0/1 hardening checklist from
+`docs/project/research/oprf-alternatives/09-cloud-security-hardening.md`, and
+`docs/project/research/oprf-alternatives/08-cloud-hosting-providers.md` is the provider menu (a
+menu, not a single vendor — see that document for why centralizing hosting across operators would
+undermine the whole point of the multi-institution design). That research also recommends
+**explicitly retiring the balenaCloud path below for the institutional model**: a
+project-controlled fleet-update mechanism is exactly the kind of single point of update-authority
+the 5-committee independence structure exists to avoid, once operators have their own IT staff
+capable of running `docker compose` on their own schedule. The balenaCloud section is kept below,
+unmodified, as the still-relevant path if the citizen-hosted device model is ever used instead —
+not deleted, since which model wins is not yet decided.
+
+## Adapting this image for balenaCloud (citizen-hosted device model only)
 
 Not integrated for real here (no real device/account exists to integrate against) — this is
 the intended path, for whoever picks this up when the founding-phase device fleet is real:

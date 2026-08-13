@@ -1,0 +1,83 @@
+# Hardened deployment for an institutional operator's committee-node instance.
+#
+# Companion to docker-compose.example.yml (local dev against a --dev chain) — this file is for a
+# real cloud VM. Implements docs/project/research/oprf-alternatives/09-cloud-security-hardening.md's
+# Tier 0/1 container-runtime checklist (items 6, 7, 9, 12, 14). Read that document and
+# deploy/README.md before using this against real key material.
+#
+# Copy to docker-compose.yml alongside this file, fill in .env (see .env.example), then:
+#   docker compose up -d
+#
+# NOT run against a real deployment as part of authoring this — reasoned through, not empirically
+# verified. See deploy/README.md's "What has and hasn't been tested" section.
+
+services:
+  committee-node:
+    # Pin by DIGEST, never by a floating tag — tags are mutable, digests are not (checklist
+    # item 6). Replace with the real published digest and verify its cosign signature first:
+    #   cosign verify --certificate-identity-regexp '...' --certificate-oidc-issuer '...' \
+    #     ghcr.io/<org>/<repo>/committee-node@sha256:<digest>
+    # See docs/.../09-cloud-security-hardening.md's "Supply-chain / build integrity" section —
+    # as of this writing the release workflow does not yet publish a signed image for this
+    # component (that's tracked there, not solved here). Until it does, build locally with
+    # `docker build -t committee-node:local ..` from a commit you've reviewed, and pin that.
+    image: "ghcr.io/CHANGE-ME/committee-node@sha256:CHANGE-ME"
+
+    # Overrides the image's default ENTRYPOINT to fetch the passphrase into tmpfs first.
+    # Requires the fetch-secret-and-run.sh script and your secret-manager CLI to be present in
+    # the image or bind-mounted — see deploy/README.md's "Extending the image" section. If you'd
+    # rather manage the passphrase file yourself (e.g. a systemd-managed tmpfs populated by a
+    # separate unit), delete this `entrypoint:` line and mount KEY_PASSPHRASE_FILE directly, but
+    # keep it on a tmpfs volume either way — see the tmpfs mount below.
+    entrypoint: ["/bin/sh", "/deploy/fetch-secret-and-run.sh"]
+
+    environment:
+      NODE_RPC_URL: "${NODE_RPC_URL:?set NODE_RPC_URL — strongly prefer your own full node over a third-party RPC, see 09's 'RPC endpoint is an unauthenticated trust boundary' section}"
+      COMMITTEE_SLOT: "${COMMITTEE_SLOT:?set COMMITTEE_SLOT (0-4)}"
+      # Required for the two-round threshold protocol — see ../README.md's "Option B" section
+      # and config.rs's doc comments. Getting either wrong fails silently downstream, not here.
+      MEMBER_INDEX: "${MEMBER_INDEX:?set MEMBER_INDEX — this node's 1-based CommitteeMembers roster position / DKG party index}"
+      GROUP_PUBKEY_HEX: "${GROUP_PUBKEY_HEX:?set GROUP_PUBKEY_HEX — this committee's group public key, 64 bytes hex, given at DKG ceremony time}"
+      KEYS_FILE: "/keys/committee-secrets.age"
+      WASM_MODULE_PATH: "/wasm/oprf-crypto-core.wasm"
+      POLL_INTERVAL_SECS: "${POLL_INTERVAL_SECS:-30}"
+      SECRET_FETCH_CMD: "${SECRET_FETCH_CMD:?set SECRET_FETCH_CMD — see deploy/fetch-secret-and-run.sh's header comment for examples}"
+      RUST_LOG: "info"
+      # Leave unset (false). Never set true against a chain with real citizens registered.
+      # ALLOW_STUB_SUBMISSION: "true"
+
+    volumes:
+      - ./keys:/keys:ro
+      - ./wasm:/wasm:ro
+      - ./fetch-secret-and-run.sh:/deploy/fetch-secret-and-run.sh:ro
+
+    tmpfs:
+      # Passphrase lands here (checklist item 7) — never on a persistent volume.
+      - /run/secrets:mode=0700,size=1m
+      # Scratch space; the image ships no writable dirs other than what's explicitly mounted.
+      - /tmp:mode=1777,size=16m
+
+    # --- Container-runtime hardening (checklist item 12) ---
+    read_only: true               # root filesystem is read-only; only the tmpfs mounts above are writable
+    cap_drop:
+      - ALL                       # no Linux capabilities granted — this process needs none
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0                     # belt-and-suspenders alongside harden-host.sh's sysctl change
+      nofile: 4096
+    pids_limit: 64
+    mem_limit: 256m               # generous for a ~idle polling daemon; adjust after observing real usage
+    cpus: 1.0
+
+    restart: unless-stopped
+
+    # Egress filtering is enforced at the HOST firewall (see deploy/harden-host.sh), not here —
+    # Docker's own network isolation doesn't do egress allowlisting by IP/host out of the box.
+    # This container needs outbound access to NODE_RPC_URL and your secret manager's API only.
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"             # bounded local retention — see 09's "bound log retention" note
