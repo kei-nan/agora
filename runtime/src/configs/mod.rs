@@ -610,10 +610,13 @@ impl pallet_courts::Config for Runtime {
 	/// Zero account used as filer for system-initiated LawChallenge cases.
 	type AutoChallengeAccount = AutoChallengeAccount;
 	type Currency = Balances;
-	/// 1 AGR — same literal `pallet-elections::CandidateDeposit` uses; no evidence anywhere in
-	/// this codebase that court filings should be priced differently from candidate
-	/// registration. `auto_file_case` (system-initiated) never reserves this — see that call's
-	/// own doc comment in `pallets/pallet-courts/src/lib.rs`.
+	/// 1 AGR — a plain spam-prevention deposit sized the same as this runtime's other
+	/// single-AGR bonds/deposits; no documented reason court filings should be priced
+	/// differently. (Until the Elections Commission subsystem was removed from
+	/// pallet-elections — see `docs/project/pallets/elections.md` — this literal matched
+	/// its since-deleted `CandidateDeposit`; that pallet no longer has any deposit of its
+	/// own to stay consistent with.) `auto_file_case` (system-initiated) never reserves
+	/// this — see that call's own doc comment in `pallets/pallet-courts/src/lib.rs`.
 	type CaseFilingBond = ConstU128<1_000_000_000_000>;
 	/// AI Model Governance Council capped at 35 seats — same order of magnitude as the
 	/// single-committee size used elsewhere in this codebase's OPRF committee governance

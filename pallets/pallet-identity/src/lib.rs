@@ -735,8 +735,7 @@ pub mod pallet {
             }
             CitizenNullifier::<T>::remove(&who);
             NullifierRegistry::<T>::remove(nullifier);
-            SuspendedNullifiers::<T>::remove(nullifier);
-            SuspendedByJuryReview::<T>::remove(nullifier);
+            Self::clear_suspension(nullifier);
             ReverificationDeadline::<T>::remove(&who);
             // Retire the citizen's identity anchor too — a fresh registration under a new
             // anchor is expected to go through the normal exclusion check again. Note:
@@ -800,8 +799,7 @@ pub mod pallet {
                 SuspendedNullifiers::<T>::contains_key(nullifier),
                 Error::<T>::NotSuspended
             );
-            SuspendedNullifiers::<T>::remove(nullifier);
-            SuspendedByJuryReview::<T>::remove(nullifier);
+            Self::clear_suspension(nullifier);
             Self::deposit_event(Event::CitizenRestored { nullifier });
             Ok(())
         }
@@ -1258,6 +1256,19 @@ pub mod pallet {
             Ok(())
         }
 
+        /// Clears a suspension record from both `SuspendedNullifiers` and
+        /// `SuspendedByJuryReview` together. These two maps must always be written and cleared
+        /// as a pair — a bare `SuspendedNullifiers::remove` without the matching
+        /// `SuspendedByJuryReview::remove` leaves a stale jury-review flag behind for a
+        /// nullifier that's no longer suspended at all (a storage leak; harmless today since
+        /// `is_suspended_by_jury_reviewed_conviction` re-checks `SuspendedNullifiers` freshness
+        /// before consulting the flag, but not something to rely on). Use this helper at every
+        /// clear site instead of removing from either map directly.
+        fn clear_suspension(nullifier: [u8; 32]) {
+            SuspendedNullifiers::<T>::remove(nullifier);
+            SuspendedByJuryReview::<T>::remove(nullifier);
+        }
+
         /// Used by pallet-courts (via a CitizenSelector trait impl in the runtime).
         pub fn citizen_at(index: u32) -> Option<T::AccountId> {
             CitizenIndex::<T>::get(index)
@@ -1288,8 +1299,9 @@ pub mod pallet {
                 Some(Some(until)) => {
                     if frame_system::Pallet::<T>::block_number() > until {
                         // Lazily clean up the expired record so future suspend/restore
-                        // calls don't incorrectly see it as an active suspension.
-                        SuspendedNullifiers::<T>::remove(nullifier);
+                        // calls don't incorrectly see it as an active suspension. Clears
+                        // SuspendedByJuryReview too — see `clear_suspension`'s doc comment.
+                        Self::clear_suspension(nullifier);
                         true
                     } else {
                         false
@@ -1316,8 +1328,7 @@ pub mod pallet {
                     if frame_system::Pallet::<T>::block_number() > until {
                         // Lazily clean up, mirroring is_active_citizen — an expired suspension
                         // is no longer "currently suspended" by either measure.
-                        SuspendedNullifiers::<T>::remove(nullifier);
-                        SuspendedByJuryReview::<T>::remove(nullifier);
+                        Self::clear_suspension(nullifier);
                         false
                     } else {
                         true

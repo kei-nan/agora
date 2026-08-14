@@ -27,7 +27,19 @@ Calls:
 - `register_conflict(entity_id, conflict_type)` — any signed
 - `clear_conflict(entity_id)` — any signed (self-removal)
 - `submit_whistleblower_report(content_hash, zk_proof, public_inputs)` — gated by ZK citizenship proof;
-  stores `public_inputs[0]` as nullifier; `(nullifier, content_hash)` unique per citizen per report
+  stores `public_inputs[0]` as nullifier; `(nullifier, content_hash)` unique per citizen per report.
+  **Not sender-anonymous** despite the module doc's original "anonymous ZK whistleblower" framing
+  and `CLAUDE.md`'s "ZK whistleblower" label: it's a normal `ensure_signed` extrinsic, so the
+  reporter's `AccountId` is public block data, and pallet-identity's `CitizenNullifier` map
+  (`AccountId -> nullifier`) lets any chain observer join that `AccountId` to the nullifier stored
+  in this call's `WhistleblowerReport` and learn which registered citizen filed a given report, and
+  when. What *is* protected: the report content itself never touches chain state — only
+  `content_hash`, the IPFS pointer to a document encrypted to the investigator's key off-chain,
+  is stored. Same structural gap as `pallet-voting::commit_vote` (documented at length on that
+  call itself); see `submit_whistleblower_report`'s doc comment in
+  `pallets/pallet-anticorruption/src/lib.rs` for the full writeup. No fix attempted here — would
+  need an unsigned/ZK-gated submission path or a relayer, which doesn't exist anywhere in this
+  repo yet.
 - `flag_report(report_id)` — investigator: Pending → Flagged
 - `open_investigation(report_id)` — investigator: Flagged → UnderInvestigation
 - `clear_report(report_id)` — investigator: UnderInvestigation → Cleared

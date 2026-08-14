@@ -3,7 +3,7 @@ use crate::{
     CitizenNullifier, CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry,
     NextQueryId, NullifierRegistry, OprfCommitteeKeys, OprfRound1Commitments, OprfRound2Responses,
     OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
-    SuspendedNullifiers, TotalCitizens,
+    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -1321,6 +1321,30 @@ fn is_active_citizen_lazily_clears_expired_timed_suspension() {
         System::set_block_number(11);
         assert!(Identity::is_active_citizen(&1));
         assert!(SuspendedNullifiers::<Test>::get(NULLIFIER_A).is_none());
+    });
+}
+
+#[test]
+fn is_active_citizen_lazy_expiry_also_clears_jury_reviewed_flag() {
+    // Regression test: is_active_citizen's lazy-expiry branch must clear
+    // SuspendedByJuryReview alongside SuspendedNullifiers, not just the latter — otherwise
+    // a stale jury-reviewed flag leaks in storage for a nullifier that's no longer
+    // suspended at all, once this function (rather than
+    // is_suspended_by_jury_reviewed_conviction) is the one that first observes the expiry.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_ok!(Identity::suspend_citizen_internal(NULLIFIER_A, Some(10), true));
+        assert!(SuspendedByJuryReview::<Test>::get(NULLIFIER_A));
+
+        // is_active_citizen (not is_suspended_by_jury_reviewed_conviction) is the first call
+        // to observe the expiry.
+        System::set_block_number(11);
+        assert!(Identity::is_active_citizen(&1));
+
+        assert!(SuspendedNullifiers::<Test>::get(NULLIFIER_A).is_none());
+        assert!(!SuspendedByJuryReview::<Test>::contains_key(NULLIFIER_A));
     });
 }
 

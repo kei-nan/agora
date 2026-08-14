@@ -7,8 +7,15 @@
 //!    renewals are due every `AssetDisclosureRenewalBlocks`.
 //! 2. **Conflict-of-interest registry** — officials self-declare relationships with entities
 //!    they vote on (financial interest, family, former employer, business partner).
-//! 3. **Anonymous ZK whistleblower reports** — citizens submit anonymous reports backed by
-//!    a ZK proof of passport registration. A per-report nullifier prevents duplicate filings.
+//! 3. **ZK-gated whistleblower reports** — citizens submit reports backed by a ZK proof of
+//!    passport registration, which gates spam behind real citizenship and (via a per-report
+//!    nullifier) prevents duplicate filings. The report *content* is off-chain and encrypted
+//!    to the investigator's key, so only its IPFS hash lands on-chain. This is **not**
+//!    anonymous submission, though: the call is a normal signed extrinsic, so the reporter's
+//!    `AccountId` is public block data, and pallet-identity's `CitizenNullifier` map
+//!    (`AccountId -> nullifier`) lets anyone watching the chain tie a report back to the
+//!    citizen who filed it. See `submit_whistleblower_report`'s doc comment below for the
+//!    full writeup — this has the same structural gap as `pallet-voting::commit_vote`.
 //!
 //! Investigators (appointed by root) move reports through a workflow:
 //! Pending → Flagged → UnderInvestigation → Cleared | ReferredToCourts
@@ -33,8 +40,11 @@ pub mod pallet {
 
     // ── Cross-pallet traits ──────────────────────────────────────────────────
 
-    /// Verifies a ZK citizenship proof. Used to gate anonymous whistleblower submissions.
-    /// The proof must attest to a registered, active passport without revealing the identity.
+    /// Verifies a ZK citizenship proof. Used to gate whistleblower submissions on real
+    /// citizenship. The proof itself attests to a registered, active passport without
+    /// revealing the identity behind it — but note that this proof-level property does not
+    /// by itself make report *submission* anonymous, since `submit_whistleblower_report` is
+    /// still a signed extrinsic; see that call's doc comment for the full gap.
     /// Implemented in the runtime by delegating to pallet-identity's verifier.
     pub trait ZkProofVerifier {
         fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool;
@@ -84,7 +94,8 @@ pub mod pallet {
         pub registered_at: BlockNumber,
     }
 
-    /// An anonymous whistleblower report backed by a ZK citizenship proof.
+    /// A whistleblower report backed by a ZK citizenship proof. Despite the name, the
+    /// *submission* is not sender-anonymous — see `submit_whistleblower_report`'s doc comment.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub struct WhistleblowerReport<BlockNumber> {
         /// IPFS hash of the report content (encrypted to investigator key off-chain).
@@ -260,14 +271,40 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Submit an anonymous whistleblower report.
+        /// Submit a whistleblower report.
         ///
         /// Requires a valid ZK proof of passport registration so that spam is gated behind
-        /// real citizenship while preserving anonymity. The nullifier in `public_inputs[0]`
-        /// is stored (not the plaintext identity) to detect duplicate filings.
+        /// real citizenship. The nullifier in `public_inputs[0]` is stored (not the plaintext
+        /// identity) to detect duplicate filings — a (nullifier, content_hash) pair may only
+        /// be used once, so a citizen cannot file the same report twice, but can file
+        /// different reports.
         ///
-        /// A (nullifier, content_hash) pair may only be used once — a citizen cannot file
-        /// the same report twice, but can file different reports.
+        /// ## Known sender-anonymity gap
+        /// This call requires `ensure_signed`, so the extrinsic's signing `AccountId` (`_who`
+        /// below — deliberately discarded, not written to storage) is publicly visible
+        /// on-chain, in the block/extrinsic itself, independent of anything this pallet
+        /// stores. The report's *content* is not exposed this way: only `content_hash`, the
+        /// IPFS hash of a document that is itself encrypted to the investigator's key
+        /// off-chain (see `WhistleblowerReport::content_hash`), ever lands in pallet storage,
+        /// and both `WhistleblowerReports` and `Event::ReportSubmitted` carry only the
+        /// nullifier/content hash, never `_who`. But pallet-identity's `CitizenNullifier`
+        /// storage is a public, permanent map from `AccountId -> nullifier`. So anyone
+        /// watching the chain can join "this signed extrinsic came from `AccountId` X" with
+        /// "X's nullifier is N" (a public lookup) and learn "the citizen behind nullifier N
+        /// filed a whistleblower report at block B" — i.e. *who* filed a report, and *when*,
+        /// is linkable to their real registered identity, even though the report's *content*
+        /// stays hidden. This is weaker than the "anonymous"/"ZK whistleblower" framing this
+        /// pallet's module doc and `CLAUDE.md` use, which implies sender anonymity that does
+        /// not exist — this call is pseudonymous against a casual reader, not anonymous
+        /// against a chain observer willing to cross-reference `CitizenNullifier`.
+        ///
+        /// This is the same structural gap as `pallet-voting::commit_vote` (see that call's
+        /// doc comment for the fuller writeup) and the same fix would apply: an unsigned
+        /// extrinsic validated via a custom `ValidateUnsigned`/`SignedExtension` that checks
+        /// ZK group-membership instead of a signature, or a relayer/mixnet that decouples
+        /// submission from the signing key. No such infrastructure exists anywhere in this
+        /// repo yet; building one is a genuine architectural addition, not a local fix to
+        /// this call — left as a tracked gap rather than force a partial change here.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(60_000, 0))]
         pub fn submit_whistleblower_report(

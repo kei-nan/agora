@@ -92,6 +92,14 @@ pub mod pallet {
             }
         }
 
+        // NOTE: this cfg can never currently activate. `pallet-courts/Cargo.toml` declares no
+        // `runtime-benchmarks` feature of its own, and `runtime/Cargo.toml`'s
+        // `runtime-benchmarks` feature list doesn't include `pallet-courts/runtime-benchmarks`
+        // either — so this is dead code, not a working benchmark hook. This pallet also has no
+        // `benchmarking.rs` (`#[benchmarks]` module) yet. See the note in
+        // `pallets/pallet-legislature/src/weights.rs` for the full accounting; making this
+        // real requires adding the feature to this crate's Cargo.toml, wiring it into
+        // `runtime/Cargo.toml`, and writing an actual `#[benchmarks]` module.
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
             let oracle = OracleAccount::<T>::get().ok_or(())?;
@@ -205,13 +213,15 @@ pub mod pallet {
         /// Currency used to reserve the citizen-filed case bond (`CaseFilingBond`).
         type Currency: ReservableCurrency<Self::AccountId>;
         /// Bond reserved from a citizen's account when they call `file_case`, released in
-        /// full once the case reaches a final status (see `auto_finalize`). Mirrors
-        /// pallet-elections' `CandidateDeposit` spam-prevention pattern: instant, free
-        /// Level-0 AI rulings make `file_case` an attractive DoS/spam vector without a cost
-        /// to filing, and this bond gives it one. Defaults to the same 1 AGR pallet-elections
-        /// uses for `CandidateDeposit`, absent any documented reason this pallet should differ.
-        /// System-initiated filings via `auto_file_case` never reserve this bond — see that
-        /// function's doc comment for why.
+        /// full once the case reaches a final status (see `auto_finalize`). A plain
+        /// spam-prevention deposit: instant, free Level-0 AI rulings make `file_case` an
+        /// attractive DoS/spam vector without a cost to filing, and this bond gives it one.
+        /// Defaults to 1 AGR, the same size as this runtime's other single-AGR bonds/deposits,
+        /// absent any documented reason this pallet should differ. (Formerly described as
+        /// matching pallet-elections' `CandidateDeposit`; that deposit no longer exists —
+        /// pallet-elections' Elections Commission subsystem was removed, see
+        /// `docs/project/pallets/elections.md`.) System-initiated filings via `auto_file_case`
+        /// never reserve this bond — see that function's doc comment for why.
         #[pallet::constant]
         type CaseFilingBond: Get<BalanceOf<Self>>;
 

@@ -53,6 +53,14 @@ rand = "0.8"
 # crypto. Still explicitly NOT an answer to hardware-backed key custody (see README).
 age = "0.10"
 
+# --- best-effort in-process zeroization of secret material (chain seed, OPRF secret key, the
+# decrypted keystore JSON blob, and the per-query round-1 nonce seed) on drop. Already present
+# transitively via `age`/the ark curve crates (see Cargo.lock), so this pins the same version
+# as a direct dependency rather than introducing a new one. Not a substitute for the hardware-
+# backed custody keystore.rs's module docs say is still an open problem — this only shrinks
+# the window secrets sit in process memory after they're no longer needed.
+zeroize = { version = "1.9", features = ["derive"] }
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

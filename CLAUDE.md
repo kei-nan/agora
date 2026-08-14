@@ -95,7 +95,12 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
 - Passport-only for v1 (country allowlist — some countries lack stable national ID in NFC chip)
 
 ## Voting System
-- Semaphore v4 / MACI for anonymous unlinkable votes
+- MACI for vote-content privacy — a citizen's chosen option is hidden via MACI commitments, but
+  *participation* (who voted, when) is not: `commit_vote` is a signed extrinsic, and the signer's
+  account is linkable to their citizen identity via pallet-identity's public nullifier map (the
+  same structural limitation applies to pallet-anticorruption's whistleblower reports — see that
+  pallet's own doc comments for the detail). No Semaphore code exists in this codebase; "anonymous
+  unlinkable votes" overstated what MACI alone delivers here — content-hidden, not sender-hidden.
 - Liquid democracy: direct vote OR delegate (transitive, revocable, per-topic)
 - Delegation caps: no single delegate can hold >X% of votes
 - Petitions: citizen signatures → threshold → votable referendum
@@ -112,7 +117,13 @@ All enforced by smart contract boundaries:
   immediately, with the normal human jury appeal path available from there. No separate HRC
   origin or veto call exists in the codebase.
 - **Emergency Council**: time-locked powers with hard coded sunset clause
-- **Elections Commission**: candidate eligibility, result certification
+- **Legislature seating**: fully automatic — no Elections Commission, no candidate certification
+  or human-certified result submission. `pallet-elections` seats the top-N delegates by
+  liquid-democracy backing directly into `pallet-legislature`; a standalone commissioner-certified
+  office-election subsystem existed earlier but was removed (nothing certified its results beyond
+  a commissioner's say-so — see `docs/project/pallets/elections.md`). The Prime Minister is then
+  chosen by the seated legislature itself via `pallet-executive`'s ranked-choice investiture
+  (see `docs/project/pallets/executive.md`), not elected directly by citizens.
 - **Anti-Corruption module**: asset disclosure, conflict-of-interest registry, ZK whistleblower
 - **Audit Office**: financial audit hooks on every treasury transaction
 
@@ -162,7 +173,13 @@ Runs without a server — connects directly to the chain and optionally to a clo
 - QR code challenge flow: desktop displays a one-time QR code
 - User scans with mobile app → phone generates ZK proof → signs a desktop session token
 - The signing key and biometric anchor never leave the phone
-- Desktop receives a time-limited bearer token for read + submit actions
+- Desktop receives a time-limited bearer token, real server-side session with enforced expiry,
+  verified against a real sr25519 signature over the QR challenge — this part is genuinely wired
+  end-to-end. The token's authorization model covers both read and submit actions in principle
+  (`chain_submit_extrinsic` is a registered, session-gated Tauri command), but **submit is not
+  yet wired to anything**: no phone-side flow exists that produces the already-signed extrinsic
+  this command expects as input, and no frontend code calls it — read is the only path actually
+  in use today.
 
 ### AI Agent Features (optional cloud, degrades gracefully offline)
 - Citizens can ask natural language questions about any law, proposal, ruling, or budget item
@@ -195,11 +212,13 @@ democracy-chain/
 │   ├── pallet-courts/            ← AI judge (oracle-accepted), jury selection, auto-enforcement (index 11)
 │   ├── pallet-constitution/      ← law ledger, petitions, auto-challenge to courts (index 12)
 │   ├── pallet-legislature/       ← collective origin for law/budget motions     (index 13)
-│   ├── pallet-elections/         ← Elections Commission, candidates             (index 14)
+│   ├── pallet-elections/         ← liquid-democracy delegate registry, automatic legislature
+│   │                                seating (no Elections Commission)             (index 14)
 │   ├── pallet-emergency-council/ ← time-locked emergency powers, auto-sunset   (index 15)
 │   ├── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
 │   ├── pallet-anticorruption/    ← asset disclosure, conflict registry, ZK whistleblower (index 17)
-│   └── pallet-executive/         ← parliamentary executive/Cabinet               (index 18)
+│   └── pallet-executive/         ← parliamentary executive/Cabinet, PM ranked-choice
+│                                    investiture, minister confirmation            (index 18)
 ├── circuits/          ← Noir ZK circuits (oprf-identity-anchor: built, proven against a dev
 │                         simulator, not a real committee — see docs/project/next-steps.md #8)
 ├── mobile/            ← React Native app; android/ real + committed (JS tests pass, no

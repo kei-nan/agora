@@ -29,6 +29,17 @@
 //!   --output pallets/pallet-legislature/src/weights.rs \
 //!   --template .maintain/frame-weight-template.hbs
 //! ```
+//!
+//! As of this writing, a full `--features runtime-benchmarks` build still doesn't reach that
+//! command: `pallet-courts`'s `EnsureOracle`'s `EnsureOrigin` impl now has a
+//! `#[cfg(feature = "runtime-benchmarks")] fn try_successful_origin()` (added after this note
+//! was previously removed as if the gap were closed), but `pallet-courts/Cargo.toml` still
+//! declares no `runtime-benchmarks` feature of its own, and `runtime/Cargo.toml`'s
+//! `runtime-benchmarks` feature list still doesn't include `pallet-courts/runtime-benchmarks`
+//! — so that cfg can never actually activate, and `pallet-courts` has no `benchmarking.rs`
+//! (`#[benchmarks]` module) at all yet, unlike this pallet's real-if-unrun scaffolding above.
+//! Not part of this pallet's scope; noted here so the blocker is visible from the file a
+//! future benchmark run would start from.
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
 #![allow(unused_parens)]

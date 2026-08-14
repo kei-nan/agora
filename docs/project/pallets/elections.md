@@ -2,37 +2,22 @@
 
 ### pallet-elections (crate: pallet-elections) — runtime index 14
 
-Manages two separate concerns: (A) the Elections Commission's office elections, and (B) the
-liquid-democracy delegate registry that periodically seats winners into pallet-legislature.
+Liquid Democracy Delegates + Legislature Elections: manages the public delegate registry
+citizens back to express vote delegation, and runs periodic elections that seat the top-N
+backed delegates (by backing count) into pallet-legislature — entirely automatic, no
+committee or human certification step anywhere in the flow.
 
-## A) Elections Commission
-
-Elections Commission pallet: manages candidate registration, commissioner certification, and result certification.
-
-Storage:
-- `Commissioners`: `BoundedVec<AccountId, 20>`
-- `Elections`: `election_id` → `ElectionInfo { office, start_block, end_block, status, winner, results_ipfs_hash }`
-- `Candidates`: `(election_id, AccountId)` → `CandidateInfo { profile_ipfs_hash, status, deposit }`
-- `NextElectionId`
-
-Calls:
-- `add_commissioner(account)` / `remove_commissioner(account)` — root
-- `create_election(office, start_block, end_block)` — root or commissioner
-- `register_candidate(election_id, profile_ipfs_hash)` — active citizen; reserves 1 AGR deposit;
-  also requires a current (non-overdue) asset disclosure on file in pallet-anticorruption (see
-  `Config::DisclosureChecker`, backed by pallet-anticorruption's `has_current_disclosure`) — a
-  citizen with no disclosure, or whose disclosure has lapsed past its renewal due date, cannot
-  register as a candidate. This is checked once at registration only; it does not retroactively
-  affect already-certified candidates or seated officials if their disclosure later lapses.
-- `certify_candidate(election_id, candidate)` — commissioner only
-- `submit_results(election_id, winner, results_ipfs_hash)` — commissioner only
-- `certify_results(election_id)` — commissioner only; unreserves all candidate deposits
-
-## B) Liquid Democracy Delegates + Legislature Elections
-
-Manages the public delegate registry citizens back to express vote delegation, and runs
-periodic elections that seat the top-N backed delegates (by backing count) into
-pallet-legislature.
+This pallet used to also run a separate "Elections Commission" subsystem (commissioners,
+named "office" elections, candidate registration/certification, result submission/certification
+— formerly `call_index` 0–6). It was removed: it certified an election's outcome on nothing
+but a commissioner's say-so, with no on-chain tally behind `submit_results` at all, and
+nothing in this system's actual design turned out to need a citizen-facing "elect one person
+to a named office" mechanism. Legislature seats now fill automatically via the backing
+mechanism below, and the Prime Minister is chosen by the legislature itself via
+pallet-executive's ranked-choice investiture (see `docs/project/pallets/executive.md`). Nothing
+replaces the removed subsystem — it's deleted, not rebuilt; `call_index` 0–6 are deliberately
+left unused rather than reassigned. See `docs/project/changelog/` for the full removal
+rationale.
 
 ### Delegate identity
 
@@ -51,8 +36,11 @@ most `MaxBackingsPerCitizen` delegates simultaneously (constitutional parameter,
 
 Every `ElectionCycleBlocks` blocks, `on_initialize` ranks all `Active` delegates by backing
 count (stable sort, ties broken by storage order) and seats the top `LegislatureSeats` into
-pallet-legislature via the `SeatLegislature` trait (`replace_members`). Defaults: 100 seats,
-2-year cycle (`DefaultElectionCycleBlocks`), max 5 backings per citizen.
+pallet-legislature via the `SeatLegislature` trait (`replace_members`). Citizenship is
+re-checked at election time (not just trusted from whenever `Active` status was last granted)
+so a delegate suspended since (e.g. an Overturned `CitizenConduct` court ruling) can never be
+seated on stale status. Defaults: 100 seats, 2-year cycle (`DefaultElectionCycleBlocks`), max 5
+backings per citizen.
 
 ### Term limits / anti-entrenchment
 
@@ -67,7 +55,9 @@ indefinitely:
 - `WarningWindowPct` — what fraction (1–50%) of the final term triggers a
   `DelegateTermWarning` event before it ends (default 10%).
 
-Every block, `on_initialize` walks all delegates and, per `DelegateInfo`:
+Each block, a bounded sweep (`MaxDelegateSweepPerBlock` entries per block, resuming from
+`DelegateSweepCursor` where the last block left off — never an unbounded full-map scan)
+examines delegates and, per `DelegateInfo`:
 
 - **Active, warning not yet emitted, elapsed ≥ warning offset** (`term_length * (100 -
   warning_pct) / 100`, computed divide-first to avoid overflow on very long terms): emits
@@ -92,6 +82,7 @@ on break-end can re-activate them without citizens having to re-back.
 Delegate registry:
 - `Delegates`: `AccountId` → `DelegateInfo { display_name, profile_ipfs_hash, status,
   consecutive_terms, term_start_block, break_until_block, warning_emitted }`
+- `DelegateSweepCursor`: `Option<AccountId>` — resume point for the bounded per-block term sweep
 - `BackingCount`: `AccountId` (delegate) → `u32`
 - `BackingOf`: `(AccountId backer, AccountId delegate)` → `()` — prevents double-backing
 - `CitizenBackingCount`: `AccountId` (citizen) → `u32` — enforced against `MaxBackingsPerCitizen`
@@ -130,9 +121,9 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
 
 ### Config constants
 
-- `CandidateDeposit` — AGR reserved by `register_candidate` (Elections Commission side)
-- `MaxCommissioners`, `MaxCandidatesPerElection` — Elections Commission bounds
 - `MaxDelegates` — hard cap on registered delegates, bounding `on_initialize` iteration
+- `MaxDelegateSweepPerBlock` — cap on how many `Delegates` entries the per-block term sweep
+  examines, regardless of how many delegates are registered
 - `DefaultLegislatureSeats` (100), `DefaultElectionCycleBlocks` (2 years),
   `DefaultMaxBackingsPerCitizen` (5) — constitutional genesis defaults
 - `DefaultBackingThreshold` (10), `DefaultBackingThresholdFloor` (5),
@@ -141,3 +132,11 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
 - `DefaultTermLengthBlocks` (1 year), `DefaultMaxConsecutiveTerms` (2),
   `DefaultMandatoryBreakBlocks` (1 year), `DefaultWarningWindowPct` (10%) — genesis defaults for
   the term-limit system above
+
+### Cross-pallet traits
+
+- `CitizenChecker<AccountId>` — implemented by pallet-identity-zk in the runtime; gates
+  `register_as_delegate`/`back_delegate`, and is re-checked at election time in `run_election`.
+- `SeatLegislature<AccountId>` — implemented by pallet-legislature; `replace_members(winners)`
+  is called at the end of each election cycle to install the winning delegates as the full
+  legislature membership.

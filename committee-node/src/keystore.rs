@@ -16,8 +16,9 @@
 //!
 //! Changelog #082 calls out that a committee member's device holds two credentials doing two
 //! different jobs:
-//! - `chain_account_seed`: signs the `submit_oprf_response` extrinsic; checked by the chain
-//!   against the (not-yet-implemented) `CommitteeMembers` roster for this node's slot.
+//! - `chain_account_seed`: signs the `submit_oprf_round1`/`submit_oprf_round2` extrinsics (the
+//!   two-round protocol that replaced the old single-shot `submit_oprf_response`); checked by
+//!   the chain against the (not-yet-implemented) `CommitteeMembers` roster for this node's slot.
 //! - `oprf_secret_key`: the actual OPRF committee secret the Wasm crypto core evaluates the
 //!   query against. Never touches the chain, never leaves this process's memory.
 //!
@@ -40,8 +41,9 @@ use anyhow::Context;
 use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct Secrets {
     pub chain_account_seed: String,
     pub oprf_secret_key: String,
@@ -87,6 +89,12 @@ pub fn load(path: &Path, passphrase: &str) -> anyhow::Result<Secrets> {
         .read_to_end(&mut decrypted)
         .context("reading decrypted key material")?;
 
-    serde_json::from_slice(&decrypted)
-        .context("decrypted KEYS_FILE content is not the expected JSON shape — see keystore.rs module docs")
+    // The plaintext JSON blob (raw chain seed + OPRF secret key, both still in the clear at
+    // this point) is only needed transiently to parse into `Secrets` — zeroize it immediately
+    // after, rather than letting it sit in a freed heap allocation until something else
+    // happens to overwrite that memory.
+    let result = serde_json::from_slice(&decrypted)
+        .context("decrypted KEYS_FILE content is not the expected JSON shape — see keystore.rs module docs");
+    decrypted.zeroize();
+    result
 }

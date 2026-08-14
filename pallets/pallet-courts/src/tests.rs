@@ -317,8 +317,7 @@ fn jury_vote_majority_auto_finalizes_and_enforces_law_challenge() {
 
 // ─── file_case bond ────────────────────────────────────────────────────────
 //
-// `file_case` reserves `CaseFilingBond` from the filer as a spam-prevention deposit,
-// mirroring pallet-elections' `CandidateDeposit` pattern on `register_candidate`. The bond
+// `file_case` reserves `CaseFilingBond` from the filer as a spam-prevention deposit. The bond
 // is released in full once the case reaches a final status (`auto_finalize`, reached either
 // via `finalize_ruling`'s no-appeal path or `cast_jury_vote`'s majority path). System-filed
 // cases via `auto_file_case` never reserve anything.

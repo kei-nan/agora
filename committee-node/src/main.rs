@@ -38,6 +38,7 @@ use sp_core::crypto::{AccountId32, Ss58Codec};
 use sp_core::Pair as _;
 use std::collections::HashMap;
 use std::time::Duration;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Mirrors `PendingOprfQueries`'s real value shape:
 /// `query_id -> { submitter: AccountId, blinded_query: [u8; 64], posted_at: BlockNumber }`.
@@ -61,6 +62,10 @@ struct PendingQuery {
 /// `Round1Submitted`'s `seed` is live nonce material for as long as it's held — see
 /// `wasm_host.rs`'s module docs on why round 2 must replay the exact same seed round 1 used,
 /// and why that makes this value as sensitive as the secret share until the query completes.
+/// `ZeroizeOnDrop` wipes `seed` the moment an entry is dropped — whether that's an explicit
+/// `HashMap::remove`, or (the actual path this code takes) an overwriting `insert` replacing
+/// `Round1Submitted` with `Done` once round 2 succeeds.
+#[derive(Zeroize, ZeroizeOnDrop)]
 enum QueryProgress {
     Round1Submitted { seed: [u8; 32] },
     Done,
