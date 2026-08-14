@@ -32,8 +32,9 @@ use core::marker::PhantomData;
 /// Weight functions needed for pallet_executive.
 pub trait WeightInfo {
 	fn define_portfolio() -> Weight;
-	fn appoint_prime_minister() -> Weight;
-	fn dismiss_prime_minister() -> Weight;
+	fn remove_and_replace_prime_minister() -> Weight;
+	fn resign_as_pm() -> Weight;
+	fn nominate_minister() -> Weight;
 	fn appoint_minister() -> Weight;
 	fn dismiss_minister() -> Weight;
 	fn resign() -> Weight;
@@ -41,6 +42,10 @@ pub trait WeightInfo {
 	fn ratify_emergency() -> Weight;
 	fn vote_end_emergency() -> Weight;
 	fn retract_emergency_vote() -> Weight;
+	fn open_pm_investiture() -> Weight;
+	fn nominate_pm() -> Weight;
+	fn cast_pm_ballot() -> Weight;
+	fn finalize_pm_investiture() -> Weight;
 }
 
 /// Weights for pallet_executive.
@@ -56,27 +61,39 @@ impl<T: crate::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(1_u64))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
-	/// Worst case: an outgoing PM is replaced. 1 read (`PrimeMinister`) + 3 writes
-	/// (`DeclareVotes` x2, `PrimeMinister`).
-	fn appoint_prime_minister() -> Weight {
-		Weight::from_parts(13_000_000, 1_957)
-			.saturating_add(T::DbWeight::get().reads(1_u64))
-			.saturating_add(T::DbWeight::get().writes(3_u64))
+	/// `PrimeMinister::get` + `PmConsecutiveTerms`/`LegislatureMembership` checks (3 reads) +
+	/// `install_pm`'s writes: `DeclareVotes` x2, `PendingMinisterNomination::clear`
+	/// (`MaxPortfolios`-bounded), `PmConsecutiveTerms` x2, `PrimeMinister` (6 writes).
+	fn remove_and_replace_prime_minister() -> Weight {
+		let clear_writes = T::MaxPortfolios::get() as u64;
+		Weight::from_parts(15_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(3_u64))
+			.saturating_add(T::DbWeight::get().writes(6_u64.saturating_add(clear_writes)))
 	}
-	/// `PrimeMinister::take` (read+write) + `DeclareVotes::remove` (write).
-	fn dismiss_prime_minister() -> Weight {
+	/// `PrimeMinister::get` (1 read) + `PrimeMinister::kill`, `PmConsecutiveTerms`,
+	/// `DeclareVotes::remove`, `PendingMinisterNomination::clear` (`MaxPortfolios`-bounded).
+	fn resign_as_pm() -> Weight {
+		let clear_writes = T::MaxPortfolios::get() as u64;
 		Weight::from_parts(11_000_000, 1_957)
 			.saturating_add(T::DbWeight::get().reads(1_u64))
-			.saturating_add(T::DbWeight::get().writes(2_u64))
+			.saturating_add(T::DbWeight::get().writes(3_u64.saturating_add(clear_writes)))
+	}
+	/// `PrimeMinister::get` + `Portfolios::contains_key` (2 reads) +
+	/// `PendingMinisterNomination::insert` (1 write).
+	fn nominate_minister() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
 	/// Worst case: both the outgoing portfolio-holder and the incoming account's prior
-	/// portfolio must be vacated. 3 reads (`Portfolios::contains_key`, `PortfolioMinister::get`,
-	/// `MinisterPortfolio::get`) + 6 writes (2x `MinisterPortfolio`/`PortfolioMinister` removal
-	/// pairs, `DeclareVotes::remove`, plus the final insert pair).
+	/// portfolio must be vacated. 4 reads (`Portfolios::contains_key`,
+	/// `PendingMinisterNomination::get`, `PortfolioMinister::get`, `MinisterPortfolio::get`) +
+	/// 7 writes (`PendingMinisterNomination::remove`, 2x `MinisterPortfolio`/`PortfolioMinister`
+	/// removal pairs, `DeclareVotes::remove`, plus the final insert pair).
 	fn appoint_minister() -> Weight {
-		Weight::from_parts(17_000_000, 3_600)
-			.saturating_add(T::DbWeight::get().reads(3_u64))
-			.saturating_add(T::DbWeight::get().writes(6_u64))
+		Weight::from_parts(18_000_000, 3_600)
+			.saturating_add(T::DbWeight::get().reads(4_u64))
+			.saturating_add(T::DbWeight::get().writes(7_u64))
 	}
 	/// 2 reads (`Portfolios::contains_key`, `PortfolioMinister::take`) + 3 writes
 	/// (`PortfolioMinister`, `MinisterPortfolio`, `DeclareVotes`).
@@ -123,6 +140,37 @@ impl<T: crate::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(4_u64.saturating_add(scan_reads)))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
+	/// `PrimeMinister::get` + `InvestitureRound::get` (2 reads) + `InvestitureRound::put` (1 write).
+	fn open_pm_investiture() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+	/// `LegislatureMembership` x2 + `InvestitureRound::get` + `PmConsecutiveTerms::get`
+	/// (4 reads) + `PmNominees::try_mutate` (1 write).
+	fn nominate_pm() -> Weight {
+		Weight::from_parts(13_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(4_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+	/// `LegislatureMembership` + `InvestitureRound::get` + `PmNominees::get` (3 reads) +
+	/// `PmBallots::insert` (1 write). Ballot validation itself is in-memory, bounded by
+	/// `MaxPmCandidates`.
+	fn cast_pm_ballot() -> Weight {
+		Weight::from_parts(13_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(3_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+	/// `InvestitureRound::get` + `PmNominees::get` + a full `PmBallots` scan
+	/// (`MaxPmCandidates`-bounded) for the instant-runoff tally, plus `install_pm`'s writes
+	/// (see `remove_and_replace_prime_minister`).
+	fn finalize_pm_investiture() -> Weight {
+		let ballot_reads = T::MaxPmCandidates::get() as u64;
+		let clear_writes = T::MaxPortfolios::get() as u64;
+		Weight::from_parts(20_000_000, 3_600)
+			.saturating_add(T::DbWeight::get().reads(2_u64.saturating_add(ballot_reads)))
+			.saturating_add(T::DbWeight::get().writes(9_u64.saturating_add(clear_writes)))
+	}
 }
 
 // For backwards compatibility and tests. Uses a fixed generous portfolio-count assumption
@@ -134,20 +182,25 @@ impl WeightInfo for () {
 			.saturating_add(RocksDbWeight::get().reads(1_u64))
 			.saturating_add(RocksDbWeight::get().writes(2_u64))
 	}
-	fn appoint_prime_minister() -> Weight {
-		Weight::from_parts(13_000_000, 1_957)
-			.saturating_add(RocksDbWeight::get().reads(1_u64))
-			.saturating_add(RocksDbWeight::get().writes(3_u64))
+	fn remove_and_replace_prime_minister() -> Weight {
+		Weight::from_parts(15_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(3_u64))
+			.saturating_add(RocksDbWeight::get().writes(26_u64))
 	}
-	fn dismiss_prime_minister() -> Weight {
+	fn resign_as_pm() -> Weight {
 		Weight::from_parts(11_000_000, 1_957)
 			.saturating_add(RocksDbWeight::get().reads(1_u64))
-			.saturating_add(RocksDbWeight::get().writes(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(23_u64))
+	}
+	fn nominate_minister() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}
 	fn appoint_minister() -> Weight {
-		Weight::from_parts(17_000_000, 3_600)
-			.saturating_add(RocksDbWeight::get().reads(3_u64))
-			.saturating_add(RocksDbWeight::get().writes(6_u64))
+		Weight::from_parts(18_000_000, 3_600)
+			.saturating_add(RocksDbWeight::get().reads(4_u64))
+			.saturating_add(RocksDbWeight::get().writes(7_u64))
 	}
 	fn dismiss_minister() -> Weight {
 		Weight::from_parts(13_000_000, 1_957)
@@ -178,5 +231,25 @@ impl WeightInfo for () {
 		Weight::from_parts(14_000_000, 1_957)
 			.saturating_add(RocksDbWeight::get().reads(24_u64))
 			.saturating_add(RocksDbWeight::get().writes(2_u64))
+	}
+	fn open_pm_investiture() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn nominate_pm() -> Weight {
+		Weight::from_parts(13_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(4_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn cast_pm_ballot() -> Weight {
+		Weight::from_parts(13_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(3_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn finalize_pm_investiture() -> Weight {
+		Weight::from_parts(20_000_000, 3_600)
+			.saturating_add(RocksDbWeight::get().reads(22_u64))
+			.saturating_add(RocksDbWeight::get().writes(29_u64))
 	}
 }

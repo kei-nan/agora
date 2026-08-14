@@ -1,6 +1,6 @@
 [package]
 name = "pallet-elections"
-description = "Elections Commission pallet for Agora. Manages commissioners, elections, candidate registration, and result certification."
+description = "Liquid democracy delegate registry for Agora. Manages the public delegate/backing registry and seats top-N delegates into the legislature automatically each election cycle."
 version = "0.1.0"
 license = "Unlicense"
 authors.workspace = true
@@ -21,7 +21,6 @@ scale-info = { features = ["derive"], workspace = true }
 sp-runtime.workspace = true
 
 [dev-dependencies]
-pallet-balances = { default-features = true, workspace = true }
 sp-core = { default-features = true, workspace = true }
 sp-io = { default-features = true, workspace = true }
 sp-runtime = { default-features = true, workspace = true }

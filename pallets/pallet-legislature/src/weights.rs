@@ -29,14 +29,6 @@
 //!   --output pallets/pallet-legislature/src/weights.rs \
 //!   --template .maintain/frame-weight-template.hbs
 //! ```
-//!
-//! As of this writing, that full build additionally requires fixing an unrelated,
-//! pre-existing gap in `pallet-courts`'s `EnsureOracle`'s `EnsureOrigin` impl (missing
-//! `try_successful_origin`), which only surfaces once `runtime-benchmarks` is enabled
-//! workspace-wide — `pallet-courts` has no `runtime-benchmarks` feature of its own yet
-//! and was never previously compiled with this feature on. Not part of this pallet's
-//! scope; noted here so the blocker is visible from the file a future benchmark run
-//! would start from.
 
 #![cfg_attr(rustfmt, rustfmt_skip)]
 #![allow(unused_parens)]

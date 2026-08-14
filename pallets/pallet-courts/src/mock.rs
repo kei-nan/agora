@@ -66,8 +66,8 @@ thread_local! {
 	pub static INVALIDATED_LAWS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
 	/// department_id -> number of times `freeze_department` was called with it.
 	pub static FROZEN_DEPARTMENTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
-	/// (nullifier, suspension_until) recorded by `suspend_citizen`.
-	pub static SUSPENDED_CITIZENS: RefCell<Vec<([u8; 32], Option<BlockNumber>)>> = RefCell::new(Vec::new());
+	/// (nullifier, suspension_until, jury_reviewed) recorded by `suspend_citizen`.
+	pub static SUSPENDED_CITIZENS: RefCell<Vec<([u8; 32], Option<BlockNumber>, bool)>> = RefCell::new(Vec::new());
 }
 
 pub fn set_citizen_count(n: u32) {
@@ -86,7 +86,7 @@ pub fn frozen_departments() -> Vec<u32> {
 	FROZEN_DEPARTMENTS.with(|v| v.borrow().clone())
 }
 
-pub fn suspended_citizens() -> Vec<([u8; 32], Option<BlockNumber>)> {
+pub fn suspended_citizens() -> Vec<([u8; 32], Option<BlockNumber>, bool)> {
 	SUSPENDED_CITIZENS.with(|v| v.borrow().clone())
 }
 
@@ -141,8 +141,12 @@ impl TreasuryEnforcer for MockTreasuryEnforcer {
 
 pub struct MockCitizenSuspender;
 impl CitizenSuspender<BlockNumber> for MockCitizenSuspender {
-	fn suspend_citizen(nullifier: [u8; 32], suspension_until: Option<BlockNumber>) -> DispatchResult {
-		SUSPENDED_CITIZENS.with(|v| v.borrow_mut().push((nullifier, suspension_until)));
+	fn suspend_citizen(
+		nullifier: [u8; 32],
+		suspension_until: Option<BlockNumber>,
+		jury_reviewed: bool,
+	) -> DispatchResult {
+		SUSPENDED_CITIZENS.with(|v| v.borrow_mut().push((nullifier, suspension_until, jury_reviewed)));
 		Ok(())
 	}
 }

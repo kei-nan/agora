@@ -1,15 +1,11 @@
 use crate as pallet_elections;
-use frame_support::{
-    derive_impl,
-    traits::{ConstU32, ConstU64, ConstU8},
-};
+use frame_support::{derive_impl, traits::{ConstU32, ConstU8}};
 use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 type Block = frame_system::mocking::MockBlock<Test>;
-type Balance = u64;
 
 // ── Test-only cross-pallet mocks ────────────────────────────────────────────
 //
@@ -22,10 +18,6 @@ type Balance = u64;
 thread_local! {
     static ACTIVE_CITIZENS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
     static SEAT_CALLS: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
-    // Absent entry defaults to `true` (has a current disclosure) so pre-existing tests that
-    // don't care about the disclosure gate don't need to opt in — only tests that specifically
-    // exercise the gate call `set_has_current_disclosure`.
-    static DISCLOSURE_CURRENT: RefCell<BTreeMap<u64, bool>> = RefCell::new(BTreeMap::new());
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or removes them.
@@ -51,21 +43,6 @@ impl pallet_elections::CitizenChecker<u64> for TestCitizenChecker {
     }
 }
 
-/// Sets whether `who` has a current asset disclosure on file (mirrors
-/// pallet-anticorruption's `has_current_disclosure`). Unset accounts default to `true`.
-pub fn set_has_current_disclosure(who: u64, current: bool) {
-    DISCLOSURE_CURRENT.with(|d| {
-        d.borrow_mut().insert(who, current);
-    });
-}
-
-pub struct TestDisclosureChecker;
-impl pallet_elections::DisclosureChecker<u64> for TestDisclosureChecker {
-    fn has_current_disclosure(who: &u64) -> bool {
-        DISCLOSURE_CURRENT.with(|d| d.borrow().get(who).copied().unwrap_or(true))
-    }
-}
-
 pub struct TestSeatLegislature;
 impl pallet_elections::SeatLegislature<u64> for TestSeatLegislature {
     fn replace_members(winners: alloc::vec::Vec<u64>) -> DispatchResult {
@@ -77,9 +54,6 @@ impl pallet_elections::SeatLegislature<u64> for TestSeatLegislature {
 // ── Mock runtime constants ──────────────────────────────────────────────────
 //
 // Small, deterministic values chosen for fast tests — not real-world day/year counts.
-pub const CANDIDATE_DEPOSIT: Balance = 100;
-pub const MAX_COMMISSIONERS: u32 = 5;
-pub const MAX_CANDIDATES_PER_ELECTION: u32 = 5;
 pub const MAX_DELEGATES: u32 = 20;
 // Comfortably above the delegate counts used by existing sweep-behavior tests (a handful of
 // delegates each), so a single `on_initialize` call still sweeps all of them in those tests.
@@ -125,34 +99,19 @@ mod runtime {
     pub type System = frame_system::Pallet<Test>;
 
     #[runtime::pallet_index(1)]
-    pub type Balances = pallet_balances::Pallet<Test>;
-
-    #[runtime::pallet_index(2)]
     pub type Elections = pallet_elections::Pallet<Test>;
 }
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
     type Block = Block;
-    type AccountData = pallet_balances::AccountData<Balance>;
-}
-
-#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
-impl pallet_balances::Config for Test {
-    type AccountStore = System;
-    type Balance = Balance;
 }
 
 impl pallet_elections::Config for Test {
     type RuntimeEvent = RuntimeEvent;
-    type CandidateDeposit = ConstU64<CANDIDATE_DEPOSIT>;
-    type MaxCommissioners = ConstU32<MAX_COMMISSIONERS>;
-    type MaxCandidatesPerElection = ConstU32<MAX_CANDIDATES_PER_ELECTION>;
     type MaxDelegates = ConstU32<MAX_DELEGATES>;
     type MaxDelegateSweepPerBlock = ConstU32<MAX_DELEGATE_SWEEP_PER_BLOCK>;
-    type Currency = Balances;
     type CitizenChecker = TestCitizenChecker;
-    type DisclosureChecker = TestDisclosureChecker;
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for the governance/constitutional calls.
     // `AsEnsureOriginWithArg` ignores the call-hash argument `GovernanceOrigin` now
@@ -185,16 +144,7 @@ impl pallet_elections::BenchmarkHelper<u64> for TestBenchmarkHelper {
     }
 }
 
-// Build genesis storage according to the mock runtime. Accounts 1..=10 start with a
-// balance comfortably above `CANDIDATE_DEPOSIT` so deposit-reservation tests don't need
-// per-test funding boilerplate; account 99 is left unfunded for the insufficient-balance case.
+// Build genesis storage according to the mock runtime.
 pub fn new_test_ext() -> sp_io::TestExternalities {
-    let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
-    pallet_balances::GenesisConfig::<Test> {
-        balances: (1..=10u64).map(|who| (who, 10_000u64)).collect(),
-        ..Default::default()
-    }
-    .assimilate_storage(&mut storage)
-    .unwrap();
-    storage.into()
+    frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into()
 }

@@ -58,10 +58,15 @@ pub mod pallet {
     /// `suspension_until` is an **absolute block number** when the suspension lifts
     /// (None = indefinite). The courts pallet computes this from `suspension_blocks` +
     /// `now` before calling this trait — the implementor just passes it through.
+    /// `jury_reviewed` is true only when this case was decided by `cast_jury_vote`'s majority
+    /// (i.e. reached `CaseStatus::JurySeated`), false when it was finalized via `finalize_ruling`
+    /// on an unappealed `AIRulingIssued` case — see `auto_finalize`'s doc comment for how this
+    /// is computed, and pallet-identity's `SuspendedByJuryReview` for what it's used for.
     pub trait CitizenSuspender<BlockNumber> {
         fn suspend_citizen(
             nullifier: [u8; 32],
             suspension_until: Option<BlockNumber>,
+            jury_reviewed: bool,
         ) -> DispatchResult;
     }
 
@@ -730,6 +735,11 @@ pub mod pallet {
             // Fetch the subject before mutating status, so we can do enforcement after.
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 != CaseStatus::FinalRuling, Error::<T>::MajorityAlreadyReached);
+            // The status right before this call distinguishes which path led here:
+            // `finalize_ruling` only proceeds from `AIRulingIssued` (never appealed, no jury
+            // ever involved); `cast_jury_vote` only proceeds from `JurySeated` (a jury actually
+            // reviewed it). Captured now, before the mutation below overwrites it.
+            let jury_reviewed = case.1 == CaseStatus::JurySeated;
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
                 c.1 = CaseStatus::FinalRuling;
@@ -767,7 +777,7 @@ pub mod pallet {
                         let until = suspension_blocks.map(|b| {
                             now.saturating_add(BlockNumberFor::<T>::from(b))
                         });
-                        T::CitizenSuspender::suspend_citizen(*nullifier, until)?;
+                        T::CitizenSuspender::suspend_citizen(*nullifier, until, jury_reviewed)?;
                         true
                     }
                     CaseSubject::General => false,

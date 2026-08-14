@@ -582,8 +582,13 @@ impl pallet_courts::CitizenSuspender<BlockNumber> for Runtime {
 	fn suspend_citizen(
 		nullifier: [u8; 32],
 		suspension_until: Option<BlockNumber>,
+		jury_reviewed: bool,
 	) -> sp_runtime::DispatchResult {
-		pallet_identity_zk::Pallet::<Runtime>::suspend_citizen_internal(nullifier, suspension_until)
+		pallet_identity_zk::Pallet::<Runtime>::suspend_citizen_internal(
+			nullifier,
+			suspension_until,
+			jury_reviewed,
+		)
 	}
 }
 
@@ -746,10 +751,65 @@ impl pallet_executive::Config for Runtime {
 	/// 2/3 cabinet supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
 	type SupermajorityDenominator = ConstU32<3>;
+	/// Daily re-check for a court-suspended PM/minister (see `pallet_executive`'s
+	/// `run_vacancy_sweep` doc comment for why this is a periodic poll, not a hook).
+	/// Implemented on `Runtime` itself, just below.
+	type CitizenChecker = Runtime;
+	/// The PM/successor/nominee/voter must currently hold a legislature seat.
+	/// Implemented on `Runtime` itself, just below.
+	type LegislatureMembership = Runtime;
+	/// 7 days to nominate PM candidates once an investiture round opens, matching
+	/// pallet-legislature's own motion-duration convention.
+	type PmNominationWindowBlocks = ConstU32<{ 7 * DAYS }>;
+	/// 7 further days to cast ranked ballots once nominations close.
+	type PmVotingWindowBlocks = ConstU32<{ 7 * DAYS }>;
+	/// Bounds ballot/tally size for a single investiture round.
+	type MaxPmCandidates = ConstU32<20>;
+	/// Same 2-consecutive-term cap already used for pallet-elections' delegates
+	/// (`DefaultMaxConsecutiveTerms` below) — consistent term-limit philosophy across
+	/// every elected role in this runtime.
+	type MaxConsecutivePmTerms = ConstU32<2>;
+	/// Daily conviction-vacancy sweep.
+	type VacancySweepIntervalBlocks = ConstU32<{ 1 * DAYS }>;
 	type WeightInfo = pallet_executive::weights::SubstrateWeight<Runtime>;
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = RuntimeBenchmarkHelper;
 }
 
-// ── Elections Commission ─────────────────────────────────────────────────────
+/// Runtime implements pallet_executive::CitizenChecker by delegating to pallet-identity —
+/// same suspension check (`SuspendedNullifiers`) every other citizen-facing pallet uses.
+impl pallet_executive::CitizenChecker<AccountId> for Runtime {
+	fn is_active_citizen(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+	fn is_suspended_by_jury_reviewed_conviction(who: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_suspended_by_jury_reviewed_conviction(who)
+	}
+}
+
+/// Runtime implements pallet_executive::LegislatureMembership by reading pallet-legislature's
+/// `Members` directly — the PM is chosen by and from the legislature, not the citizenry.
+impl pallet_executive::LegislatureMembership<AccountId> for Runtime {
+	fn is_member(who: &AccountId) -> bool {
+		pallet_legislature::Members::<Runtime>::get().contains(who)
+	}
+}
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_executive::BenchmarkHelper<AccountId> for RuntimeBenchmarkHelper {
+	fn make_active_citizen(_who: &AccountId) {}
+	fn make_legislature_member(_who: &AccountId) {}
+}
+
+// ── Liquid Democracy Delegates / Legislature Elections ──────────────────────
+//
+// pallet-elections used to also run a separate "Elections Commission" subsystem
+// (commissioners, named "office" elections, candidate registration/certification) —
+// removed: it certified an election's outcome on nothing but a commissioner's say-so, with
+// no on-chain tally behind it, and nothing in this system's design turned out to need a
+// citizen-facing "elect one person to a named office" mechanism. Legislature seats fill
+// automatically via the delegate/backing mechanism below; the Prime Minister is chosen by
+// the legislature itself via pallet-executive's ranked-choice investiture (see
+// `pallet_executive::Config` above). See docs/project/changelog/ for the removal rationale.
 
 /// Runtime implements pallet_elections::CitizenChecker by delegating to pallet-identity.
 impl pallet_elections::CitizenChecker<AccountId> for Runtime {
@@ -758,19 +818,8 @@ impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 	}
 }
 
-/// Runtime implements pallet_elections::DisclosureChecker by delegating to
-/// pallet-anticorruption — candidacy requires a current (non-overdue) asset disclosure.
-impl pallet_elections::DisclosureChecker<AccountId> for Runtime {
-	fn has_current_disclosure(who: &AccountId) -> bool {
-		pallet_anticorruption::Pallet::<Runtime>::has_current_disclosure(who)
-	}
-}
-
 impl pallet_elections::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
-	type CandidateDeposit = ConstU128<1_000_000_000_000>;
-	type MaxCommissioners = ConstU32<20>;
-	type MaxCandidatesPerElection = ConstU32<100>;
 	/// Hard cap on registered delegates.
 	type MaxDelegates = ConstU32<10_000>;
 	/// Bounds on_initialize's per-block delegate sweep (term warnings/expirations,
@@ -779,9 +828,7 @@ impl pallet_elections::Config for Runtime {
 	/// `MaxDelegates / MaxDelegateSweepPerBlock` = 100 blocks (~10-20 min at this chain's
 	/// block time) in the worst case.
 	type MaxDelegateSweepPerBlock = ConstU32<100>;
-	type Currency = Balances;
 	type CitizenChecker = Runtime;
-	type DisclosureChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.
 	type GovernanceOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// Constitutional parameters require EnsureRoot for now. Production should wire this to

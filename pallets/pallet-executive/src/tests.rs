@@ -1,13 +1,18 @@
 use crate::{
-    mock::*, ActiveEmergency, DeclareVotes, EndVotes, Error, Event, MinisterPortfolio,
-    NextPortfolioId, PendingEmergencyProposal, PortfolioMinister, Portfolios, PrimeMinister,
+    mock::*, ActiveEmergency, DeclareVotes, EndVotes, Error, Event, InvestitureRound,
+    NextPortfolioId, PendingEmergencyProposal, PendingMinisterNomination, PmConsecutiveTerms,
+    PortfolioMinister, Portfolios, PrimeMinister, VacatedRole,
 };
-use frame_support::{assert_noop, assert_ok, traits::Hooks};
+use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
 use pallet_legislature::pallet::MinisterChecker;
 use sp_runtime::DispatchError;
 
 fn hash(byte: u8) -> [u8; 32] {
     [byte; 32]
+}
+
+fn ballot(candidates: &[u64]) -> BoundedVec<u64, frame_support::traits::ConstU32<8>> {
+    BoundedVec::try_from(candidates.to_vec()).unwrap()
 }
 
 fn define_portfolio(byte: u8) -> u32 {
@@ -16,11 +21,27 @@ fn define_portfolio(byte: u8) -> u32 {
     id
 }
 
+/// Runs a full investiture round and installs `who` as PM: marks them a legislature
+/// member, opens the round, self-nominates, casts a ballot for themselves, advances past
+/// both windows, finalizes, then restores the original block number so callers'
+/// block-number assumptions (e.g. emergency-timing tests) aren't disturbed.
 fn appoint_pm(who: u64) {
-    assert_ok!(Executive::appoint_prime_minister(RuntimeOrigin::root(), who));
+    set_legislature_member(who, true);
+    let origin_block = System::block_number();
+    assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(who)));
+    assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(who), who));
+    System::set_block_number(origin_block + 5); // PmNominationWindowBlocks == 5
+    assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(who), ballot(&[who])));
+    System::set_block_number(origin_block + 10); // + PmVotingWindowBlocks == 5
+    assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(who)));
+    System::set_block_number(origin_block);
 }
 
+/// Stages and confirms `who` as minister of `portfolio_id`. Requires a PM to already be
+/// appointed (uses them as the nominating origin).
 fn appoint_minister(portfolio_id: u32, who: u64) {
+    let pm = PrimeMinister::<Test>::get().expect("PM must be set before appointing a minister");
+    assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(pm), portfolio_id, who));
     assert_ok!(Executive::appoint_minister(RuntimeOrigin::root(), portfolio_id, who));
 }
 
@@ -74,93 +95,431 @@ fn define_portfolio_fails_when_capacity_reached() {
     });
 }
 
-// ─── appoint_prime_minister / dismiss_prime_minister ───────────────────────
+// ─── PM investiture (ranked-choice among legislature members) ─────────────────
 
 #[test]
-fn appoint_prime_minister_works() {
+fn investiture_single_candidate_wins_unopposed() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
-        assert_ok!(Executive::appoint_prime_minister(RuntimeOrigin::root(), 1));
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
 
         assert_eq!(PrimeMinister::<Test>::get(), Some(1));
-        System::assert_last_event(Event::PrimeMinisterAppointed { who: 1 }.into());
+        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 1);
+        assert!(InvestitureRound::<Test>::get().is_none());
+        System::assert_has_event(Event::PmInvestitureFinalized { winner: 1 }.into());
     });
 }
 
 #[test]
-fn appoint_prime_minister_replaces_existing_pm() {
+fn investiture_runoff_redistributes_eliminated_candidates_second_preferences() {
+    // Candidates: 10, 20, 30. 5 voters. Round 1: 10 gets 2, 20 gets 1, 30 gets 2 -- no
+    // majority (need > 2.5), so 20 (fewest) is eliminated. Round 2: the voter who put 20
+    // first now counts toward their second preference, 10, giving 10 a 3-2 majority.
+    // Proves elimination + redistribution actually changes the outcome, not just that a
+    // single round of first-preference counting happens to work.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        for m in [10u64, 20, 30, 100, 101, 102, 103, 104] {
+            set_legislature_member(m, true);
+        }
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(100)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(100), 10));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(100), 20));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(100), 30));
+
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(100), ballot(&[10, 20, 30])));
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(101), ballot(&[10, 20, 30])));
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(102), ballot(&[20, 10, 30])));
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(103), ballot(&[30, 20, 10])));
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(104), ballot(&[30, 20, 10])));
+
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(100)));
+
+        assert_eq!(PrimeMinister::<Test>::get(), Some(10));
+    });
+}
+
+#[test]
+fn investiture_fails_with_no_winner_when_no_ballots_cast() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(11);
+
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        System::assert_last_event(Event::PmInvestitureFailedNoWinner.into());
+    });
+}
+
+#[test]
+fn investiture_fails_with_no_winner_when_no_candidates_nominated() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        System::set_block_number(11);
+
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        System::assert_last_event(Event::PmInvestitureFailedNoWinner.into());
+    });
+}
+
+#[test]
+fn open_pm_investiture_fails_when_seat_not_vacant() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         appoint_pm(1);
-
-        assert_ok!(Executive::appoint_prime_minister(RuntimeOrigin::root(), 2));
-
-        assert_eq!(PrimeMinister::<Test>::get(), Some(2));
-        let events = System::events();
-        assert!(events.iter().any(|r| r.event == Event::PrimeMinisterDismissed { who: 1 }.into()));
-        System::assert_last_event(Event::PrimeMinisterAppointed { who: 2 }.into());
-    });
-}
-
-#[test]
-fn appoint_prime_minister_fails_for_unauthorized_origin() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
         assert_noop!(
-            Executive::appoint_prime_minister(RuntimeOrigin::signed(1), 1),
-            DispatchError::BadOrigin
+            Executive::open_pm_investiture(RuntimeOrigin::signed(2)),
+            Error::<Test>::PmSeatNotVacant
         );
     });
 }
 
 #[test]
-fn dismiss_prime_minister_works() {
+fn open_pm_investiture_fails_when_already_open() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
-        appoint_pm(1);
-
-        assert_ok!(Executive::dismiss_prime_minister(RuntimeOrigin::root()));
-
-        assert!(PrimeMinister::<Test>::get().is_none());
-        System::assert_last_event(Event::PrimeMinisterDismissed { who: 1 }.into());
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_noop!(
+            Executive::open_pm_investiture(RuntimeOrigin::signed(2)),
+            Error::<Test>::InvestitureAlreadyOpen
+        );
     });
 }
 
 #[test]
-fn dismiss_prime_minister_fails_when_none_appointed() {
+fn nominate_pm_fails_for_non_member_nominator() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        set_legislature_member(2, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
         assert_noop!(
-            Executive::dismiss_prime_minister(RuntimeOrigin::root()),
+            Executive::nominate_pm(RuntimeOrigin::signed(1), 2),
+            Error::<Test>::NotLegislatureMember
+        );
+    });
+}
+
+#[test]
+fn nominate_pm_fails_for_non_member_candidate() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(1), 2),
+            Error::<Test>::NotLegislatureMember
+        );
+    });
+}
+
+#[test]
+fn nominate_pm_fails_after_nomination_window_closes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        System::set_block_number(6);
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(1), 1),
+            Error::<Test>::NominationWindowClosed
+        );
+    });
+}
+
+#[test]
+fn nominate_pm_fails_when_already_nominated() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(1), 1),
+            Error::<Test>::AlreadyNominated
+        );
+    });
+}
+
+#[test]
+fn nominate_pm_fails_when_candidate_at_consecutive_term_limit() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), {
+            set_legislature_member(2, true);
+            2
+        }));
+        // 1 served one term, was replaced -- their count resets to 0, so re-nominating
+        // them should still succeed (max is 2). Serve them again to actually hit the cap.
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1));
+        // 1 is back with consecutive_terms == 1 (fresh streak after the gap).
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1));
+        // 1's streak: term after first gap = 1, this reinstall makes it 2 -- exactly at cap.
+        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 1);
+    });
+}
+
+#[test]
+fn cast_pm_ballot_fails_before_nomination_window_closes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        assert_noop!(
+            Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])),
+            Error::<Test>::NominationWindowStillOpen
+        );
+    });
+}
+
+#[test]
+fn cast_pm_ballot_fails_after_voting_window_closes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(11);
+        assert_noop!(
+            Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])),
+            Error::<Test>::VotingWindowClosed
+        );
+    });
+}
+
+#[test]
+fn cast_pm_ballot_fails_for_non_nominee() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        set_legislature_member(2, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_noop!(
+            Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[2])),
+            Error::<Test>::NotANominee
+        );
+    });
+}
+
+#[test]
+fn cast_pm_ballot_fails_for_duplicate_candidate() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        set_legislature_member(2, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 2));
+        System::set_block_number(6);
+        assert_noop!(
+            Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1, 1])),
+            Error::<Test>::DuplicateCandidateInBallot
+        );
+    });
+}
+
+#[test]
+fn finalize_pm_investiture_fails_before_voting_window_closes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_noop!(
+            Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)),
+            Error::<Test>::VotingWindowStillOpen
+        );
+    });
+}
+
+// ─── remove_and_replace_prime_minister (constructive no confidence) ───────────
+
+#[test]
+fn remove_and_replace_prime_minister_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_legislature_member(2, true);
+
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
+
+        assert_eq!(PrimeMinister::<Test>::get(), Some(2));
+        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
+        assert_eq!(PmConsecutiveTerms::<Test>::get(2), 1);
+        let events = System::events();
+        assert!(events.iter().any(|r| r.event == Event::PrimeMinisterDismissed { who: 1 }.into()));
+        System::assert_last_event(
+            Event::PrimeMinisterRemovedAndReplaced { old: 1, new: 2 }.into(),
+        );
+    });
+}
+
+#[test]
+fn remove_and_replace_prime_minister_never_leaves_seat_vacant() {
+    // The whole point of the constructive mechanism: a passed motion always installs a
+    // successor in the same call -- there's no intermediate state where PrimeMinister is
+    // None after a successful call.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_legislature_member(2, true);
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
+        assert!(PrimeMinister::<Test>::get().is_some());
+    });
+}
+
+#[test]
+fn remove_and_replace_prime_minister_clears_outgoing_pms_pending_minister_nomination() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_legislature_member(2, true);
+        let p0 = define_portfolio(1);
+        assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(1), p0, 99));
+        assert!(PendingMinisterNomination::<Test>::get(p0).is_some());
+
+        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
+
+        assert!(PendingMinisterNomination::<Test>::get(p0).is_none());
+    });
+}
+
+#[test]
+fn remove_and_replace_prime_minister_fails_when_no_pm() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_noop!(
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1),
             Error::<Test>::NoPrimeMinister
         );
     });
 }
 
 #[test]
-fn dismiss_prime_minister_fails_for_unauthorized_origin() {
+fn remove_and_replace_prime_minister_fails_when_successor_is_current_pm() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         appoint_pm(1);
         assert_noop!(
-            Executive::dismiss_prime_minister(RuntimeOrigin::signed(1)),
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1),
+            Error::<Test>::SuccessorIsCurrentPm
+        );
+    });
+}
+
+#[test]
+fn remove_and_replace_prime_minister_fails_when_successor_not_a_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        assert_noop!(
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2),
+            Error::<Test>::NotLegislatureMember
+        );
+    });
+}
+
+#[test]
+fn remove_and_replace_prime_minister_fails_for_unauthorized_origin() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_legislature_member(2, true);
+        assert_noop!(
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::signed(1), 2),
             DispatchError::BadOrigin
         );
     });
 }
 
-// ─── appoint_minister / dismiss_minister ───────────────────────────────────
+// ─── resign_as_pm ───────────────────────────────────────────────────────────
+
+#[test]
+fn resign_as_pm_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+
+        assert_ok!(Executive::resign_as_pm(RuntimeOrigin::signed(1)));
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
+        System::assert_last_event(Event::PrimeMinisterResigned { who: 1 }.into());
+    });
+}
+
+#[test]
+fn resign_as_pm_fails_for_non_pm() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        assert_noop!(
+            Executive::resign_as_pm(RuntimeOrigin::signed(2)),
+            Error::<Test>::NotPrimeMinister
+        );
+    });
+}
+
+// ─── nominate_minister / appoint_minister ──────────────────────────────────
+
+#[test]
+fn nominate_minister_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+
+        assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(1), p0, 2));
+
+        assert_eq!(PendingMinisterNomination::<Test>::get(p0), Some(2));
+        System::assert_last_event(Event::MinisterNominated { portfolio_id: p0, nominee: 2 }.into());
+    });
+}
+
+#[test]
+fn nominate_minister_fails_for_non_pm() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+        assert_noop!(
+            Executive::nominate_minister(RuntimeOrigin::signed(2), p0, 2),
+            Error::<Test>::NotPrimeMinister
+        );
+    });
+}
 
 #[test]
 fn appoint_minister_works() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
 
-        assert_ok!(Executive::appoint_minister(RuntimeOrigin::root(), p0, 2));
+        appoint_minister(p0, 2);
 
         assert_eq!(PortfolioMinister::<Test>::get(p0), Some(2));
-        assert_eq!(MinisterPortfolio::<Test>::get(2), Some(p0));
+        assert_eq!(crate::MinisterPortfolio::<Test>::get(2), Some(p0));
+        assert!(PendingMinisterNomination::<Test>::get(p0).is_none());
         System::assert_last_event(Event::MinisterAppointed { portfolio_id: p0, who: 2 }.into());
     });
 }
@@ -169,7 +528,9 @@ fn appoint_minister_works() {
 fn appoint_minister_fails_for_unauthorized_origin() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
+        assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(1), p0, 2));
         assert_noop!(
             Executive::appoint_minister(RuntimeOrigin::signed(1), p0, 2),
             DispatchError::BadOrigin
@@ -189,17 +550,45 @@ fn appoint_minister_fails_when_portfolio_not_found() {
 }
 
 #[test]
-fn appoint_minister_replaces_existing_minister_in_portfolio() {
+fn appoint_minister_fails_when_no_nomination_pending() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         let p0 = define_portfolio(1);
+        assert_noop!(
+            Executive::appoint_minister(RuntimeOrigin::root(), p0, 2),
+            Error::<Test>::NoNominationPending
+        );
+    });
+}
+
+#[test]
+fn appoint_minister_fails_when_who_does_not_match_pending_nomination() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+        assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(1), p0, 2));
+
+        assert_noop!(
+            Executive::appoint_minister(RuntimeOrigin::root(), p0, 3),
+            Error::<Test>::NoNominationPending
+        );
+    });
+}
+
+#[test]
+fn appoint_minister_replaces_existing_minister_in_portfolio() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
 
-        assert_ok!(Executive::appoint_minister(RuntimeOrigin::root(), p0, 3));
+        appoint_minister(p0, 3);
 
         assert_eq!(PortfolioMinister::<Test>::get(p0), Some(3));
-        assert!(MinisterPortfolio::<Test>::get(2).is_none());
-        assert_eq!(MinisterPortfolio::<Test>::get(3), Some(p0));
+        assert!(crate::MinisterPortfolio::<Test>::get(2).is_none());
+        assert_eq!(crate::MinisterPortfolio::<Test>::get(3), Some(p0));
         let events = System::events();
         assert!(events
             .iter()
@@ -212,15 +601,16 @@ fn appoint_minister_replaces_existing_minister_in_portfolio() {
 fn appoint_minister_moves_minister_from_other_portfolio() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         let p1 = define_portfolio(2);
         appoint_minister(p0, 2);
 
-        assert_ok!(Executive::appoint_minister(RuntimeOrigin::root(), p1, 2));
+        appoint_minister(p1, 2);
 
         assert!(PortfolioMinister::<Test>::get(p0).is_none());
         assert_eq!(PortfolioMinister::<Test>::get(p1), Some(2));
-        assert_eq!(MinisterPortfolio::<Test>::get(2), Some(p1));
+        assert_eq!(crate::MinisterPortfolio::<Test>::get(2), Some(p1));
         let events = System::events();
         assert!(events
             .iter()
@@ -232,13 +622,14 @@ fn appoint_minister_moves_minister_from_other_portfolio() {
 fn dismiss_minister_works() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
 
         assert_ok!(Executive::dismiss_minister(RuntimeOrigin::root(), p0));
 
         assert!(PortfolioMinister::<Test>::get(p0).is_none());
-        assert!(MinisterPortfolio::<Test>::get(2).is_none());
+        assert!(crate::MinisterPortfolio::<Test>::get(2).is_none());
         System::assert_last_event(Event::MinisterDismissed { portfolio_id: p0, who: 2 }.into());
     });
 }
@@ -270,6 +661,7 @@ fn dismiss_minister_fails_when_portfolio_vacant() {
 fn dismiss_minister_fails_for_unauthorized_origin() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
         assert_noop!(
@@ -279,19 +671,20 @@ fn dismiss_minister_fails_for_unauthorized_origin() {
     });
 }
 
-// ─── resign ─────────────────────────────────────────────────────────────────
+// ─── resign (minister) ──────────────────────────────────────────────────────
 
 #[test]
 fn resign_works() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
 
         assert_ok!(Executive::resign(RuntimeOrigin::signed(2)));
 
         assert!(PortfolioMinister::<Test>::get(p0).is_none());
-        assert!(MinisterPortfolio::<Test>::get(2).is_none());
+        assert!(crate::MinisterPortfolio::<Test>::get(2).is_none());
         System::assert_last_event(Event::MinisterResigned { portfolio_id: p0, who: 2 }.into());
     });
 }
@@ -301,6 +694,115 @@ fn resign_fails_when_not_a_minister() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         assert_noop!(Executive::resign(RuntimeOrigin::signed(1)), Error::<Test>::NotAMinister);
+    });
+}
+
+// ─── conviction-triggered vacancy sweep ────────────────────────────────────
+
+#[test]
+fn vacancy_sweep_removes_pm_suspended_by_jury_reviewed_conviction() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_active_citizen(1, false); // simulates an Overturned CitizenConduct ruling
+        set_jury_reviewed_suspension(1, true); // ...that a jury actually reviewed
+
+        let _ = Executive::on_initialize(1);
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
+        System::assert_has_event(
+            Event::OfficeVacatedForConviction { who: 1, role: VacatedRole::PrimeMinister }.into(),
+        );
+    });
+}
+
+#[test]
+fn vacancy_sweep_removes_minister_suspended_by_jury_reviewed_conviction() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+        appoint_minister(p0, 2);
+        set_active_citizen(2, false);
+        set_jury_reviewed_suspension(2, true);
+
+        let _ = Executive::on_initialize(1);
+
+        assert!(PortfolioMinister::<Test>::get(p0).is_none());
+        assert!(crate::MinisterPortfolio::<Test>::get(2).is_none());
+        System::assert_has_event(
+            Event::OfficeVacatedForConviction {
+                who: 2,
+                role: VacatedRole::Minister { portfolio_id: p0 },
+            }
+            .into(),
+        );
+    });
+}
+
+#[test]
+fn vacancy_sweep_does_not_remove_pm_suspended_without_jury_review() {
+    // The core of the refinement: a bare, unappealed AI ruling suspends the citizen (they
+    // can't be re-nominated, can't vote, etc.) but must NOT be enough on its own to
+    // automatically remove a sitting PM -- that requires a jury having actually reviewed
+    // the conviction. Legislature's own no-confidence vote remains available regardless.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_active_citizen(1, false); // suspended...
+        // ...but set_jury_reviewed_suspension was never called -- defaults to false.
+
+        let _ = Executive::on_initialize(1);
+
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1), "AI-only suspension must not vacate the PM");
+    });
+}
+
+#[test]
+fn vacancy_sweep_does_not_remove_minister_suspended_without_jury_review() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+        appoint_minister(p0, 2);
+        set_active_citizen(2, false);
+
+        let _ = Executive::on_initialize(1);
+
+        assert_eq!(PortfolioMinister::<Test>::get(p0), Some(2));
+    });
+}
+
+#[test]
+fn vacancy_sweep_leaves_active_pm_and_ministers_untouched() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+
+        let _ = Executive::on_initialize(1);
+
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1));
+        assert!(<Executive as MinisterChecker<u64>>::is_active_minister(&2));
+        assert!(<Executive as MinisterChecker<u64>>::is_active_minister(&3));
+    });
+}
+
+#[test]
+fn vacancy_sweep_only_runs_once_per_interval() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let _ = Executive::on_initialize(1); // consumes the initial (block-0-eligible) sweep
+
+        set_active_citizen(1, false);
+        set_jury_reviewed_suspension(1, true);
+        // VacancySweepIntervalBlocks == 20, so the next sweep isn't due until block 21.
+        let _ = Executive::on_initialize(10);
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1), "sweep isn't due yet");
+
+        let _ = Executive::on_initialize(21);
+        assert!(PrimeMinister::<Test>::get().is_none(), "sweep should have run by now");
     });
 }
 
@@ -551,7 +1053,7 @@ fn emergency_lapses_when_not_ratified_within_window() {
 
         assert!(ActiveEmergency::<Test>::get().is_none());
         assert_eq!(DeclareVotes::<Test>::iter().filter(|(_, v)| *v).count(), 0);
-        System::assert_last_event(Event::EmergencyLapsed.into());
+        System::assert_has_event(Event::EmergencyLapsed.into());
     });
 }
 
@@ -585,7 +1087,7 @@ fn emergency_expires_at_sunset_block_even_if_ratified() {
         let _ = Executive::on_initialize(6);
 
         assert!(ActiveEmergency::<Test>::get().is_none());
-        System::assert_last_event(Event::EmergencyExpired { at_block: 6 }.into());
+        System::assert_has_event(Event::EmergencyExpired { at_block: 6 }.into());
     });
 }
 
@@ -738,6 +1240,7 @@ fn retract_emergency_vote_resets_pending_proposal_when_last_vote_removed() {
 fn minister_checker_true_for_active_minister() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
 
@@ -759,6 +1262,7 @@ fn minister_checker_true_for_prime_minister() {
 fn minister_checker_false_for_resigned_minister() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
         assert_ok!(Executive::resign(RuntimeOrigin::signed(2)));
@@ -771,6 +1275,7 @@ fn minister_checker_false_for_resigned_minister() {
 fn minister_checker_false_for_dismissed_minister() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        appoint_pm(1);
         let p0 = define_portfolio(1);
         appoint_minister(p0, 2);
         assert_ok!(Executive::dismiss_minister(RuntimeOrigin::root(), p0));
@@ -819,4 +1324,13 @@ fn legislature_call_hash_differs_for_different_appointees() {
     let a = crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
     let b = crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 2u64));
     assert_ne!(a, b);
+}
+
+#[test]
+fn legislature_call_hash_differs_between_replace_pm_and_appoint_minister() {
+    let replace =
+        crate::pallet::legislature_call_hash(b"pallet-executive::remove_and_replace_prime_minister", 1u64);
+    let appoint =
+        crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
+    assert_ne!(replace, appoint);
 }

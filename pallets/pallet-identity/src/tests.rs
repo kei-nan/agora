@@ -559,6 +559,84 @@ fn suspend_citizen_upserts_existing_suspension() {
 }
 
 #[test]
+fn suspend_citizen_extrinsic_is_never_jury_reviewed() {
+    // The manual admin-override extrinsic is SuspensionOrigin-gated (EnsureOracle in the real
+    // runtime) — no jury is ever involved on this path, so it must never be enough on its own
+    // to trigger a higher-bar consequence like pallet-executive's office-vacancy sweep.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_ok!(Identity::suspend_citizen(RuntimeOrigin::root(), NULLIFIER_A, None));
+
+        assert!(!Identity::is_suspended_by_jury_reviewed_conviction(&1));
+    });
+}
+
+#[test]
+fn suspend_citizen_internal_records_jury_reviewed_flag() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_ok!(Identity::suspend_citizen_internal(NULLIFIER_A, None, true));
+
+        assert!(!Identity::is_active_citizen(&1));
+        assert!(Identity::is_suspended_by_jury_reviewed_conviction(&1));
+    });
+}
+
+#[test]
+fn suspend_citizen_internal_without_jury_review_is_suspended_but_not_flagged() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_ok!(Identity::suspend_citizen_internal(NULLIFIER_A, None, false));
+
+        assert!(!Identity::is_active_citizen(&1));
+        assert!(!Identity::is_suspended_by_jury_reviewed_conviction(&1));
+    });
+}
+
+#[test]
+fn is_suspended_by_jury_reviewed_conviction_false_once_timed_suspension_expires() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_ok!(Identity::suspend_citizen_internal(NULLIFIER_A, Some(5), true));
+        assert!(Identity::is_suspended_by_jury_reviewed_conviction(&1));
+
+        System::set_block_number(6);
+
+        assert!(!Identity::is_suspended_by_jury_reviewed_conviction(&1));
+        assert!(Identity::is_active_citizen(&1));
+    });
+}
+
+#[test]
+fn restore_citizen_rights_clears_jury_reviewed_flag() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_ok!(Identity::suspend_citizen_internal(NULLIFIER_A, None, true));
+
+        assert_ok!(Identity::restore_citizen_rights(RuntimeOrigin::root(), NULLIFIER_A));
+
+        assert!(!Identity::is_suspended_by_jury_reviewed_conviction(&1));
+        // Re-suspending later without an explicit jury_reviewed=true must default to
+        // not-jury-reviewed, not silently inherit the cleared record's old value.
+        assert_ok!(Identity::suspend_citizen(RuntimeOrigin::root(), NULLIFIER_A, None));
+        assert!(!Identity::is_suspended_by_jury_reviewed_conviction(&1));
+    });
+}
+
+#[test]
 fn suspend_citizen_fails_when_not_registered() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);

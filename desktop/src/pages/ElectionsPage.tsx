@@ -13,18 +13,8 @@ interface Delegate {
   profileIpfsHash: string;
 }
 
-interface ElectionEntry {
-  id: number;
-  office: string;
-  startBlock: number;
-  endBlock: number;
-  status: "scheduled" | "active" | "results_submitted" | "certified";
-  winner: string;
-}
-
 interface ElectionsData {
   delegates: Delegate[];
-  elections: ElectionEntry[];
 }
 
 function shortAddr(hex: string): string {
@@ -36,13 +26,10 @@ const STATUS_LABEL: Record<string, string> = {
   pending: "Pending",
   active: "Active",
   on_break: "On break",
-  scheduled: "Scheduled",
-  results_submitted: "Results in",
-  certified: "Certified",
 };
 
 export default function ElectionsPage() {
-  const [data, setData] = useState<ElectionsData>({ delegates: [], elections: [] });
+  const [data, setData] = useState<ElectionsData>({ delegates: [] });
   const [selectedDelegate, setSelectedDelegate] = useState<Delegate | null>(null);
   const [loading, setLoading] = useState(true);
   const { setActiveItem } = useAgent();
@@ -50,7 +37,7 @@ export default function ElectionsPage() {
   useEffect(() => {
     invoke<ElectionsData>("fetch_elections_data")
       .then(setData)
-      .catch(() => setData({ delegates: [], elections: [] }))
+      .catch(() => setData({ delegates: [] }))
       .finally(() => setLoading(false));
   }, []);
 
@@ -62,56 +49,18 @@ export default function ElectionsPage() {
     );
   }
 
-  const activeElections = data.elections.filter((e) => e.status === "active");
-  const otherElections = data.elections.filter((e) => e.status !== "active");
-
   return (
     <div className="page-layout">
       <div className="list-panel">
         <h1 className="page-title">Elections</h1>
         <p className="page-subtitle">
-          {data.delegates.length} registered delegate{data.delegates.length !== 1 ? "s" : ""}
-          {data.elections.length > 0 &&
-            ` · ${activeElections.length} active election${activeElections.length !== 1 ? "s" : ""}`}
+          {data.delegates.length} registered delegate{data.delegates.length !== 1 ? "s" : ""} ·
+          legislature seats fill automatically by backing count each election cycle
         </p>
         {loading && <p className="loading">Loading…</p>}
 
-        {activeElections.length > 0 && (
-          <>
-            <h2 className="section-heading">Active Elections</h2>
-            <ul className="item-list">
-              {activeElections.map((e) => (
-                <li key={e.id} className="item-row election-row">
-                  <span className="tier-chip tier-constitutional">active</span>
-                  <span className="item-title">{e.office || `Election #${e.id}`}</span>
-                  <span className="item-meta">closes #{e.endBlock}</span>
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
-
-        {otherElections.length > 0 && (
-          <>
-            <h2 className="section-heading">Past / Scheduled Elections</h2>
-            <ul className="item-list">
-              {otherElections.map((e) => (
-                <li key={e.id} className="item-row election-row muted">
-                  <span className={`tier-chip tier-${e.status === "certified" ? "ordinary" : "pending"}`}>
-                    {STATUS_LABEL[e.status] ?? e.status}
-                  </span>
-                  <span className="item-title">{e.office || `Election #${e.id}`}</span>
-                  {e.winner && (
-                    <span className="item-meta">winner: {shortAddr(e.winner)}</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </>
-        )}
-
-        {!loading && data.delegates.length === 0 && data.elections.length === 0 && (
-          <p className="empty">No delegates or elections registered yet.</p>
+        {!loading && data.delegates.length === 0 && (
+          <p className="empty">No delegates registered yet.</p>
         )}
 
         {data.delegates.length > 0 && (

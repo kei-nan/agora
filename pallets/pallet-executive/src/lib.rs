@@ -92,6 +92,40 @@ pub mod pallet {
         }
     }
 
+    // ── Cross-pallet traits ─────────────────────────────────────────────────────
+
+    /// Checks whether an account is currently an active (non-suspended) registered
+    /// citizen, and separately whether any current suspension came from a jury-reviewed
+    /// conviction rather than a bare, unappealed AI ruling. Implemented by
+    /// pallet-identity-zk in the runtime. The daily vacancy sweep (`on_initialize`)
+    /// deliberately requires the *second* check, not just the first, before auto-removing
+    /// a sitting PM/minister — see `run_vacancy_sweep`'s doc comment for why: the
+    /// consequence (losing the office) is large enough to warrant the same evidentiary
+    /// bar this project's court system already applies elsewhere, and requiring it here
+    /// also closes off filing a bogus, never-appealed case as a way to force someone out.
+    pub trait CitizenChecker<AccountId> {
+        fn is_active_citizen(who: &AccountId) -> bool;
+        fn is_suspended_by_jury_reviewed_conviction(who: &AccountId) -> bool;
+    }
+
+    /// Checks whether an account currently holds a legislature seat. Implemented by
+    /// pallet-legislature in the runtime. PM nominees, ballot casters, and
+    /// no-confidence successors must all be current members — the PM is chosen by and
+    /// from the legislature, not the general citizenry.
+    pub trait LegislatureMembership<AccountId> {
+        fn is_member(who: &AccountId) -> bool;
+    }
+
+    /// Benchmark-only seeding for `CitizenChecker`/`LegislatureMembership` state, which the
+    /// real runtime backs with pallet-identity-zk/pallet-legislature storage this pallet
+    /// otherwise has no generic way to reach into from a benchmark. Same pattern as
+    /// `pallet_elections::BenchmarkHelper` — see its doc comment.
+    #[cfg(feature = "runtime-benchmarks")]
+    pub trait BenchmarkHelper<AccountId> {
+        fn make_active_citizen(who: &AccountId);
+        fn make_legislature_member(who: &AccountId);
+    }
+
     // ── Config ───────────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -121,8 +155,33 @@ pub mod pallet {
         /// Denominator of the cabinet supermajority (e.g. 3 for 2/3).
         #[pallet::constant]
         type SupermajorityDenominator: Get<u32>;
+        /// Checks suspension status for the daily PM/minister vacancy sweep.
+        type CitizenChecker: CitizenChecker<Self::AccountId>;
+        /// Checks legislature membership for PM nomination/voting/succession.
+        type LegislatureMembership: LegislatureMembership<Self::AccountId>;
+        /// How many blocks a PM-investiture nomination window stays open once opened.
+        #[pallet::constant]
+        type PmNominationWindowBlocks: Get<u32>;
+        /// How many blocks the ranked-ballot voting window runs for, starting right
+        /// after the nomination window closes.
+        #[pallet::constant]
+        type PmVotingWindowBlocks: Get<u32>;
+        /// Cap on candidates a single investiture round can hold (bounds ballot/tally size).
+        #[pallet::constant]
+        type MaxPmCandidates: Get<u32>;
+        /// Max consecutive terms the same person may serve as PM. Resets to 0 the moment
+        /// anyone else holds the office, so this only blocks *consecutive* re-selection,
+        /// not a permanent bar — see `install_pm`'s doc comment.
+        #[pallet::constant]
+        type MaxConsecutivePmTerms: Get<u32>;
+        /// Blocks between automatic PM/minister eligibility sweeps (e.g. ~1 day).
+        #[pallet::constant]
+        type VacancySweepIntervalBlocks: Get<u32>;
         /// Weight functions needed for this pallet's extrinsics.
         type WeightInfo: crate::weights::WeightInfo;
+        /// See `BenchmarkHelper`'s doc comment.
+        #[cfg(feature = "runtime-benchmarks")]
+        type BenchmarkHelper: BenchmarkHelper<Self::AccountId>;
     }
 
     // ── Types ────────────────────────────────────────────────────────────────────
@@ -147,6 +206,22 @@ pub mod pallet {
         pub reason_hash: [u8; 32],
         /// True once the legislature has passed a ratification motion.
         pub ratified: bool,
+    }
+
+    /// A currently-open PM investiture round.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct InvestitureRoundInfo<BlockNumber> {
+        /// Nominations are accepted strictly before this block.
+        pub nomination_end: BlockNumber,
+        /// Ranked ballots are accepted from `nomination_end` strictly before this block.
+        pub voting_end: BlockNumber,
+    }
+
+    /// Which office the daily vacancy sweep removed someone from.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum VacatedRole {
+        PrimeMinister,
+        Minister { portfolio_id: u32 },
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────────
@@ -196,6 +271,52 @@ pub mod pallet {
     #[pallet::storage]
     pub type PendingEmergencyProposal<T: Config> = StorageValue<_, ([u8; 32], u32), OptionQuery>;
 
+    // ── Storage: minister nomination (PM nominates, legislature confirms) ──────────
+
+    /// portfolio_id → the PM's currently staged nominee, awaiting legislature
+    /// confirmation via `appoint_minister`. Cleared on confirmation, or whenever the PM
+    /// office changes hands (see `clear_pending_minister_nominations`) so an outgoing
+    /// PM's unconfirmed pick can never be confirmed under a successor's watch.
+    #[pallet::storage]
+    pub type PendingMinisterNomination<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, T::AccountId>;
+
+    // ── Storage: PM term tracking ───────────────────────────────────────────────────
+
+    /// account → consecutive terms served as PM. Reset to 0 the instant anyone else
+    /// holds the office (resignation, constructive replacement, or conviction-triggered
+    /// vacancy all reset it) — see `install_pm`.
+    #[pallet::storage]
+    pub type PmConsecutiveTerms<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
+    // ── Storage: PM investiture (ranked-choice among legislature members) ──────────
+
+    /// The currently open investiture round, if any. Opens only while the PM seat is
+    /// vacant — see `open_pm_investiture`.
+    #[pallet::storage]
+    pub type InvestitureRound<T: Config> =
+        StorageValue<_, InvestitureRoundInfo<BlockNumberFor<T>>, OptionQuery>;
+
+    /// Nominees for the current investiture round, in nomination order — that order is
+    /// also the deterministic tie-break the instant-runoff tally eliminates by.
+    #[pallet::storage]
+    pub type PmNominees<T: Config> =
+        StorageValue<_, BoundedVec<T::AccountId, T::MaxPmCandidates>, ValueQuery>;
+
+    /// Legislature member → their ranked ballot for the current investiture round,
+    /// most-preferred candidate first.
+    #[pallet::storage]
+    pub type PmBallots<T: Config> = StorageMap<
+        _, Blake2_128Concat, T::AccountId, BoundedVec<T::AccountId, T::MaxPmCandidates>,
+    >;
+
+    // ── Storage: conviction-triggered vacancy sweep ─────────────────────────────────
+
+    /// Block the next automatic PM/minister eligibility sweep should run at.
+    #[pallet::storage]
+    pub type NextVacancySweepBlock<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+
     // ── Hooks ────────────────────────────────────────────────────────────────────
 
     #[pallet::hooks]
@@ -219,6 +340,18 @@ pub mod pallet {
                     weight = weight.saturating_add(T::DbWeight::get().writes(3));
                 }
             }
+
+            // Daily (config-driven) sweep: auto-vacate a PM/minister a court has
+            // suspended since they took office. See `run_vacancy_sweep`'s doc comment
+            // for why this is a periodic re-check rather than a cross-pallet hook.
+            if now >= NextVacancySweepBlock::<T>::get() {
+                weight = weight.saturating_add(Self::run_vacancy_sweep());
+                NextVacancySweepBlock::<T>::put(
+                    now.saturating_add(BlockNumberFor::<T>::from(T::VacancySweepIntervalBlocks::get())),
+                );
+                weight = weight.saturating_add(T::DbWeight::get().reads_writes(1, 1));
+            }
+
             weight
         }
     }
@@ -252,6 +385,28 @@ pub mod pallet {
         EmergencyExpired { at_block: BlockNumberFor<T> },
         /// Cabinet voted to end the emergency early; supermajority reached.
         EmergencyLifted,
+        /// The PM staged a nominee for a portfolio, awaiting legislature confirmation.
+        MinisterNominated { portfolio_id: u32, nominee: T::AccountId },
+        /// The Prime Minister resigned voluntarily.
+        PrimeMinisterResigned { who: T::AccountId },
+        /// A constructive no-confidence motion passed: old PM removed, successor
+        /// installed atomically in the same call — the office is never left vacant by
+        /// this path.
+        PrimeMinisterRemovedAndReplaced { old: T::AccountId, new: T::AccountId },
+        /// A PM investiture round opened; nominations close at `nomination_end`, voting
+        /// closes at `voting_end`.
+        PmInvestitureOpened { nomination_end: BlockNumberFor<T>, voting_end: BlockNumberFor<T> },
+        /// A candidate was nominated for the current PM investiture round.
+        PmCandidateNominated { candidate: T::AccountId },
+        /// A legislature member cast (or replaced) their ranked ballot.
+        PmBallotCast { voter: T::AccountId },
+        /// The investiture round closed with a winner, who is now Prime Minister.
+        PmInvestitureFinalized { winner: T::AccountId },
+        /// The investiture round closed with no winner (no candidates were nominated, or
+        /// no ballots were cast) — the seat remains vacant; a new round must be opened.
+        PmInvestitureFailedNoWinner,
+        /// The daily vacancy sweep removed a PM/minister a court has suspended.
+        OfficeVacatedForConviction { who: T::AccountId, role: VacatedRole },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────────
@@ -284,6 +439,43 @@ pub mod pallet {
         AlreadyRatified,
         /// Cabinet member has not cast an emergency declaration vote to retract.
         NotYetVoted,
+        /// Caller is not the current Prime Minister (`nominate_minister` is PM-only).
+        NotPrimeMinister,
+        /// `appoint_minister` was called for an account the PM never staged via
+        /// `nominate_minister` — legislature can only confirm, not originate, a pick.
+        NoNominationPending,
+        /// Candidate/nominee/successor must currently hold a legislature seat — the PM
+        /// is chosen by and from the legislature, not the general citizenry.
+        NotLegislatureMember,
+        /// The named successor is already the current Prime Minister.
+        SuccessorIsCurrentPm,
+        /// This account has already served `MaxConsecutivePmTerms` consecutive terms —
+        /// someone else must hold the office for at least one term before they're
+        /// eligible again.
+        PmTermLimitReached,
+        /// `open_pm_investiture` was called while a round is already open.
+        InvestitureAlreadyOpen,
+        /// `nominate_pm`/`cast_pm_ballot`/`finalize_pm_investiture` was called with no
+        /// investiture round currently open.
+        NoInvestitureOpen,
+        /// Investiture only opens on a vacancy — a Prime Minister is already appointed.
+        PmSeatNotVacant,
+        /// The current investiture round's nomination window has already closed.
+        NominationWindowClosed,
+        /// Still inside the nomination window — voting hasn't opened yet.
+        NominationWindowStillOpen,
+        /// The current investiture round's voting window has already closed.
+        VotingWindowClosed,
+        /// Still inside the voting window — the round can't be finalized yet.
+        VotingWindowStillOpen,
+        /// This candidate has already been nominated for the current round.
+        AlreadyNominated,
+        /// The current investiture round already holds `MaxPmCandidates` nominees.
+        TooManyPmCandidates,
+        /// A ranked ballot named an account that isn't a nominee this round.
+        NotANominee,
+        /// A ranked ballot named the same candidate more than once.
+        DuplicateCandidateInBallot,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -310,45 +502,197 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Appoint a Prime Minister. LegislatureOrigin only.
-        #[pallet::call_index(1)]
-        #[pallet::weight(T::WeightInfo::appoint_prime_minister())]
-        pub fn appoint_prime_minister(
+        /// Removed: direct single-candidate PM appointment. Superseded entirely by
+        /// `open_pm_investiture`/`nominate_pm`/`cast_pm_ballot`/`finalize_pm_investiture`
+        /// — a ranked-choice vote among legislature members, not a single up/down motion.
+        /// Keeping both would let legislature bypass the fair investiture process
+        /// whenever convenient. call_index 1 is deliberately left unused rather than
+        /// reassigned (see `#[pallet::call_index]`'s docs — indices need not be
+        /// contiguous, and reassigning a removed call's index to new, unrelated
+        /// behavior would be more confusing than leaving a gap).
+
+        /// Constructive vote of no confidence: removes the current Prime Minister and
+        /// installs `successor` atomically in the same motion. LegislatureOrigin only.
+        ///
+        /// Deliberately not a plain no-confidence vote (remove with no successor) —
+        /// that pattern lets a majority topple a government for purely obstructive
+        /// reasons with no obligation to agree on a replacement, which is what destabilized
+        /// interwar parliamentary systems. Requiring the successor to be named *in the same
+        /// vote* means removal is only possible when a replacement already has support.
+        #[pallet::call_index(2)]
+        #[pallet::weight(T::WeightInfo::remove_and_replace_prime_minister())]
+        pub fn remove_and_replace_prime_minister(
             origin: OriginFor<T>,
-            who: T::AccountId,
+            successor: T::AccountId,
         ) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-executive::appoint_prime_minister", who.clone()),
+                &legislature_call_hash(
+                    b"pallet-executive::remove_and_replace_prime_minister",
+                    successor.clone(),
+                ),
             )?;
-            if let Some(old) = PrimeMinister::<T>::get() {
-                // Invalidate the outgoing PM's pending emergency declaration vote.
-                DeclareVotes::<T>::remove(&old);
-                Self::deposit_event(Event::PrimeMinisterDismissed { who: old });
+            let old = PrimeMinister::<T>::get().ok_or(Error::<T>::NoPrimeMinister)?;
+            ensure!(successor != old, Error::<T>::SuccessorIsCurrentPm);
+            ensure!(
+                T::LegislatureMembership::is_member(&successor),
+                Error::<T>::NotLegislatureMember
+            );
+            ensure!(
+                PmConsecutiveTerms::<T>::get(&successor) < T::MaxConsecutivePmTerms::get(),
+                Error::<T>::PmTermLimitReached
+            );
+            Self::deposit_event(Event::PrimeMinisterDismissed { who: old.clone() });
+            Self::install_pm(successor.clone());
+            Self::deposit_event(Event::PrimeMinisterRemovedAndReplaced { old, new: successor });
+            Ok(())
+        }
+
+        /// Resign from being Prime Minister. Only the sitting PM may call this. Opens
+        /// the seat for a fresh investiture round — see `open_pm_investiture`.
+        #[pallet::call_index(10)]
+        #[pallet::weight(T::WeightInfo::resign_as_pm())]
+        pub fn resign_as_pm(origin: OriginFor<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(PrimeMinister::<T>::get().as_ref() == Some(&who), Error::<T>::NotPrimeMinister);
+            PrimeMinister::<T>::kill();
+            PmConsecutiveTerms::<T>::insert(&who, 0u32);
+            DeclareVotes::<T>::remove(&who);
+            Self::clear_pending_minister_nominations();
+            Self::deposit_event(Event::PrimeMinisterResigned { who });
+            Ok(())
+        }
+
+        /// Stage a nominee for a portfolio. Prime Minister only. Legislature must then
+        /// confirm via `appoint_minister` naming this exact account before it takes effect.
+        #[pallet::call_index(11)]
+        #[pallet::weight(T::WeightInfo::nominate_minister())]
+        pub fn nominate_minister(
+            origin: OriginFor<T>,
+            portfolio_id: u32,
+            candidate: T::AccountId,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(PrimeMinister::<T>::get().as_ref() == Some(&who), Error::<T>::NotPrimeMinister);
+            ensure!(Portfolios::<T>::contains_key(portfolio_id), Error::<T>::PortfolioNotFound);
+            PendingMinisterNomination::<T>::insert(portfolio_id, candidate.clone());
+            Self::deposit_event(Event::MinisterNominated { portfolio_id, nominee: candidate });
+            Ok(())
+        }
+
+        /// Open a PM investiture round. Anyone may call this, but only while the PM
+        /// seat is actually vacant and no round is already open — starting the clock on
+        /// an objective vacancy isn't a judgment call that needs a legislature vote.
+        #[pallet::call_index(12)]
+        #[pallet::weight(T::WeightInfo::open_pm_investiture())]
+        pub fn open_pm_investiture(origin: OriginFor<T>) -> DispatchResult {
+            let _ = ensure_signed(origin)?;
+            ensure!(PrimeMinister::<T>::get().is_none(), Error::<T>::PmSeatNotVacant);
+            ensure!(InvestitureRound::<T>::get().is_none(), Error::<T>::InvestitureAlreadyOpen);
+            let now = frame_system::Pallet::<T>::block_number();
+            let nomination_end =
+                now.saturating_add(BlockNumberFor::<T>::from(T::PmNominationWindowBlocks::get()));
+            let voting_end = nomination_end
+                .saturating_add(BlockNumberFor::<T>::from(T::PmVotingWindowBlocks::get()));
+            InvestitureRound::<T>::put(InvestitureRoundInfo { nomination_end, voting_end });
+            Self::deposit_event(Event::PmInvestitureOpened { nomination_end, voting_end });
+            Ok(())
+        }
+
+        /// Nominate a candidate for the open PM investiture round. Caller and candidate
+        /// must both currently hold a legislature seat — the PM is chosen by and from
+        /// the legislature.
+        #[pallet::call_index(13)]
+        #[pallet::weight(T::WeightInfo::nominate_pm())]
+        pub fn nominate_pm(origin: OriginFor<T>, candidate: T::AccountId) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                T::LegislatureMembership::is_member(&who),
+                Error::<T>::NotLegislatureMember
+            );
+            let round = InvestitureRound::<T>::get().ok_or(Error::<T>::NoInvestitureOpen)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now < round.nomination_end, Error::<T>::NominationWindowClosed);
+            ensure!(
+                T::LegislatureMembership::is_member(&candidate),
+                Error::<T>::NotLegislatureMember
+            );
+            ensure!(
+                PmConsecutiveTerms::<T>::get(&candidate) < T::MaxConsecutivePmTerms::get(),
+                Error::<T>::PmTermLimitReached
+            );
+            PmNominees::<T>::try_mutate(|nominees| {
+                ensure!(!nominees.contains(&candidate), Error::<T>::AlreadyNominated);
+                nominees.try_push(candidate.clone()).map_err(|_| Error::<T>::TooManyPmCandidates)?;
+                Ok::<(), DispatchError>(())
+            })?;
+            Self::deposit_event(Event::PmCandidateNominated { candidate });
+            Ok(())
+        }
+
+        /// Cast (or replace) a ranked ballot for the open PM investiture round. Must be
+        /// a current legislature member; every ranked candidate must be a nominee this
+        /// round, with no duplicates.
+        #[pallet::call_index(14)]
+        #[pallet::weight(T::WeightInfo::cast_pm_ballot())]
+        pub fn cast_pm_ballot(
+            origin: OriginFor<T>,
+            ranked_candidates: BoundedVec<T::AccountId, T::MaxPmCandidates>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                T::LegislatureMembership::is_member(&who),
+                Error::<T>::NotLegislatureMember
+            );
+            let round = InvestitureRound::<T>::get().ok_or(Error::<T>::NoInvestitureOpen)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now >= round.nomination_end, Error::<T>::NominationWindowStillOpen);
+            ensure!(now < round.voting_end, Error::<T>::VotingWindowClosed);
+            let nominees = PmNominees::<T>::get();
+            let mut seen: alloc::vec::Vec<T::AccountId> = alloc::vec::Vec::new();
+            for c in ranked_candidates.iter() {
+                ensure!(nominees.contains(c), Error::<T>::NotANominee);
+                ensure!(!seen.contains(c), Error::<T>::DuplicateCandidateInBallot);
+                seen.push(c.clone());
             }
-            // Clear any stale vote the incoming account may carry from a prior cabinet tenure.
-            DeclareVotes::<T>::remove(&who);
-            PrimeMinister::<T>::put(who.clone());
-            Self::deposit_event(Event::PrimeMinisterAppointed { who });
+            PmBallots::<T>::insert(&who, ranked_candidates);
+            Self::deposit_event(Event::PmBallotCast { voter: who });
             Ok(())
         }
 
-        /// Dismiss the Prime Minister. LegislatureOrigin only.
-        #[pallet::call_index(2)]
-        #[pallet::weight(T::WeightInfo::dismiss_prime_minister())]
-        pub fn dismiss_prime_minister(origin: OriginFor<T>) -> DispatchResult {
-            T::LegislatureOrigin::ensure_origin(
-                origin,
-                &legislature_call_hash(b"pallet-executive::dismiss_prime_minister", ()),
-            )?;
-            let who = PrimeMinister::<T>::take().ok_or(Error::<T>::NoPrimeMinister)?;
-            // Invalidate the dismissed PM's pending emergency declaration vote.
-            DeclareVotes::<T>::remove(&who);
-            Self::deposit_event(Event::PrimeMinisterDismissed { who });
+        /// Close the PM investiture round once its voting window has passed, tally
+        /// ranked ballots by instant-runoff, and install the winner. Anyone may call
+        /// this. Emits `PmInvestitureFailedNoWinner` (seat stays vacant, a fresh round
+        /// must be opened) if no candidates were nominated or no ballots were cast.
+        #[pallet::call_index(15)]
+        #[pallet::weight(T::WeightInfo::finalize_pm_investiture())]
+        pub fn finalize_pm_investiture(origin: OriginFor<T>) -> DispatchResult {
+            let _ = ensure_signed(origin)?;
+            let round = InvestitureRound::<T>::get().ok_or(Error::<T>::NoInvestitureOpen)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now >= round.voting_end, Error::<T>::VotingWindowStillOpen);
+
+            let winner = Self::run_instant_runoff();
+
+            InvestitureRound::<T>::kill();
+            let _ = PmBallots::<T>::clear(u32::MAX, None);
+            PmNominees::<T>::kill();
+
+            match winner {
+                Some(w) => {
+                    Self::install_pm(w.clone());
+                    Self::deposit_event(Event::PmInvestitureFinalized { winner: w });
+                }
+                None => {
+                    Self::deposit_event(Event::PmInvestitureFailedNoWinner);
+                }
+            }
             Ok(())
         }
 
-        /// Appoint a minister to a portfolio. LegislatureOrigin only.
+        /// Appoint a minister to a portfolio. LegislatureOrigin only, and only for the
+        /// account the Prime Minister has staged via `nominate_minister` for this
+        /// portfolio — legislature confirms the PM's pick, it doesn't originate one.
         ///
         /// If the portfolio is already occupied, the previous holder is automatically dismissed.
         /// If the incoming account already holds a different portfolio, they are vacated first.
@@ -367,6 +711,10 @@ pub mod pallet {
                 ),
             )?;
             ensure!(Portfolios::<T>::contains_key(portfolio_id), Error::<T>::PortfolioNotFound);
+            let nominee = PendingMinisterNomination::<T>::get(portfolio_id)
+                .ok_or(Error::<T>::NoNominationPending)?;
+            ensure!(nominee == who, Error::<T>::NoNominationPending);
+            PendingMinisterNomination::<T>::remove(portfolio_id);
 
             // Vacate whoever currently holds this portfolio.
             if let Some(old) = PortfolioMinister::<T>::get(portfolio_id) {
@@ -579,6 +927,159 @@ pub mod pallet {
             }
             votes.saturating_mul(T::SupermajorityDenominator::get())
                 >= cabinet_size.saturating_mul(T::SupermajorityNumerator::get())
+        }
+
+        /// Installs `new_pm` as Prime Minister, handling all of the bookkeeping any path
+        /// that changes who holds the office needs: clears the outgoing PM's stale
+        /// emergency vote and any pending minister nomination they staged (so it can
+        /// never be confirmed under a successor's watch — see
+        /// `clear_pending_minister_nominations`), and updates consecutive-term tracking.
+        ///
+        /// Consecutive-term semantics: incremented only when `new_pm` is the *same*
+        /// account that just held the office (i.e. re-selected with nobody else holding
+        /// it in between); reset to 1 for anyone else. The outgoing PM's own count is
+        /// simultaneously reset to 0, since their consecutive streak is broken the
+        /// moment someone else holds the office — this is what makes the term limit a
+        /// *consecutive*-terms cap rather than a lifetime one.
+        fn install_pm(new_pm: T::AccountId) {
+            let previous = PrimeMinister::<T>::get();
+            if let Some(prev) = &previous {
+                DeclareVotes::<T>::remove(prev);
+                if prev != &new_pm {
+                    PmConsecutiveTerms::<T>::insert(prev, 0u32);
+                }
+            }
+            Self::clear_pending_minister_nominations();
+            let terms = if previous.as_ref() == Some(&new_pm) {
+                PmConsecutiveTerms::<T>::get(&new_pm).saturating_add(1)
+            } else {
+                1u32
+            };
+            PmConsecutiveTerms::<T>::insert(&new_pm, terms);
+            DeclareVotes::<T>::remove(&new_pm);
+            PrimeMinister::<T>::put(new_pm.clone());
+            Self::deposit_event(Event::PrimeMinisterAppointed { who: new_pm });
+        }
+
+        /// Clears every staged-but-unconfirmed minister nomination. Called whenever the
+        /// PM office changes hands, so an outgoing PM's pick can never be confirmed by
+        /// legislature after they've left — confirmation should always reflect the
+        /// *current* PM's judgment.
+        fn clear_pending_minister_nominations() {
+            let _ = PendingMinisterNomination::<T>::clear(u32::MAX, None);
+        }
+
+        /// Re-checks the sitting PM and every sitting minister's citizen-suspension
+        /// status and auto-vacates anyone suspended by a *jury-reviewed* conviction since
+        /// they took office. Run periodically from `on_initialize` (see
+        /// `VacancySweepIntervalBlocks`) rather than wired as a cross-pallet hook off
+        /// pallet-courts/pallet-identity: the set being checked is always tiny (one PM, a
+        /// handful of ministers), so polling costs nothing meaningful, and it keeps this
+        /// pallet self-contained instead of threading a hook through two other pallets.
+        ///
+        /// Deliberately checks `is_suspended_by_jury_reviewed_conviction`, not just
+        /// `is_active_citizen`: a bare, unappealed AI ruling is *not* enough on its own to
+        /// remove a sitting PM/minister — only a suspension a jury actually reviewed is.
+        /// This is the same reasoning as requiring a named successor for a no-confidence
+        /// vote (`remove_and_replace_prime_minister`): the consequence is large, so the
+        /// bar for triggering it automatically is the highest one this system has,
+        /// rather than the lowest. A suspended-but-not-jury-reviewed office holder isn't
+        /// exempt from consequences — legislature can still remove them via a
+        /// no-confidence vote at any time, and they're simply blocked from being
+        /// nominated again (see `nominate_pm`) if their suspension outlives their term.
+        fn run_vacancy_sweep() -> Weight {
+            let mut weight = Weight::zero();
+            if let Some(pm) = PrimeMinister::<T>::get() {
+                weight = weight.saturating_add(T::DbWeight::get().reads(2));
+                if T::CitizenChecker::is_suspended_by_jury_reviewed_conviction(&pm) {
+                    PrimeMinister::<T>::kill();
+                    PmConsecutiveTerms::<T>::insert(&pm, 0u32);
+                    DeclareVotes::<T>::remove(&pm);
+                    Self::clear_pending_minister_nominations();
+                    Self::deposit_event(Event::OfficeVacatedForConviction {
+                        who: pm,
+                        role: VacatedRole::PrimeMinister,
+                    });
+                    weight = weight.saturating_add(T::DbWeight::get().writes(4));
+                }
+            }
+            let ministers: alloc::vec::Vec<(u32, T::AccountId)> =
+                PortfolioMinister::<T>::iter().collect();
+            for (portfolio_id, minister) in ministers {
+                weight = weight.saturating_add(T::DbWeight::get().reads(2));
+                if T::CitizenChecker::is_suspended_by_jury_reviewed_conviction(&minister) {
+                    PortfolioMinister::<T>::remove(portfolio_id);
+                    MinisterPortfolio::<T>::remove(&minister);
+                    DeclareVotes::<T>::remove(&minister);
+                    Self::deposit_event(Event::OfficeVacatedForConviction {
+                        who: minister,
+                        role: VacatedRole::Minister { portfolio_id },
+                    });
+                    weight = weight.saturating_add(T::DbWeight::get().writes(3));
+                }
+            }
+            weight
+        }
+
+        /// Instant-runoff tally over the current investiture round's nominees/ballots.
+        /// Returns `None` if there are no nominees or no ballots were cast at all
+        /// (rather than declaring an arbitrary winner by tie-break alone).
+        ///
+        /// Each round: tally every ballot's most-preferred still-active candidate: if
+        /// one has a strict majority of ballots still counting toward *some* active
+        /// candidate, they win. Otherwise eliminate whoever has the fewest such votes
+        /// and repeat. Ties for fewest are broken toward eliminating whoever was
+        /// nominated later — deterministic, no on-chain randomness needed for a
+        /// governance tally. `active` strictly shrinks by exactly one every iteration,
+        /// so this always terminates within `nominees.len()` rounds.
+        fn run_instant_runoff() -> Option<T::AccountId> {
+            let mut active: alloc::vec::Vec<T::AccountId> = PmNominees::<T>::get().into_inner();
+            if active.is_empty() {
+                return None;
+            }
+            let ballots: alloc::vec::Vec<alloc::vec::Vec<T::AccountId>> =
+                PmBallots::<T>::iter().map(|(_, b)| b.into_inner()).collect();
+            if ballots.is_empty() {
+                return None;
+            }
+
+            while active.len() > 1 {
+                let mut tally: alloc::vec::Vec<(T::AccountId, u32)> =
+                    active.iter().cloned().map(|c| (c, 0u32)).collect();
+                for ballot in ballots.iter() {
+                    if let Some(pref) = ballot.iter().find(|c| active.contains(c)) {
+                        if let Some(entry) = tally.iter_mut().find(|(c, _)| c == pref) {
+                            entry.1 = entry.1.saturating_add(1);
+                        }
+                    }
+                }
+                let total_counted: u32 = tally.iter().map(|(_, c)| *c).sum();
+
+                if let Some((winner, count)) = tally.iter().max_by_key(|(_, c)| *c) {
+                    if total_counted > 0 && (*count as u64).saturating_mul(2) > total_counted as u64 {
+                        return Some(winner.clone());
+                    }
+                }
+
+                let min_count = tally.iter().map(|(_, c)| *c).min().unwrap_or(0);
+                let elimination = active
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        tally.iter().find(|(cand, _)| cand == *c).map(|(_, ct)| *ct)
+                            == Some(min_count)
+                    })
+                    .map(|(i, _)| i)
+                    .last();
+                match elimination {
+                    Some(pos) => {
+                        active.remove(pos);
+                    }
+                    None => return None, // unreachable: tally is built from active itself.
+                }
+            }
+
+            active.into_iter().next()
         }
     }
 }

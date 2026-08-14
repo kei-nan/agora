@@ -341,6 +341,19 @@ pub mod pallet {
     pub type SuspendedNullifiers<T: Config> =
         StorageMap<_, Blake2_128Concat, [u8; 32], Option<BlockNumberFor<T>>>;
 
+    /// Whether the *current* entry in `SuspendedNullifiers` (if any) came from a jury-reviewed
+    /// conviction — i.e. a `pallet-courts` case that reached `CaseStatus::JurySeated` and was
+    /// decided by `cast_jury_vote`'s majority, as opposed to an unappealed `AIRulingIssued`
+    /// case finalized by `finalize_ruling`, or the manual `suspend_citizen` extrinsic below
+    /// (both oracle-only, no jury ever involved). Absent/false is the safe default. Consumers
+    /// that need a higher evidentiary bar before acting on a suspension — see
+    /// `pallet-executive`'s conviction-triggered office vacancy sweep, which deliberately does
+    /// NOT auto-remove a sitting PM/minister on a bare, unappealed AI ruling — check this
+    /// alongside `is_active_citizen` via `is_suspended_by_jury_reviewed_conviction`.
+    #[pallet::storage]
+    pub type SuspendedByJuryReview<T: Config> =
+        StorageMap<_, Blake2_128Concat, [u8; 32], bool, ValueQuery>;
+
     /// Trusted issuer Merkle roots (certificate_registry_root from ZKPassport's outer
     /// circuit, public_inputs[0]). A proof is only accepted if its certificate_registry_root
     /// matches one of these roots. Roots represent trusted sets of country certificate
@@ -723,6 +736,7 @@ pub mod pallet {
             CitizenNullifier::<T>::remove(&who);
             NullifierRegistry::<T>::remove(nullifier);
             SuspendedNullifiers::<T>::remove(nullifier);
+            SuspendedByJuryReview::<T>::remove(nullifier);
             ReverificationDeadline::<T>::remove(&who);
             // Retire the citizen's identity anchor too — a fresh registration under a new
             // anchor is expected to go through the normal exclusion check again. Note:
@@ -762,6 +776,11 @@ pub mod pallet {
             ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
             // Upsert: courts may extend or modify an existing suspension.
             SuspendedNullifiers::<T>::insert(nullifier, until);
+            // This extrinsic is `SuspensionOrigin`-gated (the same oracle account as an
+            // unappealed AI ruling, see `Config::SuspensionOrigin`'s doc comment) — no jury is
+            // ever involved on this path, so it's never eligible to trigger a higher-bar
+            // consequence like automatic office removal.
+            SuspendedByJuryReview::<T>::insert(nullifier, false);
             Self::deposit_event(Event::CitizenSuspended { nullifier, until });
             Ok(())
         }
@@ -782,6 +801,7 @@ pub mod pallet {
                 Error::<T>::NotSuspended
             );
             SuspendedNullifiers::<T>::remove(nullifier);
+            SuspendedByJuryReview::<T>::remove(nullifier);
             Self::deposit_event(Event::CitizenRestored { nullifier });
             Ok(())
         }
@@ -1223,12 +1243,17 @@ pub mod pallet {
         /// is finalized. Bypasses the extrinsic origin check — courts are pre-authorized.
         /// Upserts: if a suspension record already exists it is replaced, allowing courts to
         /// extend or modify a citizen's suspension without needing to restore first.
+        /// `jury_reviewed` reflects which path pallet-courts' `auto_finalize` took to get
+        /// here (jury majority vs. an unappealed AI ruling) — see `SuspendedByJuryReview`'s
+        /// doc comment for what it's used for and why the distinction matters.
         pub fn suspend_citizen_internal(
             nullifier: [u8; 32],
             until: Option<BlockNumberFor<T>>,
+            jury_reviewed: bool,
         ) -> DispatchResult {
             ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
             SuspendedNullifiers::<T>::insert(nullifier, until);
+            SuspendedByJuryReview::<T>::insert(nullifier, jury_reviewed);
             Self::deposit_event(Event::CitizenSuspended { nullifier, until });
             Ok(())
         }
@@ -1276,6 +1301,30 @@ pub mod pallet {
         /// True if the account is registered (regardless of suspension status).
         pub fn is_citizen(who: &T::AccountId) -> bool {
             CitizenNullifier::<T>::contains_key(who)
+        }
+
+        /// True only if the account is *currently* suspended (not expired — same lazy-expiry
+        /// semantics as `is_active_citizen`) AND that suspension came from a jury-reviewed
+        /// conviction, not a bare unappealed AI ruling or the manual admin override. See
+        /// `SuspendedByJuryReview`'s doc comment for the full rationale.
+        pub fn is_suspended_by_jury_reviewed_conviction(who: &T::AccountId) -> bool {
+            let Some(nullifier) = CitizenNullifier::<T>::get(who) else { return false; };
+            let currently_suspended = match SuspendedNullifiers::<T>::get(nullifier) {
+                None => false,
+                Some(None) => true, // indefinite
+                Some(Some(until)) => {
+                    if frame_system::Pallet::<T>::block_number() > until {
+                        // Lazily clean up, mirroring is_active_citizen — an expired suspension
+                        // is no longer "currently suspended" by either measure.
+                        SuspendedNullifiers::<T>::remove(nullifier);
+                        SuspendedByJuryReview::<T>::remove(nullifier);
+                        false
+                    } else {
+                        true
+                    }
+                }
+            };
+            currently_suspended && SuspendedByJuryReview::<T>::get(nullifier)
         }
 
         /// Shared bump logic for `rotate_oprf_scheme` / `emergency_rotate_oprf_scheme`. Only

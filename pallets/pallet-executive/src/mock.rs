@@ -1,9 +1,86 @@
 use crate as pallet_executive;
-use frame_support::derive_impl;
-use frame_support::traits::ConstU32;
+use frame_support::{derive_impl, traits::ConstU32};
 use sp_runtime::BuildStorage;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 type Block = frame_system::mocking::MockBlock<Test>;
+
+// ── Test-only cross-pallet mocks ────────────────────────────────────────────
+//
+// pallet-executive depends on cross-pallet traits normally backed by pallet-identity
+// (CitizenChecker) and pallet-legislature (LegislatureMembership) in the real runtime. Here
+// we back them with simple thread-local state so each test can freely control which
+// accounts are "active citizens" / "legislature members".
+
+thread_local! {
+    // Tracked as *suspended* accounts (opt-in), not active ones — so an account nobody
+    // has called `set_active_citizen(_, false)` on defaults to active. That default matters:
+    // the daily vacancy sweep runs unconditionally from block 0 in every test, and without
+    // this default every test that appoints a PM/minister and then calls `on_initialize`
+    // would find them "not active" and silently vacate them.
+    static SUSPENDED_CITIZENS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    static LEGISLATURE_MEMBERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    // Accounts whose *current* suspension (if any) came from a jury-reviewed conviction, not
+    // a bare unappealed AI ruling. Defaults to false: suspending an account via
+    // `set_active_citizen(_, false)` alone models the AI-only path, which must NOT be enough
+    // on its own to trigger the vacancy sweep — see `is_suspended_by_jury_reviewed_conviction`.
+    static JURY_REVIEWED_SUSPENSIONS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+}
+
+/// Marks `who` as an active (non-suspended) registered citizen, or suspended (modeling the
+/// unappealed-AI-ruling path unless paired with `set_jury_reviewed_suspension`). Defaults to
+/// active for any account this is never called for.
+pub fn set_active_citizen(who: u64, active: bool) {
+    SUSPENDED_CITIZENS.with(|c| {
+        if active {
+            c.borrow_mut().remove(&who);
+        } else {
+            c.borrow_mut().insert(who);
+        }
+    });
+}
+
+/// Marks whether `who`'s current suspension (set via `set_active_citizen(_, false)`) came
+/// from a jury-reviewed conviction. Meaningless if `who` isn't currently suspended.
+pub fn set_jury_reviewed_suspension(who: u64, jury_reviewed: bool) {
+    JURY_REVIEWED_SUSPENSIONS.with(|j| {
+        if jury_reviewed {
+            j.borrow_mut().insert(who);
+        } else {
+            j.borrow_mut().remove(&who);
+        }
+    });
+}
+
+/// Marks `who` as a current legislature member, or removes them.
+pub fn set_legislature_member(who: u64, member: bool) {
+    LEGISLATURE_MEMBERS.with(|m| {
+        if member {
+            m.borrow_mut().insert(who);
+        } else {
+            m.borrow_mut().remove(&who);
+        }
+    });
+}
+
+pub struct TestCitizenChecker;
+impl pallet_executive::CitizenChecker<u64> for TestCitizenChecker {
+    fn is_active_citizen(who: &u64) -> bool {
+        !SUSPENDED_CITIZENS.with(|c| c.borrow().contains(who))
+    }
+    fn is_suspended_by_jury_reviewed_conviction(who: &u64) -> bool {
+        SUSPENDED_CITIZENS.with(|c| c.borrow().contains(who))
+            && JURY_REVIEWED_SUSPENSIONS.with(|j| j.borrow().contains(who))
+    }
+}
+
+pub struct TestLegislatureMembership;
+impl pallet_executive::LegislatureMembership<u64> for TestLegislatureMembership {
+    fn is_member(who: &u64) -> bool {
+        LEGISLATURE_MEMBERS.with(|m| m.borrow().contains(who))
+    }
+}
 
 #[frame_support::runtime]
 mod runtime {
@@ -50,7 +127,28 @@ impl pallet_executive::Config for Test {
     type RatificationWindowBlocks = ConstU32<10>;
     type SupermajorityNumerator = ConstU32<2>;
     type SupermajorityDenominator = ConstU32<3>;
+    type CitizenChecker = TestCitizenChecker;
+    type LegislatureMembership = TestLegislatureMembership;
+    type PmNominationWindowBlocks = ConstU32<5>;
+    type PmVotingWindowBlocks = ConstU32<5>;
+    type MaxPmCandidates = ConstU32<8>;
+    type MaxConsecutivePmTerms = ConstU32<2>;
+    type VacancySweepIntervalBlocks = ConstU32<20>;
     type WeightInfo = ();
+    #[cfg(feature = "runtime-benchmarks")]
+    type BenchmarkHelper = TestBenchmarkHelper;
+}
+
+#[cfg(feature = "runtime-benchmarks")]
+pub struct TestBenchmarkHelper;
+#[cfg(feature = "runtime-benchmarks")]
+impl pallet_executive::BenchmarkHelper<u64> for TestBenchmarkHelper {
+    fn make_active_citizen(who: &u64) {
+        set_active_citizen(*who, true);
+    }
+    fn make_legislature_member(who: &u64) {
+        set_legislature_member(*who, true);
+    }
 }
 
 // Build genesis storage according to the mock runtime.

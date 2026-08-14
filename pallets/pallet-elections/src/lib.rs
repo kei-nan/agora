@@ -1,16 +1,18 @@
 //! # Elections Pallet
 //!
-//! Manages two separate concerns:
+//! Liquid Democracy Delegates + Legislature Elections: manages the public delegate registry
+//! for vote delegation, and runs periodic elections to seat the top-N delegates (by backing
+//! count) into pallet-legislature — entirely automatic, no committee or human certification
+//! step anywhere in the flow.
 //!
-//! ## A) Elections Commission
-//! Handles office elections (commissioners, candidates, results certification).
-//! Flow: root adds commissioners → commissioner creates election → citizens register as
-//! candidates → commissioner certifies eligible candidates → commissioner submits results
-//! → commissioner certifies results.
-//!
-//! ## B) Liquid Democracy Delegates + Legislature Elections
-//! Manages the public delegate registry for vote delegation, and runs periodic elections
-//! to seat the top-N delegates (by backing count) into pallet-legislature.
+//! This pallet used to also run a separate "Elections Commission" subsystem (commissioners,
+//! named "office" elections, candidate registration/certification, result submission).
+//! Removed: it certified an election's outcome on nothing but a commissioner's say-so — there
+//! was no on-chain tally behind `submit_results` at all — and nothing in this system's actual
+//! design turned out to need a citizen-facing "elect one person to a named office" mechanism.
+//! Legislature seats fill automatically via the backing mechanism below; the Prime Minister is
+//! chosen by the legislature itself via pallet-executive's ranked-choice investiture. See
+//! docs/project/changelog/ for the full removal rationale.
 //!
 //! ### Delegate identity
 //! Separate from citizen identity: uses `Poseidon2(national_id || country_code || "delegate")`
@@ -53,7 +55,7 @@ pub mod pallet {
     use codec::DecodeWithMemTracking;
     use frame_support::{
         pallet_prelude::*,
-        traits::{Currency, EnsureOriginWithArg, ReservableCurrency},
+        traits::EnsureOriginWithArg,
     };
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::{Saturating, Zero};
@@ -68,23 +70,10 @@ pub mod pallet {
         frame_support::Hashable::blake2_256(&preimage)
     }
 
-    // ── Balance type alias ─────────────────────────────────────────────────────
-
-    pub type BalanceOf<T> = <<T as Config>::Currency as Currency<
-        <T as frame_system::Config>::AccountId,
-    >>::Balance;
-
     // ── Cross-pallet traits ────────────────────────────────────────────────────
 
     pub trait CitizenChecker<AccountId> {
         fn is_active_citizen(who: &AccountId) -> bool;
-    }
-
-    /// Checks whether an account has a current (non-overdue) asset disclosure on file in
-    /// pallet-anticorruption. Implemented in the runtime by delegating to
-    /// pallet-anticorruption's `has_current_disclosure`.
-    pub trait DisclosureChecker<AccountId> {
-        fn has_current_disclosure(who: &AccountId) -> bool;
     }
 
     /// Called by pallet-elections at the end of each election cycle.
@@ -102,40 +91,6 @@ pub mod pallet {
     #[cfg(feature = "runtime-benchmarks")]
     pub trait BenchmarkHelper<AccountId> {
         fn make_active_citizen(who: &AccountId);
-    }
-
-    // ── Data types: Elections Commission ──────────────────────────────────────
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
-    pub enum CandidateStatus {
-        Registered,
-        Certified,
-        Disqualified,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
-    pub struct CandidateInfo<AccountId, Balance> {
-        pub profile_ipfs_hash: [u8; 32],
-        pub status: CandidateStatus,
-        pub deposit: Balance,
-        pub account: AccountId,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
-    pub enum ElectionStatus {
-        Open,
-        ResultsSubmitted,
-        Certified,
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
-    pub struct ElectionInfo<AccountId, BlockNumber> {
-        pub office: BoundedVec<u8, ConstU32<64>>,
-        pub start_block: BlockNumber,
-        pub end_block: BlockNumber,
-        pub status: ElectionStatus,
-        pub winner: Option<AccountId>,
-        pub results_ipfs_hash: Option<[u8; 32]>,
     }
 
     // ── Data types: Delegates ──────────────────────────────────────────────────
@@ -178,15 +133,6 @@ pub mod pallet {
     pub trait Config: frame_system::Config {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
-        #[pallet::constant]
-        type CandidateDeposit: Get<BalanceOf<Self>>;
-
-        #[pallet::constant]
-        type MaxCommissioners: Get<u32>;
-
-        #[pallet::constant]
-        type MaxCandidatesPerElection: Get<u32>;
-
         /// Hard cap on the number of registered delegates.
         #[pallet::constant]
         type MaxDelegates: Get<u32>;
@@ -198,11 +144,7 @@ pub mod pallet {
         #[pallet::constant]
         type MaxDelegateSweepPerBlock: Get<u32>;
 
-        type Currency: ReservableCurrency<Self::AccountId>;
         type CitizenChecker: CitizenChecker<Self::AccountId>;
-
-        /// Gates candidacy on having a current asset disclosure in pallet-anticorruption.
-        type DisclosureChecker: DisclosureChecker<Self::AccountId>;
 
         /// Origin that can change `BackingThreshold` (ordinary supermajority governance).
         /// `EnsureOriginWithArg` so the call site must pass the domain-separated hash of its
@@ -266,34 +208,6 @@ pub mod pallet {
         #[cfg(feature = "runtime-benchmarks")]
         type BenchmarkHelper: BenchmarkHelper<Self::AccountId>;
     }
-
-    // ── Storage: Elections Commission ──────────────────────────────────────────
-
-    #[pallet::storage]
-    pub type Commissioners<T: Config> =
-        StorageValue<_, BoundedVec<T::AccountId, T::MaxCommissioners>, ValueQuery>;
-
-    #[pallet::storage]
-    pub type Elections<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32, ElectionInfo<T::AccountId, BlockNumberFor<T>>>;
-
-    #[pallet::storage]
-    pub type Candidates<T: Config> = StorageDoubleMap<
-        _,
-        Blake2_128Concat, u32,
-        Blake2_128Concat, T::AccountId,
-        CandidateInfo<T::AccountId, BalanceOf<T>>,
-    >;
-
-    #[pallet::storage]
-    pub type NextElectionId<T: Config> = StorageValue<_, u32, ValueQuery>;
-
-    /// Number of candidates registered per election. Enforced against
-    /// MaxCandidatesPerElection on every register_candidate call — bounds the
-    /// unbounded iteration in certify_results over Candidates::iter_prefix.
-    #[pallet::storage]
-    pub type CandidateCount<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32, u32, ValueQuery>;
 
     // ── Storage: Delegate registry ─────────────────────────────────────────────
 
@@ -416,15 +330,6 @@ pub mod pallet {
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
-        // ── Elections Commission ──
-        CommissionerAdded { account: T::AccountId },
-        CommissionerRemoved { account: T::AccountId },
-        ElectionCreated { id: u32 },
-        CandidateRegistered { election_id: u32, candidate: T::AccountId },
-        CandidateCertified { election_id: u32, candidate: T::AccountId },
-        ResultsSubmitted { election_id: u32, winner: T::AccountId },
-        ElectionCertified { election_id: u32, winner: T::AccountId },
-
         // ── Delegates ──
         DelegateRegistered { delegate: T::AccountId, display_name: BoundedVec<u8, ConstU32<64>> },
         DelegateActivated { delegate: T::AccountId },
@@ -456,16 +361,7 @@ pub mod pallet {
 
     #[pallet::error]
     pub enum Error<T> {
-        NotCommissioner,
         NotActiveCitizen,
-        ElectionNotFound,
-        CandidateAlreadyRegistered,
-        ResultsAlreadySubmitted,
-        ElectionNotOpen,
-        AlreadyCertified,
-        CandidateNotFound,
-        TooManyCommissioners,
-        InsufficientBalance,
         AlreadyRegisteredAsDelegate,
         DelegateNotFound,
         AlreadyBacking,
@@ -481,17 +377,8 @@ pub mod pallet {
         BackingLimitReached,
         /// Legislature seat count must be at least 1.
         ElectionSeatsZero,
-        /// Account is already a registered commissioner.
-        AlreadyCommissioner,
-        /// certify_results requires results to be submitted first.
-        ResultsNotSubmitted,
         /// Election cycle length cannot be zero — elections would never run.
         ElectionCycleBlocksZero,
-        /// Election has reached MaxCandidatesPerElection and cannot accept more registrations.
-        TooManyCandidates,
-        /// Candidacy requires a current (non-overdue) asset disclosure on file in
-        /// pallet-anticorruption; the caller has none, or theirs has lapsed past its due date.
-        DisclosureRequired,
     }
 
     // ── on_initialize: term warnings, expirations, and legislature elections ───
@@ -652,147 +539,19 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        // ── Elections Commission ───────────────────────────────────────────────
-
-        #[pallet::call_index(0)]
-        #[pallet::weight(T::WeightInfo::add_commissioner())]
-        pub fn add_commissioner(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
-            Commissioners::<T>::try_mutate(|commissioners| {
-                ensure!(!commissioners.contains(&account), Error::<T>::AlreadyCommissioner);
-                commissioners.try_push(account.clone()).map_err(|_| Error::<T>::TooManyCommissioners)?;
-                Self::deposit_event(Event::CommissionerAdded { account });
-                Ok(())
-            })
-        }
-
-        #[pallet::call_index(1)]
-        #[pallet::weight(T::WeightInfo::remove_commissioner())]
-        pub fn remove_commissioner(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
-            Commissioners::<T>::try_mutate(|commissioners| {
-                if let Some(idx) = commissioners.iter().position(|a| a == &account) {
-                    commissioners.remove(idx);
-                    Self::deposit_event(Event::CommissionerRemoved { account });
-                }
-                Ok(())
-            })
-        }
-
-        #[pallet::call_index(2)]
-        #[pallet::weight(T::WeightInfo::create_election())]
-        pub fn create_election(
-            origin: OriginFor<T>,
-            office: BoundedVec<u8, ConstU32<64>>,
-            start_block: BlockNumberFor<T>,
-            end_block: BlockNumberFor<T>,
-        ) -> DispatchResult {
-            match ensure_signed(origin.clone()) {
-                Ok(signed) => Self::ensure_commissioner_account(&signed)?,
-                Err(_) => ensure_root(origin)?,
-            }
-            let id = NextElectionId::<T>::get();
-            Elections::<T>::insert(id, ElectionInfo {
-                office, start_block, end_block,
-                status: ElectionStatus::Open, winner: None, results_ipfs_hash: None,
-            });
-            NextElectionId::<T>::put(id.saturating_add(1));
-            Self::deposit_event(Event::ElectionCreated { id });
-            Ok(())
-        }
-
-        #[pallet::call_index(3)]
-        #[pallet::weight(T::WeightInfo::register_candidate())]
-        pub fn register_candidate(
-            origin: OriginFor<T>,
-            election_id: u32,
-            profile_ipfs_hash: [u8; 32],
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::NotActiveCitizen);
-            ensure!(
-                T::DisclosureChecker::has_current_disclosure(&who),
-                Error::<T>::DisclosureRequired
-            );
-            let election = Elections::<T>::get(election_id).ok_or(Error::<T>::ElectionNotFound)?;
-            ensure!(election.status == ElectionStatus::Open, Error::<T>::ElectionNotOpen);
-            ensure!(!Candidates::<T>::contains_key(election_id, &who), Error::<T>::CandidateAlreadyRegistered);
-            let count = CandidateCount::<T>::get(election_id);
-            ensure!(count < T::MaxCandidatesPerElection::get(), Error::<T>::TooManyCandidates);
-            let deposit = T::CandidateDeposit::get();
-            T::Currency::reserve(&who, deposit).map_err(|_| Error::<T>::InsufficientBalance)?;
-            Candidates::<T>::insert(election_id, &who, CandidateInfo {
-                profile_ipfs_hash, status: CandidateStatus::Registered, deposit, account: who.clone(),
-            });
-            CandidateCount::<T>::insert(election_id, count.saturating_add(1));
-            Self::deposit_event(Event::CandidateRegistered { election_id, candidate: who });
-            Ok(())
-        }
-
-        #[pallet::call_index(4)]
-        #[pallet::weight(T::WeightInfo::certify_candidate())]
-        pub fn certify_candidate(
-            origin: OriginFor<T>, election_id: u32, candidate: T::AccountId,
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            Self::ensure_commissioner_account(&who)?;
-            ensure!(Elections::<T>::contains_key(election_id), Error::<T>::ElectionNotFound);
-            Candidates::<T>::try_mutate(election_id, &candidate, |maybe| {
-                let info = maybe.as_mut().ok_or(Error::<T>::CandidateNotFound)?;
-                info.status = CandidateStatus::Certified;
-                Ok::<(), DispatchError>(())
-            })?;
-            Self::deposit_event(Event::CandidateCertified { election_id, candidate });
-            Ok(())
-        }
-
-        #[pallet::call_index(5)]
-        #[pallet::weight(T::WeightInfo::submit_results())]
-        pub fn submit_results(
-            origin: OriginFor<T>, election_id: u32, winner: T::AccountId,
-            results_ipfs_hash: [u8; 32],
-        ) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            Self::ensure_commissioner_account(&who)?;
-            Elections::<T>::try_mutate(election_id, |maybe| {
-                let election = maybe.as_mut().ok_or(Error::<T>::ElectionNotFound)?;
-                ensure!(election.status == ElectionStatus::Open, Error::<T>::ElectionNotOpen);
-                election.status = ElectionStatus::ResultsSubmitted;
-                election.winner = Some(winner.clone());
-                election.results_ipfs_hash = Some(results_ipfs_hash);
-                Ok::<(), DispatchError>(())
-            })?;
-            Self::deposit_event(Event::ResultsSubmitted { election_id, winner });
-            Ok(())
-        }
-
-        #[pallet::call_index(6)]
-        #[pallet::weight(T::WeightInfo::certify_results())]
-        pub fn certify_results(origin: OriginFor<T>, election_id: u32) -> DispatchResult {
-            let who = ensure_signed(origin)?;
-            Self::ensure_commissioner_account(&who)?;
-            let winner = Elections::<T>::try_mutate(election_id, |maybe| {
-                let election = maybe.as_mut().ok_or(Error::<T>::ElectionNotFound)?;
-                ensure!(election.status != ElectionStatus::Certified, Error::<T>::AlreadyCertified);
-                // Results must be submitted before certification is possible.
-                ensure!(
-                    election.status == ElectionStatus::ResultsSubmitted,
-                    Error::<T>::ResultsNotSubmitted
-                );
-                election.status = ElectionStatus::Certified;
-                Ok::<Option<T::AccountId>, DispatchError>(election.winner.clone())
-            })?;
-            let candidates: alloc::vec::Vec<_> =
-                Candidates::<T>::iter_prefix(election_id).collect();
-            for (account, info) in candidates {
-                T::Currency::unreserve(&account, info.deposit);
-            }
-            let winner_account = winner.ok_or(Error::<T>::ElectionNotFound)?;
-            Self::deposit_event(Event::ElectionCertified { election_id, winner: winner_account });
-            Ok(())
-        }
-
         // ── Delegate registry ──────────────────────────────────────────────────
+        //
+        // Removed: the Elections Commission subsystem (commissioners, named "office"
+        // elections, candidate registration/certification, result submission/certification —
+        // formerly call_index 0-6). It certified election outcomes on nothing but a
+        // commissioner's say-so, with no on-chain tally behind it — see
+        // docs/project/changelog/ for the removal rationale. Legislature seats are filled
+        // entirely by the delegate/backing mechanism below (fully automatic, no committee),
+        // and the Prime Minister is chosen by the legislature itself via
+        // pallet-executive's ranked-choice investiture — neither needs a citizen-facing
+        // "elect one person to a named office" mechanism, so nothing replaces this; it's
+        // deleted, not rebuilt. call_index 0-6 are deliberately left unused rather than
+        // reassigned (see `#[pallet::call_index]`'s docs — indices need not be contiguous).
 
         #[pallet::call_index(7)]
         #[pallet::weight(T::WeightInfo::register_as_delegate())]
@@ -961,11 +720,6 @@ pub mod pallet {
     // ── Internal helpers ───────────────────────────────────────────────────────
 
     impl<T: Config> Pallet<T> {
-        fn ensure_commissioner_account(account: &T::AccountId) -> DispatchResult {
-            let commissioners = Commissioners::<T>::get();
-            ensure!(commissioners.contains(account), Error::<T>::NotCommissioner);
-            Ok(())
-        }
 
         fn activate_delegate(delegate: &T::AccountId) {
             let now = frame_system::Pallet::<T>::block_number();
@@ -990,7 +744,14 @@ pub mod pallet {
             let mut candidates: alloc::vec::Vec<(T::AccountId, u32)> = all_delegates
                 .into_iter()
                 .filter_map(|(addr, info)| {
-                    if info.status == DelegateStatus::Active {
+                    // Re-check citizenship now, not just trust Active status from whenever the
+                    // backing threshold was last crossed: a delegate can hold Active status for
+                    // years, and may have been suspended since (e.g. an Overturned
+                    // CitizenConduct court ruling) without ever re-registering. This is the
+                    // point power is actually granted, so it's the point that must be checked.
+                    if info.status == DelegateStatus::Active
+                        && T::CitizenChecker::is_active_citizen(&addr)
+                    {
                         Some((addr.clone(), BackingCount::<T>::get(&addr)))
                     } else {
                         None

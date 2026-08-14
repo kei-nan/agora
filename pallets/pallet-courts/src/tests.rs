@@ -256,7 +256,31 @@ fn jury_vote_majority_suspends_citizen_for_conduct_case() {
 
 		// suspension_blocks (a duration) is converted to an absolute block number by adding it
 		// to "now" at finalization time (the block the 4th, majority-clinching vote lands in).
-		assert_eq!(suspended_citizens(), vec![(nullifier, Some(select_block + 50))]);
+		// jury_reviewed is true here: the case reached JurySeated before auto_finalize ran.
+		assert_eq!(suspended_citizens(), vec![(nullifier, Some(select_block + 50), true)]);
+	});
+}
+
+#[test]
+fn unappealed_ai_ruling_suspends_citizen_without_jury_review_flag() {
+	// Same CitizenConduct enforcement, but via the *other* path into auto_finalize:
+	// finalize_ruling on a case nobody ever appealed. The suspension still happens, but
+	// jury_reviewed must be false — no jury ever saw this case.
+	new_test_ext().execute_with(|| {
+		let nullifier = [9u8; 32];
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(
+			RuntimeOrigin::signed(1),
+			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(50) },
+		));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+
+		// Let the appeal window (100 blocks in the mock) lapse without an appeal, then finalize.
+		System::set_block_number(200);
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id, Verdict::Overturned));
+
+		assert_eq!(suspended_citizens(), vec![(nullifier, Some(200 + 50), false)]);
 	});
 }
 

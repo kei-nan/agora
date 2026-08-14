@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use codec::Encode;
 use frame_benchmarking::v2::*;
 use frame_support::traits::{EnsureOriginWithArg, Get};
+use frame_support::BoundedVec;
 use frame_system::pallet_prelude::BlockNumberFor;
 use frame_system::RawOrigin;
 use sp_runtime::traits::Saturating;
@@ -64,32 +65,44 @@ mod benchmarks {
 	}
 
 	#[benchmark]
-	fn appoint_prime_minister() {
-		// Worst case: an outgoing PM is replaced.
+	fn remove_and_replace_prime_minister() {
 		let old_pm: T::AccountId = account("old_pm", 0, 0);
 		PrimeMinister::<T>::put(old_pm);
-		let new_pm: T::AccountId = account("new_pm", 0, 0);
+		let successor: T::AccountId = account("successor", 0, 0);
+		T::BenchmarkHelper::make_legislature_member(&successor);
 		let origin = legislature_origin::<T>(
-			b"pallet-executive::appoint_prime_minister",
-			new_pm.clone(),
+			b"pallet-executive::remove_and_replace_prime_minister",
+			successor.clone(),
 		);
 
 		#[extrinsic_call]
-		appoint_prime_minister(origin, new_pm.clone());
+		remove_and_replace_prime_minister(origin, successor.clone());
 
-		assert_eq!(PrimeMinister::<T>::get(), Some(new_pm));
+		assert_eq!(PrimeMinister::<T>::get(), Some(successor));
 	}
 
 	#[benchmark]
-	fn dismiss_prime_minister() {
-		let pm: T::AccountId = account("pm", 0, 0);
-		PrimeMinister::<T>::put(pm);
-		let origin = legislature_origin::<T>(b"pallet-executive::dismiss_prime_minister", ());
+	fn resign_as_pm() {
+		let pm: T::AccountId = whitelisted_caller();
+		PrimeMinister::<T>::put(pm.clone());
 
 		#[extrinsic_call]
-		dismiss_prime_minister(origin);
+		resign_as_pm(RawOrigin::Signed(pm));
 
 		assert!(PrimeMinister::<T>::get().is_none());
+	}
+
+	#[benchmark]
+	fn nominate_minister() {
+		let pm: T::AccountId = whitelisted_caller();
+		PrimeMinister::<T>::put(pm.clone());
+		Portfolios::<T>::insert(0u32, Portfolio { name_hash: [1u8; 32] });
+		let candidate: T::AccountId = account("candidate", 0, 0);
+
+		#[extrinsic_call]
+		nominate_minister(RawOrigin::Signed(pm), 0u32, candidate.clone());
+
+		assert_eq!(PendingMinisterNomination::<T>::get(0u32), Some(candidate));
 	}
 
 	#[benchmark]
@@ -107,6 +120,7 @@ mod benchmarks {
 		let incoming: T::AccountId = account("incoming", 0, 0);
 		PortfolioMinister::<T>::insert(1u32, incoming.clone());
 		MinisterPortfolio::<T>::insert(incoming.clone(), 1u32);
+		PendingMinisterNomination::<T>::insert(0u32, incoming.clone());
 
 		let origin = legislature_origin::<T>(
 			b"pallet-executive::appoint_minister",
@@ -226,6 +240,64 @@ mod benchmarks {
 		retract_emergency_vote(RawOrigin::Signed(voter.clone()));
 
 		assert!(!DeclareVotes::<T>::get(&voter));
+	}
+
+	#[benchmark]
+	fn open_pm_investiture() {
+		let opener: T::AccountId = whitelisted_caller();
+
+		#[extrinsic_call]
+		open_pm_investiture(RawOrigin::Signed(opener));
+
+		assert!(InvestitureRound::<T>::get().is_some());
+	}
+
+	#[benchmark]
+	fn nominate_pm() {
+		let nominator: T::AccountId = whitelisted_caller();
+		T::BenchmarkHelper::make_legislature_member(&nominator);
+		Pallet::<T>::open_pm_investiture(RawOrigin::Signed(nominator.clone()).into()).unwrap();
+
+		#[extrinsic_call]
+		nominate_pm(RawOrigin::Signed(nominator.clone()), nominator.clone());
+
+		assert!(PmNominees::<T>::get().contains(&nominator));
+	}
+
+	#[benchmark]
+	fn cast_pm_ballot() {
+		let voter: T::AccountId = whitelisted_caller();
+		T::BenchmarkHelper::make_legislature_member(&voter);
+		Pallet::<T>::open_pm_investiture(RawOrigin::Signed(voter.clone()).into()).unwrap();
+		Pallet::<T>::nominate_pm(RawOrigin::Signed(voter.clone()).into(), voter.clone()).unwrap();
+		let nomination_end = InvestitureRound::<T>::get().unwrap().nomination_end;
+		frame_system::Pallet::<T>::set_block_number(nomination_end);
+		let ranked: BoundedVec<T::AccountId, T::MaxPmCandidates> =
+			BoundedVec::try_from(alloc::vec![voter.clone()]).unwrap();
+
+		#[extrinsic_call]
+		cast_pm_ballot(RawOrigin::Signed(voter.clone()), ranked);
+
+		assert!(PmBallots::<T>::get(&voter).is_some());
+	}
+
+	#[benchmark]
+	fn finalize_pm_investiture() {
+		let voter: T::AccountId = whitelisted_caller();
+		T::BenchmarkHelper::make_legislature_member(&voter);
+		Pallet::<T>::open_pm_investiture(RawOrigin::Signed(voter.clone()).into()).unwrap();
+		Pallet::<T>::nominate_pm(RawOrigin::Signed(voter.clone()).into(), voter.clone()).unwrap();
+		let round = InvestitureRound::<T>::get().unwrap();
+		frame_system::Pallet::<T>::set_block_number(round.nomination_end);
+		let ranked: BoundedVec<T::AccountId, T::MaxPmCandidates> =
+			BoundedVec::try_from(alloc::vec![voter.clone()]).unwrap();
+		Pallet::<T>::cast_pm_ballot(RawOrigin::Signed(voter.clone()).into(), ranked).unwrap();
+		frame_system::Pallet::<T>::set_block_number(round.voting_end);
+
+		#[extrinsic_call]
+		finalize_pm_investiture(RawOrigin::Signed(voter.clone()));
+
+		assert_eq!(PrimeMinister::<T>::get(), Some(voter));
 	}
 
 	impl_benchmark_test_suite!(Cabinet, crate::mock::new_test_ext(), crate::mock::Test);

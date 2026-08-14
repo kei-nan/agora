@@ -664,25 +664,11 @@ pub struct Delegate {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ElectionEntry {
-    pub id: u32,
-    pub office: String,
-    #[serde(rename = "startBlock")]
-    pub start_block: u64,
-    #[serde(rename = "endBlock")]
-    pub end_block: u64,
-    pub status: String,
-    pub winner: String,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct ElectionsData {
     pub delegates: Vec<Delegate>,
-    pub elections: Vec<ElectionEntry>,
 }
 
-/// Fetches PalletElections.Delegates, PalletElections.BackingCount, and
-/// PalletElections.Elections.
+/// Fetches PalletElections.Delegates and PalletElections.BackingCount.
 ///
 /// DelegateInfo SCALE (variable — display_name is a compact-prefixed BoundedVec<u8,64>):
 ///   display_name:       compact_len + utf8_bytes
@@ -692,14 +678,6 @@ pub struct ElectionsData {
 ///   term_start_block:   Option<u32>  (0x00 | 0x01 + 4 bytes)
 ///   break_until_block:  Option<u32>  (0x00 | 0x01 + 4 bytes)
 ///   warning_emitted:    bool
-///
-/// ElectionInfo SCALE (variable — office is a compact-prefixed BoundedVec<u8,64>):
-///   office:             compact_len + utf8_bytes
-///   start_block:        u32 LE
-///   end_block:          u32 LE
-///   status:             u8  (0=Scheduled, 1=Active, 2=ResultsSubmitted, 3=Certified)
-///   winner:             Option<AccountId>  (0x00 | 0x01 + 32 bytes)
-///   results_ipfs_hash:  Option<[u8;32]>    (0x00 | 0x01 + 32 bytes)
 #[tauri::command]
 pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
     let client = RpcClient::new(NODE_URL);
@@ -800,56 +778,7 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
     // Sort delegates by backing_count descending
     delegates.sort_by(|a, b| b.backing_count.cmp(&a.backing_count));
 
-    // ── Elections ─────────────────────────────────────────────────────────────
-    let elections_prefix = storage_prefix("PalletElections", "Elections");
-    let election_keys = client
-        .get_keys_paged(&elections_prefix)
-        .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
-    let mut elections: Vec<ElectionEntry> = Vec::new();
-    if !election_keys.is_empty() {
-        let values = client
-            .query_storage_at(&election_keys)
-            .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
-        for (key_hex, val_opt) in election_keys.iter().zip(values.iter()) {
-            if let Some(val_hex) = val_opt {
-                let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
-                let mut pos = 0usize;
-                // office: compact len + utf8 bytes
-                let (office_len, consumed) = decode_compact(&bytes[pos..]);
-                pos += consumed;
-                let office = if pos + office_len as usize <= bytes.len() {
-                    let s = String::from_utf8_lossy(&bytes[pos..pos + office_len as usize]).to_string();
-                    pos += office_len as usize;
-                    s
-                } else {
-                    String::new()
-                };
-                if pos + 9 > bytes.len() {
-                    continue;
-                }
-                let start_block = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as u64;
-                pos += 4;
-                let end_block = u32::from_le_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as u64;
-                pos += 4;
-                let status_str = match bytes[pos] { 1 => "active", 2 => "results_submitted", 3 => "certified", _ => "scheduled" };
-                pos += 1;
-                // winner: Option<AccountId>
-                let winner = if pos < bytes.len() && bytes[pos] == 1 && pos + 33 <= bytes.len() {
-                    let w = format!("0x{}", hex::encode(&bytes[pos+1..pos+33]));
-                    w
-                } else {
-                    String::new()
-                };
-                let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
-                let id = extract_u32_key_suffix(&kbytes);
-                elections.push(ElectionEntry { id, office, start_block, end_block, status: status_str.to_string(), winner });
-            }
-        }
-    }
-
-    Ok(ElectionsData { delegates, elections })
+    Ok(ElectionsData { delegates })
 }
 
 // ── Anti-Corruption commands ──────────────────────────────────────────────────

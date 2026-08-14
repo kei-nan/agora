@@ -1,19 +1,15 @@
 use crate::{
     mock::*, BackingCount, BackingOf, BackingThreshold, BackingThresholdCeiling,
-    BackingThresholdFloor, CandidateCount, Candidates, CandidateStatus, CitizenBackingCount,
-    Commissioners, DelegateInfo, DelegateStatus, DelegateSweepCursor, Delegates,
-    Elections as ElectionMap, ElectionCycleBlocks, ElectionStatus, Error, Event,
+    BackingThresholdFloor, CitizenBackingCount,
+    DelegateInfo, DelegateStatus, DelegateSweepCursor, Delegates,
+    ElectionCycleBlocks, Error, Event,
     LastElectionBlock, LegislatureSeats, MandatoryBreakBlocks, MaxBackingsPerCitizen,
-    MaxConsecutiveTerms, NextElectionId, TermLengthBlocks, WarningWindowPct,
+    MaxConsecutiveTerms, TermLengthBlocks, WarningWindowPct,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-fn office() -> BoundedVec<u8, ConstU32<64>> {
-    BoundedVec::try_from(b"President".to_vec()).unwrap()
-}
 
 fn name() -> BoundedVec<u8, ConstU32<64>> {
     BoundedVec::try_from(b"Alice".to_vec()).unwrap()
@@ -21,27 +17,6 @@ fn name() -> BoundedVec<u8, ConstU32<64>> {
 
 fn ipfs(byte: u8) -> [u8; 32] {
     [byte; 32]
-}
-
-fn add_commissioner(who: u64) {
-    assert_ok!(Elections::add_commissioner(RuntimeOrigin::root(), who));
-}
-
-/// Creates an election (as commissioner `by`) and returns its id.
-fn create_election(by: u64) -> u32 {
-    let id = NextElectionId::<Test>::get();
-    assert_ok!(Elections::create_election(
-        RuntimeOrigin::signed(by),
-        office(),
-        1,
-        1000,
-    ));
-    id
-}
-
-fn register_candidate(who: u64, election_id: u32) {
-    set_active_citizen(who, true);
-    assert_ok!(Elections::register_candidate(RuntimeOrigin::signed(who), election_id, ipfs(1)));
 }
 
 fn register_delegate(who: u64) {
@@ -64,511 +39,6 @@ fn delegate_info_with_status(status: DelegateStatus) -> DelegateInfo<u64> {
         break_until_block: None,
         warning_emitted: false,
     }
-}
-
-// ─── add_commissioner / remove_commissioner ─────────────────────────────────
-
-#[test]
-fn add_commissioner_works() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_eq!(Commissioners::<Test>::get().into_inner(), vec![1]);
-        System::assert_last_event(Event::CommissionerAdded { account: 1 }.into());
-    });
-}
-
-#[test]
-fn add_commissioner_fails_for_unauthorized_origin() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        assert_noop!(
-            Elections::add_commissioner(RuntimeOrigin::signed(1), 2),
-            DispatchError::BadOrigin
-        );
-    });
-}
-
-#[test]
-fn add_commissioner_fails_when_already_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_noop!(
-            Elections::add_commissioner(RuntimeOrigin::root(), 1),
-            Error::<Test>::AlreadyCommissioner
-        );
-    });
-}
-
-#[test]
-fn add_commissioner_fails_when_too_many() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        for who in 1..=MAX_COMMISSIONERS as u64 {
-            add_commissioner(who);
-        }
-
-        assert_noop!(
-            Elections::add_commissioner(RuntimeOrigin::root(), MAX_COMMISSIONERS as u64 + 1),
-            Error::<Test>::TooManyCommissioners
-        );
-    });
-}
-
-#[test]
-fn remove_commissioner_works() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_ok!(Elections::remove_commissioner(RuntimeOrigin::root(), 1));
-
-        assert!(Commissioners::<Test>::get().is_empty());
-        System::assert_last_event(Event::CommissionerRemoved { account: 1 }.into());
-    });
-}
-
-#[test]
-fn remove_commissioner_is_noop_when_not_a_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        // Removing an account that was never a commissioner succeeds (no error) but is a
-        // silent no-op: no event, no storage change.
-        assert_ok!(Elections::remove_commissioner(RuntimeOrigin::root(), 2));
-
-        assert_eq!(Commissioners::<Test>::get().into_inner(), vec![1]);
-        System::assert_last_event(Event::CommissionerAdded { account: 1 }.into());
-    });
-}
-
-#[test]
-fn remove_commissioner_fails_for_unauthorized_origin() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_noop!(
-            Elections::remove_commissioner(RuntimeOrigin::signed(1), 1),
-            DispatchError::BadOrigin
-        );
-    });
-}
-
-// ─── create_election ─────────────────────────────────────────────────────────
-
-#[test]
-fn create_election_works_by_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_ok!(Elections::create_election(RuntimeOrigin::signed(1), office(), 1, 1000));
-
-        let election = ElectionMap::<Test>::get(0).unwrap();
-        assert_eq!(election.status, ElectionStatus::Open);
-        assert_eq!(NextElectionId::<Test>::get(), 1);
-        System::assert_last_event(Event::ElectionCreated { id: 0 }.into());
-    });
-}
-
-#[test]
-fn create_election_works_by_root() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        assert_ok!(Elections::create_election(RuntimeOrigin::root(), office(), 1, 1000));
-
-        assert!(ElectionMap::<Test>::get(0).is_some());
-    });
-}
-
-#[test]
-fn create_election_fails_for_non_commissioner_signed_origin() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        assert_noop!(
-            Elections::create_election(RuntimeOrigin::signed(1), office(), 1, 1000),
-            Error::<Test>::NotCommissioner
-        );
-    });
-}
-
-#[test]
-fn create_election_increments_next_election_id() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        assert_ok!(Elections::create_election(RuntimeOrigin::signed(1), office(), 1, 1000));
-        assert_ok!(Elections::create_election(RuntimeOrigin::signed(1), office(), 1, 1000));
-
-        assert_eq!(NextElectionId::<Test>::get(), 2);
-        assert!(ElectionMap::<Test>::get(0).is_some());
-        assert!(ElectionMap::<Test>::get(1).is_some());
-    });
-}
-
-// ─── register_candidate ──────────────────────────────────────────────────────
-
-#[test]
-fn register_candidate_works() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        register_candidate(2, id);
-
-        let info = Candidates::<Test>::get(id, 2).unwrap();
-        assert_eq!(info.status, CandidateStatus::Registered);
-        assert_eq!(info.deposit, CANDIDATE_DEPOSIT);
-        assert_eq!(Balances::reserved_balance(2), CANDIDATE_DEPOSIT);
-        System::assert_last_event(Event::CandidateRegistered { election_id: id, candidate: 2 }.into());
-    });
-}
-
-#[test]
-fn register_candidate_fails_when_not_active_citizen() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(1)),
-            Error::<Test>::NotActiveCitizen
-        );
-        assert_eq!(Balances::reserved_balance(2), 0);
-    });
-}
-
-#[test]
-fn register_candidate_fails_when_election_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        set_active_citizen(2, true);
-
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(2), 42, ipfs(1)),
-            Error::<Test>::ElectionNotFound
-        );
-    });
-}
-
-#[test]
-fn register_candidate_fails_when_election_not_open() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-
-        // Election is now ResultsSubmitted, not Open.
-        set_active_citizen(3, true);
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(3), id, ipfs(1)),
-            Error::<Test>::ElectionNotOpen
-        );
-    });
-}
-
-#[test]
-fn register_candidate_fails_when_already_registered() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(3)),
-            Error::<Test>::CandidateAlreadyRegistered
-        );
-        // Still only reserved once, not double-reserved.
-        assert_eq!(Balances::reserved_balance(2), CANDIDATE_DEPOSIT);
-    });
-}
-
-#[test]
-fn register_candidate_fails_with_insufficient_balance_and_leaves_no_dangling_reserve() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        // Account 99 was never funded in genesis.
-        set_active_citizen(99, true);
-
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(99), id, ipfs(1)),
-            Error::<Test>::InsufficientBalance
-        );
-        assert_eq!(Balances::reserved_balance(99), 0);
-        assert!(Candidates::<Test>::get(id, 99).is_none());
-    });
-}
-
-#[test]
-fn register_candidate_beyond_max_candidates_per_election_is_rejected() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        for who in 1..=MAX_CANDIDATES_PER_ELECTION as u64 {
-            register_candidate(who, id);
-        }
-        assert_eq!(CandidateCount::<Test>::get(id), MAX_CANDIDATES_PER_ELECTION);
-
-        // One more, once the election is already at capacity, must be rejected — and must not
-        // reserve a deposit or otherwise mutate state.
-        let extra = MAX_CANDIDATES_PER_ELECTION as u64 + 1;
-        set_active_citizen(extra, true);
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(extra), id, ipfs(1)),
-            Error::<Test>::TooManyCandidates
-        );
-        assert_eq!(
-            Candidates::<Test>::iter_prefix(id).count(),
-            MAX_CANDIDATES_PER_ELECTION as usize
-        );
-    });
-}
-
-#[test]
-fn register_candidate_fails_when_no_current_disclosure() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        set_active_citizen(2, true);
-        set_has_current_disclosure(2, false);
-
-        assert_noop!(
-            Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(1)),
-            Error::<Test>::DisclosureRequired
-        );
-        assert_eq!(Balances::reserved_balance(2), 0);
-        assert!(Candidates::<Test>::get(id, 2).is_none());
-    });
-}
-
-#[test]
-fn register_candidate_succeeds_with_current_disclosure() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        set_active_citizen(2, true);
-        set_has_current_disclosure(2, true);
-
-        assert_ok!(Elections::register_candidate(RuntimeOrigin::signed(2), id, ipfs(1)));
-        assert!(Candidates::<Test>::get(id, 2).is_some());
-    });
-}
-
-// ─── certify_candidate ───────────────────────────────────────────────────────
-
-#[test]
-fn certify_candidate_works() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-
-        assert_ok!(Elections::certify_candidate(RuntimeOrigin::signed(1), id, 2));
-
-        assert_eq!(Candidates::<Test>::get(id, 2).unwrap().status, CandidateStatus::Certified);
-        System::assert_last_event(Event::CandidateCertified { election_id: id, candidate: 2 }.into());
-    });
-}
-
-#[test]
-fn certify_candidate_fails_for_non_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-
-        assert_noop!(
-            Elections::certify_candidate(RuntimeOrigin::signed(2), id, 2),
-            Error::<Test>::NotCommissioner
-        );
-    });
-}
-
-#[test]
-fn certify_candidate_fails_when_election_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_noop!(
-            Elections::certify_candidate(RuntimeOrigin::signed(1), 42, 2),
-            Error::<Test>::ElectionNotFound
-        );
-    });
-}
-
-#[test]
-fn certify_candidate_fails_when_candidate_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        assert_noop!(
-            Elections::certify_candidate(RuntimeOrigin::signed(1), id, 2),
-            Error::<Test>::CandidateNotFound
-        );
-    });
-}
-
-// ─── submit_results / certify_results ───────────────────────────────────────
-
-#[test]
-fn submit_results_works() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-
-        let election = ElectionMap::<Test>::get(id).unwrap();
-        assert_eq!(election.status, ElectionStatus::ResultsSubmitted);
-        assert_eq!(election.winner, Some(2));
-        assert_eq!(election.results_ipfs_hash, Some(ipfs(9)));
-        System::assert_last_event(Event::ResultsSubmitted { election_id: id, winner: 2 }.into());
-    });
-}
-
-#[test]
-fn submit_results_fails_for_non_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        assert_noop!(
-            Elections::submit_results(RuntimeOrigin::signed(2), id, 2, ipfs(9)),
-            Error::<Test>::NotCommissioner
-        );
-    });
-}
-
-#[test]
-fn submit_results_fails_when_election_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_noop!(
-            Elections::submit_results(RuntimeOrigin::signed(1), 42, 2, ipfs(9)),
-            Error::<Test>::ElectionNotFound
-        );
-    });
-}
-
-#[test]
-fn submit_results_fails_when_not_open() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-
-        assert_noop!(
-            Elections::submit_results(RuntimeOrigin::signed(1), id, 3, ipfs(8)),
-            Error::<Test>::ElectionNotOpen
-        );
-    });
-}
-
-#[test]
-fn certify_results_works_and_unreserves_all_candidate_deposits() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-        register_candidate(3, id);
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-
-        assert_ok!(Elections::certify_results(RuntimeOrigin::signed(1), id));
-
-        assert_eq!(ElectionMap::<Test>::get(id).unwrap().status, ElectionStatus::Certified);
-        // Both the winner and the loser get their deposits back.
-        assert_eq!(Balances::reserved_balance(2), 0);
-        assert_eq!(Balances::reserved_balance(3), 0);
-        System::assert_last_event(Event::ElectionCertified { election_id: id, winner: 2 }.into());
-    });
-}
-
-#[test]
-fn certify_results_fails_for_non_commissioner() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-
-        assert_noop!(
-            Elections::certify_results(RuntimeOrigin::signed(2), id),
-            Error::<Test>::NotCommissioner
-        );
-    });
-}
-
-#[test]
-fn certify_results_fails_when_election_not_found() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-
-        assert_noop!(
-            Elections::certify_results(RuntimeOrigin::signed(1), 42),
-            Error::<Test>::ElectionNotFound
-        );
-    });
-}
-
-#[test]
-fn certify_results_fails_when_results_not_submitted() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-
-        assert_noop!(
-            Elections::certify_results(RuntimeOrigin::signed(1), id),
-            Error::<Test>::ResultsNotSubmitted
-        );
-    });
-}
-
-#[test]
-fn certify_results_fails_when_already_certified() {
-    new_test_ext().execute_with(|| {
-        System::set_block_number(1);
-        add_commissioner(1);
-        let id = create_election(1);
-        register_candidate(2, id);
-        assert_ok!(Elections::submit_results(RuntimeOrigin::signed(1), id, 2, ipfs(9)));
-        assert_ok!(Elections::certify_results(RuntimeOrigin::signed(1), id));
-
-        assert_noop!(
-            Elections::certify_results(RuntimeOrigin::signed(1), id),
-            Error::<Test>::AlreadyCertified
-        );
-    });
 }
 
 // ─── register_as_delegate ────────────────────────────────────────────────────
@@ -1294,6 +764,36 @@ fn on_initialize_election_excludes_pending_delegates() {
         let _ = Elections::on_initialize(System::block_number());
 
         assert_eq!(seat_calls(), vec![vec![1]]);
+    });
+}
+
+#[test]
+fn on_initialize_election_excludes_suspended_delegates() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1); // crosses the backing threshold -> Active
+
+        register_delegate(5);
+        back(2, 5);
+        back(3, 5);
+        back(4, 5); // also Active
+
+        assert_eq!(Delegates::<Test>::get(1).unwrap().status, DelegateStatus::Active);
+        assert_eq!(Delegates::<Test>::get(5).unwrap().status, DelegateStatus::Active);
+
+        // Delegate 1 was an active citizen when they registered and built backing, but has
+        // since been suspended (e.g. an Overturned CitizenConduct court ruling). Their
+        // DelegateStatus is still Active -- nothing re-runs registration -- so only the
+        // seating-time re-check can catch this.
+        set_active_citizen(1, false);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        assert_eq!(seat_calls(), vec![vec![5]]);
     });
 }
 
