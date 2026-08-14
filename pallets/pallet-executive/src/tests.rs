@@ -1,7 +1,7 @@
 use crate::{
     mock::*, ActiveEmergency, DeclareVotes, EndVotes, Error, Event, InvestitureRound,
-    NextPortfolioId, PendingEmergencyProposal, PendingMinisterNomination, PmConsecutiveTerms,
-    PortfolioMinister, Portfolios, PrimeMinister, VacatedRole,
+    NextPortfolioId, PendingEmergencyProposal, PendingMinisterNomination, PortfolioMinister,
+    Portfolios, PrimeMinister, VacatedRole,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
 use pallet_legislature::pallet::MinisterChecker;
@@ -110,7 +110,11 @@ fn investiture_single_candidate_wins_unopposed() {
         assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
 
         assert_eq!(PrimeMinister::<Test>::get(), Some(1));
-        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 1);
+        // Rolling-window occupancy is 0 the instant a tenure starts (nothing elapsed
+        // yet), and accrues linearly with elapsed blocks thereafter -- confirms the
+        // in-progress tenure is actually being tracked from this install.
+        assert_eq!(Executive::pm_occupancy_in_window(&1, System::block_number()), 0);
+        assert_eq!(Executive::pm_occupancy_in_window(&1, System::block_number() + 7), 7);
         assert!(InvestitureRound::<Test>::get().is_none());
         System::assert_has_event(Event::PmInvestitureFinalized { winner: 1 }.into());
     });
@@ -255,23 +259,133 @@ fn nominate_pm_fails_when_already_nominated() {
     });
 }
 
+// The rolling-window occupancy cap replaces an earlier "consecutive terms" counter that
+// counted *whether a different account was installed in between* two of X's terms. That
+// was gameable: X could get a complicit ally Y installed for as little as one block via
+// `remove_and_replace_prime_minister`, then get reinstalled -- Y counts as "a different
+// account holding it in between" even though X never meaningfully left power, so X's old
+// counter would reset to 1 and the cap would never bite. A time-based rolling budget
+// closes this because a one-block puppet term barely dents the true power-holder's
+// cumulative occupancy within the window. Mock config: `PmOccupancyWindowBlocks == 50`,
+// `MaxPmOccupancyBlocks == 30`, `PmNominationWindowBlocks == PmVotingWindowBlocks == 5`.
+
 #[test]
-fn nominate_pm_fails_when_candidate_at_consecutive_term_limit() {
+fn pm_occupancy_cap_blocks_reinstall_then_restores_after_window_ages_out() {
+    // Straightforward case: one account accumulates enough real (uninterrupted) time in
+    // office on its own to hit the cap, is blocked via `PmOccupancyLimitReached` on both
+    // the `nominate_pm` and `remove_and_replace_prime_minister` paths, and later becomes
+    // eligible again once that time ages out of the trailing window.
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
-        appoint_pm(1);
-        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), {
-            set_legislature_member(2, true);
-            2
-        }));
-        // 1 served one term, was replaced -- their count resets to 0, so re-nominating
-        // them should still succeed (max is 2). Serve them again to actually hit the cap.
-        assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1));
-        // 1 is back with consecutive_terms == 1 (fresh streak after the gap).
+        set_legislature_member(1, true);
+        set_legislature_member(2, true);
+
+        // Install 1 as PM: tenure starts at block 11.
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1));
+
+        // Serve uninterrupted for exactly `MaxPmOccupancyBlocks` (30) blocks, then resign.
+        // This closes a single 30-block tenure into `PmTenureHistory`, landing 1 exactly
+        // at the cap.
+        System::set_block_number(41);
+        assert_ok!(Executive::resign_as_pm(RuntimeOrigin::signed(1)));
+        assert_eq!(Executive::pm_occupancy_in_window(&1, 41), 30);
+
+        // ── nominate_pm path ────────────────────────────────────────────────
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(2)));
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(2), 1),
+            Error::<Test>::PmOccupancyLimitReached
+        );
+
+        // ── remove_and_replace_prime_minister path ──────────────────────────
+        // Install 2 instead (uncontested by the cap) so there's a sitting PM to replace.
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(2), 2));
+        System::set_block_number(46);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(2), ballot(&[2])));
+        System::set_block_number(51);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(2)));
+        assert_eq!(PrimeMinister::<Test>::get(), Some(2));
+        // 1's 30-block tenure (blocks 11..41) is still within the trailing 50-block
+        // window as of block 51, so the cap still bites here too.
+        assert_noop!(
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1),
+            Error::<Test>::PmOccupancyLimitReached
+        );
+
+        // ── eligibility restored once the tenure ages out of the window ────────
+        // At block 92, the window is [42, 92] -- 1's tenure (11..41) has fully aged out.
+        System::set_block_number(92);
+        assert_eq!(Executive::pm_occupancy_in_window(&1, 92), 0);
+        assert_ok!(Executive::resign_as_pm(RuntimeOrigin::signed(2)));
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(97);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+        System::set_block_number(102);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1));
+    });
+}
+
+#[test]
+fn pm_occupancy_rolling_window_defeats_puppet_swap_collusion() {
+    // Reproduces the exact collusion scenario that motivated the rolling-window
+    // mechanism: PM X (1) serves long enough to approach the cap, then a complicit ally
+    // Y (2) is installed via `remove_and_replace_prime_minister` for just one block,
+    // then X is reinstalled. Under the old "consecutive terms" mechanism, Y counting as
+    // "a different account holding office in between" would have reset X's counter to 1.
+    // Under the rolling window, X's real cumulative occupancy is essentially unaffected
+    // by Y's token tenure, and once X's genuine cumulative time crosses the cap, further
+    // reinstallation is still blocked -- proving the swap-and-back trick resets nothing.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true); // X
+        set_legislature_member(2, true); // Y
+
+        // Install X: tenure starts at block 11.
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+
+        // X serves 25 real blocks (11..36), approaching but not yet at the 30-block cap.
+        System::set_block_number(36);
         assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
+        assert_eq!(PrimeMinister::<Test>::get(), Some(2));
+        assert_eq!(Executive::pm_occupancy_in_window(&1, 36), 25);
+
+        // Y (the puppet) holds the seat for exactly one block, then X is swapped back in.
+        System::set_block_number(37);
         assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 1));
-        // 1's streak: term after first gap = 1, this reinstall makes it 2 -- exactly at cap.
-        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 1);
+        assert_eq!(PrimeMinister::<Test>::get(), Some(1));
+
+        // X's cumulative occupancy is unchanged by the round trip through Y (still 25 --
+        // no accrual happened while X wasn't PM, and nothing was reset either), while Y's
+        // own occupancy reflects only the single token block it actually held.
+        assert_eq!(Executive::pm_occupancy_in_window(&1, 37), 25);
+        assert_eq!(Executive::pm_occupancy_in_window(&2, 37), 1);
+
+        // X keeps serving for 5 more real blocks, crossing the cap (25 + 5 == 30), then
+        // resigns.
+        System::set_block_number(42);
+        assert_ok!(Executive::resign_as_pm(RuntimeOrigin::signed(1)));
+        assert_eq!(Executive::pm_occupancy_in_window(&1, 42), 30);
+
+        // The swap-and-back trick did not launder any of X's real time in office: a fresh
+        // reinstall attempt is blocked exactly as it would be without Y's interference.
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(2)));
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(2), 1),
+            Error::<Test>::PmOccupancyLimitReached
+        );
     });
 }
 
@@ -362,8 +476,10 @@ fn remove_and_replace_prime_minister_works() {
         assert_ok!(Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2));
 
         assert_eq!(PrimeMinister::<Test>::get(), Some(2));
-        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
-        assert_eq!(PmConsecutiveTerms::<Test>::get(2), 1);
+        // The outgoing PM's in-progress tenure was closed out into history, and the
+        // incoming PM's own in-progress tenure starts fresh (zero elapsed occupancy).
+        assert!(crate::PmTenureHistory::<Test>::get().iter().any(|r| r.who == 1));
+        assert_eq!(Executive::pm_occupancy_in_window(&2, System::block_number()), 0);
         let events = System::events();
         assert!(events.iter().any(|r| r.event == Event::PrimeMinisterDismissed { who: 1 }.into()));
         System::assert_last_event(
@@ -462,7 +578,11 @@ fn resign_as_pm_works() {
         assert_ok!(Executive::resign_as_pm(RuntimeOrigin::signed(1)));
 
         assert!(PrimeMinister::<Test>::get().is_none());
-        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
+        // Resignation closes out the in-progress tenure into `PmTenureHistory` (so it
+        // still counts toward rolling-window occupancy on a future reinstall) and
+        // clears the in-progress marker.
+        assert!(crate::CurrentPmTenureStart::<Test>::get().is_none());
+        assert!(crate::PmTenureHistory::<Test>::get().iter().any(|r| r.who == 1));
         System::assert_last_event(Event::PrimeMinisterResigned { who: 1 }.into());
     });
 }
@@ -710,7 +830,11 @@ fn vacancy_sweep_removes_pm_suspended_by_jury_reviewed_conviction() {
         let _ = Executive::on_initialize(1);
 
         assert!(PrimeMinister::<Test>::get().is_none());
-        assert_eq!(PmConsecutiveTerms::<Test>::get(1), 0);
+        // The forced removal closes out the in-progress tenure into `PmTenureHistory`,
+        // same as a voluntary resignation, so it still counts toward rolling-window
+        // occupancy on a future reinstall attempt.
+        assert!(crate::CurrentPmTenureStart::<Test>::get().is_none());
+        assert!(crate::PmTenureHistory::<Test>::get().iter().any(|r| r.who == 1));
         System::assert_has_event(
             Event::OfficeVacatedForConviction { who: 1, role: VacatedRole::PrimeMinister }.into(),
         );

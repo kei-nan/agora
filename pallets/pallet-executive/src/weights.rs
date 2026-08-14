@@ -61,17 +61,19 @@ impl<T: crate::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(1_u64))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
-	/// `PrimeMinister::get` + `PmConsecutiveTerms`/`LegislatureMembership` checks (3 reads) +
+	/// `PrimeMinister::get` + `PmTenureHistory`/`LegislatureMembership` checks (3 reads) +
 	/// `install_pm`'s writes: `DeclareVotes` x2, `PendingMinisterNomination::clear`
-	/// (`MaxPortfolios`-bounded), `PmConsecutiveTerms` x2, `PrimeMinister` (6 writes).
+	/// (`MaxPortfolios`-bounded), `PmTenureHistory`/`CurrentPmTenureStart` x2, `PrimeMinister`
+	/// (6 writes).
 	fn remove_and_replace_prime_minister() -> Weight {
 		let clear_writes = T::MaxPortfolios::get() as u64;
 		Weight::from_parts(15_000_000, 1_957)
 			.saturating_add(T::DbWeight::get().reads(3_u64))
 			.saturating_add(T::DbWeight::get().writes(6_u64.saturating_add(clear_writes)))
 	}
-	/// `PrimeMinister::get` (1 read) + `PrimeMinister::kill`, `PmConsecutiveTerms`,
-	/// `DeclareVotes::remove`, `PendingMinisterNomination::clear` (`MaxPortfolios`-bounded).
+	/// `PrimeMinister::get` (1 read) + `PrimeMinister::kill`, `PmTenureHistory`/
+	/// `CurrentPmTenureStart` (via `close_current_pm_tenure`), `DeclareVotes::remove`,
+	/// `PendingMinisterNomination::clear` (`MaxPortfolios`-bounded).
 	fn resign_as_pm() -> Weight {
 		let clear_writes = T::MaxPortfolios::get() as u64;
 		Weight::from_parts(11_000_000, 1_957)
@@ -146,8 +148,8 @@ impl<T: crate::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
-	/// `LegislatureMembership` x2 + `InvestitureRound::get` + `PmConsecutiveTerms::get`
-	/// (4 reads) + `PmNominees::try_mutate` (1 write).
+	/// `LegislatureMembership` x2 + `InvestitureRound::get` + `PmTenureHistory::get`
+	/// (via `pm_occupancy_in_window`) (4 reads) + `PmNominees::try_mutate` (1 write).
 	fn nominate_pm() -> Weight {
 		Weight::from_parts(13_000_000, 1_957)
 			.saturating_add(T::DbWeight::get().reads(4_u64))

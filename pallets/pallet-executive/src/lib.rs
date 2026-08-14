@@ -45,7 +45,7 @@ pub mod pallet {
     use frame_support::pallet_prelude::*;
     use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
-    use sp_runtime::traits::Saturating;
+    use sp_runtime::traits::{Saturating, Zero};
     use crate::weights::WeightInfo;
 
     /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
@@ -169,11 +169,23 @@ pub mod pallet {
         /// Cap on candidates a single investiture round can hold (bounds ballot/tally size).
         #[pallet::constant]
         type MaxPmCandidates: Get<u32>;
-        /// Max consecutive terms the same person may serve as PM. Resets to 0 the moment
-        /// anyone else holds the office, so this only blocks *consecutive* re-selection,
-        /// not a permanent bar — see `install_pm`'s doc comment.
+        /// Size (in blocks) of the trailing window used to cap how much of recent
+        /// history any single account may have spent as Prime Minister.
         #[pallet::constant]
-        type MaxConsecutivePmTerms: Get<u32>;
+        type PmOccupancyWindowBlocks: Get<u32>;
+        /// Maximum total blocks any single account may have served as Prime
+        /// Minister within the trailing `PmOccupancyWindowBlocks` window. Must be
+        /// less than `PmOccupancyWindowBlocks` to have any effect.
+        #[pallet::constant]
+        type MaxPmOccupancyBlocks: Get<u32>;
+        /// Bound on the ring buffer of past PM tenure records retained for
+        /// computing rolling occupancy. Must be set generously relative to
+        /// `PmOccupancyWindowBlocks` divided by the shortest realistic tenure
+        /// length, so that a burst of rapid turnover within one window cannot
+        /// evict still-in-window history before it naturally ages out (see the
+        /// eviction policy on the storage item below).
+        #[pallet::constant]
+        type MaxPmTenureHistory: Get<u32>;
         /// Blocks between automatic PM/minister eligibility sweeps (e.g. ~1 day).
         #[pallet::constant]
         type VacancySweepIntervalBlocks: Get<u32>;
@@ -217,6 +229,15 @@ pub mod pallet {
         pub voting_end: BlockNumber,
     }
 
+    /// A completed Prime Minister tenure, retained to compute rolling-window
+    /// occupancy (see `PmTenureHistory`).
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub struct PmTenureRecord<AccountId, BlockNumber> {
+        pub who: AccountId,
+        pub start: BlockNumber,
+        pub end: BlockNumber,
+    }
+
     /// Which office the daily vacancy sweep removed someone from.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub enum VacatedRole {
@@ -229,6 +250,27 @@ pub mod pallet {
     /// The current Prime Minister. None = no PM appointed.
     #[pallet::storage]
     pub type PrimeMinister<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
+
+    /// Ring buffer of completed PM tenures, used to compute how many blocks
+    /// within the trailing `PmOccupancyWindowBlocks` window any given account
+    /// has spent as PM (see `pm_occupancy_in_window`). Eviction policy on
+    /// overflow: first drop any record whose `end` already predates the
+    /// current occupancy window (safe — it can no longer contribute to any
+    /// future occupancy calculation), and only if none are prunable, drop the
+    /// single oldest record as a last-resort safety valve. `MaxPmTenureHistory`
+    /// must be sized generously enough in practice that this last resort is
+    /// never hit by legitimate turnover within one window.
+    #[pallet::storage]
+    pub type PmTenureHistory<T: Config> = StorageValue<
+        _,
+        BoundedVec<PmTenureRecord<T::AccountId, BlockNumberFor<T>>, T::MaxPmTenureHistory>,
+        ValueQuery,
+    >;
+
+    /// Start block of the currently sitting PM's in-progress tenure. `None`
+    /// while the seat is vacant.
+    #[pallet::storage]
+    pub type CurrentPmTenureStart<T: Config> = StorageValue<_, BlockNumberFor<T>, OptionQuery>;
 
     /// portfolio_id → Portfolio definition.
     #[pallet::storage]
@@ -280,15 +322,6 @@ pub mod pallet {
     #[pallet::storage]
     pub type PendingMinisterNomination<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, T::AccountId>;
-
-    // ── Storage: PM term tracking ───────────────────────────────────────────────────
-
-    /// account → consecutive terms served as PM. Reset to 0 the instant anyone else
-    /// holds the office (resignation, constructive replacement, or conviction-triggered
-    /// vacancy all reset it) — see `install_pm`.
-    #[pallet::storage]
-    pub type PmConsecutiveTerms<T: Config> =
-        StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
 
     // ── Storage: PM investiture (ranked-choice among legislature members) ──────────
 
@@ -449,10 +482,9 @@ pub mod pallet {
         NotLegislatureMember,
         /// The named successor is already the current Prime Minister.
         SuccessorIsCurrentPm,
-        /// This account has already served `MaxConsecutivePmTerms` consecutive terms —
-        /// someone else must hold the office for at least one term before they're
-        /// eligible again.
-        PmTermLimitReached,
+        /// Installing this account would push its total time served as Prime
+        /// Minister within the trailing occupancy window at or above the cap.
+        PmOccupancyLimitReached,
         /// `open_pm_investiture` was called while a round is already open.
         InvestitureAlreadyOpen,
         /// `nominate_pm`/`cast_pm_ballot`/`finalize_pm_investiture` was called with no
@@ -538,9 +570,11 @@ pub mod pallet {
                 T::LegislatureMembership::is_member(&successor),
                 Error::<T>::NotLegislatureMember
             );
+            let now = frame_system::Pallet::<T>::block_number();
             ensure!(
-                PmConsecutiveTerms::<T>::get(&successor) < T::MaxConsecutivePmTerms::get(),
-                Error::<T>::PmTermLimitReached
+                Self::pm_occupancy_in_window(&successor, now)
+                    < BlockNumberFor::<T>::from(T::MaxPmOccupancyBlocks::get()),
+                Error::<T>::PmOccupancyLimitReached
             );
             Self::deposit_event(Event::PrimeMinisterDismissed { who: old.clone() });
             Self::install_pm(successor.clone());
@@ -555,8 +589,9 @@ pub mod pallet {
         pub fn resign_as_pm(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(PrimeMinister::<T>::get().as_ref() == Some(&who), Error::<T>::NotPrimeMinister);
+            let now = frame_system::Pallet::<T>::block_number();
             PrimeMinister::<T>::kill();
-            PmConsecutiveTerms::<T>::insert(&who, 0u32);
+            Self::close_current_pm_tenure(who.clone(), now);
             DeclareVotes::<T>::remove(&who);
             Self::clear_pending_minister_nominations();
             Self::deposit_event(Event::PrimeMinisterResigned { who });
@@ -618,8 +653,9 @@ pub mod pallet {
                 Error::<T>::NotLegislatureMember
             );
             ensure!(
-                PmConsecutiveTerms::<T>::get(&candidate) < T::MaxConsecutivePmTerms::get(),
-                Error::<T>::PmTermLimitReached
+                Self::pm_occupancy_in_window(&candidate, now)
+                    < BlockNumberFor::<T>::from(T::MaxPmOccupancyBlocks::get()),
+                Error::<T>::PmOccupancyLimitReached
             );
             PmNominees::<T>::try_mutate(|nominees| {
                 ensure!(!nominees.contains(&candidate), Error::<T>::AlreadyNominated);
@@ -933,32 +969,86 @@ pub mod pallet {
         /// that changes who holds the office needs: clears the outgoing PM's stale
         /// emergency vote and any pending minister nomination they staged (so it can
         /// never be confirmed under a successor's watch — see
-        /// `clear_pending_minister_nominations`), and updates consecutive-term tracking.
+        /// `clear_pending_minister_nominations`), and starts `new_pm`'s in-progress
+        /// tenure clock.
         ///
-        /// Consecutive-term semantics: incremented only when `new_pm` is the *same*
-        /// account that just held the office (i.e. re-selected with nobody else holding
-        /// it in between); reset to 1 for anyone else. The outgoing PM's own count is
-        /// simultaneously reset to 0, since their consecutive streak is broken the
-        /// moment someone else holds the office — this is what makes the term limit a
-        /// *consecutive*-terms cap rather than a lifetime one.
+        /// Rolling-window occupancy semantics: this function no longer tracks anything
+        /// per-account itself. If a live sitting PM is being directly displaced (no
+        /// intervening vacancy), their in-progress tenure is closed out into
+        /// `PmTenureHistory` via `close_current_pm_tenure` before the new tenure starts.
+        /// `CurrentPmTenureStart` is then set to `now` for `new_pm`. How much of the
+        /// trailing `PmOccupancyWindowBlocks` window any account has actually occupied is
+        /// derived purely from `PmTenureHistory` plus this in-progress tenure — see
+        /// `pm_occupancy_in_window` — and is what `remove_and_replace_prime_minister` and
+        /// `nominate_pm` check against `MaxPmOccupancyBlocks` before allowing (re)install.
         fn install_pm(new_pm: T::AccountId) {
-            let previous = PrimeMinister::<T>::get();
-            if let Some(prev) = &previous {
+            let now = frame_system::Pallet::<T>::block_number();
+            let live_previous = PrimeMinister::<T>::get();
+            if let Some(prev) = &live_previous {
                 DeclareVotes::<T>::remove(prev);
                 if prev != &new_pm {
-                    PmConsecutiveTerms::<T>::insert(prev, 0u32);
+                    Self::close_current_pm_tenure(prev.clone(), now);
                 }
             }
             Self::clear_pending_minister_nominations();
-            let terms = if previous.as_ref() == Some(&new_pm) {
-                PmConsecutiveTerms::<T>::get(&new_pm).saturating_add(1)
-            } else {
-                1u32
-            };
-            PmConsecutiveTerms::<T>::insert(&new_pm, terms);
+
+            CurrentPmTenureStart::<T>::put(now);
             DeclareVotes::<T>::remove(&new_pm);
             PrimeMinister::<T>::put(new_pm.clone());
             Self::deposit_event(Event::PrimeMinisterAppointed { who: new_pm });
+        }
+
+        /// Sum, over `PmTenureHistory` plus the in-progress tenure if `who` is the
+        /// sitting PM, of each tenure's overlap with the trailing
+        /// `[now - PmOccupancyWindowBlocks, now]` window.
+        ///
+        /// `pub(crate)` (rather than fully private, like most other helpers here) so
+        /// `tests.rs` can assert directly on rolling occupancy rather than only on
+        /// externally-observable call outcomes.
+        pub(crate) fn pm_occupancy_in_window(who: &T::AccountId, now: BlockNumberFor<T>) -> BlockNumberFor<T> {
+            let window_start =
+                now.saturating_sub(BlockNumberFor::<T>::from(T::PmOccupancyWindowBlocks::get()));
+            let mut total = BlockNumberFor::<T>::zero();
+            for record in PmTenureHistory::<T>::get().iter() {
+                if &record.who == who {
+                    let overlap_start = record.start.max(window_start);
+                    let overlap_end = record.end.min(now);
+                    if overlap_end > overlap_start {
+                        total = total.saturating_add(overlap_end - overlap_start);
+                    }
+                }
+            }
+            if PrimeMinister::<T>::get().as_ref() == Some(who) {
+                if let Some(start) = CurrentPmTenureStart::<T>::get() {
+                    let overlap_start = start.max(window_start);
+                    if now > overlap_start {
+                        total = total.saturating_add(now - overlap_start);
+                    }
+                }
+            }
+            total
+        }
+
+        /// Closes out the in-progress PM tenure (if any) into `PmTenureHistory`
+        /// and clears `CurrentPmTenureStart`. Call this on every path that ends a
+        /// PM's time in office: `resign_as_pm`, `run_vacancy_sweep`'s forced
+        /// removal, and `install_pm` when displacing a sitting PM directly (no
+        /// intervening vacancy).
+        fn close_current_pm_tenure(who: T::AccountId, now: BlockNumberFor<T>) {
+            let start = CurrentPmTenureStart::<T>::take().unwrap_or(now);
+            let record = PmTenureRecord { who, start, end: now };
+            PmTenureHistory::<T>::mutate(|history| {
+                let window_start = now
+                    .saturating_sub(BlockNumberFor::<T>::from(T::PmOccupancyWindowBlocks::get()));
+                if history.is_full() {
+                    if let Some(pos) = history.iter().position(|r| r.end <= window_start) {
+                        history.remove(pos);
+                    } else {
+                        history.remove(0);
+                    }
+                }
+                let _ = history.try_push(record);
+            });
         }
 
         /// Clears every staged-but-unconfirmed minister nomination. Called whenever the
@@ -989,11 +1079,12 @@ pub mod pallet {
         /// nominated again (see `nominate_pm`) if their suspension outlives their term.
         fn run_vacancy_sweep() -> Weight {
             let mut weight = Weight::zero();
+            let now = frame_system::Pallet::<T>::block_number();
             if let Some(pm) = PrimeMinister::<T>::get() {
                 weight = weight.saturating_add(T::DbWeight::get().reads(2));
                 if T::CitizenChecker::is_suspended_by_jury_reviewed_conviction(&pm) {
                     PrimeMinister::<T>::kill();
-                    PmConsecutiveTerms::<T>::insert(&pm, 0u32);
+                    Self::close_current_pm_tenure(pm.clone(), now);
                     DeclareVotes::<T>::remove(&pm);
                     Self::clear_pending_minister_nominations();
                     Self::deposit_event(Event::OfficeVacatedForConviction {

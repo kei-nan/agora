@@ -132,7 +132,9 @@ impl pallet_executive::Config for Test {
     type PmNominationWindowBlocks = ConstU32<5>;
     type PmVotingWindowBlocks = ConstU32<5>;
     type MaxPmCandidates = ConstU32<8>;
-    type MaxConsecutivePmTerms = ConstU32<2>;
+    type PmOccupancyWindowBlocks = ConstU32<50>;
+    type MaxPmOccupancyBlocks = ConstU32<30>;
+    type MaxPmTenureHistory = ConstU32<16>;
     type VacancySweepIntervalBlocks = ConstU32<20>;
     type WeightInfo = ();
     #[cfg(feature = "runtime-benchmarks")]

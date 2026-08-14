@@ -768,10 +768,14 @@ impl pallet_executive::Config for Runtime {
 	type PmVotingWindowBlocks = ConstU32<{ 7 * DAYS }>;
 	/// Bounds ballot/tally size for a single investiture round.
 	type MaxPmCandidates = ConstU32<20>;
-	/// Same 2-consecutive-term cap already used for pallet-elections' delegates
-	/// (`DefaultMaxConsecutiveTerms` below) — consistent term-limit philosophy across
-	/// every elected role in this runtime.
-	type MaxConsecutivePmTerms = ConstU32<2>;
+	/// Rolling-window occupancy cap on the PM office (replaces an earlier consecutive-terms
+	/// counter that a one-block puppet reinstall could reset — see
+	/// `pallet_executive::pallet::Pallet::pm_occupancy_in_window`'s doc comment for the full
+	/// rationale). Tunable policy constants, not derived from first principles: no account may
+	/// hold the PM office for more than ~74% of the trailing year (270 of 365 days).
+	type PmOccupancyWindowBlocks = ConstU32<{ 365 * DAYS }>;
+	type MaxPmOccupancyBlocks = ConstU32<{ 270 * DAYS }>;
+	type MaxPmTenureHistory = ConstU32<128>;
 	/// Daily conviction-vacancy sweep.
 	type VacancySweepIntervalBlocks = ConstU32<{ 1 * DAYS }>;
 	type WeightInfo = pallet_executive::weights::SubstrateWeight<Runtime>;
