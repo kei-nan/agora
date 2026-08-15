@@ -35,7 +35,9 @@ import {
   getSigningKeypair,
   migrateOprfScheme,
   registerCitizen,
+  resolveCommitteeMemberIndex,
   reverifyCitizen,
+  submitOprfQuery,
 } from './identity';
 
 /** A 32-byte field element filled with `seed`, distinct per call so args are identifiable. */
@@ -302,6 +304,120 @@ describe('migrateOprfScheme', () => {
     (params as any).newOprfPkHashes = committeeHashes(31).slice(0, 3);
     await expect(migrateOprfScheme(params)).rejects.toThrow(/\(new\)/);
     expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Tests `submitOprfQuery` (call index 15, `submit_oprf_query(origin, blinded_query: [u8; 64])`)
+ * against a small fake `api` exposing `tx.identity.submitOprfQuery` and
+ * `events.identity.OprfQuerySubmitted`, mirroring `voting.test.ts`'s `submitProposal`
+ * fake — same "read the assigned id back off an event" shape, different pallet/event.
+ */
+describe('submitOprfQuery', () => {
+  function fakeSubmitApi(opts: { dispatchError?: unknown; queryId?: number } = {}) {
+    const calls: RecordedCall[] = [];
+    const queryId = opts.queryId ?? 7;
+    // Mirrors the shape submitOprfQuery's onEvents callback destructures:
+    // `for (const { event } of events)`, then `event.data.queryId.toString()` once
+    // `api.events.identity.OprfQuerySubmitted.is(event)` matches it by reference.
+    const oprfQuerySubmittedEvent = { data: { queryId: { toString: () => String(queryId) } } };
+
+    return {
+      calls,
+      api: {
+        tx: {
+          identity: {
+            submitOprfQuery: (...args: unknown[]) => {
+              calls.push({ name: 'submitOprfQuery', args });
+              return {
+                signAndSend: (_pair: unknown, callback: (result: any) => void) => {
+                  queueMicrotask(() => {
+                    if (opts.dispatchError) {
+                      callback({ status: { isFinalized: false }, events: [], dispatchError: opts.dispatchError });
+                    } else {
+                      callback({
+                        status: { isFinalized: true },
+                        events: [{ event: oprfQuerySubmittedEvent }],
+                        dispatchError: undefined,
+                      });
+                    }
+                  });
+                  return Promise.resolve(() => undefined);
+                },
+              };
+            },
+          },
+        },
+        events: {
+          identity: {
+            OprfQuerySubmitted: {
+              is: (event: unknown) => event === oprfQuerySubmittedEvent,
+            },
+          },
+        },
+      },
+    };
+  }
+
+  it('rejects a non-64-byte blindedQuery without ever calling getApi', async () => {
+    await expect(submitOprfQuery(new Uint8Array(63))).rejects.toThrow(RangeError);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('submits identity.submitOprfQuery with the blinded query and extracts queryId as a decimal string', async () => {
+    const { api, calls } = fakeSubmitApi({ queryId: 42 });
+    mockedGetApi.mockResolvedValue(api as any);
+
+    const blindedQuery = new Uint8Array(64).fill(7);
+    const result = await submitOprfQuery(blindedQuery);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe('submitOprfQuery');
+    expect(calls[0].args).toEqual([blindedQuery]);
+    expect(result).toEqual({ queryId: '42' });
+  });
+
+  it('rejects when the chain reports a dispatch error (e.g. NotRegistered)', async () => {
+    const { api } = fakeSubmitApi({ dispatchError: { toString: () => 'identity.NotRegistered' } });
+    mockedGetApi.mockResolvedValue(api as any);
+    await expect(submitOprfQuery(new Uint8Array(64))).rejects.toThrow('identity.NotRegistered');
+  });
+});
+
+/**
+ * Tests `resolveCommitteeMemberIndex` against a fake `query.identity.committeeMembers`,
+ * confirming the 1-based (not 0-based) roster-position convention
+ * `committee-node/README.md` documents for the DKG party index.
+ */
+describe('resolveCommitteeMemberIndex', () => {
+  function fakeQueryApi(roster: string[]) {
+    return {
+      api: {
+        query: {
+          identity: {
+            committeeMembers: jest.fn(async (_slot: number) => roster.map((addr) => ({ toString: () => addr }))),
+          },
+        },
+      },
+    };
+  }
+
+  it('returns the correct 1-based index for a member present in the roster', async () => {
+    const roster = ['5Alice', '5Bob', '5Carol'];
+    const { api } = fakeQueryApi(roster);
+    mockedGetApi.mockResolvedValue(api as any);
+
+    await expect(resolveCommitteeMemberIndex(2, '5Alice')).resolves.toBe(1);
+    await expect(resolveCommitteeMemberIndex(2, '5Bob')).resolves.toBe(2);
+    await expect(resolveCommitteeMemberIndex(2, '5Carol')).resolves.toBe(3);
+  });
+
+  it('throws for a member absent from the roster', async () => {
+    const roster = ['5Alice', '5Bob'];
+    const { api } = fakeQueryApi(roster);
+    mockedGetApi.mockResolvedValue(api as any);
+
+    await expect(resolveCommitteeMemberIndex(0, '5Zed')).rejects.toThrow(/not a member/);
   });
 });
 

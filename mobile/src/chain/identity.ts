@@ -45,6 +45,18 @@
  * this project yet, so callers of the functions below must supply that
  * material from wherever that eventually lives; this module only validates,
  * encodes, and submits it.
+ *
+ * # A 4th extrinsic: `submit_oprf_query`
+ *
+ * `submitOprfQuery` below wraps a 4th pallet-identity extrinsic, `submit_oprf_query`
+ * (call index 15) — changelog entry 82's on-chain OPRF mailbox, replacing an earlier
+ * relay-server design. It doesn't share the other three's `zk_proof`/`public_inputs`
+ * shape (it takes a single `blinded_query: [u8; 64]`), but it's the same kind of thing:
+ * a validated, direct pallet-identity extrinsic wrapper, so it lives here alongside them
+ * rather than in a new file. `resolveCommitteeMemberIndex`, next to it, is not an
+ * extrinsic at all — it's a read-only lookup against `CommitteeMembers` storage, needed
+ * to translate an `AccountId` into the 1-based DKG roster position that round1/round2
+ * OPRF committee responses are keyed by (see that function's doc comment).
  */
 import { Keyring } from '@polkadot/keyring';
 import { KeyringPair } from '@polkadot/keyring/types';
@@ -304,4 +316,85 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
     ),
     keypair,
   );
+}
+
+/**
+ * Submits `submit_oprf_query(origin, blinded_query: [u8; 64])` (call index 15,
+ * `pallets/pallet-identity/src/lib.rs`) — posts a citizen's blinded OPRF query to the
+ * on-chain mailbox (changelog entry 82), which the query's target committee slot
+ * (derived off-chain via `committee_slot_for`) polls and answers via
+ * `submit_oprf_round1`/`submit_oprf_round2`.
+ *
+ * Validates `blindedQuery`'s length locally (mirrors `assertValidAnchor`/
+ * `assertValidOprfCommitteeKeyHashes` above — fail before ever touching the network)
+ * rather than letting a malformed call hit the chain's own decode failure.
+ *
+ * The pallet assigns and emits the query's id via `Event::OprfQuerySubmitted { query_id,
+ * submitter }` — it is not derivable locally, so this reads it back out of the finalized
+ * extrinsic's own events, the same way `voting.ts`'s `submitProposal` reads back
+ * `ProposalCreated.id`. Returned as a decimal string, not a `u64`/`BN`/`number` — the
+ * same JSON-safe convention `registrationState.ts`'s `queryId` fields already use, since
+ * this value is meant to be persisted there.
+ */
+export async function submitOprfQuery(blindedQuery: Uint8Array): Promise<{ queryId: string }> {
+  if (blindedQuery.length !== 64) {
+    throw new RangeError(`submitOprfQuery: blindedQuery is ${blindedQuery.length} bytes, expected 64`);
+  }
+
+  const api = await getApi();
+  const { keypair } = await getSigningKeypair();
+
+  let queryId: string | null = null;
+  await submitExtrinsic(api.tx.identity.submitOprfQuery(blindedQuery), keypair, {
+    onEvents: (events) => {
+      for (const { event } of events) {
+        if (api.events.identity.OprfQuerySubmitted.is(event)) {
+          queryId = (event.data as any).queryId.toString();
+        }
+      }
+    },
+  });
+
+  if (queryId === null) {
+    throw new Error(
+      'submitOprfQuery: extrinsic finalized without ever emitting identity.OprfQuerySubmitted — ' +
+        'cannot report a query id',
+    );
+  }
+  return { queryId };
+}
+
+/**
+ * Resolves `member`'s (an SS58 address) 1-based position in `CommitteeMembers[committeeSlot]`
+ * — pallet-identity's `StorageMap<u8, BoundedVec<AccountId, MaxCommitteeSize>>` roster of
+ * which accounts belong to which OPRF committee slot (`pallets/pallet-identity/src/lib.rs`,
+ * "OPRF committee on-chain mailbox" section).
+ *
+ * This is the DKG party index a round1/round2 OPRF response is keyed by, per
+ * `committee-node/README.md`'s own documented convention: "`MEMBER_INDEX` (this node's
+ * 1-based `CommitteeMembers[slot]` roster position — the DKG party index; getting it wrong
+ * fails silently downstream, see its doc comment)". 1-based (not 0-based) because that's
+ * what the threshold-crypto Lagrange-interpolation math the DKG party index eventually
+ * feeds requires — party index 0 is not a valid participant.
+ *
+ * Pure read-only data lookup, no cryptography — implemented for real, not a stub. Throws if
+ * `member` is not found in the roster: an out-of-band round1/round2 response for a non-member
+ * indicates corrupted chain state or a bug elsewhere in the caller, not a condition to handle
+ * silently by e.g. returning `-1` or `0`.
+ */
+export async function resolveCommitteeMemberIndex(committeeSlot: number, member: string): Promise<number> {
+  const api = await getApi();
+  const roster = await api.query.identity.committeeMembers(committeeSlot);
+  const addresses = Array.from(roster as unknown as Iterable<{ toString(): string }>).map((entry) =>
+    entry.toString(),
+  );
+  const position = addresses.indexOf(member);
+  if (position === -1) {
+    throw new Error(
+      `resolveCommitteeMemberIndex: ${member} is not a member of CommitteeMembers[${committeeSlot}] ` +
+        `(roster has ${addresses.length} member(s)) — this indicates corrupted chain state or a bug ` +
+        'elsewhere, not a case to handle silently',
+    );
+  }
+  return position + 1;
 }

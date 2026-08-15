@@ -3,6 +3,7 @@ import { Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, Activity
 import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { KeyringPair } from '@polkadot/keyring/types';
 import { RootStackParamList } from '../App';
 import { readPassport, cancelPendingScan, RawPassportData } from '../native/nfcPassportReader';
 import { buildCircuitInputs } from '../chain/sodParser';
@@ -12,6 +13,8 @@ import {
   TEST_PASSPORT_SOD_BASE64,
 } from '../chain/__fixtures__/testPassport';
 import { useAppModal } from '../components/AppModal';
+import { getSigningKeypair } from '../chain/identity';
+import { writeRegistrationStatus } from '../chain/registrationState';
 import { colors } from '../theme';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
@@ -103,7 +106,21 @@ export default function RegisterScreen({ navigation }: Props) {
       );
       return;
     }
+    // Declared outside the try block (rather than `const { keypair } =` right
+    // inside it) so the catch block below can still reach `keypair.address`
+    // for the Failed-status write even when the failure happened *before*
+    // getSigningKeypair() resolved — in which case it's simply left
+    // `undefined` and the write is skipped (see the inner try/catch around
+    // that write below).
+    let keypair: KeyringPair | undefined;
     try {
+      // New dependency introduced by this screen: previously RegisterScreen
+      // had zero reliance on identity.ts/signing key material. Keystore
+      // unavailability is therefore a genuinely new failure mode partway
+      // through this flow — it's covered by this same try/catch, falling
+      // into the generic "didn't complete" branch below like any other error
+      // here.
+      keypair = (await getSigningKeypair()).keypair;
       setStep('nfc');
       // Real as of HANDOFF log #58 — Android only (see readPassport's own
       // doc comment; iOS needs a Swift module wrapping AndyQ/NFCPassportReader,
@@ -121,6 +138,7 @@ export default function RegisterScreen({ navigation }: Props) {
           });
       setRawPassport(raw);
       setStep('liveness');
+      await writeRegistrationStatus(keypair.address, { stage: 'PassportScanned' });
       // TODO: await FaceMatch.verify(scan.faceImage);
       setStep('proving');
       // Real as of this session (../chain/sodParser.ts) — parses the SOD's
@@ -144,6 +162,7 @@ export default function RegisterScreen({ navigation }: Props) {
       // specific variant identified below (see ../chain/zkProving.ts's
       // module doc + HANDOFF item 8/log #56).
       const { variant } = buildCircuitInputs(raw.dg1, raw.dg15, raw.sod);
+      await writeRegistrationStatus(keypair.address, { stage: 'ProofMaterialAssembled' });
       throw new NotImplementedError(
         `Passport chip read succeeded (DG1: ${raw.dg1.length}B, DG15: ${raw.dg15.length}B, ` +
           `SOD: ${raw.sod.length}B) and circuit inputs were assembled for variant "${variant.name}" — ` +
@@ -161,6 +180,21 @@ export default function RegisterScreen({ navigation }: Props) {
           __DEV__ ? e.message : undefined,
         );
       } else {
+        try {
+          // Best-effort: if keypair never resolved (e.g. the failure was
+          // getSigningKeypair() itself), `keypair` is still undefined here
+          // and `.address` throws — caught right below, so a failure to
+          // persist the failure record can't mask the original error or
+          // crash this error-handling path.
+          await writeRegistrationStatus(keypair!.address, {
+            stage: 'Failed',
+            failedStage: step === 'idle' ? 'PassportScanned' : step,
+            reason: e.message ?? String(e),
+            retryable: true,
+          });
+        } catch {
+          // Swallowed — see comment above.
+        }
         showInfo(
           "Registration didn't complete",
           'Something went wrong while reading or processing your passport. Please try again.',

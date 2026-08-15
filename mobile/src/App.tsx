@@ -11,6 +11,7 @@ enableScreens();
 import { AppModalProvider } from './components/AppModal';
 import { colors } from './theme';
 import RegisterScreen from './screens/RegisterScreen';
+import RegistrationStatusScreen from './screens/RegistrationStatusScreen';
 import HomeScreen from './screens/HomeScreen';
 import ProposalsScreen from './screens/ProposalsScreen';
 import LawsScreen from './screens/LawsScreen';
@@ -20,13 +21,17 @@ import DelegateDetailScreen from './screens/DelegateDetailScreen';
 import RegisterDelegateScreen from './screens/RegisterDelegateScreen';
 import AuthScreen from './screens/AuthScreen';
 import VoteScreen from './screens/VoteScreen';
+import CasesScreen from './screens/CasesScreen';
+import FileCaseScreen from './screens/FileCaseScreen';
 
 export type RootStackParamList = {
   Main: undefined;
   Register: undefined;
+  RegistrationStatus: undefined;
   Auth: { deepLink?: string };
   DelegateDetail: { address: string };
   RegisterDelegate: undefined;
+  FileCase: undefined;
 };
 
 export type TabParamList = {
@@ -36,6 +41,7 @@ export type TabParamList = {
   Petitions: undefined;
   Delegate: undefined;
   Budget: undefined;
+  Courts: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -58,6 +64,7 @@ function MainTabs() {
       <Tab.Screen name="Petitions" component={PetitionScreen} />
       <Tab.Screen name="Delegate" component={DelegateScreen} />
       <Tab.Screen name="Budget" component={VoteScreen} />
+      <Tab.Screen name="Courts" component={CasesScreen} />
     </Tab.Navigator>
   );
 }
@@ -100,6 +107,11 @@ export default function App() {
           options={{ title: 'Register as Citizen' }}
         />
         <Stack.Screen
+          name="RegistrationStatus"
+          component={RegistrationStatusScreen}
+          options={{ title: 'Registration Status' }}
+        />
+        <Stack.Screen
           name="Auth"
           component={AuthScreen}
           options={{ title: 'Desktop Sign-In', presentation: 'modal' }}
@@ -113,6 +125,11 @@ export default function App() {
           name="RegisterDelegate"
           component={RegisterDelegateScreen}
           options={{ title: 'Become a Delegate' }}
+        />
+        <Stack.Screen
+          name="FileCase"
+          component={FileCaseScreen}
+          options={{ title: 'File a Case', presentation: 'modal' }}
         />
       </Stack.Navigator>
     </NavigationContainer>

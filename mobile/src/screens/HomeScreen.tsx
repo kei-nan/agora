@@ -10,7 +10,9 @@ import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { RootStackParamList } from '../App';
 import { getRegistered, setRegistered } from '../chain/citizenState';
-import { getSigningKeypair, isCitizen } from '../chain/identity';
+import { getSigningKeypair } from '../chain/identity';
+import { RegistrationStatus } from '../chain/registrationState';
+import { reconcileRegistrationStatus } from '../chain/registrationReconciler';
 import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
@@ -28,9 +30,33 @@ interface ChainStats {
   activeProposals: number;
 }
 
+/** Short line for the in-progress/terminal-but-not-Active card. Used for every stage except 'checking'/'NotStarted'/'Active', which have their own dedicated card bodies below. */
+function stageLabel(stage: RegistrationStatus['stage']): string {
+  switch (stage) {
+    case 'PassportScanned':
+    case 'ProofMaterialAssembled':
+    case 'ProofReady':
+    case 'ChainSubmissionPending':
+      return 'Registration in progress';
+    case 'OprfQuerySubmitted':
+    case 'AwaitingCommitteeRound1':
+    case 'AwaitingCommitteeRound2':
+    case 'ProofCombining':
+      return 'Waiting on OPRF committee';
+    case 'Failed':
+      return 'Registration failed';
+    case 'ReverificationDue':
+      return 'Reverification needed';
+    case 'Suspended':
+      return 'Account suspended';
+    default:
+      return 'Registration in progress';
+  }
+}
+
 export default function HomeScreen() {
   const navigation = useNavigation<Nav>();
-  const [citizenStatus, setCitizenStatus] = useState<'checking' | 'registered' | 'unregistered'>('checking');
+  const [regStatus, setRegStatus] = useState<RegistrationStatus | 'checking'>('checking');
   const [stats, setStats] = useState<ChainStats | null>(null);
   const { showConfirm } = useAppModal();
 
@@ -46,14 +72,14 @@ export default function HomeScreen() {
     // visit — this mirrors the desktop app's "degrades gracefully offline"
     // behavior (CLAUDE.md).
     let cancelled = false;
-    setCitizenStatus(getRegistered() ? 'registered' : 'unregistered');
+    setRegStatus({ stage: getRegistered() ? 'Active' : 'NotStarted' });
     (async () => {
       try {
         const { keypair } = await getSigningKeypair();
-        const registered = await isCitizen(keypair.address);
+        const result = await reconcileRegistrationStatus(keypair.address);
         if (cancelled) return;
-        setRegistered(registered);
-        setCitizenStatus(registered ? 'registered' : 'unregistered');
+        setRegStatus(result.status);
+        setRegistered(result.status.stage === 'Active');
       } catch {
         // Chain unreachable or not yet connected — leave the cached value shown above.
       }
@@ -75,10 +101,10 @@ export default function HomeScreen() {
         // citizenState.ts's local UI-convenience cache (see the comment on
         // that cache above), nothing on-chain. It can't actually
         // "deregister" a real citizen: the very next time this screen
-        // regains focus, useFocusEffect above re-queries isCitizen() from
-        // the chain and overwrites the cache right back to 'registered' if
-        // that's still true on-chain. So its only real effect is letting a
-        // developer force the unregistered-citizen UI path (e.g. to check
+        // regains focus, useFocusEffect above re-reconciles via
+        // reconcileRegistrationStatus() and overwrites the cache right back
+        // to 'Active' if that's still true on-chain. So its only real effect
+        // is letting a developer force the unregistered-citizen UI path (e.g. to check
         // Quick access's locked-card state) without a second device/account.
         // That makes it a debug tool, not a user-facing feature, and an
         // undocumented gesture is a bad way to expose even a debug tool —
@@ -86,25 +112,25 @@ export default function HomeScreen() {
         // uses for its test-passport button) rather than making it a real
         // always-on affordance.
         onLongPress={__DEV__ ? () => {
-          if (citizenStatus !== 'registered') return;
+          if (regStatus === 'checking' || regStatus.stage !== 'Active') return;
           showConfirm({
             title: 'Reset registration?',
             message: 'This will clear your citizen status for this session.',
             confirmLabel: 'Reset',
             destructive: true,
-            onConfirm: () => { setRegistered(false); setCitizenStatus('unregistered'); },
+            onConfirm: () => { setRegistered(false); },
           });
         } : undefined}
       >
-        {citizenStatus === 'checking' ? (
+        {regStatus === 'checking' ? (
           <ActivityIndicator color={colors.accent} />
-        ) : citizenStatus === 'registered' ? (
+        ) : regStatus.stage === 'Active' ? (
           <>
             <Text style={s.statusBadge}>✓ Registered citizen</Text>
             <Text style={s.statusSub}>Your passport identity is active on-chain</Text>
             {__DEV__ && <Text style={s.devHint}>Long-press to reset local status (dev only)</Text>}
           </>
-        ) : (
+        ) : regStatus.stage === 'NotStarted' ? (
           <>
             <Text style={[s.statusBadge, s.notRegistered]}>Not registered</Text>
             <Text style={s.statusSub}>Register your passport to participate</Text>
@@ -115,6 +141,19 @@ export default function HomeScreen() {
               accessibilityLabel="Register now"
             >
               <Text style={s.registerBtnText}>Register now</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <Text style={[s.statusBadge, s.notRegistered]}>{stageLabel(regStatus.stage)}</Text>
+            <Text style={s.statusSub}>Check your registration's current progress</Text>
+            <TouchableOpacity
+              style={s.registerBtn}
+              onPress={() => navigation.navigate('RegistrationStatus')}
+              accessibilityRole="button"
+              accessibilityLabel="View registration status"
+            >
+              <Text style={s.registerBtnText}>View registration status</Text>
             </TouchableOpacity>
           </>
         )}
@@ -130,10 +169,10 @@ export default function HomeScreen() {
 
       <Text style={s.sectionTitle}>Quick access</Text>
       <View style={s.quickGrid}>
-        <QuickCard emoji="🗳" label="Vote on proposals" onPress={() => (navigation as any).navigate('Proposals')} disabled={citizenStatus !== 'registered'} />
-        <QuickCard emoji="📝" label="Sign petitions" onPress={() => (navigation as any).navigate('Petitions')} disabled={citizenStatus !== 'registered'} />
-        <QuickCard emoji="🤝" label="Manage delegation" onPress={() => (navigation as any).navigate('Delegate')} disabled={citizenStatus !== 'registered'} />
-        <QuickCard emoji="💻" label="Sign in to desktop" onPress={() => navigation.navigate('Auth', {})} disabled={citizenStatus !== 'registered'} />
+        <QuickCard emoji="🗳" label="Vote on proposals" onPress={() => (navigation as any).navigate('Proposals')} disabled={regStatus === 'checking' || regStatus.stage !== 'Active'} />
+        <QuickCard emoji="📝" label="Sign petitions" onPress={() => (navigation as any).navigate('Petitions')} disabled={regStatus === 'checking' || regStatus.stage !== 'Active'} />
+        <QuickCard emoji="🤝" label="Manage delegation" onPress={() => (navigation as any).navigate('Delegate')} disabled={regStatus === 'checking' || regStatus.stage !== 'Active'} />
+        <QuickCard emoji="💻" label="Sign in to desktop" onPress={() => navigation.navigate('Auth', {})} disabled={regStatus === 'checking' || regStatus.stage !== 'Active'} />
       </View>
     </View>
   );
