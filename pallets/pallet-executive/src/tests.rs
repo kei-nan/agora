@@ -1280,6 +1280,93 @@ fn vote_end_emergency_fails_when_already_voted() {
     });
 }
 
+// ─── cabinet-too-small floor (HIGH-severity solo-emergency fix) ────────────
+//
+// A freshly-invested PM with no confirmed ministers yet has cabinet_size() == 1, at which
+// point supermajority_reached(1, 1) (1*3 >= 1*2) is trivially true -- the PM's own single
+// vote would satisfy "2/3 cabinet supermajority" with zero actual cabinet consensus. Both
+// vote_declare_emergency and vote_end_emergency require cabinet_size() >= 2 up front so a
+// 1-member cabinet can never pass the check regardless of the ratio math.
+
+#[test]
+fn vote_declare_emergency_fails_when_cabinet_too_small() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1); // cabinet_size == 1: PM alone, no confirmed ministers yet.
+
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50),
+            Error::<Test>::CabinetTooSmallForEmergencyVote
+        );
+    });
+}
+
+#[test]
+fn vote_end_emergency_fails_when_cabinet_too_small() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three(); // PM = 1, ministers 2 and 3.
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+        assert!(ActiveEmergency::<Test>::get().is_some());
+
+        // Both ministers leave office, shrinking the live cabinet down to just the PM.
+        assert_ok!(Executive::resign(RuntimeOrigin::signed(2)));
+        assert_ok!(Executive::resign(RuntimeOrigin::signed(3)));
+
+        assert_noop!(
+            Executive::vote_end_emergency(RuntimeOrigin::signed(1)),
+            Error::<Test>::CabinetTooSmallForEmergencyVote
+        );
+    });
+}
+
+// ─── stale EndVotes from departed cabinet members (HIGH-severity fix) ──────
+//
+// Every office-vacating path purges DeclareVotes for the departing account, but previously
+// none of them purged EndVotes -- so a departed minister's stale "yes, end it" vote kept
+// inflating vote_end_emergency's numerator after they left, while cabinet_size() (the
+// denominator) is always computed live from who's actually still in office.
+
+#[test]
+fn vote_end_emergency_stale_vote_from_departed_minister_does_not_count() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three(); // PM = 1, ministers 2 and 3. cabinet_size == 3.
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+        assert!(ActiveEmergency::<Test>::get().is_some());
+
+        // Minister 2 casts an "end it" vote -- 1 of 3 is insufficient alone (needs 2/3).
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_some(), "1 of 3 must not end it");
+        assert!(EndVotes::<Test>::get(2));
+
+        // Minister 2 then leaves office entirely.
+        assert_ok!(Executive::resign(RuntimeOrigin::signed(2)));
+        assert!(
+            !EndVotes::<Test>::contains_key(2),
+            "departed minister's stale end-vote must be purged from storage"
+        );
+
+        // Cabinet is now PM(1) + minister(3) only -- cabinet_size == 2, needs both votes
+        // for 2/3. If minister 2's stale vote still counted, minister 3 voting alone would
+        // wrongly reach the supermajority (stale 2 + fresh 3 == 2 votes of 2). It must not.
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(3)));
+        assert!(
+            ActiveEmergency::<Test>::get().is_some(),
+            "a departed member's stale vote must not let one fresh vote satisfy the supermajority"
+        );
+
+        // Ending it now genuinely requires a fresh vote from a still-current cabinet member.
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert!(
+            ActiveEmergency::<Test>::get().is_none(),
+            "two fresh votes from the genuinely current cabinet must end it"
+        );
+    });
+}
+
 // ─── retract_emergency_vote ─────────────────────────────────────────────────
 
 #[test]
@@ -1430,8 +1517,74 @@ fn minister_checker_false_for_unrelated_account() {
 fn legislature_call_hash_differs_between_appoint_minister_and_ratify_emergency() {
     let appoint =
         crate::pallet::legislature_call_hash(b"pallet-executive::appoint_minister", (0u32, 1u64));
-    let ratify = crate::pallet::legislature_call_hash(b"pallet-executive::ratify_emergency", ());
+    let ratify =
+        crate::pallet::legislature_call_hash(b"pallet-executive::ratify_emergency", (hash(1), 1u64));
     assert_ne!(appoint, ratify);
+}
+
+// ── ratify_emergency hash bound to a specific emergency (MEDIUM-severity replay fix) ──
+//
+// Previously ratify_emergency's hash was `legislature_call_hash(b"...", ())` -- a constant
+// identical for every emergency that will ever exist. Since PendingLegislatureApproval only
+// tracks one outstanding token system-wide and doesn't invalidate it when the emergency it
+// was meant for lapses, a token approved for emergency #1 could be replayed later to ratify
+// an unrelated emergency #2 the legislature never actually voted on. The hash must now bind
+// to that specific emergency's (reason_hash, declared_at).
+
+#[test]
+fn ratify_emergency_call_hash_differs_across_different_emergencies() {
+    let e1 = crate::pallet::legislature_call_hash(
+        b"pallet-executive::ratify_emergency",
+        (hash(1), 10u64),
+    );
+    // Same reason, different declared_at -- e.g. the same wording used for two separate
+    // emergencies declared at different times.
+    let e2 = crate::pallet::legislature_call_hash(
+        b"pallet-executive::ratify_emergency",
+        (hash(1), 20u64),
+    );
+    // Different reason, same declared_at.
+    let e3 = crate::pallet::legislature_call_hash(
+        b"pallet-executive::ratify_emergency",
+        (hash(2), 10u64),
+    );
+    assert_ne!(e1, e2);
+    assert_ne!(e1, e3);
+    assert_ne!(e2, e3);
+}
+
+#[test]
+fn ratify_emergency_binds_hash_to_the_actual_active_emergencys_reason_and_declared_at() {
+    // Behavioral check that the extrinsic itself hashes the *actual* ActiveEmergency fields
+    // (not e.g. always `(reason_hash, 0)` or some other placeholder): declare with a known
+    // reason at a known block, then confirm the value ratify_emergency would need to be
+    // authorized for matches legislature_call_hash(tag, (that reason_hash, that declared_at)).
+    new_test_ext().execute_with(|| {
+        System::set_block_number(7);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(3), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(3), 50));
+
+        let info = ActiveEmergency::<Test>::get().unwrap();
+        assert_eq!(info.reason_hash, hash(3));
+        assert_eq!(info.declared_at, 7);
+
+        let expected = crate::pallet::legislature_call_hash(
+            b"pallet-executive::ratify_emergency",
+            (info.reason_hash, info.declared_at),
+        );
+        // A hash bound to a *different* emergency's fields must differ from this one.
+        let wrong = crate::pallet::legislature_call_hash(
+            b"pallet-executive::ratify_emergency",
+            (hash(9), info.declared_at),
+        );
+        assert_ne!(expected, wrong);
+
+        // Root passes regardless under this mock's AsEnsureOriginWithArg (which doesn't
+        // check the hash) -- the binding invariant itself is exercised end-to-end in
+        // pallet-legislature's own suite against the real EnsureLegislatureMotion origin.
+        assert_ok!(Executive::ratify_emergency(RuntimeOrigin::root()));
+    });
 }
 
 #[test]

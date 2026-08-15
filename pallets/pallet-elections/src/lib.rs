@@ -721,13 +721,32 @@ pub mod pallet {
 
     impl<T: Config> Pallet<T> {
 
+        /// Activates `delegate` (Pending/OnBreak -> Active).
+        ///
+        /// Term-clock handling is the crux of closing the backing-drop-cycling term-limit
+        /// evasion: a genuine fresh start (initial registration, or reactivation right after
+        /// a completed mandatory break) must start a new term clock, but a transient
+        /// backing-drop gap (`remove_backing` flipping Active -> Pending, which never touches
+        /// `term_start_block`) must NOT reset it — otherwise a delegate with one cooperating
+        /// backer could cycle `remove_backing`/`back_delegate` shortly before each term would
+        /// complete and silently restart the elapsed-time clock from zero every time, so
+        /// `consecutive_terms` would never reach the cap and the delegate would never be
+        /// forced onto a mandatory break.
+        ///
+        /// `term_start_block` is already the right discriminator for this, in both call
+        /// sites: it is only ever `None` on a genuine fresh start (registration leaves it
+        /// `None`; `on_initialize`'s OnBreak-ending branch explicitly resets it to `None`
+        /// before calling this) and is preserved as `Some` across a `remove_backing`-induced
+        /// Pending gap. So: only start a new clock when there isn't one already running.
         fn activate_delegate(delegate: &T::AccountId) {
             let now = frame_system::Pallet::<T>::block_number();
             Delegates::<T>::mutate(delegate, |maybe| {
                 if let Some(d) = maybe {
                     d.status = DelegateStatus::Active;
-                    d.term_start_block = Some(now);
-                    d.warning_emitted = false;
+                    if d.term_start_block.is_none() {
+                        d.term_start_block = Some(now);
+                        d.warning_emitted = false;
+                    }
                 }
             });
             Self::deposit_event(Event::DelegateActivated { delegate: delegate.clone() });

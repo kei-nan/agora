@@ -184,14 +184,18 @@ mod benchmarks {
 	#[benchmark]
 	fn ratify_emergency() {
 		let now = frame_system::Pallet::<T>::block_number();
+		let reason_hash = [6u8; 32];
 		ActiveEmergency::<T>::put(EmergencyInfo {
 			declared_at: now,
 			expires_at: now.saturating_add(BlockNumberFor::<T>::from(1_000u32)),
 			ratify_by: now.saturating_add(BlockNumberFor::<T>::from(500u32)),
-			reason_hash: [6u8; 32],
+			reason_hash,
 			ratified: false,
 		});
-		let origin = legislature_origin::<T>(b"pallet-executive::ratify_emergency", ());
+		let origin = legislature_origin::<T>(
+			b"pallet-executive::ratify_emergency",
+			(reason_hash, now),
+		);
 
 		#[extrinsic_call]
 		ratify_emergency(origin);
