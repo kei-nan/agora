@@ -271,6 +271,21 @@ async fn run_callback_server(
 /// `complete_challenge_at`, which enforces `CHALLENGE_TTL_SECS` and rejects a double-completion
 /// server-side — a late callback that slips past the early `challenge_known` check (e.g. because
 /// the chain lookup above took a while) still can't complete an aged-out challenge.
+///
+/// TRUST BOUNDARY CAVEAT — read before touching this function: "verified against the public key
+/// on-chain" above is only as trustworthy as the RPC endpoint that supplies that key. The lookup
+/// at the `chain::lookup_registered_account` call below has no state-proof/consensus verification
+/// (see the TRUST BOUNDARY comment on that function in `commands/chain.rs`) — it's a plain,
+/// unauthenticated JSON-RPC call to a hardcoded local node over plaintext HTTP. A
+/// malicious/compromised node, or a local MITM on that channel, can hand this function an
+/// attacker-chosen public key for any nullifier, and this function will faithfully verify the
+/// callback signature against it and mint a real bearer session for a forged identity. The
+/// sr25519 signature check right below is doing exactly what it claims — proving the caller
+/// controls the private key matching the pubkey it was given — it just isn't yet given a pubkey
+/// that's cryptographically bound to the real chain state. Closing this requires the smoldot
+/// light-client integration CLAUDE.md already documents as architected-for-but-not-built; until
+/// then, do not treat a minted session's `nullifier_hash` as a verified identity against a
+/// hostile or compromised RPC endpoint.
 async fn handle_auth_callback(
     cb: AuthCallback,
     sessions: &Arc<Mutex<HashMap<String, ChallengeEntry>>>,
