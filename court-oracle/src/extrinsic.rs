@@ -30,8 +30,12 @@
 //! **Solid** (fetched live from the chain, standard/stable wire format, or read directly from
 //! `pallets/pallet-courts/src/lib.rs`): spec_version, transaction_version, genesis hash,
 //! account nonce, the sr25519 signing scheme itself, and
-//! `submit_ai_ruling(case_id: u32, ruling_hash: [u8; 32], model_version: u32)`'s exact
-//! argument shape and call index (1) — read directly, not guessed.
+//! `submit_ai_ruling(case_id: u32, ruling_hash: [u8; 32], model_version: u32, verdict:
+//! Verdict)`'s exact argument shape and call index (1) — read directly, not guessed. Note the
+//! `verdict` argument: `submit_ai_ruling` now commits the verdict on-chain at submission time
+//! (closing a hole where a compromised oracle key could publish reasoning saying one thing and
+//! finalize with a different verdict), so `finalize_ruling(case_id: u32)` — call index 4 — no
+//! longer takes a verdict argument of its own; it applies whatever was committed above.
 //!
 //! `model_version` must match `pallet_courts::CurrentAIModelVersion` exactly (a plain
 //! `StorageValue<u32>`, governance-set via `vote_approve_ai_model`) or `submit_ai_ruling`
@@ -72,23 +76,29 @@ const ERA_IMMORTAL: u8 = 0x00;
 /// `frame_metadata_hash_extension::Mode::Disabled` — see module docs, "best-effort" list.
 const METADATA_HASH_MODE_DISABLED: u8 = 0x00;
 
-/// Arguments to `pallet-courts::submit_ai_ruling(case_id, ruling_hash, model_version)`.
+/// Arguments to `pallet-courts::submit_ai_ruling(case_id, ruling_hash, model_version, verdict)`.
+/// `verdict` is committed on-chain here (in `AIRulingVerdict`) — `finalize_ruling`'s no-appeal
+/// path later applies exactly this value, taking no verdict argument of its own.
 pub struct SubmitAiRuling {
     pub case_id: u32,
     pub ruling_hash: [u8; 32],
     pub model_version: u32,
+    pub verdict: Verdict,
 }
 
-/// Arguments to `pallet-courts::finalize_ruling(case_id, verdict)` — the no-appeal-path call
-/// that applies an AI ruling's verdict once the appeal window has closed unappealed (see
-/// `Cases`/`AIRulingBlock` in `pallets/pallet-courts/src/lib.rs`, `#[pallet::call_index(4)]`).
+/// Arguments to `pallet-courts::finalize_ruling(case_id)` — the no-appeal-path call that
+/// applies an AI ruling's verdict once the appeal window has closed unappealed (see
+/// `Cases`/`AIRulingBlock`/`AIRulingVerdict` in `pallets/pallet-courts/src/lib.rs`,
+/// `#[pallet::call_index(4)]`). Takes no verdict argument: the chain applies whatever
+/// `submit_ai_ruling` committed to `AIRulingVerdict` at submission time, so this service no
+/// longer needs to reconstruct the verdict at finalize time (previously done by re-fetching
+/// the published IPFS ruling document — see README.md's history of that gap and its fix).
 /// Gated by the same `T::OracleOrigin` as `submit_ai_ruling` — see this pallet's
 /// `EnsureOracle`, which checks the signer against `OracleAccount` storage — so this crate's
 /// existing oracle signing key (already used for `submit_ai_ruling`) is also the correct signer
 /// here; no separate key or origin is needed.
 pub struct FinalizeRuling {
     pub case_id: u32,
-    pub verdict: Verdict,
 }
 
 /// Encodes just the `[pallet_index, call_index] ++ arguments` portion of a call — the part
@@ -101,25 +111,26 @@ pub trait CourtsCall {
 
 impl CourtsCall for SubmitAiRuling {
     fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8> {
-        // [pallet_index, call_index] ++ case_id ++ ruling_hash ++ model_version
+        // [pallet_index, call_index] ++ case_id ++ ruling_hash ++ model_version ++ verdict
         let mut call_bytes = Vec::new();
         call_bytes.push(pallet_index);
         call_bytes.push(call_index);
         call_bytes.extend(self.case_id.encode());
         call_bytes.extend(self.ruling_hash); // fixed-size array: raw bytes, no length prefix
         call_bytes.extend(self.model_version.encode());
+        call_bytes.extend(self.verdict.encode()); // single-byte enum discriminant
         call_bytes
     }
 }
 
 impl CourtsCall for FinalizeRuling {
     fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8> {
-        // [pallet_index, call_index] ++ case_id ++ verdict (single-byte enum discriminant)
+        // [pallet_index, call_index] ++ case_id -- no verdict argument, see this struct's doc
+        // comment: the chain applies whatever submit_ai_ruling already committed.
         let mut call_bytes = Vec::new();
         call_bytes.push(pallet_index);
         call_bytes.push(call_index);
         call_bytes.extend(self.case_id.encode());
-        call_bytes.extend(self.verdict.encode());
         call_bytes
     }
 }
@@ -198,39 +209,50 @@ mod tests {
 
     /// Pure-logic check on the call-byte encoding alone (no RPC): confirms the argument
     /// layout matches what `pallet-courts::submit_ai_ruling(case_id: u32, ruling_hash: [u8;
-    /// 32], model_version: u32)` expects to decode — pallet_index, call_index, then case_id as
-    /// a plain (non-compact) little-endian u32, then the 32 raw hash bytes with no length
-    /// prefix (fixed-size array), then model_version as a plain little-endian u32. Exercises the
-    /// real `CourtsCall::encode_call_bytes` implementation, not a hand-duplicated copy.
+    /// 32], model_version: u32, verdict: Verdict)` expects to decode — pallet_index,
+    /// call_index, then case_id as a plain (non-compact) little-endian u32, then the 32 raw
+    /// hash bytes with no length prefix (fixed-size array), then model_version as a plain
+    /// little-endian u32, then verdict as a single-byte enum discriminant (Upheld = 0,
+    /// Overturned = 1 — see `cases::Verdict`). Exercises the real `CourtsCall::encode_call_bytes`
+    /// implementation, not a hand-duplicated copy.
     #[test]
     fn call_bytes_layout_matches_submit_ai_ruling_signature() {
-        let call = SubmitAiRuling { case_id: 42, ruling_hash: [7u8; 32], model_version: 3 };
+        let call = SubmitAiRuling {
+            case_id: 42,
+            ruling_hash: [7u8; 32],
+            model_version: 3,
+            verdict: Verdict::Overturned,
+        };
         let call_bytes = call.encode_call_bytes(11, 1);
 
-        assert_eq!(call_bytes.len(), 2 + 4 + 32 + 4);
+        assert_eq!(call_bytes.len(), 2 + 4 + 32 + 4 + 1);
         assert_eq!(call_bytes[0], 11);
         assert_eq!(call_bytes[1], 1);
         assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
         assert_eq!(&call_bytes[6..38], &[7u8; 32]);
         assert_eq!(&call_bytes[38..42], &3u32.to_le_bytes());
+        assert_eq!(call_bytes[42], 1); // Overturned's discriminant
+
+        let call = SubmitAiRuling {
+            case_id: 42,
+            ruling_hash: [7u8; 32],
+            model_version: 3,
+            verdict: Verdict::Upheld,
+        };
+        assert_eq!(call.encode_call_bytes(11, 1)[42], 0); // Upheld's discriminant
     }
 
-    /// Same idea for `pallet-courts::finalize_ruling(case_id: u32, verdict: Verdict)` —
-    /// pallet_index, call_index, case_id as a plain little-endian u32, then the verdict as a
-    /// single-byte enum discriminant (Upheld = 0, Overturned = 1 — see `cases::Verdict`).
+    /// Same idea for `pallet-courts::finalize_ruling(case_id: u32)` — pallet_index, call_index,
+    /// then case_id as a plain little-endian u32. No verdict argument: the chain applies
+    /// whatever `submit_ai_ruling` already committed on-chain.
     #[test]
     fn call_bytes_layout_matches_finalize_ruling_signature() {
-        let call = FinalizeRuling { case_id: 42, verdict: Verdict::Overturned };
+        let call = FinalizeRuling { case_id: 42 };
         let call_bytes = call.encode_call_bytes(11, 4);
 
-        assert_eq!(call_bytes.len(), 2 + 4 + 1);
+        assert_eq!(call_bytes.len(), 2 + 4);
         assert_eq!(call_bytes[0], 11);
         assert_eq!(call_bytes[1], 4);
         assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
-        assert_eq!(call_bytes[6], 1); // Overturned's discriminant
-
-        let call = FinalizeRuling { case_id: 7, verdict: Verdict::Upheld };
-        let call_bytes = call.encode_call_bytes(11, 4);
-        assert_eq!(call_bytes[6], 0); // Upheld's discriminant
     }
 }

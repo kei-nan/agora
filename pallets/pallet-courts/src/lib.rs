@@ -42,6 +42,10 @@ pub mod pallet {
     /// Implemented by the runtime to check whether an account is an active citizen.
     pub trait CitizenChecker<AccountId> {
         fn is_active_citizen(who: &AccountId) -> bool;
+        /// Returns `who`'s registered identity nullifier, if any. Used by `appeal_ruling` to
+        /// verify that a signer claiming to be the ruled-against party of a
+        /// `CaseSubject::CitizenConduct` case actually is — see `is_ruled_against_party`.
+        fn citizen_nullifier(who: &AccountId) -> Option<[u8; 32]>;
     }
 
     /// Implemented by the runtime to call pallet-constitution's invalidate_law_internal.
@@ -207,6 +211,13 @@ pub mod pallet {
         /// implemented here; see HANDOFF.md item 7.
         #[pallet::constant]
         type JurySeedDelayBlocks: Get<u32>;
+        /// Maximum number of cases whose jury-seed capture can be scheduled for the same
+        /// block (i.e. whose `JurySeedDelayBlocks` window closes at the same block number).
+        /// Bounds `on_initialize`'s worst-case per-block weight for `SeedCaptureDue`. In
+        /// practice this only needs to be as large as "how many `appeal_ruling` calls could
+        /// plausibly land in the same block."
+        #[pallet::constant]
+        type MaxCasesPerBlock: Get<u32>;
         /// AccountId used as the filer for system-initiated cases (e.g. auto law challenges).
         /// Wire to a well-known zero account or a dedicated pallet account in the runtime.
         type AutoChallengeAccount: Get<Self::AccountId>;
@@ -244,11 +255,14 @@ pub mod pallet {
 
     // ── Storage ─────────────────────────────────────────────────────────────────
 
+    /// (filer, status, ruling_ipfs_hash, subject) — the shape of a `Cases` entry, named so
+    /// `is_filer_or_oracle`/`is_ruled_against_party` don't need to repeat the tuple type.
+    pub type CaseOf<T> =
+        (<T as frame_system::Config>::AccountId, CaseStatus, Option<[u8; 32]>, CaseSubject);
+
     /// case_id -> (filer, status, ruling_ipfs_hash, subject).
     #[pallet::storage]
-    pub type Cases<T: Config> =
-        StorageMap<_, Blake2_128Concat, u32,
-            (T::AccountId, CaseStatus, Option<[u8; 32]>, CaseSubject)>;
+    pub type Cases<T: Config> = StorageMap<_, Blake2_128Concat, u32, CaseOf<T>>;
 
     /// case_id -> verdict (set after jury or AI ruling is final).
     #[pallet::storage]
@@ -338,6 +352,66 @@ pub mod pallet {
     #[pallet::storage]
     pub type AIRulingModelVersion<T: Config> = StorageMap<_, Blake2_128Concat, u32, u32>;
 
+    /// case_id -> the verdict committed by `submit_ai_ruling` at Level-0 ruling time.
+    ///
+    /// This is what closes the "verdict never bound to the published ruling" hole:
+    /// `finalize_ruling`'s no-appeal path applies exactly this value — it no longer takes a
+    /// free-form `verdict` argument of its own — so a compromised oracle key can no longer
+    /// publish reasoning saying one thing (`ruling_hash`) and finalize with the opposite
+    /// verdict. The jury-appeal path (`cast_jury_vote`'s majority tally) does NOT read this
+    /// map; its verdict is derived independently from real jury votes, which is a strictly
+    /// stronger binding than anything recorded here.
+    #[pallet::storage]
+    pub type AIRulingVerdict<T: Config> = StorageMap<_, Blake2_128Concat, u32, Verdict>;
+
+    /// Captured jury-selection entropy per case, written by `on_initialize` at the block the
+    /// case's delayed-reveal seed window closes -- i.e. while the window's block hashes are
+    /// still live in `frame_system::BlockHash`, before `BlockHashCount`-based pruning can erase
+    /// them. Once captured, `select_jury` can be called arbitrarily far in the future (long
+    /// after the live block hashes it was derived from have been pruned) and still get the
+    /// same, real, unpredictable-at-commit-time seed. See `SeedCaptureDue` and
+    /// `JurySeedDelayBlocks`.
+    #[pallet::storage]
+    pub type CapturedJurySeed<T: Config> = StorageMap<_, Blake2_128Concat, u32, [u8; 32]>;
+
+    /// Schedule of pending seed captures: block number -> case_ids whose seed window closes
+    /// (becomes fully elapsed) at that block. Populated by `appeal_ruling` at the same time it
+    /// sets `JuryRequestBlock`, using the fixed `JurySeedDelayBlocks` window length to compute
+    /// the exact future capture block. Consumed (and cleared) by `on_initialize` once that block
+    /// is reached.
+    #[pallet::storage]
+    pub type SeedCaptureDue<T: Config> =
+        StorageMap<_, Blake2_128Concat, BlockNumberFor<T>, BoundedVec<u32, T::MaxCasesPerBlock>>;
+
+    // ── Hooks ───────────────────────────────────────────────────────────────────
+
+    #[pallet::hooks]
+    impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+        /// Capture each due case's jury-selection entropy from still-live block hashes at
+        /// exactly the block its seed window closes, before `frame_system`'s separate
+        /// `BlockHashCount`-based pruning can erase them. See `SeedCaptureDue` /
+        /// `CapturedJurySeed` and the `JurySeedDelayBlocks` doc comment for the full design
+        /// this closes a hole in.
+        fn on_initialize(now: BlockNumberFor<T>) -> Weight {
+            let due = SeedCaptureDue::<T>::take(now).unwrap_or_default();
+            if due.is_empty() {
+                return T::DbWeight::get().reads(1);
+            }
+            let delay = T::JurySeedDelayBlocks::get();
+            let mut weight = T::DbWeight::get().reads_writes(1, 1);
+            for case_id in due.iter().copied() {
+                weight = weight.saturating_add(T::DbWeight::get().reads(1));
+                if let Some(request_block) = JuryRequestBlock::<T>::get(case_id) {
+                    let window_start = request_block.saturating_add(BlockNumberFor::<T>::from(1u32));
+                    let seed = Self::anchored_entropy(case_id, window_start, delay);
+                    CapturedJurySeed::<T>::insert(case_id, seed);
+                    weight = weight.saturating_add(T::DbWeight::get().writes(1));
+                }
+            }
+            weight
+        }
+    }
+
     // ── Events ──────────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -397,6 +471,13 @@ pub mod pallet {
         NoApprovedAIModel,
         /// `model_version` does not match the currently approved AI model version.
         UnapprovedAIModel,
+        /// `finalize_ruling` was called on a case with no `AIRulingVerdict` recorded. Should
+        /// never happen in practice — `submit_ai_ruling` always sets it in the same call that
+        /// moves a case to `AIRulingIssued` — but is handled explicitly rather than panicking.
+        NoRulingVerdict,
+        /// Too many cases have their jury-seed capture scheduled for the same block; this
+        /// `appeal_ruling` call would exceed `MaxCasesPerBlock` for its capture block.
+        TooManyCasesInBlock,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -429,6 +510,12 @@ pub mod pallet {
         }
 
         /// Submit an AI ruling. ruling_hash is the IPFS CID of the full reasoning document.
+        /// `verdict` is committed on-chain here, at submission time — this is the actual
+        /// on-chain binding between the published reasoning and the verdict that will later
+        /// be applied: `finalize_ruling`'s no-appeal path applies exactly this stored value
+        /// and no longer accepts a free-form verdict argument of its own, closing the hole
+        /// where a compromised oracle key could publish reasoning saying one thing and
+        /// finalize with the opposite verdict. See `AIRulingVerdict`.
         ///
         /// `model_version` must match `CurrentAIModelVersion` — this is the actual on-chain
         /// enforcement of CLAUDE.md's "AI model updates require on-chain governance vote
@@ -446,6 +533,7 @@ pub mod pallet {
             case_id: u32,
             ruling_hash: [u8; 32],
             model_version: u32,
+            verdict: Verdict,
         ) -> DispatchResult {
             T::OracleOrigin::ensure_origin(origin)?;
             let current_model_version = CurrentAIModelVersion::<T>::get();
@@ -460,11 +548,30 @@ pub mod pallet {
             })?;
             AIRulingBlock::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
             AIRulingModelVersion::<T>::insert(case_id, model_version);
+            AIRulingVerdict::<T>::insert(case_id, verdict);
             Self::deposit_event(Event::AIRulingIssued { case_id, ruling_hash, model_version });
             Ok(())
         }
 
         /// Appeal an AI ruling within the appeal window. Triggers jury selection.
+        ///
+        /// Restricted to the case's filer, the designated oracle, or (for system-initiated
+        /// cases with no natural filer to restrict to) any active citizen — the same
+        /// filer-or-oracle rule `select_jury` already applies, via `is_filer_or_oracle`.
+        /// Additionally open to the verified losing party of a `CaseSubject::CitizenConduct`
+        /// case (via `is_ruled_against_party`, matched by registered identity nullifier) — a
+        /// genuine appeal right for the person actually ruled against, not just whoever filed.
+        ///
+        /// Before this check existed, *any* signed account (not necessarily the filer, not
+        /// even necessarily a citizen) could force a case into `InJuryAppeal`. Combined with
+        /// `select_jury` being restricted to the filer/oracle and no off-chain service ever
+        /// automating jury selection for appealed cases, that let a party who'd rather not
+        /// face the enforced ruling hijack their own case into permanent limbo via any
+        /// throwaway account, evading enforcement indefinitely. Extending appeal rights to a
+        /// verified losing party for `LawChallenge`/`TreasuryDispute` cases (which don't
+        /// identify a specific ruled-against citizen the way `CitizenConduct` does) is a
+        /// documented follow-up, not attempted here — no clean existing mechanism identifies
+        /// "the losing party" for those subjects the way `CitizenNullifier` does for a citizen.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(6_000, 0))]
         pub fn appeal_ruling(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
@@ -476,11 +583,32 @@ pub mod pallet {
                 .saturating_add(BlockNumberFor::<T>::from(T::AppealWindowBlocks::get()));
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(now <= deadline, Error::<T>::AppealWindowClosed);
+            let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+            ensure!(
+                Self::is_filer_or_oracle(&who, &case) || Self::is_ruled_against_party(&who, &case),
+                Error::<T>::NotAuthorized
+            );
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let case = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
                 ensure!(case.1 == CaseStatus::AIRulingIssued, Error::<T>::InvalidStatus);
                 case.1 = CaseStatus::InJuryAppeal;
                 Ok::<(), DispatchError>(())
+            })?;
+            // Schedule the delayed-reveal jury seed to be captured (from still-live block
+            // hashes) at the exact block the seed window closes -- see `SeedCaptureDue` /
+            // `CapturedJurySeed`. Must succeed before we commit to InJuryAppeal state, so a
+            // full schedule slot fails this call atomically rather than leaving the case
+            // stuck (dispatch failure reverts everything in this call, including the Cases
+            // mutation above).
+            let delay = T::JurySeedDelayBlocks::get();
+            let capture_block = now
+                .saturating_add(BlockNumberFor::<T>::from(delay))
+                .saturating_add(BlockNumberFor::<T>::from(1u32));
+            SeedCaptureDue::<T>::try_mutate(capture_block, |maybe_due| {
+                maybe_due
+                    .get_or_insert_with(BoundedVec::default)
+                    .try_push(case_id)
+                    .map_err(|_| Error::<T>::TooManyCasesInBlock)
             })?;
             // Commit point for the delayed-reveal jury seed: jury selection can't use any
             // block hash from at or before `now`, only ones produced after it.
@@ -512,12 +640,7 @@ pub mod pallet {
             // fixed post-appeal window (see `JurySeedDelayBlocks`), not to whichever block the
             // caller of `select_jury` happens to submit in, so delaying this call doesn't let the
             // caller pick a favorable outcome the way it could under the old scheme.
-            let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| o == who);
-            let system_case = case.0 == T::AutoChallengeAccount::get();
-            let authorized = who == case.0
-                || oracle_ok
-                || (system_case && T::CitizenChecker::is_active_citizen(&who));
-            ensure!(authorized, Error::<T>::NotAuthorized);
+            ensure!(Self::is_filer_or_oracle(&who, &case), Error::<T>::NotAuthorized);
             // Derive the required jury size from the case subject so that the
             // routing logic (Level 1 vs Level 2) is enforced on-chain rather than
             // relying on the caller to pass the correct value.
@@ -528,18 +651,15 @@ pub mod pallet {
             ensure!(jury_size == required_size, Error::<T>::InvalidJurySize);
             let total = T::CitizenSelector::total_citizens();
             ensure!(total >= required_size as u32, Error::<T>::NotEnoughCitizens);
-            // Delayed-reveal seed window: must be fully elapsed (all its block hashes fixed
-            // in history) before we can derive the jury seed from it. See
-            // `JurySeedDelayBlocks` doc comment for why this window is anchored to the
-            // appeal block rather than "now".
-            let request_block =
-                JuryRequestBlock::<T>::get(case_id).ok_or(Error::<T>::JurySeedNotReady)?;
-            let window_start = request_block.saturating_add(BlockNumberFor::<T>::from(1u32));
-            let delay = T::JurySeedDelayBlocks::get();
-            let window_end = request_block.saturating_add(BlockNumberFor::<T>::from(delay));
-            let now = frame_system::Pallet::<T>::block_number();
-            ensure!(now > window_end, Error::<T>::JurySeedNotReady);
-            let jurors = Self::pick_random_jurors(case_id, required_size, total, window_start, delay)?;
+            // Read the pre-captured delayed-reveal seed rather than recomputing it from live
+            // block-hash storage. `CapturedJurySeed` is written by `on_initialize` at exactly
+            // the block the seed window closes (see `SeedCaptureDue`), so its mere presence
+            // here already proves the window has fully elapsed -- no separate block-number
+            // check is needed, and (unlike recomputing from `frame_system::block_hash`) this
+            // is immune to `BlockHashCount`-based pruning no matter how late `select_jury` is
+            // actually called.
+            let seed = CapturedJurySeed::<T>::get(case_id).ok_or(Error::<T>::JurySeedNotReady)?;
+            let jurors = Self::pick_random_jurors(case_id, required_size, total, seed)?;
             Self::deposit_event(Event::JurySelected { case_id, jurors: jurors.clone() });
             JuryPool::<T>::insert(case_id, jurors);
             // Advance status so a second select_jury call is rejected.
@@ -554,13 +674,15 @@ pub mod pallet {
         /// Finalize a ruling for the no-appeal path (AI ruling expires without appeal).
         /// Only callable when status is AIRulingIssued (InJuryAppeal cases auto-finalize via jury).
         /// Automatically enforces: pauses laws, freezes treasury departments.
+        ///
+        /// Applies the verdict `submit_ai_ruling` committed on-chain (`AIRulingVerdict`) —
+        /// this call deliberately takes no `verdict` argument of its own. That's the fix for
+        /// the "compromised oracle key finalizes with a different verdict than the reasoning
+        /// it published" hole: there is nothing left for the caller to choose here, only
+        /// whether to apply the already-bound verdict.
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
-        pub fn finalize_ruling(
-            origin: OriginFor<T>,
-            case_id: u32,
-            verdict: Verdict,
-        ) -> DispatchResult {
+        pub fn finalize_ruling(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
             T::OracleOrigin::ensure_origin(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::AIRulingIssued, Error::<T>::InvalidStatus);
@@ -571,6 +693,7 @@ pub mod pallet {
                 frame_system::Pallet::<T>::block_number() > appeal_deadline,
                 Error::<T>::AppealWindowClosed
             );
+            let verdict = AIRulingVerdict::<T>::get(case_id).ok_or(Error::<T>::NoRulingVerdict)?;
             Self::auto_finalize(case_id, verdict)?;
             Ok(())
         }
@@ -739,6 +862,31 @@ pub mod pallet {
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
     impl<T: Config> Pallet<T> {
+        /// True if `who` is authorized to act on `case` in a filer/oracle capacity: the
+        /// case's own filer, the designated oracle, or — for system-initiated cases with no
+        /// natural filer to restrict to (see `AutoChallengeAccount`) — any active citizen.
+        /// Shared by `appeal_ruling` and `select_jury` so both calls that gate on "who may
+        /// move this case along" apply exactly the same rule.
+        fn is_filer_or_oracle(who: &T::AccountId, case: &CaseOf<T>) -> bool {
+            let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| &o == who);
+            let system_case = case.0 == T::AutoChallengeAccount::get();
+            who == &case.0 || oracle_ok || (system_case && T::CitizenChecker::is_active_citizen(who))
+        }
+
+        /// True if `who` is the verified losing party of a `CaseSubject::CitizenConduct` case
+        /// -- i.e. their own registered identity nullifier (`CitizenChecker::citizen_nullifier`)
+        /// matches the nullifier the case was filed against. Always false for every other
+        /// subject (see `appeal_ruling`'s doc comment for why those subjects aren't extended
+        /// the same way).
+        fn is_ruled_against_party(who: &T::AccountId, case: &CaseOf<T>) -> bool {
+            match &case.3 {
+                CaseSubject::CitizenConduct { nullifier, .. } => {
+                    T::CitizenChecker::citizen_nullifier(who) == Some(*nullifier)
+                }
+                _ => false,
+            }
+        }
+
         /// Shared finalization logic used by both `finalize_ruling` (root / AI path)
         /// and `cast_jury_vote` (automatic majority path).
         fn auto_finalize(case_id: u32, verdict: Verdict) -> DispatchResult {
@@ -855,16 +1003,16 @@ pub mod pallet {
             out
         }
 
-        /// Pick `jury_size` unique citizens at random, using the delayed-reveal seed
-        /// derived from `[window_start, window_start + window_len)`.
+        /// Pick `jury_size` unique citizens at random, using an already-captured delayed-reveal
+        /// seed (see `CapturedJurySeed`) — this no longer recomputes `anchored_entropy` itself
+        /// from live block-hash storage, so it has no dependency on whether the seed window's
+        /// block hashes are still live in `frame_system::BlockHash` at call time.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
             total: u32,
-            window_start: BlockNumberFor<T>,
-            window_len: u32,
+            raw: [u8; 32],
         ) -> Result<BoundedVec<T::AccountId, ConstU32<21>>, DispatchError> {
-            let raw = Self::anchored_entropy(case_id, window_start, window_len);
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
             let max_attempts = total.saturating_add(jury_size as u32).saturating_mul(3);

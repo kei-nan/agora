@@ -3,11 +3,12 @@
 The off-chain AI-ruling oracle for `pallet-courts`. Polls on-chain `Cases` for
 `CaseStatus::Filed` entries, builds a case-appropriate context from other on-chain storage, asks
 Claude for a Level-0 AI ruling (see `/CLAUDE.md`'s "Court System (AI-First)" section), publishes
-the full reasoning document to IPFS, and submits `submit_ai_ruling` signed by a configured oracle
-account. Also polls `Cases` for `CaseStatus::AIRulingIssued` entries whose appeal window has
-closed unappealed, and submits the second, separate `finalize_ruling` call that actually applies
-the verdict (auto-enforcement: pausing a law, freezing a department, suspending a citizen) — see
-"A real gap found while building this, since closed" below.
+the full reasoning document to IPFS, and submits `submit_ai_ruling` (case_id, ruling_hash,
+model_version, verdict) signed by a configured oracle account — the verdict is committed
+on-chain at this point. Also polls `Cases` for `CaseStatus::AIRulingIssued` entries whose appeal
+window has closed unappealed, and submits the second, separate `finalize_ruling(case_id)` call
+that actually applies enforcement (pausing a law, freezing a department, suspending a citizen)
+— see "`finalize_ruling` scheduling, and the verdict-binding fix" below.
 
 **Read this whole file before running this anywhere real.** Large parts of the live-integration
 path (chain RPC, the Claude API call, IPFS publishing) have never been exercised against a real
@@ -20,9 +21,11 @@ changelog entry #081, predating entries #082/#083 (the `committee-node`/`committ
 components) and a set of `pallet-courts` additions: `CurrentAIModelVersion`/
 `AIGovernanceCouncil`/`vote_approve_ai_model` governance gating `submit_ai_ruling`, and a
 `CaseFilingBond` spam-prevention deposit on `file_case`. That gap was found and reconciled during
-merge into the main tree: `submit_ai_ruling` really does take three arguments —
-`(case_id: u32, ruling_hash: [u8; 32], model_version: u32)` — and `extrinsic.rs`/`main.rs` now
-match it. `main.rs`'s `poll_once` reads `Courts::CurrentAIModelVersion` fresh from chain at the
+merge into the main tree: `submit_ai_ruling` really does take four arguments —
+`(case_id: u32, ruling_hash: [u8; 32], model_version: u32, verdict: Verdict)` — and
+`extrinsic.rs`/`main.rs` now match it (the `verdict` argument was added later still, by the fix
+described in "`finalize_ruling` scheduling, and the verdict-binding fix" below). `main.rs`'s
+`poll_once` reads `Courts::CurrentAIModelVersion` fresh from chain at the
 start of every poll cycle and skips the cycle entirely (rather than ruling on cases it can't
 submit for) if it's still `0` (no AI model ever governance-approved) — this was never exercised
 against a live chain in this sandboxed environment, only unit-tested at the call-encoding level
@@ -54,10 +57,10 @@ against a live chain in this sandboxed environment, only unit-tested at the call
   `TxExtension` tuple shape) is transcribed directly from `runtime/src/lib.rs`, confirmed
   identical to the version `desktop`/`oprf-committee-dev` already assume elsewhere in this
   codebase. The *call* itself (`pallet_courts` index 11, `submit_ai_ruling` call index 1, its
-  3-argument `(case_id, ruling_hash, model_version)` shape) was read directly from
+  4-argument `(case_id, ruling_hash, model_version, verdict)` shape) was read directly from
   `pallets/pallet-courts/src/lib.rs`, not guessed. Same for `finalize_ruling` (call index 4,
-  `(case_id, verdict)`) — `build_signed` is generic over a small `CourtsCall` trait so both
-  calls share one envelope/signing implementation.
+  just `(case_id,)` — no verdict argument, see below) — `build_signed` is generic over a small
+  `CourtsCall` trait so both calls share one envelope/signing implementation.
 - **Case-context building from a decoded `CaseSubject`** (`src/context.rs`): real, pure, unit
   tested for all four subject variants (`General`, `LawChallenge`, `TreasuryDispute`,
   `CitizenConduct`), including the honest "no further on-chain context exists" cases and the
@@ -118,47 +121,57 @@ themselves; verifying means re-fetching from IPFS or re-running `ipfs add` and c
 (e.g. a hosted pinning service instead of a local daemon assumption) — flagged as unevaluated
 rather than silently decided.
 
-## A real gap found while building this, since closed: `finalize_ruling` scheduling
+## `finalize_ruling` scheduling, and the verdict-binding fix
 
-`submit_ai_ruling` records only `ruling_hash` (an evidence pointer) and starts the 7-day appeal
-clock (`AIRulingBlock`) — it does **not** record any verdict on-chain. Reading
+`submit_ai_ruling` starts the 7-day appeal clock (`AIRulingBlock`). Reading
 `pallets/pallet-courts/src/lib.rs` closely: the actual verdict that drives enforcement (pause a
-law, freeze a department, suspend a citizen) is only ever set by `auto_finalize`, called from
-either `cast_jury_vote` (the appeal path) or `finalize_ruling` — a *separate* oracle-signed call,
-requiring the *same* verdict as an explicit `Verdict` argument, only callable once the 7-day
-appeal window has closed with no appeal filed.
+law, freeze a department, suspend a citizen) is only ever applied by `auto_finalize`, called
+from either `cast_jury_vote` (the appeal path, deriving its verdict independently from real
+jury votes) or `finalize_ruling` — a *separate* oracle-signed call, only callable once the
+7-day appeal window has closed with no appeal filed.
 
 In other words: `submit_ai_ruling` alone never enforces anything. A real deployment needs a
-second call — `finalize_ruling(case_id, verdict)`, signed by the oracle, sent again after the
-appeal window closes — for an unappealed AI ruling to actually take legal effect.
-
-**This is now implemented.** `poll_once` (`src/main.rs`) has a second branch, alongside the
-existing `CaseStatus::Filed` handling, for cases in `CaseStatus::AIRulingIssued`:
-`finalize_ruling` is gated by the *same* `T::OracleOrigin` as `submit_ai_ruling` (see
-`EnsureOracle` in `pallets/pallet-courts/src/lib.rs`), so this service's existing oracle signing
-key — already loaded and used for `submit_ai_ruling` — is also the correct, and only, signer for
-this call; no separate key or origin is needed.
+second call — `finalize_ruling`, signed by the oracle, sent again after the appeal window closes
+— for an unappealed AI ruling to actually take legal effect. **This scheduling gap is
+implemented**: `poll_once` (`src/main.rs`) has a second branch, alongside the existing
+`CaseStatus::Filed` handling, for cases in `CaseStatus::AIRulingIssued`. `finalize_ruling` is
+gated by the *same* `T::OracleOrigin` as `submit_ai_ruling` (see `EnsureOracle` in
+`pallets/pallet-courts/src/lib.rs`), so this service's existing oracle signing key — already
+loaded and used for `submit_ai_ruling` — is also the correct, and only, signer for this call; no
+separate key or origin is needed.
 
 - `should_finalize` (pure, unit tested) mirrors the pallet's own gate exactly: status must be
   `AIRulingIssued` (an appealed case moves to `InJuryAppeal` and is correctly never a candidate),
   and the current block must be strictly past `AIRulingBlock[case_id] + AppealWindowBlocks`
   (`config.appeal_window_blocks`, default `50_400` — `7 * DAYS` at this runtime's 12s block
   time, read from `runtime/src/configs/mod.rs`/`runtime/src/lib.rs`).
-- Since `submit_ai_ruling` never records a verdict on-chain, this service can't read one back
-  from chain state at finalize time. `fetch_ruling_verdict` recovers it by re-fetching the same
-  reasoning document `rule_on_case` originally published to IPFS (re-deriving the CID from the
-  on-chain `ruling_hash`, same convention as `fetch_ipfs_gateway_content`) and reading its
-  `verdict` field back out via `parse_verdict_from_ruling_document` (pure, unit tested against
-  literal JSON fixtures). This is deliberately *not* just remembered in local process memory
-  from when the ruling was first produced — that would make a service restart between submit and
-  finalize silently unable to finalize correctly; re-deriving from the published document doesn't
-  have that failure mode.
 - A `finalize_processed: HashSet<u32>` (mirrors the existing `already_processed` for
   `submit_ai_ruling`) prevents a duplicate `finalize_ruling` submission while a prior one is still
   pending inclusion.
 
 New config: `FINALIZE_RULING_CALL_INDEX` (default `4`, `#[pallet::call_index(4)]` read directly
 from the pallet source) and `APPEAL_WINDOW_BLOCKS` (default `50_400`) — see `src/config.rs`.
+
+**A second, separate gap this service used to work around client-side, since closed at the
+pallet level instead.** Earlier, `submit_ai_ruling` recorded only `ruling_hash` (an evidence
+pointer) and no verdict — so `finalize_ruling` took an explicit `verdict: Verdict` argument of
+its own, with nothing on-chain tying it to the reasoning `submit_ai_ruling` had published. That
+meant a compromised oracle key could publish reasoning saying one thing and finalize with the
+opposite verdict, and this service had to work around the gap by re-fetching its own
+just-published IPFS document at finalize time to recover the verdict it had already decided
+once.
+
+That's now fixed in `pallets/pallet-courts/src/lib.rs` itself, not just worked around here:
+`submit_ai_ruling` takes a fourth argument, `verdict: Verdict`, and commits it on-chain
+(`AIRulingVerdict`) in the same call that records `ruling_hash`. `finalize_ruling` no longer
+takes a verdict argument at all — it applies exactly the value `submit_ai_ruling` committed,
+so there is nothing left for the caller of `finalize_ruling` to choose. This service now mirrors
+that: `rule_on_case` (`src/main.rs`) returns `(ruling_hash, verdict)` together, and `poll_once`
+submits both in the one `submit_ai_ruling` call; the finalize branch just calls
+`extrinsic::FinalizeRuling { case_id }` with nothing to reconstruct. The old
+`fetch_ruling_verdict`/`parse_verdict_from_ruling_document` machinery (re-fetching the
+published IPFS document at finalize time) has been removed entirely — it has no remaining
+purpose once the chain enforces the same binding on its own.
 
 ## Configuration
 
@@ -192,23 +205,22 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 - Jury-vote-driven finalization (`cast_jury_vote`'s own auto-finalize on reaching a majority) —
   that path is entirely on-chain and needs no off-chain scheduler. Only the no-appeal path
   (`finalize_ruling`) needed an off-chain caller, and that's what this service now does — see
-  "A real gap found while building this, since closed" above.
+  "`finalize_ruling` scheduling, and the verdict-binding fix" above.
 
 ## Test coverage — what's real, what isn't
 
-`cargo test` (47 tests, all passing in this environment): case-context rendering for all four
+`cargo test` (42 tests, all passing in this environment): case-context rendering for all four
 `CaseSubject` variants; Claude request formatting and `VERDICT:`/`REASONING:` response parsing,
 including a realistic-shaped JSON fixture and a refusal fixture; IPFS CID digest math
 (round-trip, rejection of malformed input); SCALE encode/decode round-trips for the mirrored
-`CaseStatus`/`CaseSubject`/`Verdict` enums; the `submit_ai_ruling` and `finalize_ruling`
-extrinsic call-byte layouts; storage-key prefix/hashing including the `twox128("System")`
-known-answer vector; `should_finalize`'s appeal-window/status gating (window still open, exactly
-at the deadline block, one block past it, every non-`AIRulingIssued` status including appealed
-ones, and a missing `AIRulingBlock` entry); and `parse_verdict_from_ruling_document`'s parsing of
-a re-fetched ruling document (`Upheld`, `Overturned`, an unrecognized verdict string, invalid
-JSON, and a missing `verdict` field).
+`CaseStatus`/`CaseSubject`/`Verdict` enums; the `submit_ai_ruling` (now 4-argument, including
+`verdict`) and `finalize_ruling` (now argument-free beyond `case_id`) extrinsic call-byte
+layouts; storage-key prefix/hashing including the `twox128("System")` known-answer vector; and
+`should_finalize`'s appeal-window/status gating (window still open, exactly at the deadline
+block, one block past it, every non-`AIRulingIssued` status including appealed ones, and a
+missing `AIRulingBlock` entry).
 
 **Not covered, and cannot be covered in this environment**: the live chain RPC round trip, the
 live Claude API call, the live IPFS daemon/gateway call, and therefore the full
-`poll_once`/`rule_on_case`/`fetch_ruling_verdict` orchestration paths end-to-end. Say so plainly
-rather than mocking these and claiming coverage that isn't real.
+`poll_once`/`rule_on_case` orchestration paths end-to-end. Say so plainly rather than mocking
+these and claiming coverage that isn't real.

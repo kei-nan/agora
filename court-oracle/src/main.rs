@@ -5,11 +5,14 @@
 //!
 //! Also polls for cases in `CaseStatus::AIRulingIssued` whose appeal window
 //! (`AIRulingBlock[case_id] + AppealWindowBlocks`) has closed with no `appeal_ruling` call in
-//! between, and calls `finalize_ruling(case_id, verdict)` for them — the second, separate
-//! oracle-signed call `pallet-courts` requires before an unappealed AI ruling actually takes
-//! effect (auto-enforcement: pausing a law, freezing a department, suspending a citizen). See
-//! `should_finalize` below for the pure deadline/status logic, and `fetch_ruling_verdict` for
-//! how the verdict — never recorded on-chain by `submit_ai_ruling` itself — is recovered.
+//! between, and calls `finalize_ruling(case_id)` for them — the second, separate oracle-signed
+//! call `pallet-courts` requires before an unappealed AI ruling actually takes effect
+//! (auto-enforcement: pausing a law, freezing a department, suspending a citizen). See
+//! `should_finalize` below for the pure deadline/status logic. `finalize_ruling` takes no
+//! verdict argument of its own -- it applies whatever `submit_ai_ruling` already committed
+//! on-chain (`AIRulingVerdict`) when this service first ruled on the case, so `rule_on_case`
+//! determines and submits the verdict once, up front, rather than this service reconstructing
+//! it a second time at finalize.
 //!
 //! **Never run against a live chain, live Claude API, or live IPFS daemon in this sandboxed
 //! environment** — no network egress to any of the three is available here. See README.md for
@@ -30,9 +33,8 @@ use config::Config;
 use context::SubjectContext;
 use rpc::RpcClient;
 
-use anyhow::Context as _;
 use codec::{Decode, Encode};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sp_core::crypto::{AccountId32, Ss58Codec};
 use sp_core::Pair as _;
 use std::collections::HashSet;
@@ -163,7 +165,7 @@ async fn poll_once(
                 continue;
             }
         };
-        let (filer, status, ruling_hash, subject) = case;
+        let (filer, status, _ruling_hash, subject) = case;
 
         match status {
             CaseStatus::Filed => {
@@ -173,13 +175,13 @@ async fn poll_once(
                 tracing::info!(case_id, filer = %filer.to_ss58check(), subject = ?subject, "found filed case, ruling");
 
                 match rule_on_case(rpc, config, claude_client, ipfs_client, &filer, case_id, &subject).await {
-                    Ok(ruling_hash) => {
+                    Ok((ruling_hash, verdict)) => {
                         if config.dry_run {
-                            tracing::info!(case_id, ruling_hash = %hex::encode(ruling_hash), "DRY_RUN set — not submitting submit_ai_ruling");
+                            tracing::info!(case_id, ruling_hash = %hex::encode(ruling_hash), verdict = ?verdict, "DRY_RUN set — not submitting submit_ai_ruling");
                             already_processed.insert(case_id);
                             continue;
                         }
-                        let call = extrinsic::SubmitAiRuling { case_id, ruling_hash, model_version };
+                        let call = extrinsic::SubmitAiRuling { case_id, ruling_hash, model_version, verdict };
                         match extrinsic::build_signed(
                             rpc,
                             seed,
@@ -208,10 +210,6 @@ async fn poll_once(
                 if finalize_processed.contains(&case_id) {
                     continue;
                 }
-                let Some(ruling_hash) = ruling_hash else {
-                    tracing::warn!(case_id, "case is AIRulingIssued but has no ruling_hash recorded — skipping (storage shape mismatch?)");
-                    continue;
-                };
                 let ruling_block = match fetch_ai_ruling_block(rpc, case_id).await {
                     Ok(b) => b,
                     Err(e) => {
@@ -226,36 +224,32 @@ async fn poll_once(
                     continue;
                 }
                 tracing::info!(case_id, "appeal window closed unappealed, finalizing");
-                match fetch_ruling_verdict(&ruling_hash).await {
-                    Ok(verdict) => {
-                        if config.dry_run {
-                            tracing::info!(case_id, verdict = ?verdict, "DRY_RUN set — not submitting finalize_ruling");
+                if config.dry_run {
+                    tracing::info!(case_id, "DRY_RUN set — not submitting finalize_ruling");
+                    finalize_processed.insert(case_id);
+                    continue;
+                }
+                // No verdict to determine or pass here: finalize_ruling(case_id) applies
+                // whatever verdict submit_ai_ruling already committed on-chain when this
+                // service first ruled on the case (see module doc comment).
+                let call = extrinsic::FinalizeRuling { case_id };
+                match extrinsic::build_signed(
+                    rpc,
+                    seed,
+                    config.courts_pallet_index,
+                    config.finalize_ruling_call_index,
+                    call,
+                )
+                .await
+                {
+                    Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
+                        Ok(tx_hash) => {
+                            tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted finalize_ruling");
                             finalize_processed.insert(case_id);
-                            continue;
                         }
-                        let call = extrinsic::FinalizeRuling { case_id, verdict: verdict.clone() };
-                        match extrinsic::build_signed(
-                            rpc,
-                            seed,
-                            config.courts_pallet_index,
-                            config.finalize_ruling_call_index,
-                            call,
-                        )
-                        .await
-                        {
-                            Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
-                                Ok(tx_hash) => {
-                                    tracing::info!(case_id, tx_hash, verdict = ?verdict, oracle_account = %oracle_account.to_ss58check(), "submitted finalize_ruling");
-                                    finalize_processed.insert(case_id);
-                                }
-                                Err(e) => tracing::error!(case_id, error = %e, "author_submitExtrinsic failed for finalize_ruling"),
-                            },
-                            Err(e) => tracing::error!(case_id, error = %e, "failed to build/sign finalize_ruling extrinsic"),
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(case_id, error = %e, "failed to recover the verdict for finalize_ruling from IPFS — leaving case for a later poll cycle");
-                    }
+                        Err(e) => tracing::error!(case_id, error = %e, "author_submitExtrinsic failed for finalize_ruling"),
+                    },
+                    Err(e) => tracing::error!(case_id, error = %e, "failed to build/sign finalize_ruling extrinsic"),
                 }
             }
             _ => continue,
@@ -297,53 +291,6 @@ fn should_finalize(
     current_block > deadline
 }
 
-/// Recovers the verdict for a ruling that has already been submitted on-chain, by re-fetching
-/// the reasoning document `rule_on_case` originally published to IPFS and reading its `verdict`
-/// field back out. Needed because `submit_ai_ruling` records only `ruling_hash` on-chain — see
-/// README.md's "A real gap found" section: the verdict itself is never chain-state until
-/// `finalize_ruling` supplies it as an explicit argument, so this service has to know it from
-/// somewhere. Re-deriving from the already-published IPFS document (rather than only
-/// remembering it in local process memory from when `rule_on_case` produced it) means a service
-/// restart between submit and finalize doesn't lose the ability to finalize correctly.
-async fn fetch_ruling_verdict(ruling_hash: &[u8; 32]) -> anyhow::Result<Verdict> {
-    let cid = ipfs::digest_to_cidv0(ruling_hash);
-    let url = format!("https://ipfs.io/ipfs/{cid}");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("IPFS gateway unreachable while fetching ruling document {cid}"))?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "IPFS gateway returned {} for ruling document {cid}",
-        resp.status()
-    );
-    let bytes = resp.bytes().await.context("reading ruling document body")?;
-    parse_verdict_from_ruling_document(&bytes)
-}
-
-/// The subset of `RulingDocument`'s fields this needs to parse back out — deliberately not
-/// `#[derive(Deserialize)]` on `RulingDocument` itself (that struct borrows `&'a str` fields for
-/// zero-copy serialization; this needs owned data parsed from a fresh HTTP response body).
-#[derive(Deserialize)]
-struct RulingDocumentVerdict {
-    verdict: String,
-}
-
-/// Pure parsing logic, split out from `fetch_ruling_verdict`'s network call so it's directly
-/// unit testable against literal JSON fixtures (same pattern `claude.rs` uses for its
-/// `VERDICT:`/`REASONING:` response parser).
-fn parse_verdict_from_ruling_document(bytes: &[u8]) -> anyhow::Result<Verdict> {
-    let doc: RulingDocumentVerdict = serde_json::from_slice(bytes)
-        .context("ruling document was not valid JSON, or was missing/mistyped its verdict field")?;
-    match doc.verdict.as_str() {
-        "Upheld" => Ok(Verdict::Upheld),
-        "Overturned" => Ok(Verdict::Overturned),
-        other => anyhow::bail!("ruling document had an unrecognized verdict string: {other:?}"),
-    }
-}
-
 /// Reads `pallet_courts::AIRulingBlock[case_id]` — the block `submit_ai_ruling` was called at
 /// for this case, used to compute its appeal deadline. `Blake2_128Concat`-hashed `u32` map key,
 /// same pattern as `map_key_u32`'s other callers.
@@ -353,11 +300,13 @@ async fn fetch_ai_ruling_block(rpc: &RpcClient, case_id: u32) -> anyhow::Result<
     Ok(u32::decode(&mut &bytes[..]).ok())
 }
 
-/// Builds case context, asks Claude, publishes the reasoning document to IPFS, and returns the
-/// `ruling_hash` to submit on-chain. Does not itself submit the extrinsic — that's `poll_once`'s
-/// job, so this function stays testable-by-construction (every side effect is delegated to an
-/// injected client) even though it isn't unit-tested directly here (it does real I/O throughout
-/// — see this crate's README on what actually has test coverage).
+/// Builds case context, asks Claude, publishes the reasoning document to IPFS, and returns
+/// both the `ruling_hash` and `verdict` to submit on-chain together (via
+/// `submit_ai_ruling(case_id, ruling_hash, model_version, verdict)`, which commits the verdict
+/// at submission time — see module doc comment). Does not itself submit the extrinsic — that's
+/// `poll_once`'s job, so this function stays testable-by-construction (every side effect is
+/// delegated to an injected client) even though it isn't unit-tested directly here (it does
+/// real I/O throughout — see this crate's README on what actually has test coverage).
 async fn rule_on_case(
     rpc: &RpcClient,
     config: &Config,
@@ -366,15 +315,19 @@ async fn rule_on_case(
     filer: &AccountId32,
     case_id: u32,
     subject: &CaseSubject,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<([u8; 32], Verdict)> {
     let subject_context = build_subject_context(rpc, config, subject).await?;
     let case_context = context::render_case_context(case_id, &filer.to_ss58check(), &subject_context);
 
     let ruling = claude_client.rule(case_id, &case_context).await?;
 
-    let verdict_str = match ruling.verdict {
-        claude::Verdict::Upheld => "Upheld",
-        claude::Verdict::Overturned => "Overturned",
+    let verdict = match ruling.verdict {
+        claude::Verdict::Upheld => Verdict::Upheld,
+        claude::Verdict::Overturned => Verdict::Overturned,
+    };
+    let verdict_str = match verdict {
+        Verdict::Upheld => "Upheld",
+        Verdict::Overturned => "Overturned",
     };
     let document = RulingDocument {
         case_id,
@@ -389,7 +342,7 @@ async fn rule_on_case(
     let ruling_hash = ipfs::cidv0_to_digest(&cid)?;
     tracing::info!(case_id, cid = %cid, verdict = verdict_str, "published ruling reasoning to IPFS");
 
-    Ok(ruling_hash)
+    Ok((ruling_hash, verdict))
 }
 
 /// Fetches whatever additional on-chain context is appropriate for `subject`, per
@@ -636,36 +589,5 @@ mod tests {
         // written together by submit_ai_ruling), but must fail safe (not finalize) rather than
         // guess a deadline.
         assert!(!should_finalize(&CaseStatus::AIRulingIssued, None, 1_000_000, APPEAL_WINDOW));
-    }
-
-    // ── parse_verdict_from_ruling_document ───────────────────────────────────────────────────
-
-    #[test]
-    fn parses_upheld_verdict_from_ruling_document() {
-        let json = br#"{"case_id":1,"subject_kind":"General","model":"claude-opus-5","verdict":"Upheld","reasoning":"..."}"#;
-        assert_eq!(parse_verdict_from_ruling_document(json).unwrap(), Verdict::Upheld);
-    }
-
-    #[test]
-    fn parses_overturned_verdict_from_ruling_document() {
-        let json = br#"{"case_id":1,"subject_kind":"LawChallenge","model":"claude-opus-5","verdict":"Overturned","reasoning":"..."}"#;
-        assert_eq!(parse_verdict_from_ruling_document(json).unwrap(), Verdict::Overturned);
-    }
-
-    #[test]
-    fn rejects_ruling_document_with_unrecognized_verdict_string() {
-        let json = br#"{"case_id":1,"subject_kind":"General","model":"x","verdict":"Maybe","reasoning":"..."}"#;
-        assert!(parse_verdict_from_ruling_document(json).is_err());
-    }
-
-    #[test]
-    fn rejects_ruling_document_that_is_not_valid_json() {
-        assert!(parse_verdict_from_ruling_document(b"not json").is_err());
-    }
-
-    #[test]
-    fn rejects_ruling_document_missing_verdict_field() {
-        let json = br#"{"case_id":1,"subject_kind":"General","model":"x","reasoning":"..."}"#;
-        assert!(parse_verdict_from_ruling_document(json).is_err());
     }
 }

@@ -26,15 +26,18 @@ pub struct Config {
     pub courts_pallet_index: u8,
     /// `submit_ai_ruling`'s call index within pallet-courts. `#[pallet::call_index(1)]` in
     /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
-    /// real call is `submit_ai_ruling(case_id: u32, ruling_hash: [u8; 32], model_version:
-    /// u32)`, gated by `T::OracleOrigin` (checks the signer against `OracleAccount` storage)
-    /// and requiring `model_version == CurrentAIModelVersion` (governance-set via
-    /// `vote_approve_ai_model`) — `main.rs` fetches that value fresh from chain before every
-    /// submission rather than caching or guessing it.
+    /// real call is `submit_ai_ruling(case_id: u32, ruling_hash: [u8; 32], model_version: u32,
+    /// verdict: Verdict)`, gated by `T::OracleOrigin` (checks the signer against
+    /// `OracleAccount` storage) and requiring `model_version == CurrentAIModelVersion`
+    /// (governance-set via `vote_approve_ai_model`) — `main.rs` fetches that value fresh from
+    /// chain before every submission rather than caching or guessing it. `verdict` is
+    /// committed on-chain here (`AIRulingVerdict`) — `finalize_ruling` below applies exactly
+    /// this value later and no longer takes a verdict argument of its own.
     pub submit_ai_ruling_call_index: u8,
     /// `finalize_ruling`'s call index within pallet-courts. `#[pallet::call_index(4)]` in
     /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
-    /// real call is `finalize_ruling(case_id: u32, verdict: Verdict)`, gated by the *same*
+    /// real call is `finalize_ruling(case_id: u32)` — no verdict argument; it applies whatever
+    /// `submit_ai_ruling` already committed to `AIRulingVerdict` — gated by the *same*
     /// `T::OracleOrigin` as `submit_ai_ruling` (see `EnsureOracle`), and additionally requires
     /// `Cases[case_id].status == AIRulingIssued` and the current block to be strictly past
     /// `AIRulingBlock[case_id] + AppealWindowBlocks` — i.e. the appeal window has closed with no

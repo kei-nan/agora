@@ -2,7 +2,7 @@ use crate::{
 	mock::*,
 	pallet::{CaseBonds, CaseStatus, CaseSubject, Error, Event, JuryPool, JuryRequestBlock, Verdict},
 };
-use frame_support::{assert_noop, assert_ok};
+use frame_support::{assert_noop, assert_ok, traits::Hooks};
 use sp_core::H256;
 use sp_runtime::DispatchError;
 
@@ -16,13 +16,21 @@ fn approve_first_ai_model(model_hash: [u8; 32]) -> u32 {
 	crate::CurrentAIModelVersion::<Test>::get()
 }
 
-/// File a case, submit an AI ruling, and appeal it — leaving the case in `InJuryAppeal` with
-/// `JuryRequestBlock` set to the current block. Returns the case id.
+/// File a case, submit an AI ruling (with an arbitrary `Verdict::Upheld` — the jury-appeal
+/// tests that use this helper always re-derive the real verdict from actual jury votes, so
+/// the AI-submitted one is just a placeholder here), and appeal it — leaving the case in
+/// `InJuryAppeal` with `JuryRequestBlock` set to the current block. Returns the case id.
 fn file_ai_rule_and_appeal(filer: AccountId, subject: CaseSubject) -> u32 {
 	let case_id = crate::NextCaseId::<Test>::get();
 	assert_ok!(Courts::file_case(RuntimeOrigin::signed(filer), subject));
 	let model_version = approve_first_ai_model([7u8; 32]);
-	assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+	assert_ok!(Courts::submit_ai_ruling(
+		RuntimeOrigin::root(),
+		case_id,
+		[7u8; 32],
+		model_version,
+		Verdict::Upheld
+	));
 	assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(filer), case_id));
 	case_id
 }
@@ -37,22 +45,36 @@ fn set_window_hashes(case_id: u32, hashes: &[H256]) {
 	}
 }
 
-/// Block at which the seed window for `case_id` closes (inclusive) — `select_jury` only
-/// succeeds strictly after this block.
+/// Block at which the seed window for `case_id` closes (inclusive) — the jury seed is
+/// captured by `on_initialize` at `window_end(case_id) + 1`, see `capture_jury_seed`.
 fn window_end(case_id: u32) -> u64 {
 	JuryRequestBlock::<Test>::get(case_id).unwrap() + 3 // JurySeedDelayBlocks = 3 in the mock.
+}
+
+/// Advance to the first block after `case_id`'s seed window closes and run the pallet's
+/// `on_initialize` hook there, so `CapturedJurySeed` gets populated — mirrors what the
+/// runtime's block-authoring executive does automatically outside of these unit tests (which
+/// only advance `System::block_number()` directly and never run hooks on their own unless
+/// explicitly told to). Returns the block number reached.
+fn capture_jury_seed(case_id: u32) -> u64 {
+	let capture_block = window_end(case_id) + 1;
+	System::set_block_number(capture_block);
+	let _ = Courts::on_initialize(capture_block);
+	capture_block
 }
 
 #[test]
 fn select_jury_fails_before_seed_window_elapses() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
-		// Right at the appeal block: nowhere near ready.
+		// Right at the appeal block: nowhere near ready, and on_initialize hasn't run yet.
 		assert_noop!(
 			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
 			Error::<Test>::JurySeedNotReady
 		);
-		// Exactly at window_end (inclusive): still not ready — the boundary is strict.
+		// Exactly at window_end (inclusive), still without running on_initialize: still not
+		// ready — capture only happens at window_end + 1, and select_jury reads only the
+		// captured seed, never live block-hash storage.
 		System::set_block_number(window_end(case_id));
 		assert_noop!(
 			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
@@ -66,7 +88,7 @@ fn select_jury_succeeds_once_window_elapses() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 
@@ -92,7 +114,7 @@ fn select_jury_requires_21_jurors_for_law_challenge() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::LawChallenge { law_id: 5 });
 		set_window_hashes(case_id, &[H256::repeat_byte(0x44), H256::repeat_byte(0x55), H256::repeat_byte(0x66)]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 
 		// Wrong size for a constitutional (Level 2) case is rejected.
 		assert_noop!(
@@ -118,8 +140,8 @@ fn select_jury_result_is_independent_of_call_time_and_outside_hashes() {
 	let jurors_called_early = new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &window);
-		// Call select_jury the block right after the window closes.
-		System::set_block_number(window_end(case_id) + 1);
+		// Capture, then call select_jury the block right after the window closes.
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		JuryPool::<Test>::get(case_id).unwrap().into_inner()
 	});
@@ -127,8 +149,11 @@ fn select_jury_result_is_independent_of_call_time_and_outside_hashes() {
 	let jurors_called_late = new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &window);
+		// Capture right at window close, as usual.
+		capture_jury_seed(case_id);
 		// Populate an *outside-the-window* block with a completely different hash, and wait
-		// several extra blocks before finally calling select_jury.
+		// several extra blocks before finally calling select_jury -- must have zero effect now
+		// that the seed was captured once and select_jury only ever reads the captured value.
 		frame_system::BlockHash::<Test>::insert(window_end(case_id) + 2, H256::repeat_byte(0x99));
 		System::set_block_number(window_end(case_id) + 5);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
@@ -148,7 +173,7 @@ fn select_jury_result_changes_with_window_hashes() {
 	let jurors_a = new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		JuryPool::<Test>::get(case_id).unwrap().into_inner()
 	});
@@ -156,7 +181,7 @@ fn select_jury_result_changes_with_window_hashes() {
 	let jurors_b = new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &[H256::repeat_byte(0xEE); 3]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		JuryPool::<Test>::get(case_id).unwrap().into_inner()
 	});
@@ -164,12 +189,67 @@ fn select_jury_result_changes_with_window_hashes() {
 	assert_ne!(jurors_a, jurors_b, "different window hashes should (almost certainly) produce a different jury");
 }
 
+/// Proves the actual security property Fix 2 is about: even once the seed window's live block
+/// hashes have been wiped from `frame_system::BlockHash` (simulating `BlockHashCount`-based
+/// pruning long after the fact -- what would happen in real deployment ~4h after window close),
+/// `select_jury` still produces the same, real, unpredictable-at-commit-time jury, because it
+/// now reads a value captured (via `on_initialize`) at window-close time rather than
+/// recomputing `anchored_entropy` from live storage. Before this fix, the exact same setup
+/// would degrade to fully-computable "zero-hash" entropy once the window's blocks were pruned.
+#[test]
+fn select_jury_seed_survives_blockhash_pruning_once_captured() {
+	let window = [H256::repeat_byte(0x5A), H256::repeat_byte(0x5B), H256::repeat_byte(0x5C)];
+
+	// Baseline: seed captured and consumed promptly, well within any pruning window.
+	let baseline = new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &window);
+		capture_jury_seed(case_id);
+		assert!(
+			crate::pallet::CapturedJurySeed::<Test>::contains_key(case_id),
+			"on_initialize must have captured the seed at window-close time"
+		);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		JuryPool::<Test>::get(case_id).unwrap().into_inner()
+	});
+
+	// Adversarial: capture the seed at the correct block (while the window's hashes are still
+	// live), then wipe those same live BlockHash entries and jump far into the future before
+	// finally calling select_jury. A live recompute of anchored_entropy at that point would see
+	// all-zero hashes for the whole window (frame_system's actual pruning behavior); the
+	// captured value must be immune to this entirely.
+	let after_pruning = new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &window);
+		let request_block = JuryRequestBlock::<Test>::get(case_id).unwrap();
+		capture_jury_seed(case_id);
+		assert!(crate::pallet::CapturedJurySeed::<Test>::contains_key(case_id));
+
+		// Simulate BlockHashCount pruning: wipe the window's live block hashes...
+		for (offset, _) in window.iter().enumerate() {
+			frame_system::BlockHash::<Test>::remove(request_block + 1 + offset as u64);
+		}
+		// ...and advance far past where select_jury is first callable, well beyond any
+		// plausible pruning horizon.
+		System::set_block_number(window_end(case_id) + 10_000);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		JuryPool::<Test>::get(case_id).unwrap().into_inner()
+	});
+
+	assert_eq!(
+		baseline, after_pruning,
+		"a captured seed must produce the same jury regardless of later block-hash pruning \
+		 or how much later select_jury is actually called"
+	);
+}
+
 #[test]
 fn select_jury_authorization_rejects_unrelated_signed_account() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 
 		// Account 2 is neither the filer nor the oracle, and this isn't a system case.
 		assert_noop!(
@@ -187,7 +267,7 @@ fn select_jury_fails_when_not_enough_citizens() {
 		set_citizen_count(5); // fewer than the 7 required for a Level-1 jury.
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 
 		assert_noop!(
 			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
@@ -203,10 +283,16 @@ fn select_jury_system_case_requires_active_citizen() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::auto_file_case(CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
-		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
 		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(9), case_id));
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 
 		// A suspended (non-active) citizen may not trigger jury selection even for a system case.
 		set_suspended(6);
@@ -224,7 +310,7 @@ fn jury_vote_majority_freezes_department_for_treasury_dispute() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::TreasuryDispute { department_id: 3 });
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		let jury = JuryPool::<Test>::get(case_id).unwrap();
 
@@ -245,8 +331,7 @@ fn jury_vote_majority_suspends_citizen_for_conduct_case() {
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(50) },
 		);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
-		let select_block = window_end(case_id) + 1;
-		System::set_block_number(select_block);
+		let select_block = capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		let jury = JuryPool::<Test>::get(case_id).unwrap();
 
@@ -255,7 +340,9 @@ fn jury_vote_majority_suspends_citizen_for_conduct_case() {
 		}
 
 		// suspension_blocks (a duration) is converted to an absolute block number by adding it
-		// to "now" at finalization time (the block the 4th, majority-clinching vote lands in).
+		// to "now" at finalization time (the block the 4th, majority-clinching vote lands in,
+		// which here is still `select_block` since capture_jury_seed's on_initialize call and
+		// the votes below all happen at that same block number).
 		// jury_reviewed is true here: the case reached JurySeated before auto_finalize ran.
 		assert_eq!(suspended_citizens(), vec![(nullifier, Some(select_block + 50), true)]);
 	});
@@ -274,11 +361,19 @@ fn unappealed_ai_ruling_suspends_citizen_without_jury_review_flag() {
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(50) },
 		));
 		let model_version = approve_first_ai_model([7u8; 32]);
-		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Overturned
+		));
 
 		// Let the appeal window (100 blocks in the mock) lapse without an appeal, then finalize.
+		// finalize_ruling no longer takes a verdict argument -- it applies the Overturned
+		// verdict committed above by submit_ai_ruling.
 		System::set_block_number(200);
-		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id, Verdict::Overturned));
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
 
 		assert_eq!(suspended_citizens(), vec![(nullifier, Some(200 + 50), false)]);
 	});
@@ -291,7 +386,7 @@ fn jury_vote_majority_auto_finalizes_and_enforces_law_challenge() {
 	new_test_ext().execute_with(|| {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::LawChallenge { law_id: 42 });
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 21));
 		let jury = JuryPool::<Test>::get(case_id).unwrap();
 
@@ -416,12 +511,19 @@ fn file_case_bond_is_released_when_finalized_without_appeal() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
-		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
 		assert_eq!(Balances::reserved_balance(1), CASE_FILING_BOND);
 
-		// Let the appeal window (100 blocks in the mock) lapse, then finalize.
+		// Let the appeal window (100 blocks in the mock) lapse, then finalize. finalize_ruling
+		// applies the Upheld verdict committed above, with no argument of its own.
 		System::set_block_number(200);
-		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id, Verdict::Upheld));
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
 
 		assert_eq!(Balances::reserved_balance(1), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
@@ -447,11 +549,11 @@ fn submit_ai_ruling_rejects_when_no_model_approved() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 0),
+			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 0, Verdict::Upheld),
 			Error::<Test>::NoApprovedAIModel
 		);
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1),
+			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1, Verdict::Upheld),
 			Error::<Test>::NoApprovedAIModel
 		);
 	});
@@ -463,7 +565,7 @@ fn file_case_bond_is_released_when_jury_finalizes_case() {
 		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
 		assert_eq!(Balances::reserved_balance(1), CASE_FILING_BOND);
 		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
-		System::set_block_number(window_end(case_id) + 1);
+		capture_jury_seed(case_id);
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
 		let jury = JuryPool::<Test>::get(case_id).unwrap();
 
@@ -493,7 +595,7 @@ fn submit_ai_ruling_rejects_stale_model_version() {
 
 		// Citing the now-stale version 1 is rejected even though it was once valid.
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1),
+			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1, Verdict::Upheld),
 			Error::<Test>::UnapprovedAIModel
 		);
 	});
@@ -521,14 +623,213 @@ fn submit_ai_ruling_succeeds_with_current_approved_version() {
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([9u8; 32]);
 
-		assert_ok!(Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], model_version));
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Overturned
+		));
 
 		assert_eq!(crate::AIRulingModelVersion::<Test>::get(case_id), Some(model_version));
+		assert_eq!(crate::pallet::AIRulingVerdict::<Test>::get(case_id), Some(Verdict::Overturned));
 		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
 		assert_eq!(status, CaseStatus::AIRulingIssued);
 		assert_eq!(ruling_hash, Some([7u8; 32]));
 		System::assert_last_event(
 			Event::AIRulingIssued { case_id, ruling_hash: [7u8; 32], model_version }.into(),
+		);
+	});
+}
+
+// ─── Fix 1: finalize_ruling applies the verdict bound at submit_ai_ruling time ─────────────
+
+#[test]
+fn finalize_ruling_applies_the_verdict_committed_at_submission_not_a_caller_supplied_one() {
+	// The core property of the fix: finalize_ruling(case_id) takes no verdict argument at all
+	// now, so whatever was committed by submit_ai_ruling is what gets applied and enforced --
+	// there is no longer any way for the caller of finalize_ruling to choose a different one.
+	new_test_ext().execute_with(|| {
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::LawChallenge { law_id: 7 }));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Overturned
+		));
+
+		System::set_block_number(200);
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
+
+		// The Overturned verdict committed at submission time was applied and enforced (law 7
+		// invalidated), even though finalize_ruling's call site above supplied no verdict.
+		assert_eq!(crate::Rulings::<Test>::get(case_id), Some(Verdict::Overturned));
+		assert_eq!(invalidated_laws(), vec![7]);
+	});
+}
+
+#[test]
+fn finalize_ruling_fails_if_no_verdict_was_ever_recorded() {
+	// Defensive case: AIRulingIssued status with no AIRulingVerdict entry shouldn't be
+	// reachable through the normal call surface (submit_ai_ruling always sets both together),
+	// but finalize_ruling must fail safe rather than panic if it somehow happens.
+	new_test_ext().execute_with(|| {
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		// Simulate a corrupted/partial state: verdict entry removed after submission.
+		crate::pallet::AIRulingVerdict::<Test>::remove(case_id);
+
+		System::set_block_number(200);
+		assert_noop!(
+			Courts::finalize_ruling(RuntimeOrigin::root(), case_id),
+			Error::<Test>::NoRulingVerdict
+		);
+	});
+}
+
+// ─── Fix 3: appeal_ruling authorization ────────────────────────────────────────────────────
+
+#[test]
+fn appeal_ruling_rejects_unrelated_signed_account() {
+	new_test_ext().execute_with(|| {
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+
+		// Account 2 is neither the filer nor the oracle, and this isn't a system case, and it
+		// has no registered nullifier matching a CitizenConduct subject (this is General
+		// anyway). Before the fix, any signed account could do this.
+		assert_noop!(
+			Courts::appeal_ruling(RuntimeOrigin::signed(2), case_id),
+			Error::<Test>::NotAuthorized
+		);
+		// The filer themself is still authorized.
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(1), case_id));
+	});
+}
+
+#[test]
+fn appeal_ruling_allows_the_designated_oracle() {
+	new_test_ext().execute_with(|| {
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::set_oracle_account(RuntimeOrigin::root(), 50));
+
+		// Account 50 is neither the filer nor a CitizenConduct nullifier match, but it is the
+		// configured oracle, which is independently sufficient.
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(50), case_id));
+	});
+}
+
+#[test]
+fn appeal_ruling_rejects_suspended_citizen_for_system_case() {
+	new_test_ext().execute_with(|| {
+		// System-initiated case: filer is the AutoChallengeAccount (account 0 in the mock), so
+		// there's no natural filer to restrict appeal to -- any *active* citizen should be
+		// able to trigger it, but a suspended one must not.
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::auto_file_case(CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+
+		set_suspended(6);
+		assert_noop!(
+			Courts::appeal_ruling(RuntimeOrigin::signed(6), case_id),
+			Error::<Test>::NotAuthorized
+		);
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(9), case_id));
+	});
+}
+
+#[test]
+fn appeal_ruling_allows_verified_ruled_against_party_for_citizen_conduct_case() {
+	// A CitizenConduct case's registered nullifier holder may appeal even though they didn't
+	// file the case -- the genuine "losing party" appeal right described in the fix, verified
+	// via CitizenChecker::citizen_nullifier (pallet-identity's real AccountId -> nullifier
+	// reverse lookup in the runtime).
+	new_test_ext().execute_with(|| {
+		let nullifier = [42u8; 32];
+		let case_id = crate::NextCaseId::<Test>::get();
+		// Filed by account 1 (e.g. a prosecutor/complainant), against the citizen holding
+		// `nullifier` -- account 5, who registers that nullifier via the mock helper.
+		assert_ok!(Courts::file_case(
+			RuntimeOrigin::signed(1),
+			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(10) },
+		));
+		set_citizen_nullifier(5, nullifier);
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Overturned
+		));
+
+		// Account 5 is neither the filer nor the oracle nor a system case, but they *are* the
+		// verified ruled-against party.
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(5), case_id));
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::InJuryAppeal);
+	});
+}
+
+#[test]
+fn appeal_ruling_rejects_nullifier_mismatch_for_citizen_conduct_case() {
+	new_test_ext().execute_with(|| {
+		let nullifier = [42u8; 32];
+		let other_nullifier = [99u8; 32];
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(
+			RuntimeOrigin::signed(1),
+			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(10) },
+		));
+		// Account 5 is registered under a *different* nullifier than the one this case names.
+		set_citizen_nullifier(5, other_nullifier);
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::root(),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Overturned
+		));
+
+		assert_noop!(
+			Courts::appeal_ruling(RuntimeOrigin::signed(5), case_id),
+			Error::<Test>::NotAuthorized
 		);
 	});
 }
