@@ -38,9 +38,10 @@ pub enum CaseSubject {
 pub type CaseRecord = (AccountId32, CaseStatus, Option<[u8; 32]>, CaseSubject);
 
 /// Mirrors `pallet_courts::pallet::Verdict`. Variant order matches exactly (SCALE encodes enums
-/// by variant index). Needed on the write side too: `finalize_ruling(case_id, verdict)` takes
-/// this as an explicit argument (the pallet does not record a verdict on submit_ai_ruling — see
-/// README.md's "A real gap found" section), so `extrinsic::FinalizeRuling` encodes one of these.
+/// by variant index). Needed on the write side too: `submit_ai_ruling` now takes this as an
+/// explicit fourth argument and commits it on-chain at submission time (see README.md's
+/// "`finalize_ruling` scheduling, and the verdict-binding fix" section) — `finalize_ruling`
+/// itself takes no verdict argument at all — so `extrinsic::SubmitAiRuling` encodes one of these.
 #[derive(Clone, Debug, PartialEq, Decode, Encode)]
 pub enum Verdict {
     Upheld,

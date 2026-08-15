@@ -567,10 +567,15 @@ impl pallet_courts::CitizenSelector<AccountId> for Runtime {
 	}
 }
 
-/// Runtime implements CitizenChecker for pallet-courts (file_case active-citizen gate).
+/// Runtime implements CitizenChecker for pallet-courts (file_case active-citizen gate, and
+/// appeal_ruling's ruled-against-party nullifier check).
 impl pallet_courts::CitizenChecker<AccountId> for Runtime {
 	fn is_active_citizen(who: &AccountId) -> bool {
 		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+
+	fn citizen_nullifier(who: &AccountId) -> Option<[u8; 32]> {
+		pallet_identity_zk::CitizenNullifier::<Runtime>::get(who)
 	}
 }
 
@@ -621,6 +626,11 @@ impl pallet_courts::Config for Runtime {
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`
 	/// for what this buys and its residual risk — it is not VRF-grade.
 	type JurySeedDelayBlocks = ConstU32<{ 10 * MINUTES }>;
+	/// Bounds how many cases may have their jury-seed capture scheduled for the same block
+	/// (see `pallet_courts::Config::MaxCasesPerBlock`). 128 is generous headroom relative to
+	/// this runtime's expected appeal volume, sized the same order of magnitude as this
+	/// runtime's other generic per-block/per-round bounds.
+	type MaxCasesPerBlock = ConstU32<128>;
 	/// Zero account used as filer for system-initiated LawChallenge cases.
 	type AutoChallengeAccount = AutoChallengeAccount;
 	type Currency = Balances;

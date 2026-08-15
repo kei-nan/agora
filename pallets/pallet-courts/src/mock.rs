@@ -68,6 +68,9 @@ thread_local! {
 	pub static FROZEN_DEPARTMENTS: RefCell<Vec<u32>> = RefCell::new(Vec::new());
 	/// (nullifier, suspension_until, jury_reviewed) recorded by `suspend_citizen`.
 	pub static SUSPENDED_CITIZENS: RefCell<Vec<([u8; 32], Option<BlockNumber>, bool)>> = RefCell::new(Vec::new());
+	/// account -> registered identity nullifier, used by `MockCitizenChecker::citizen_nullifier`
+	/// (`appeal_ruling`'s ruled-against-party check).
+	pub static CITIZEN_NULLIFIERS: RefCell<Vec<(AccountId, [u8; 32])>> = RefCell::new(Vec::new());
 }
 
 pub fn set_citizen_count(n: u32) {
@@ -76,6 +79,11 @@ pub fn set_citizen_count(n: u32) {
 
 pub fn set_suspended(who: AccountId) {
 	SUSPENDED.with(|s| s.borrow_mut().push(who));
+}
+
+/// Register `who` as the citizen holding `nullifier`, for `MockCitizenChecker::citizen_nullifier`.
+pub fn set_citizen_nullifier(who: AccountId, nullifier: [u8; 32]) {
+	CITIZEN_NULLIFIERS.with(|v| v.borrow_mut().push((who, nullifier)));
 }
 
 pub fn invalidated_laws() -> Vec<u32> {
@@ -96,6 +104,7 @@ fn reset_mocks() {
 	INVALIDATED_LAWS.with(|v| v.borrow_mut().clear());
 	FROZEN_DEPARTMENTS.with(|v| v.borrow_mut().clear());
 	SUSPENDED_CITIZENS.with(|v| v.borrow_mut().clear());
+	CITIZEN_NULLIFIERS.with(|v| v.borrow_mut().clear());
 }
 
 /// Citizens are accounts `1..=CITIZEN_COUNT`, one-indexed to match `citizen_at`'s 0-based index
@@ -120,6 +129,10 @@ pub struct MockCitizenChecker;
 impl CitizenChecker<AccountId> for MockCitizenChecker {
 	fn is_active_citizen(who: &AccountId) -> bool {
 		!SUSPENDED.with(|s| s.borrow().contains(who))
+	}
+
+	fn citizen_nullifier(who: &AccountId) -> Option<[u8; 32]> {
+		CITIZEN_NULLIFIERS.with(|v| v.borrow().iter().find(|(a, _)| a == who).map(|(_, n)| *n))
 	}
 }
 
@@ -166,6 +179,7 @@ impl pallet_courts::Config for Test {
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;
+	type MaxCasesPerBlock = ConstU32<16>;
 	type AutoChallengeAccount = AutoChallengeAccountId;
 	type Currency = Balances;
 	type CaseFilingBond = ConstU64<CASE_FILING_BOND>;
