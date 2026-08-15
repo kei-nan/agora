@@ -35,6 +35,15 @@ bs58 = "0.5"
 # mobile/src/chain/identity.ts uses an sr25519 `@polkadot/keyring` KeyringPair) — see
 # commands/auth.rs's QR-auth callback signature verification.
 schnorrkel = "0.11"
+# RediSearch's vector-search commands (FT.CREATE/FT.SEARCH) are issued over Redis's native RESP
+# wire protocol, not HTTP — reqwest (already a dependency, used by chain.rs/agent.rs) can't speak
+# it. See vector_search.rs's module doc comment for the full reasoning. tokio-comp wires it to
+# this crate's existing tokio runtime rather than pulling in a second async runtime.
+redis = { version = "0.27", features = ["tokio-comp"] }
+# Makes VectorSearchClient (vector_search.rs) dyn-compatible — native async-fn-in-trait can't
+# back a `Box<dyn Trait>` without this. See the trait's doc comment for why dyn was chosen over
+# compile-time generics here.
+async-trait = "0.1"
 
 [profile.release]
 panic = "abort"

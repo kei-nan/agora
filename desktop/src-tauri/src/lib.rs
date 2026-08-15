@@ -1,5 +1,6 @@
 mod commands;
 mod rpc;
+mod vector_search;
 
 use commands::{agent, auth, chain};
 use auth::{PendingSessions, SessionStore};
