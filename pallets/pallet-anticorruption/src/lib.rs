@@ -50,6 +50,84 @@ pub mod pallet {
         fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool;
     }
 
+    // ── ZKPassport public-input layout ──────────────────────────────────────
+    //
+    // `submit_whistleblower_report`'s `public_inputs` is a ZKPassport `main/outer/count_N`
+    // outer-circuit public-input array. See `runtime/src/verifier.rs`'s module doc for the
+    // authoritative, source-confirmed field-by-field table; summarized here:
+    //
+    //   0            certificate_registry_root   (shared by every citizen at a given
+    //                                              registry state — NOT per-citizen)
+    //   1            circuit_registry_root
+    //   2            current_date
+    //   3            service_scope
+    //   4            service_subscope
+    //   5 .. 5+D     param_commitments[D]         D = outer_count - 3
+    //   5+D          nullifier_type
+    //   6+D          scoped_nullifier              (= len - 2; the real per-citizen value)
+    //   7+D          oprf_pk_hash                   (= len - 1)
+    //
+    // So `public_inputs.len() == D + 8`, minimized at `D = 1` (the smallest allowlisted
+    // `count_4` variant) to exactly 9. `MIN_PUBLIC_INPUTS` mirrors
+    // `pallet_identity::Pallet::verify_outer_proof`'s identical `public_inputs.len() >= 9`
+    // guard, for the same reason: with this floor, the fixed-offset fields below
+    // (`service_scope`/`service_subscope` at 3/4, `scoped_nullifier` at `len - 2`) are
+    // always in bounds no matter how many disclosure subproofs the proof actually carries —
+    // extra disclosures only widen the `param_commitments` slice in the middle, they never
+    // move these fields out of range.
+
+    /// Minimum length a structurally valid `public_inputs` array can have (the `count_4`
+    /// variant, `D = 1`). Checked before indexing anything below it, and before invoking
+    /// `T::ZkVerifier::verify` at all — so a dev-mode passthrough verifier (which does not
+    /// itself check shape) can't be exploited with a too-short array to smuggle an
+    /// attacker-chosen sentinel into `scoped_nullifier`/`service_scope`/`service_subscope`.
+    const MIN_PUBLIC_INPUTS: usize = 9;
+
+    /// Index of `service_scope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SCOPE_INDEX: usize = 3;
+    /// Index of `service_subscope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SUBSCOPE_INDEX: usize = 4;
+
+    /// Zero-pads a 31-byte ASCII tag into a canonical 32-byte big-endian BN254 `Fr` element:
+    /// leading byte `0x00`, tag in the remaining 31 bytes. The field modulus's own leading
+    /// byte is `0x30`, so any value whose leading byte is `0x00` is unconditionally below it
+    /// regardless of what follows — this makes the result canonical by construction, without
+    /// needing to hash anything or reason about the tag's specific bytes. The `&[u8; 31]`
+    /// parameter type is itself a compile-time length check: a tag literal that isn't exactly
+    /// 31 bytes fails to typecheck at the call site below.
+    const fn zero_padded_scope_tag(tag: &[u8; 31]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 31 {
+            out[i + 1] = tag[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Domain-separation constant this pallet requires as the proof's `service_scope`
+    /// (`public_inputs[SERVICE_SCOPE_INDEX]`). A ZKPassport outer-circuit proof only
+    /// satisfies `submit_whistleblower_report` if it was generated with exactly this value
+    /// (and [`WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE`] below) as its ZKPassport
+    /// `scope`/`subscope` request parameters — this is what stops a proof produced for a
+    /// different purpose (e.g. `pallet-identity::register_citizen`'s citizen-registration
+    /// flow, which would carry a different scope) from being replayed here even though the
+    /// underlying passport proof is perfectly valid citizenship. This pallet is the source
+    /// of truth for the expected value; whatever constructs the real proof request
+    /// (mobile/desktop ZKPassport integration) must be configured to match it exactly, the
+    /// same way `mobile/src/chain/proofEncoding.ts` and `runtime/src/verifier.rs` already
+    /// have to agree on the proof envelope.
+    pub const WHISTLEBLOWER_REPORT_SERVICE_SCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_ANTICORRUPTION_WHISTLE_V1");
+
+    /// Domain-separation constant this pallet requires as the proof's `service_subscope`
+    /// (`public_inputs[SERVICE_SUBSCOPE_INDEX]`). See
+    /// [`WHISTLEBLOWER_REPORT_SERVICE_SCOPE`] above for the full rationale; `scope` and
+    /// `subscope` are checked independently so a proof cannot pass by matching only one of
+    /// the two.
+    pub const WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_ANTICORRUPTION_WB_REPORT1");
+
     // ── Data types ───────────────────────────────────────────────────────────
 
     /// The nature of a declared conflict of interest.
@@ -102,8 +180,10 @@ pub mod pallet {
         pub content_hash: [u8; 32],
         pub submitted_at: BlockNumber,
         pub status: ReportStatus,
-        /// Privacy-preserving citizen nullifier from the ZK proof.
-        /// Stored for linkage detection; not the raw national-ID hash.
+        /// The ZKPassport outer circuit's own `scoped_nullifier` public output
+        /// (`public_inputs[public_inputs.len() - 2]`) — a real per-citizen value, not the
+        /// shared `certificate_registry_root` at index 0. Stored for linkage detection; not
+        /// the raw national-ID hash.
         pub nullifier: [u8; 32],
     }
 
@@ -197,8 +277,14 @@ pub mod pallet {
         InvalidZkProof,
         /// This citizen has already filed an identical report (same nullifier + content hash).
         DuplicateReport,
-        /// public_inputs is empty — at minimum public_inputs[0] (the nullifier) must be present.
+        /// `public_inputs` is shorter than `MIN_PUBLIC_INPUTS` — too short to contain a real
+        /// ZKPassport outer-circuit layout (`service_scope`/`service_subscope`/
+        /// `scoped_nullifier` at their expected fixed offsets).
         MissingNullifierInput,
+        /// The proof's `service_scope`/`service_subscope` public inputs don't match this
+        /// call's required domain-separation constants — the proof was generated for a
+        /// different purpose (e.g. citizen registration) and cannot be replayed here.
+        InvalidProofScope,
         /// Report id does not exist.
         ReportNotFound,
         /// The report is not in the expected state for this transition.
@@ -274,10 +360,16 @@ pub mod pallet {
         /// Submit a whistleblower report.
         ///
         /// Requires a valid ZK proof of passport registration so that spam is gated behind
-        /// real citizenship. The nullifier in `public_inputs[0]` is stored (not the plaintext
-        /// identity) to detect duplicate filings — a (nullifier, content_hash) pair may only
-        /// be used once, so a citizen cannot file the same report twice, but can file
-        /// different reports.
+        /// real citizenship. The real per-citizen nullifier — ZKPassport's own
+        /// `scoped_nullifier` output, at `public_inputs[public_inputs.len() - 2]`, **not**
+        /// `public_inputs[0]` (which is `certificate_registry_root`, shared by every citizen
+        /// at a given registry state) — is stored (not the plaintext identity) to detect
+        /// duplicate filings: a (nullifier, content_hash) pair may only be used once, so a
+        /// citizen cannot file the same report twice, but can file different reports. The
+        /// proof must also carry this call's own `service_scope`/`service_subscope`
+        /// (see [`WHISTLEBLOWER_REPORT_SERVICE_SCOPE`]/[`WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE`]),
+        /// so a valid proof generated for a different purpose (e.g.
+        /// `pallet-identity::register_citizen`) cannot be replayed into this call.
         ///
         /// ## Known sender-anonymity gap
         /// This call requires `ensure_signed`, so the extrinsic's signing `AccountId` (`_who`
@@ -314,15 +406,34 @@ pub mod pallet {
             public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
         ) -> DispatchResult {
             let _who = ensure_signed(origin)?;
-            // public_inputs[0] is the citizen nullifier (Poseidon2(national_id || country_code)).
-            // Must check length before calling the verifier so dev-mode passthrough can't be
-            // exploited with empty inputs to produce an all-zero sentinel nullifier.
-            ensure!(!public_inputs.is_empty(), Error::<T>::MissingNullifierInput);
+            // Must check length before indexing anything, and before calling the verifier, so
+            // a dev-mode passthrough verifier (which does not itself check shape) can't be
+            // exploited with a too-short array to smuggle an attacker-chosen sentinel into
+            // scoped_nullifier/service_scope/service_subscope.
+            ensure!(public_inputs.len() >= MIN_PUBLIC_INPUTS, Error::<T>::MissingNullifierInput);
+            // Domain-separation: this proof must have been generated specifically for this
+            // call (service_scope/service_subscope), not replayed from a different-purpose
+            // proof (e.g. pallet-identity::register_citizen) that happens to be a valid,
+            // observable-on-chain ZK proof of citizenship. Checked before the expensive
+            // pairing check for the same cheap-first reasoning as the length check above.
+            ensure!(
+                public_inputs[SERVICE_SCOPE_INDEX] == WHISTLEBLOWER_REPORT_SERVICE_SCOPE
+                    && public_inputs[SERVICE_SUBSCOPE_INDEX]
+                        == WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
+                Error::<T>::InvalidProofScope
+            );
             ensure!(
                 T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
                 Error::<T>::InvalidZkProof
             );
-            let nullifier = public_inputs[0];
+            // The real per-citizen value is scoped_nullifier, at `len - 2` (== `6 + D`, where
+            // `D` is the disclosure-subproof count derived from the array's own length) — see
+            // the "ZKPassport public-input layout" section above and
+            // `pallet_identity::Pallet::register_citizen`'s identical extraction. NOT
+            // `public_inputs[0]` (certificate_registry_root), which is shared by every
+            // citizen at a given registry state and would collapse dedup to essentially just
+            // content_hash.
+            let nullifier = public_inputs[public_inputs.len() - 2];
             ensure!(
                 !ReportNullifiers::<T>::get((nullifier, content_hash)),
                 Error::<T>::DuplicateReport

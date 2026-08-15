@@ -1,6 +1,7 @@
 use crate::{
     mock::*, AssetDisclosures, ConflictRegistry, ConflictType, Error, Event, Investigators,
     NextReportId, ReportNullifiers, ReportStatus, WhistleblowerReports,
+    WHISTLEBLOWER_REPORT_SERVICE_SCOPE, WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -13,14 +14,64 @@ fn invalid_proof() -> BoundedVec<u8, ConstU32<4096>> {
     BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap()
 }
 
+/// A minimal, structurally valid ZKPassport `count_4` outer-circuit public-input array
+/// (`D = 1` disclosure subproof, so `len == 9`), matching the layout documented in
+/// `runtime/src/verifier.rs`'s module doc and mirrored in
+/// `pallets/pallet-anticorruption/src/lib.rs`'s "ZKPassport public-input layout" section:
+/// `[certificate_registry_root, circuit_registry_root, current_date, service_scope,
+///   service_subscope, param_commitments[0], nullifier_type, scoped_nullifier, oprf_pk_hash]`.
+/// Every field is caller-controlled so tests can independently vary the shared registry root
+/// (index 0, NOT per-citizen) versus the real per-citizen `scoped_nullifier` (index `len - 2`
+/// = 7), and the scope/subscope fields the domain-separation check reads (indices 3/4).
+fn public_inputs_with(
+    registry_root: [u8; 32],
+    scope: [u8; 32],
+    subscope: [u8; 32],
+    nullifier: [u8; 32],
+) -> BoundedVec<[u8; 32], ConstU32<16>> {
+    BoundedVec::try_from(vec![
+        registry_root,       // 0: certificate_registry_root
+        [2u8; 32],           // 1: circuit_registry_root
+        [0u8; 32],           // 2: current_date (not checked by this pallet)
+        scope,               // 3: service_scope
+        subscope,            // 4: service_subscope
+        [3u8; 32],           // 5: param_commitments[0]
+        [4u8; 32],           // 6: nullifier_type
+        nullifier,           // 7 = len - 2: scoped_nullifier
+        [6u8; 32],           // 8 = len - 1: oprf_pk_hash
+    ])
+    .unwrap()
+}
+
+/// Convenience wrapper for the common case: correct domain-separation scope/subscope, a
+/// caller-chosen registry root and per-citizen nullifier.
+fn public_inputs_for(registry_root: [u8; 32], nullifier: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<16>> {
+    public_inputs_with(
+        registry_root,
+        WHISTLEBLOWER_REPORT_SERVICE_SCOPE,
+        WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
+        nullifier,
+    )
+}
+
+/// Further convenience wrapper matching most existing tests' shape: a fixed default registry
+/// root, correct scope/subscope, caller-chosen nullifier.
 fn public_inputs(nullifier: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<16>> {
-    BoundedVec::try_from(vec![nullifier]).unwrap()
+    public_inputs_for(DEFAULT_REGISTRY_ROOT, nullifier)
 }
 
 fn empty_public_inputs() -> BoundedVec<[u8; 32], ConstU32<16>> {
     BoundedVec::try_from(Vec::new()).unwrap()
 }
 
+/// Structurally too-short (fewer than the real layout's 9-element floor) but non-empty, so
+/// tests can distinguish "empty" from "short but nonzero" — both must be rejected the same
+/// way, before the array is ever indexed.
+fn too_short_public_inputs() -> BoundedVec<[u8; 32], ConstU32<16>> {
+    BoundedVec::try_from(vec![[1u8; 32]; 5]).unwrap()
+}
+
+const DEFAULT_REGISTRY_ROOT: [u8; 32] = [9u8; 32];
 const NULLIFIER_A: [u8; 32] = [1u8; 32];
 const CONTENT_A: [u8; 32] = [10u8; 32];
 const CONTENT_B: [u8; 32] = [20u8; 32];
@@ -226,8 +277,8 @@ fn submit_whistleblower_report_fails_with_empty_public_inputs_before_verifier_ru
         System::set_block_number(1);
 
         // Valid proof (the mock verifier would accept it) but empty public_inputs: the
-        // MissingNullifierInput check must run before the verifier is invoked, so this
-        // must fail with MissingNullifierInput, not InvalidZkProof.
+        // length check must run before the verifier is invoked, so this must fail with
+        // MissingNullifierInput, not InvalidZkProof.
         assert_noop!(
             AntiCorruption::submit_whistleblower_report(
                 RuntimeOrigin::signed(1),
@@ -238,6 +289,143 @@ fn submit_whistleblower_report_fails_with_empty_public_inputs_before_verifier_ru
             Error::<Test>::MissingNullifierInput
         );
         assert!(WhistleblowerReports::<Test>::get(0).is_none());
+    });
+}
+
+#[test]
+fn submit_whistleblower_report_fails_with_too_short_public_inputs_before_verifier_runs() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // Non-empty (5 elements) but still short of the real layout's 9-element floor
+        // (count_4, D = 1). Must be rejected before indexing service_scope/service_subscope/
+        // scoped_nullifier, and before the verifier runs — same MissingNullifierInput error
+        // as the empty case, not a panic and not InvalidZkProof.
+        assert_noop!(
+            AntiCorruption::submit_whistleblower_report(
+                RuntimeOrigin::signed(1),
+                CONTENT_A,
+                valid_proof(),
+                too_short_public_inputs(),
+            ),
+            Error::<Test>::MissingNullifierInput
+        );
+        assert!(WhistleblowerReports::<Test>::get(0).is_none());
+    });
+}
+
+#[test]
+fn submit_whistleblower_report_fails_with_wrong_service_scope() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // A structurally valid, otherwise-acceptable proof, but stamped with a scope that
+        // isn't this call's domain-separation constant — e.g. as if replayed from a proof
+        // generated for a different purpose such as pallet-identity::register_citizen. Must
+        // be rejected with InvalidProofScope, before the verifier even runs (checked before
+        // T::ZkVerifier::verify in the call body), and no report may be persisted.
+        let wrong_scope = [0xABu8; 32];
+        assert_noop!(
+            AntiCorruption::submit_whistleblower_report(
+                RuntimeOrigin::signed(1),
+                CONTENT_A,
+                valid_proof(),
+                public_inputs_with(
+                    DEFAULT_REGISTRY_ROOT,
+                    wrong_scope,
+                    WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
+                    NULLIFIER_A,
+                ),
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+        assert!(WhistleblowerReports::<Test>::get(0).is_none());
+    });
+}
+
+#[test]
+fn submit_whistleblower_report_fails_with_wrong_service_subscope() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // Correct service_scope but wrong service_subscope must also be rejected — the two
+        // are checked independently, so a proof can't pass by matching only one of them.
+        let wrong_subscope = [0xCDu8; 32];
+        assert_noop!(
+            AntiCorruption::submit_whistleblower_report(
+                RuntimeOrigin::signed(1),
+                CONTENT_A,
+                valid_proof(),
+                public_inputs_with(
+                    DEFAULT_REGISTRY_ROOT,
+                    WHISTLEBLOWER_REPORT_SERVICE_SCOPE,
+                    wrong_subscope,
+                    NULLIFIER_A,
+                ),
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+        assert!(WhistleblowerReports::<Test>::get(0).is_none());
+    });
+}
+
+#[test]
+fn submit_whistleblower_report_uses_real_scoped_nullifier_not_shared_registry_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // Two different citizens (different scoped_nullifier — the real per-citizen value at
+        // index len-2) but the *same* certificate_registry_root (index 0 — shared by every
+        // citizen at a given registry state) and the same content_hash. Under the old,
+        // buggy code, which stored public_inputs[0] (the shared registry root) as
+        // "nullifier", the second submission below would collide with the first — the
+        // (registry_root, CONTENT_A) pair would already be marked used — and fail with
+        // DuplicateReport even though it's a genuinely different citizen filing a genuinely
+        // different report. The fix keys dedup on the real scoped_nullifier, so both must
+        // succeed.
+        let shared_registry_root = [7u8; 32];
+        let nullifier_citizen_a = [111u8; 32];
+        let nullifier_citizen_b = [222u8; 32];
+        assert_ne!(nullifier_citizen_a, shared_registry_root);
+        assert_ne!(nullifier_citizen_b, shared_registry_root);
+
+        assert_ok!(AntiCorruption::submit_whistleblower_report(
+            RuntimeOrigin::signed(1),
+            CONTENT_A,
+            valid_proof(),
+            public_inputs_for(shared_registry_root, nullifier_citizen_a),
+        ));
+        assert_ok!(AntiCorruption::submit_whistleblower_report(
+            RuntimeOrigin::signed(2),
+            CONTENT_A,
+            valid_proof(),
+            public_inputs_for(shared_registry_root, nullifier_citizen_b),
+        ));
+
+        let report_a = WhistleblowerReports::<Test>::get(0).unwrap();
+        let report_b = WhistleblowerReports::<Test>::get(1).unwrap();
+        assert_eq!(report_a.nullifier, nullifier_citizen_a);
+        assert_eq!(report_b.nullifier, nullifier_citizen_b);
+        assert_ne!(report_a.nullifier, report_b.nullifier);
+        // Neither stored nullifier is the shared registry root — proves the pallet isn't
+        // still reading public_inputs[0].
+        assert_ne!(report_a.nullifier, shared_registry_root);
+        assert_ne!(report_b.nullifier, shared_registry_root);
+        assert!(ReportNullifiers::<Test>::get((nullifier_citizen_a, CONTENT_A)));
+        assert!(ReportNullifiers::<Test>::get((nullifier_citizen_b, CONTENT_A)));
+        // The old buggy key — (shared_registry_root, CONTENT_A) — was never written.
+        assert!(!ReportNullifiers::<Test>::get((shared_registry_root, CONTENT_A)));
+
+        // Genuine duplicate (same citizen, same content_hash) is still rejected.
+        assert_noop!(
+            AntiCorruption::submit_whistleblower_report(
+                RuntimeOrigin::signed(1),
+                CONTENT_A,
+                valid_proof(),
+                public_inputs_for(shared_registry_root, nullifier_citizen_a),
+            ),
+            Error::<Test>::DuplicateReport
+        );
     });
 }
 
