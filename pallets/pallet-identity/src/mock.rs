@@ -127,6 +127,10 @@ impl pallet_identity_zk::Config for Test {
     // (see `tests.rs::public_inputs`) stays comfortably inside the window, while still
     // leaving room for a dedicated staleness test to use an obviously-expired one.
     type MaxAnchorProofAge = frame_support::traits::ConstU64<3600>;
+    // 5 minutes — generous enough that every fixture using the default fresh `current_date`
+    // stays inside it, while still leaving room for a dedicated future-dated test to use an
+    // obviously-out-of-tolerance `current_date`.
+    type MaxAnchorProofClockSkew = frame_support::traits::ConstU64<300>;
     // Small on purpose: big enough for tests to exercise a full roster plus one rejected
     // over-capacity add, without needing a large fixture.
     type MaxCommitteeSize = frame_support::traits::ConstU32<3>;

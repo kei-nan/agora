@@ -208,6 +208,21 @@ pub mod pallet {
         /// `current_date` against the passport's own expiry, not against "now".
         #[pallet::constant]
         type MaxAnchorProofAge: Get<u64>;
+        /// How far into the future (in seconds) an outer proof's `current_date` public input
+        /// is allowed to be, relative to `T::Now`, before it's rejected outright. Exists
+        /// because `current_date` is a fully prover-controlled public input — the in-circuit
+        /// check (`check_expiry_from_date`, see
+        /// `circuits/oprf-identity-anchor/disclosure/src/main.nr`) only constrains it against
+        /// the passport's own expiry, never against real time. Without this check, a
+        /// future-dated `current_date` makes `MaxAnchorProofAge`'s `saturating_sub` clamp to
+        /// zero and the freshness check above passes unconditionally, forever — a single proof
+        /// generated once with a sufficiently future-dated `current_date` could then be
+        /// resubmitted indefinitely to keep a citizen "verified" without ever holding a
+        /// currently-valid passport. A small nonzero value (e.g. a few minutes) tolerates
+        /// ordinary clock skew between the prover and this chain's `T::Now` without reopening
+        /// that gap by more than the tolerance itself.
+        #[pallet::constant]
+        type MaxAnchorProofClockSkew: Get<u64>;
         /// Maximum number of accounts permitted in a single OPRF committee slot's roster
         /// (`CommitteeMembers`), changelog entry 82's on-chain query/response mailbox design.
         /// Set with headroom above the eventual ~35-member committees (changelog entry 73's
@@ -581,6 +596,11 @@ pub mod pallet {
         /// the current chain time — an old-but-not-yet-passport-expired proof cannot be
         /// replayed indefinitely.
         AnchorProofStale,
+        /// The outer proof's `current_date` is further in the future than
+        /// `MaxAnchorProofClockSkew` relative to the current chain time. `current_date` is a
+        /// prover-controlled public input; without this check a future-dated value would make
+        /// `AnchorProofStale`'s `saturating_sub` clamp to zero and pass unconditionally.
+        AnchorProofFuture,
         /// The account is already present in this committee slot's roster.
         CommitteeMemberAlreadyPresent,
         /// The account is not present in this committee slot's roster.
@@ -922,11 +942,14 @@ pub mod pallet {
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
             let new_version =
                 old_version.checked_add(1).ok_or(Error::<T>::OprfSchemeVersionOverflow)?;
-            ensure!(
-                !IdentityAnchorRegistry::<T>::contains_key((new_version, new_anchor)),
-                Error::<T>::NewAnchorAlreadyUsed
-            );
 
+            // Verify the proof (and committee keys) before consulting the anchor-registry
+            // exclusion check below — same ordering rationale as `register_citizen` (see its
+            // own doc comment on this point): checking `NewAnchorAlreadyUsed` first would let
+            // an attacker submit a bogus `zk_proof` with a guessed `new_anchor` and learn, from
+            // the returned error alone and at zero real proof-computation cost, whether that
+            // `(new_version, new_anchor)` pair already belongs to another citizen — leaking
+            // cross-citizen anchor-registry membership ahead of proof authentication.
             Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
             Self::check_outer_proof_freshness(public_inputs.as_slice())?;
             Self::check_committee_keys(old_version, &old_oprf_pk_hashes)?;
@@ -943,6 +966,11 @@ pub mod pallet {
                     new_oprf_pk_hashes,
                 ),
                 Error::<T>::InvalidMigrationProof
+            );
+
+            ensure!(
+                !IdentityAnchorRegistry::<T>::contains_key((new_version, new_anchor)),
+                Error::<T>::NewAnchorAlreadyUsed
             );
 
             IdentityAnchorRegistry::<T>::remove((old_version, old_anchor));
@@ -1366,7 +1394,11 @@ pub mod pallet {
         /// module docs for the full outer-circuit public-input table), a u64 encoded as a
         /// field element's low 8 bytes. Rejects a proof whose `current_date` is older than
         /// `MaxAnchorProofAge` relative to `T::Now`, so a genuine-at-generation-time proof
-        /// cannot be replayed indefinitely.
+        /// cannot be replayed indefinitely. Also rejects a `current_date` further in the
+        /// future than `MaxAnchorProofClockSkew` — `current_date` is a fully prover-controlled
+        /// public input (the in-circuit check only constrains it against the passport's own
+        /// expiry, never against real time), so without this second check a future-dated value
+        /// would make the staleness check's `saturating_sub` clamp to zero and pass forever.
         fn check_outer_proof_freshness(public_inputs: &[[u8; 32]]) -> DispatchResult {
             let current_date_field = public_inputs[2];
             ensure!(
@@ -1377,6 +1409,10 @@ pub mod pallet {
                 current_date_field[24..32].try_into().expect("slice is exactly 8 bytes"),
             );
             let now = T::Now::now().as_secs();
+            ensure!(
+                current_date <= now.saturating_add(T::MaxAnchorProofClockSkew::get()),
+                Error::<T>::AnchorProofFuture
+            );
             ensure!(
                 now.saturating_sub(current_date) <= T::MaxAnchorProofAge::get(),
                 Error::<T>::AnchorProofStale
