@@ -1335,6 +1335,71 @@ fn emergency_rotate_oprf_scheme_fails_for_unauthorized_origin() {
     });
 }
 
+// ─── trigger_voluntary_oprf_rotation ────────────────────────────────────────
+
+#[test]
+fn trigger_voluntary_oprf_rotation_works() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 0);
+        let reason = [7u8; 32];
+
+        assert_ok!(Identity::trigger_voluntary_oprf_rotation(RuntimeOrigin::root(), reason));
+
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 1);
+        System::assert_last_event(
+            Event::OprfSchemeVoluntarilyRotated { new_version: 1, reason }.into(),
+        );
+    });
+}
+
+#[test]
+fn trigger_voluntary_oprf_rotation_fails_for_unauthorized_origin() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Identity::trigger_voluntary_oprf_rotation(RuntimeOrigin::signed(1), [7u8; 32]),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn trigger_voluntary_oprf_rotation_is_independent_of_the_other_two_rotation_paths() {
+    // Distinctness check: a voluntary rotation advances the same global counter as the
+    // scheduled/emergency paths (they share `do_bump_scheme_version`) but emits its own event,
+    // and all three can be interleaved without interfering with each other.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        assert_ok!(Identity::rotate_oprf_scheme(RuntimeOrigin::root()));
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 1);
+
+        assert_ok!(Identity::trigger_voluntary_oprf_rotation(RuntimeOrigin::root(), [9u8; 32]));
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 2);
+        System::assert_last_event(
+            Event::OprfSchemeVoluntarilyRotated { new_version: 2, reason: [9u8; 32] }.into(),
+        );
+
+        assert_ok!(Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::root()));
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 3);
+        System::assert_last_event(Event::OprfSchemeEmergencyRotated { new_version: 3 }.into());
+    });
+}
+
+#[test]
+fn trigger_voluntary_oprf_rotation_fails_on_version_overflow() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        OprfSchemeVersion::<Test>::put(u32::MAX);
+
+        assert_noop!(
+            Identity::trigger_voluntary_oprf_rotation(RuntimeOrigin::root(), [1u8; 32]),
+            Error::<Test>::OprfSchemeVersionOverflow
+        );
+    });
+}
+
 // ─── declare_no_other_passport ──────────────────────────────────────────────
 
 #[test]

@@ -528,6 +528,12 @@ pub mod pallet {
         OprfSchemeRotated { new_version: u32 },
         /// The OPRF scheme version was bumped out-of-cycle via `EmergencyRotationOrigin`.
         OprfSchemeEmergencyRotated { new_version: u32 },
+        /// The OPRF scheme version was bumped voluntarily and early via `AdminOrigin` — not on
+        /// the normal schedule and not a compromise response (see
+        /// `trigger_voluntary_oprf_rotation`). `reason` is an IPFS content hash for the
+        /// legislature's public rationale (mirrors `pallet_courts`' reasoning-on-IPFS pattern),
+        /// so a voluntary rotation is always distinguishable on-chain from a silent one.
+        OprfSchemeVoluntarilyRotated { new_version: u32, reason: [u8; 32] },
         /// A citizen recorded a self-declaration of holding no other valid passport.
         SelfDeclarationRecorded { who: T::AccountId },
         /// A governance-approved OPRF committee key was set for a `(scheme_version, slot)`
@@ -1007,6 +1013,37 @@ pub mod pallet {
             T::EmergencyRotationOrigin::ensure_origin(origin)?;
             let new_version = Self::do_bump_scheme_version()?;
             Self::deposit_event(Event::OprfSchemeEmergencyRotated { new_version });
+            Ok(())
+        }
+
+        /// Voluntary, early OPRF scheme-version bump initiated by governance for a reason other
+        /// than a suspected compromise (closes the gap changelog entry 82's "Still open" section
+        /// flagged: "Neither [existing rotation path] fits 'move from phones to dedicated
+        /// servers on our own schedule, nothing's wrong'"). Distinct from both
+        /// `rotate_oprf_scheme` (the normal scheduled cadence) and `emergency_rotate_oprf_scheme`
+        /// (`EmergencyRotationOrigin`, compromise-triggered): same `AdminOrigin`/`legislature_call_hash`
+        /// gating pattern as `rotate_oprf_scheme` (matching how `pallet_voting::open_voting_epoch`
+        /// gates its own `LegislatureOrigin`-equivalent action), but its own call, event, and a
+        /// mandatory `reason`.
+        ///
+        /// `reason` is an IPFS content hash for the legislature's public rationale — mirrors
+        /// `pallet_courts`' pattern of keeping reasoning off-chain-but-hash-anchored rather than
+        /// storing free text in this `no_std` pallet. It is required, not optional, specifically
+        /// so a voluntary rotation is always distinguishable after the fact from a silent one:
+        /// anyone auditing `OprfSchemeVoluntarilyRotated` can always resolve *why* governance
+        /// chose to rotate early, without confusing it for a scheduled or compromise-driven bump.
+        #[pallet::call_index(18)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn trigger_voluntary_oprf_rotation(
+            origin: OriginFor<T>,
+            reason: [u8; 32],
+        ) -> DispatchResult {
+            T::AdminOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::trigger_voluntary_oprf_rotation", reason),
+            )?;
+            let new_version = Self::do_bump_scheme_version()?;
+            Self::deposit_event(Event::OprfSchemeVoluntarilyRotated { new_version, reason });
             Ok(())
         }
 
