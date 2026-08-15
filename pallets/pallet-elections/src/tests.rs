@@ -558,6 +558,82 @@ fn on_initialize_triggers_mandatory_break_at_max_consecutive_terms() {
     });
 }
 
+// ─── term-limit evasion via backing-drop cycling (HIGH-severity fix) ────────
+//
+// `remove_backing` flips an Active delegate to Pending without touching term_start_block or
+// consecutive_terms -- it's a transient gap, not a real break. Previously `activate_delegate`
+// unconditionally reset term_start_block = now on every reactivation, so a delegate with one
+// cooperating backer could cycle remove_backing -> back_delegate shortly before each term
+// would complete and silently restart the elapsed-time clock every time: consecutive_terms
+// would never reach MaxConsecutiveTerms, and the delegate would never be forced onto a
+// mandatory break. The fix: only reset term_start_block on a genuine fresh start (it's None
+// only then); a Pending gap with a term already in progress must preserve it.
+#[test]
+fn backing_drop_cycling_does_not_evade_term_limit() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1); // activates at threshold (3); term_start_block = Some(1).
+        assert_eq!(Delegates::<Test>::get(1).unwrap().term_start_block, Some(1));
+
+        // Shortly before the first term would complete (term_length = 100, so it completes
+        // at block 101), backer 4 cooperates: drops their backing, then immediately restores
+        // it -- the exact two-transaction exploit described in the audit finding.
+        System::set_block_number(95);
+        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(4), 1));
+        let mid = Delegates::<Test>::get(1).unwrap();
+        assert_eq!(mid.status, DelegateStatus::Pending);
+        assert_eq!(mid.term_start_block, Some(1), "a transient gap must not touch the clock");
+        assert_eq!(mid.consecutive_terms, 0);
+
+        assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(4), 1));
+        let reactivated = Delegates::<Test>::get(1).unwrap();
+        assert_eq!(reactivated.status, DelegateStatus::Active);
+        assert_eq!(
+            reactivated.term_start_block,
+            Some(1),
+            "reactivating from a backing-drop gap must NOT reset the term clock \
+             (this is the exploit: it used to reset to Some(95) here)"
+        );
+
+        // Real elapsed time still crosses the threshold on schedule -- the cycle bought
+        // nothing.
+        System::set_block_number(101);
+        let _ = Elections::on_initialize(101);
+        let after_first_term = Delegates::<Test>::get(1).unwrap();
+        assert_eq!(after_first_term.consecutive_terms, 1);
+        assert_eq!(after_first_term.status, DelegateStatus::Active);
+        assert_eq!(after_first_term.term_start_block, Some(101));
+
+        // Repeat the exact same cooperating-backer cycle right before the second term
+        // (which would complete at block 201) finishes.
+        System::set_block_number(195);
+        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(4), 1));
+        assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(4), 1));
+        let reactivated_2 = Delegates::<Test>::get(1).unwrap();
+        assert_eq!(
+            reactivated_2.term_start_block,
+            Some(101),
+            "second cycle must also preserve the original (renewed) term clock"
+        );
+
+        // The delegate is still forced onto the mandatory break once real elapsed time
+        // crosses the threshold -- exactly as if backing had never dropped.
+        System::set_block_number(201);
+        let _ = Elections::on_initialize(201);
+        let final_info = Delegates::<Test>::get(1).unwrap();
+        assert_eq!(final_info.consecutive_terms, 2, "the cap must still be reached");
+        assert_eq!(
+            final_info.status,
+            DelegateStatus::OnBreak,
+            "backing-drop cycling must not evade the mandatory break"
+        );
+        assert_eq!(final_info.break_until_block, Some(201 + DEFAULT_MANDATORY_BREAK_BLOCKS as u64));
+    });
+}
+
 #[test]
 fn on_initialize_ends_break_and_reactivates_when_still_above_threshold() {
     new_test_ext().execute_with(|| {

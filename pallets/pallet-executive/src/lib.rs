@@ -472,6 +472,11 @@ pub mod pallet {
         AlreadyRatified,
         /// Cabinet member has not cast an emergency declaration vote to retract.
         NotYetVoted,
+        /// Cabinet has fewer than 2 members — a supermajority ratio check is meaningless
+        /// (and trivially satisfiable) against a denominator of 1, e.g. a freshly-invested
+        /// PM with no confirmed ministers yet. Emergency declaration/ending votes require
+        /// a real cabinet, not just a single office-holder.
+        CabinetTooSmallForEmergencyVote,
         /// Caller is not the current Prime Minister (`nominate_minister` is PM-only).
         NotPrimeMinister,
         /// `appoint_minister` was called for an account the PM never staged via
@@ -593,6 +598,7 @@ pub mod pallet {
             PrimeMinister::<T>::kill();
             Self::close_current_pm_tenure(who.clone(), now);
             DeclareVotes::<T>::remove(&who);
+            EndVotes::<T>::remove(&who);
             Self::clear_pending_minister_nominations();
             Self::deposit_event(Event::PrimeMinisterResigned { who });
             Ok(())
@@ -755,8 +761,9 @@ pub mod pallet {
             // Vacate whoever currently holds this portfolio.
             if let Some(old) = PortfolioMinister::<T>::get(portfolio_id) {
                 MinisterPortfolio::<T>::remove(&old);
-                // Invalidate the outgoing minister's pending emergency declaration vote.
+                // Invalidate the outgoing minister's pending emergency declaration/end votes.
                 DeclareVotes::<T>::remove(&old);
+                EndVotes::<T>::remove(&old);
                 Self::deposit_event(Event::MinisterDismissed { portfolio_id, who: old });
             }
 
@@ -786,8 +793,9 @@ pub mod pallet {
             let who = PortfolioMinister::<T>::take(portfolio_id)
                 .ok_or(Error::<T>::PortfolioVacant)?;
             MinisterPortfolio::<T>::remove(&who);
-            // Invalidate the dismissed minister's pending emergency declaration vote.
+            // Invalidate the dismissed minister's pending emergency declaration/end votes.
             DeclareVotes::<T>::remove(&who);
+            EndVotes::<T>::remove(&who);
             Self::deposit_event(Event::MinisterDismissed { portfolio_id, who });
             Ok(())
         }
@@ -800,8 +808,9 @@ pub mod pallet {
             let portfolio_id =
                 MinisterPortfolio::<T>::take(&who).ok_or(Error::<T>::NotAMinister)?;
             PortfolioMinister::<T>::remove(portfolio_id);
-            // Invalidate the resigned minister's pending emergency declaration vote.
+            // Invalidate the resigned minister's pending emergency declaration/end votes.
             DeclareVotes::<T>::remove(&who);
+            EndVotes::<T>::remove(&who);
             Self::deposit_event(Event::MinisterResigned { portfolio_id, who });
             Ok(())
         }
@@ -820,6 +829,7 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_cabinet_member(&who), Error::<T>::NotCabinetMember);
+            ensure!(Self::cabinet_size() >= 2, Error::<T>::CabinetTooSmallForEmergencyVote);
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
@@ -869,12 +879,26 @@ pub mod pallet {
         ///
         /// Must be called within `RatificationWindowBlocks` of the emergency being declared.
         /// Once ratified, the emergency remains active until `expires_at` or early termination.
+        ///
+        /// The required `legislature_call_hash` is bound to the specific active emergency's
+        /// `(reason_hash, declared_at)`, matching the pattern every other `LegislatureOrigin`
+        /// call in this pallet uses to bind its hash to its own parameters (e.g.
+        /// `remove_and_replace_prime_minister` binds `successor`). Without this, a single
+        /// constant hash would let a legislature motion approved to ratify one emergency be
+        /// replayed later to ratify a completely different, unrelated one the legislature
+        /// never actually voted on — `PendingLegislatureApproval` only tracks one outstanding
+        /// token system-wide and doesn't invalidate it when the emergency it was meant for
+        /// lapses.
         #[pallet::call_index(7)]
         #[pallet::weight(T::WeightInfo::ratify_emergency())]
         pub fn ratify_emergency(origin: OriginFor<T>) -> DispatchResult {
+            let active = ActiveEmergency::<T>::get().ok_or(Error::<T>::NoActiveEmergency)?;
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-executive::ratify_emergency", ()),
+                &legislature_call_hash(
+                    b"pallet-executive::ratify_emergency",
+                    (active.reason_hash, active.declared_at),
+                ),
             )?;
             ActiveEmergency::<T>::try_mutate(|maybe| {
                 let info = maybe.as_mut().ok_or(Error::<T>::NoActiveEmergency)?;
@@ -896,6 +920,7 @@ pub mod pallet {
         pub fn vote_end_emergency(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_cabinet_member(&who), Error::<T>::NotCabinetMember);
+            ensure!(Self::cabinet_size() >= 2, Error::<T>::CabinetTooSmallForEmergencyVote);
             ensure!(ActiveEmergency::<T>::get().is_some(), Error::<T>::NoActiveEmergency);
             ensure!(!EndVotes::<T>::get(&who), Error::<T>::AlreadyVotedToEnd);
 
@@ -986,6 +1011,7 @@ pub mod pallet {
             let live_previous = PrimeMinister::<T>::get();
             if let Some(prev) = &live_previous {
                 DeclareVotes::<T>::remove(prev);
+                EndVotes::<T>::remove(prev);
                 if prev != &new_pm {
                     Self::close_current_pm_tenure(prev.clone(), now);
                 }
@@ -1086,12 +1112,13 @@ pub mod pallet {
                     PrimeMinister::<T>::kill();
                     Self::close_current_pm_tenure(pm.clone(), now);
                     DeclareVotes::<T>::remove(&pm);
+                    EndVotes::<T>::remove(&pm);
                     Self::clear_pending_minister_nominations();
                     Self::deposit_event(Event::OfficeVacatedForConviction {
                         who: pm,
                         role: VacatedRole::PrimeMinister,
                     });
-                    weight = weight.saturating_add(T::DbWeight::get().writes(4));
+                    weight = weight.saturating_add(T::DbWeight::get().writes(5));
                 }
             }
             let ministers: alloc::vec::Vec<(u32, T::AccountId)> =
@@ -1102,11 +1129,12 @@ pub mod pallet {
                     PortfolioMinister::<T>::remove(portfolio_id);
                     MinisterPortfolio::<T>::remove(&minister);
                     DeclareVotes::<T>::remove(&minister);
+                    EndVotes::<T>::remove(&minister);
                     Self::deposit_event(Event::OfficeVacatedForConviction {
                         who: minister,
                         role: VacatedRole::Minister { portfolio_id },
                     });
-                    weight = weight.saturating_add(T::DbWeight::get().writes(3));
+                    weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 }
             }
             weight
