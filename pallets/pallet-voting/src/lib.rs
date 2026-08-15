@@ -203,6 +203,14 @@ pub mod pallet {
         /// Maximum duration of a voting epoch in blocks (constitutional ceiling).
         #[pallet::constant]
         type MaxEpochDurationBlocks: Get<u32>;
+        /// Maximum number of referenda whose automatic finalization can be scheduled for the
+        /// same block via `PendingFinalization`. Bounds `on_initialize`'s worst-case per-block
+        /// cost. If more referenda than this happen to share a finalization block, the excess
+        /// simply aren't auto-scheduled — they still finalize via the permissionless
+        /// `finalize_referendum` extrinsic fallback, just without the automatic close-the-gap
+        /// guarantee `on_initialize` otherwise provides. See `PendingFinalization`'s doc comment.
+        #[pallet::constant]
+        type MaxReferendaPerBlock: Get<u32>;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -328,6 +336,36 @@ pub mod pallet {
 
     #[pallet::storage]
     pub type NextReferendumId<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    /// Schedules automatic finalization: block_number -> referendum ids that should be
+    /// finalized (via the same logic `finalize_referendum` runs) during that block's
+    /// `on_initialize`. Populated whenever a referendum's `end_block` is set (referendum
+    /// creation, at all three call sites), keyed by `end_block + 1` — the first block at which
+    /// `finalize_referendum`'s own `now > end_block` gate would allow finalization.
+    ///
+    /// Exists to close the gap the permissionless, never-automatically-called
+    /// `finalize_referendum` extrinsic otherwise leaves open: without this, a referendum could
+    /// sit finalized-but-not-finalized for an unbounded number of blocks after its voting window
+    /// closes, during which an attacker who has seen the (already publicly readable) tally could
+    /// delegate to a winning-side voter or revoke a delegation to a losing-side voter and change
+    /// the outcome after the fact. Scheduling here plus the `on_initialize` hook that drains it
+    /// closes that window to effectively zero: finalization now runs automatically in the very
+    /// next block after voting closes, before any of that block's extrinsics (including a
+    /// same-block delegation change) get to execute.
+    ///
+    /// Bounded per block by `MaxReferendaPerBlock` to keep `on_initialize`'s worst-case cost
+    /// bounded; if a block's list is full, the referendum simply isn't auto-scheduled and instead
+    /// relies on the permissionless `finalize_referendum` extrinsic as a fallback (still a much
+    /// smaller window than before this fix, since referenda sharing an exact finalization block
+    /// are the only ones that can overflow it).
+    #[pallet::storage]
+    pub type PendingFinalization<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        BlockNumberFor<T>,
+        BoundedVec<u32, T::MaxReferendaPerBlock>,
+        ValueQuery,
+    >;
 
     // ── Voting epoch storage ─────────────────────────────────────────────────
 
@@ -599,10 +637,30 @@ pub mod pallet {
             let resolved_weight = if replacing_same_delegate {
                 maybe_old.as_ref().expect("replacing_same_delegate implies Some").resolved_weight
             } else {
-                // `who`'s own contribution to whichever terminal this edge resolves to: their
-                // own vote, plus (only if `who` is currently itself a terminal delegate for
-                // others) whatever weight has already accumulated behind them.
-                let who_weight = 1u32.saturating_add(DelegatedWeight::<T>::get((topic_id, &who)));
+                // `who`'s own contribution to whichever terminal this edge resolves to.
+                //
+                // Two cases:
+                //  - `who` has no existing outgoing delegation on this topic (first-time
+                //    delegator, or their previous one already expired/was removed): their real
+                //    weight is their own vote, plus (only if `who` is currently itself a
+                //    terminal delegate for others) whatever weight has already accumulated
+                //    behind them in `DelegatedWeight`. `DelegatedWeight[who]` accurately
+                //    reflects that here, since `who` currently has no outgoing edge.
+                //  - `who` already has an outgoing delegation to a *different* delegate
+                //    (`replacing_same_delegate` is false here, so if `maybe_old` is `Some` its
+                //    `delegate` field differs from the new `delegate`): per `DelegatedWeight`'s
+                //    documented invariant, `DelegatedWeight[who]` is always 0 while `who` has an
+                //    active outgoing delegation — it does NOT reflect `who`'s real transitively
+                //    resolved weight. That real total is exactly `old_record.resolved_weight`,
+                //    already snapshotted and available here (it's also what the old-edge unwind
+                //    below uses). Using `1 + DelegatedWeight[who]` in this case would silently
+                //    collapse `who_weight` to 1 regardless of `who`'s real backing, letting the
+                //    cap check for the new edge pass trivially and permanently dropping the
+                //    difference from cap-tracking entirely (not credited to either delegate).
+                let who_weight = match maybe_old.as_ref() {
+                    Some(old_record) => old_record.resolved_weight,
+                    None => 1u32.saturating_add(DelegatedWeight::<T>::get((topic_id, &who))),
+                };
                 // Where the NEW edge would ultimately route weight to. Cycle detection above
                 // already guarantees `who` cannot appear anywhere in this chain.
                 let new_terminal = Self::resolve_delegate_readonly(&delegate, topic_id, now);
@@ -812,74 +870,22 @@ pub mod pallet {
         /// Anyone may call this. Passes if yes_votes * 100 >= PassageThreshold * total_votes.
         /// On pass, calls LawEnactor to enact the law in pallet-constitution.
         ///
+        /// In the common case this extrinsic never needs to be called at all: `on_initialize`
+        /// automatically runs the same finalization logic (`do_finalize_referendum`) at the
+        /// first block after a referendum's `end_block`, via `PendingFinalization`. This call
+        /// remains as a permissionless backstop for anything the hook misses — e.g. a block
+        /// whose `PendingFinalization` list was already full when this referendum was created
+        /// (bounded by `MaxReferendaPerBlock`) — so a referendum can never get permanently
+        /// stuck in `Voting` if the automatic path doesn't reach it.
+        ///
         /// Permissionless (`ensure_signed`, callable by anyone), so the declared weight must
-        /// track the real cost of what this call does, not just its own body. It internally
-        /// calls `apply_delegated_weight`, which scans `Delegations::<T>::iter_prefix(topic_id)`
-        /// — bounded to delegators on this referendum's specific topic (see that storage item's
-        /// doc comment), but every registered citizen may hold at most one delegation per topic,
-        /// so that scan can still cost up to `CitizenChecker::total_citizens()` iterations (e.g.
-        /// many distinct delegates, each near `MaxDelegationsPerDelegate`, all delegated-to on
-        /// the same topic). The weight below adds a per-citizen component on top of the flat base
-        /// cost — one flat `Weight::from_parts` estimate per potential delegator, scaled by
-        /// `MaxDelegationDepth` to account for `resolve_delegate_readonly`'s chain walk, matching
-        /// this file's other hand-estimated `Weight::from_parts` literals — so a caller pays
-        /// roughly what the scan actually costs instead of a flat estimate that silently
-        /// under-charges as the delegation graph grows. No formal benchmarking harness exists
-        /// yet in this repo; this is a conservative hand-estimate, not a benchmarked figure.
+        /// track the real cost of what this call does, not just its own body — see
+        /// `finalize_referendum_weight`'s doc comment for the accounting.
         #[pallet::call_index(8)]
-        #[pallet::weight({
-            // Per-delegator iteration cost: is_active_citizen + ReferendumHasVoted reads, the
-            // resolve_delegate_readonly chain walk (up to MaxDelegationDepth Delegations reads),
-            // plus a final ReferendumHasVoted/ReferendumVoteChoice read and a ReferendumTally
-            // mutate. 1_000 per step is a conservative flat estimate, not a benchmarked figure.
-            let per_delegator_steps =
-                4u64.saturating_add(T::MaxDelegationDepth::get() as u64);
-            let per_delegator = Weight::from_parts(1_000, 0).saturating_mul(per_delegator_steps);
-            let worst_case_delegators = T::CitizenChecker::total_citizens() as u64;
-            Weight::from_parts(20_000, 0)
-                .saturating_add(per_delegator.saturating_mul(worst_case_delegators))
-        })]
+        #[pallet::weight(Pallet::<T>::finalize_referendum_weight())]
         pub fn finalize_referendum(origin: OriginFor<T>, referendum_id: u32) -> DispatchResult {
             let _who = ensure_signed(origin)?;
-            let (petition_id, topic_hash, end_block, state, tier) =
-                Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
-            ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
-            ensure!(
-                frame_system::Pallet::<T>::block_number() > end_block,
-                Error::<T>::ReferendumStillActive
-            );
-            // Resolve liquid-democracy delegation into the tally before reading it. Any citizen
-            // who delegated their vote on this referendum's topic and did NOT vote directly gets
-            // their weight added on top of whichever side their (transitively resolved) delegate
-            // voted, provided that delegate voted directly. Safe to run exactly once here: the
-            // state transition below moves the referendum out of `Voting`, and the `ensure!`
-            // above guarantees finalize_referendum can never re-enter this branch for the same
-            // referendum_id. See `topic_id_of` and `apply_delegated_weight` doc comments.
-            let topic_id = Self::topic_id_of(&topic_hash);
-            Self::apply_delegated_weight(referendum_id, topic_id, end_block);
-            let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
-            let total = yes_count.saturating_add(no_count);
-            let threshold = match tier {
-                ReferendumTier::Ordinary => T::PassageThreshold::get() as u64,
-                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u64,
-                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u64,
-            };
-            // Use u64 arithmetic to avoid overflow with large citizenries (yes_count * 100 would
-            // saturate a u32 above ~42 million votes, causing the check to always pass).
-            let passed = total > 0
-                && (yes_count as u64).saturating_mul(100) >= threshold * (total as u64);
-            let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
-            Referenda::<T>::insert(
-                referendum_id,
-                (petition_id, topic_hash, end_block, new_state, tier.clone()),
-            );
-            if passed {
-                T::LawEnactor::enact_law(tier, topic_hash)?;
-                Self::deposit_event(Event::ReferendumPassed { referendum_id, topic_hash });
-            } else {
-                Self::deposit_event(Event::ReferendumFailed { referendum_id });
-            }
-            Ok(())
+            Self::do_finalize_referendum(referendum_id)
         }
 
         /// Submit a verified MACI tally for a proposal whose voting window has closed.
@@ -990,6 +996,7 @@ pub mod pallet {
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Constitutional),
             );
             NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::schedule_finalization(id, ends_at);
             Self::deposit_event(Event::ReferendumCreated {
                 referendum_id: id,
                 petition_id: u32::MAX,
@@ -1025,6 +1032,7 @@ pub mod pallet {
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Foundational),
             );
             NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::schedule_finalization(id, ends_at);
             Self::deposit_event(Event::ReferendumCreated {
                 referendum_id: id,
                 petition_id: u32::MAX,
@@ -1057,17 +1065,42 @@ pub mod pallet {
 
     #[pallet::hooks]
     impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
-        /// Auto-expire the active voting epoch on the first block after its end.
+        /// Auto-expires the active voting epoch on the first block after its end, and
+        /// auto-finalizes any referenda scheduled (via `PendingFinalization`) to close at this
+        /// block — see `PendingFinalization`'s doc comment for why this matters: it closes the
+        /// window between a referendum's `end_block` and its finalization to effectively zero,
+        /// rather than leaving it open indefinitely until someone happens to call the
+        /// permissionless `finalize_referendum` extrinsic.
         fn on_initialize(now: BlockNumberFor<T>) -> Weight {
+            let mut weight = Weight::zero();
+
             if let Some((_, end_block)) = ActiveEpoch::<T>::get() {
                 if now > end_block {
                     ActiveEpoch::<T>::kill();
                     let epoch = EpochNumber::<T>::get();
                     Self::deposit_event(Event::VotingEpochClosed { epoch });
-                    return Weight::from_parts(10_000, 0);
+                    weight = weight.saturating_add(Weight::from_parts(10_000, 0));
                 }
             }
-            Weight::zero()
+
+            // Bounded by MaxReferendaPerBlock (the BoundedVec's capacity), so this loop's
+            // worst-case cost per block is fixed regardless of how many referenda exist overall.
+            let scheduled = PendingFinalization::<T>::take(now);
+            for referendum_id in scheduled.into_iter() {
+                weight = weight.saturating_add(Self::finalize_referendum_weight());
+                // Run each finalization in its own storage transaction so a failure (e.g.
+                // LawEnactor::enact_law erroring) rolls back just that referendum's partial
+                // state instead of corrupting it or aborting the whole block — mirroring the
+                // atomicity the `finalize_referendum` extrinsic gets for free from dispatch.
+                let _ = frame_support::storage::with_transaction(|| {
+                    match Self::do_finalize_referendum(referendum_id) {
+                        Ok(()) => sp_runtime::TransactionOutcome::Commit(Ok(())),
+                        Err(e) => sp_runtime::TransactionOutcome::Rollback(Err(e)),
+                    }
+                });
+            }
+
+            weight
         }
     }
 
@@ -1098,6 +1131,7 @@ pub mod pallet {
             );
             PetitionReferendum::<T>::insert(petition_id, id);
             NextReferendumId::<T>::put(id.saturating_add(1));
+            Self::schedule_finalization(id, ends_at);
             Self::deposit_event(Event::ReferendumCreated {
                 referendum_id: id,
                 petition_id,
@@ -1105,6 +1139,105 @@ pub mod pallet {
                 ends_at,
                 tier,
             });
+            Ok(())
+        }
+
+        /// Schedules `referendum_id` (whose voting window closes at `end_block`) for automatic
+        /// finalization in `on_initialize`, at `end_block + 1` — the first block at which
+        /// `do_finalize_referendum`'s own `now > end_block` gate allows finalization to proceed.
+        /// See `PendingFinalization`'s doc comment for why this exists.
+        ///
+        /// If that block's `PendingFinalization` list is already at `MaxReferendaPerBlock`
+        /// capacity, this referendum is simply left unscheduled — it still finalizes correctly
+        /// via the permissionless `finalize_referendum` extrinsic fallback, just without the
+        /// automatic same-block guarantee. Never fails referendum creation itself.
+        fn schedule_finalization(referendum_id: u32, end_block: BlockNumberFor<T>) {
+            let finalize_at = end_block.saturating_add(BlockNumberFor::<T>::from(1u32));
+            PendingFinalization::<T>::mutate(finalize_at, |scheduled| {
+                let _ = scheduled.try_push(referendum_id);
+            });
+        }
+
+        /// Hand-estimated weight for one finalization pass (delegation resolution + tally +
+        /// state transition), shared by both the permissionless `finalize_referendum` extrinsic
+        /// and `on_initialize`'s automatic scheduling — both run exactly the same
+        /// `do_finalize_referendum` logic, so both need to account for the same worst-case cost.
+        ///
+        /// It internally calls `apply_delegated_weight`, which scans
+        /// `Delegations::<T>::iter_prefix(topic_id)` — bounded to delegators on this
+        /// referendum's specific topic (see that storage item's doc comment), but every
+        /// registered citizen may hold at most one delegation per topic, so that scan can still
+        /// cost up to `CitizenChecker::total_citizens()` iterations (e.g. many distinct
+        /// delegates, each near `MaxDelegationsPerDelegate`, all delegated-to on the same
+        /// topic). This adds a per-citizen component on top of the flat base cost — one flat
+        /// `Weight::from_parts` estimate per potential delegator, scaled by `MaxDelegationDepth`
+        /// to account for `resolve_delegate_readonly`'s chain walk, matching this file's other
+        /// hand-estimated `Weight::from_parts` literals — so weight roughly tracks what the scan
+        /// actually costs instead of a flat estimate that silently under-charges as the
+        /// delegation graph grows. No formal benchmarking harness exists yet in this repo; this
+        /// is a conservative hand-estimate, not a benchmarked figure.
+        fn finalize_referendum_weight() -> Weight {
+            // Per-delegator iteration cost: is_active_citizen + ReferendumHasVoted reads, the
+            // resolve_delegate_readonly chain walk (up to MaxDelegationDepth Delegations reads),
+            // plus a final ReferendumHasVoted/ReferendumVoteChoice read and a ReferendumTally
+            // mutate. 1_000 per step is a conservative flat estimate, not a benchmarked figure.
+            let per_delegator_steps = 4u64.saturating_add(T::MaxDelegationDepth::get() as u64);
+            let per_delegator = Weight::from_parts(1_000, 0).saturating_mul(per_delegator_steps);
+            let worst_case_delegators = T::CitizenChecker::total_citizens() as u64;
+            Weight::from_parts(20_000, 0)
+                .saturating_add(per_delegator.saturating_mul(worst_case_delegators))
+        }
+
+        /// Shared finalization logic for a referendum whose voting window has closed. Resolves
+        /// liquid-democracy delegation into the tally, decides pass/fail against the tier's
+        /// threshold, transitions `Referenda`'s state out of `Voting`, and enacts the law on
+        /// pass. Used by both the permissionless `finalize_referendum` extrinsic and the
+        /// automatic `on_initialize` scheduling (`PendingFinalization`) — see both call sites'
+        /// doc comments for why finalization needs to happen at all and why it's now automatic.
+        ///
+        /// Safe to call at most once per referendum: the `ensure!(state == Voting)` guard below
+        /// means a second call (whether from the extrinsic after the hook already ran, or vice
+        /// versa) is a cheap no-op error rather than double-applying delegated weight or
+        /// double-enacting a law.
+        fn do_finalize_referendum(referendum_id: u32) -> DispatchResult {
+            let (petition_id, topic_hash, end_block, state, tier) =
+                Referenda::<T>::get(referendum_id).ok_or(Error::<T>::ReferendumNotFound)?;
+            ensure!(state == ReferendumState::Voting, Error::<T>::ReferendumNotActive);
+            ensure!(
+                frame_system::Pallet::<T>::block_number() > end_block,
+                Error::<T>::ReferendumStillActive
+            );
+            // Resolve liquid-democracy delegation into the tally before reading it. Any citizen
+            // who delegated their vote on this referendum's topic and did NOT vote directly gets
+            // their weight added on top of whichever side their (transitively resolved) delegate
+            // voted, provided that delegate voted directly. Safe to run exactly once here: the
+            // state transition below moves the referendum out of `Voting`, and the `ensure!`
+            // above guarantees this can never re-enter this branch for the same referendum_id.
+            // See `topic_id_of` and `apply_delegated_weight` doc comments.
+            let topic_id = Self::topic_id_of(&topic_hash);
+            Self::apply_delegated_weight(referendum_id, topic_id, end_block);
+            let (yes_count, no_count) = ReferendumTally::<T>::get(referendum_id);
+            let total = yes_count.saturating_add(no_count);
+            let threshold = match tier {
+                ReferendumTier::Ordinary => T::PassageThreshold::get() as u64,
+                ReferendumTier::Constitutional => T::ConstitutionalPassageThreshold::get() as u64,
+                ReferendumTier::Foundational => T::FoundationalPassageThreshold::get() as u64,
+            };
+            // Use u64 arithmetic to avoid overflow with large citizenries (yes_count * 100 would
+            // saturate a u32 above ~42 million votes, causing the check to always pass).
+            let passed = total > 0
+                && (yes_count as u64).saturating_mul(100) >= threshold * (total as u64);
+            let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
+            Referenda::<T>::insert(
+                referendum_id,
+                (petition_id, topic_hash, end_block, new_state, tier.clone()),
+            );
+            if passed {
+                T::LawEnactor::enact_law(tier, topic_hash)?;
+                Self::deposit_event(Event::ReferendumPassed { referendum_id, topic_hash });
+            } else {
+                Self::deposit_event(Event::ReferendumFailed { referendum_id });
+            }
             Ok(())
         }
 

@@ -152,6 +152,7 @@ pub const CONSTITUTIONAL_PASSAGE_THRESHOLD: u8 = 67;
 pub const FOUNDATIONAL_PASSAGE_THRESHOLD: u8 = 75;
 pub const MIN_EPOCH_DURATION: u32 = 5;
 pub const MAX_EPOCH_DURATION: u32 = 50;
+pub const MAX_REFERENDA_PER_BLOCK: u32 = 10;
 
 #[frame_support::runtime]
 mod runtime {
@@ -209,6 +210,7 @@ impl pallet_voting::Config for Test {
         frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type MinEpochDurationBlocks = ConstU32<MIN_EPOCH_DURATION>;
     type MaxEpochDurationBlocks = ConstU32<MAX_EPOCH_DURATION>;
+    type MaxReferendaPerBlock = ConstU32<MAX_REFERENDA_PER_BLOCK>;
 }
 
 // Build genesis storage according to the mock runtime.
