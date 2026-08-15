@@ -287,6 +287,13 @@ impl pallet_identity_zk::Config for Runtime {
 	/// passport-expired proof (HANDOFF log #75). Placeholder pending real-world timing data,
 	/// same governance-tunable-not-hardcoded spirit as `ReverificationPeriod` above.
 	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
+	/// 5 minutes of tolerance for ordinary clock skew between the prover and this chain's
+	/// `T::Now`. Bounds the total exploitable replay window for a single proof to roughly
+	/// `MaxAnchorProofClockSkew + MaxAnchorProofAge` instead of unbounded — without this, a
+	/// future-dated `current_date` public input (fully prover-controlled, see
+	/// `MaxAnchorProofClockSkew`'s doc comment in `pallet_identity_zk::Config`) would make
+	/// `MaxAnchorProofAge`'s staleness check pass unconditionally, forever.
+	type MaxAnchorProofClockSkew = ConstU64<300>;
 	/// Room above the eventual ~35-member committees (changelog entry 73's 5-independent-
 	/// committee governance topology) — see `pallet_identity_zk::CommitteeMembers`'s doc
 	/// comment.
@@ -329,6 +336,8 @@ impl pallet_identity_zk::Config for Runtime {
 	type Now = Timestamp;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MaxAnchorProofClockSkew = ConstU64<300>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxCommitteeSize = ConstU32<50>;
 	/// See the `dev-mode` impl above for the same rationale.

@@ -359,6 +359,30 @@ fn register_citizen_fails_when_proof_is_stale() {
 }
 
 #[test]
+fn register_citizen_fails_when_proof_is_future_dated() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+
+        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        // MaxAnchorProofClockSkew is 300 in the mock (see mock.rs); this is far beyond that.
+        future_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS + 999_999);
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                future_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorProofFuture
+        );
+    });
+}
+
+#[test]
 fn register_citizen_fails_with_malformed_proof_date() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -994,6 +1018,30 @@ fn reverify_citizen_fails_when_proof_is_stale() {
 }
 
 #[test]
+fn reverify_citizen_fails_when_proof_is_future_dated() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        // MaxAnchorProofClockSkew is 300 in the mock (see mock.rs); this is far beyond that.
+        future_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS + 999_999);
+
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                future_inputs,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorProofFuture
+        );
+    });
+}
+
+#[test]
 fn is_active_citizen_false_once_reverification_deadline_passes() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -1103,6 +1151,38 @@ fn migrate_oprf_scheme_fails_when_new_anchor_already_used() {
                 OPRF_PK_HASHES,
             ),
             Error::<Test>::NewAnchorAlreadyUsed
+        );
+    });
+}
+
+/// Ordering regression test: `migrate_oprf_scheme` must verify the ZK proof *before*
+/// consulting `IdentityAnchorRegistry`, exactly matching `register_citizen`'s ordering (see
+/// its own doc comment on this point). A bogus proof submitted against an already-used
+/// `new_anchor` must fail on proof verification (`InvalidZKProof`), not on the anchor-registry
+/// check (`NewAnchorAlreadyUsed`) — the latter would let a caller probe anchor-registry
+/// membership with zero real proof-computation cost.
+#[test]
+fn migrate_oprf_scheme_does_not_leak_anchor_registry_membership_via_bogus_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        // Same genuinely-taken (1, ANCHOR_B) setup as
+        // `migrate_oprf_scheme_fails_when_new_anchor_already_used`.
+        assert_ok!(Identity::rotate_oprf_scheme(RuntimeOrigin::root()));
+        register(2, NULLIFIER_B, ANCHOR_B);
+
+        assert_noop!(
+            Identity::migrate_oprf_scheme(
+                RuntimeOrigin::signed(1),
+                invalid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::InvalidZKProof
         );
     });
 }
