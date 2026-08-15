@@ -506,6 +506,11 @@ impl pallet_voting::Config for Runtime {
 	type MinEpochDurationBlocks = ConstU32<{ 7 * DAYS }>;
 	/// Voting epochs may not exceed 30 days (constitutional ceiling).
 	type MaxEpochDurationBlocks = ConstU32<{ 30 * DAYS }>;
+	/// Bounds how many referenda sharing an exact finalization block can be auto-scheduled via
+	/// `PendingFinalization`. Generous relative to realistic referendum creation rates (this
+	/// many would all have to be created within the same block to overflow it); any overflow
+	/// still finalizes correctly via the permissionless `finalize_referendum` extrinsic.
+	type MaxReferendaPerBlock = ConstU32<500>;
 }
 
 /// Type alias for the audit pallet used in cross-pallet trait wiring.

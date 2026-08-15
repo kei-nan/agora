@@ -1,8 +1,8 @@
 use crate::{
     mock::*, ActiveEpoch, BudgetBalance, CategoryVotes, CitizenClaimedEpoch, DelegatedWeight,
     DelegatorCount, Delegations, EpochNumber, EpochTokenAllocation, Error, Event, FiscalYearEpoch,
-    NextProposalId, NextReferendumId, PetitionReferendum, ProposalResults, Proposals,
-    ReferendumHasVoted, ReferendumState, ReferendumTally, ReferendumTier, Referenda,
+    NextProposalId, NextReferendumId, PendingFinalization, PetitionReferendum, ProposalResults,
+    Proposals, ReferendumHasVoted, ReferendumState, ReferendumTally, ReferendumTier, Referenda,
     VoteCommitments,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
@@ -502,6 +502,63 @@ fn delegate_vote_replacing_different_delegate_moves_weight() {
         assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 3, 0, MIN_DELEGATION_DURATION));
         assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 0);
         assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 1);
+    });
+}
+
+/// Reproduces the "hub re-targets to a different delegate" cap-bypass this fix closes. Many
+/// citizens delegate to hub B (building real transitive weight at B: 3 leaves + B's own vote =
+/// 4), B forwards that full weight on to C via its own first outgoing edge (correct under both
+/// old and new code — it's B's first delegation, so `DelegatedWeight[B]` still accurately
+/// reflected its real weight at that moment). B then re-targets away from C to a fresh delegate
+/// D that already carries weight 1 from an unrelated delegator.
+///
+/// The OLD code recomputed `who_weight` for B's re-targeted edge as `1 + DelegatedWeight[B]`,
+/// which is always `1 + 0 = 1` per `DelegatedWeight`'s documented invariant (B has had an active
+/// outgoing delegation the whole time, so its own bucket never accumulates) — making D's
+/// projected total look like `1 + 1 = 2` (comfortably under the 40%-of-10 = 4 cap) when B's real
+/// weight, exactly what's about to land on D, is 4, for a real total of 5 — over the cap. The fix
+/// uses `old_record.resolved_weight` (4, already snapshotted from the B -> C edge, and exactly
+/// what the old-edge unwind below it already uses) instead, correctly rejecting the re-target
+/// and leaving every count untouched.
+#[test]
+fn delegate_vote_retargeting_hub_uses_real_transitive_weight_for_cap_check() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10); // cap allows at most weight 4 (40%)
+
+        // Build real weight at hub B (200): three leaves delegate to it.
+        activate_citizen(200); // B, the hub
+        for leaf in [1u64, 2, 3] {
+            activate_citizen(leaf);
+            assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(leaf), 200, 0, MIN_DELEGATION_DURATION));
+        }
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 200u64)), 3);
+
+        // B forwards its full weight (3 leaves + its own vote = 4) to C (300) — B's first
+        // outgoing edge on this topic, correctly handled under both old and new code.
+        activate_citizen(300); // C
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(200), 300, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 4);
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().resolved_weight, 4);
+
+        // D (400) already carries weight 1 from an unrelated delegator.
+        activate_citizen(400); // D
+        activate_citizen(500);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(500), 400, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 1);
+
+        // B re-targets from C to D. Real projected total at D is B's real weight (4) + D's
+        // existing weight (1) = 5, i.e. 50% of 10 citizens — over the 40% cap. Must reject.
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(200), 400, 0, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+
+        // Rejected atomically: B's old edge to C, and both C's and D's tracked weight, are
+        // untouched — none of B's real weight silently vanished from cap-tracking either.
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().delegate, 300);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 4);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 1);
     });
 }
 
@@ -1316,6 +1373,107 @@ fn finalize_referendum_weight_scales_with_total_citizens() {
     // Sanity bound: the weight for a huge citizenry must be meaningfully larger than the base
     // cost charged when there are no citizens at all -- not just a rounding-noise difference.
     assert!(large.ref_time() > empty.ref_time().saturating_mul(1000));
+}
+
+// ── automatic finalization (on_initialize / PendingFinalization) ────────────
+
+/// Fix for the "finalize-then-react" window: before this fix, `finalize_referendum` was
+/// permissionless but never called automatically, so a referendum could sit past its `end_block`
+/// for an unbounded number of blocks, during which the (already publicly visible) tally could be
+/// manipulated via a late delegation to the winning side. This proves the window is closed:
+/// `on_initialize` finalizes the referendum automatically at `end_block + 1` (scheduled via
+/// `PendingFinalization` at referendum creation), so a delegation created afterward — even to
+/// the referendum's own winning voter, on the referendum's own topic — has zero effect on the
+/// already-locked-in tally, because finalization has already run by the time it lands.
+#[test]
+fn referendum_auto_finalizes_on_initialize_closing_the_late_delegation_window() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+        let rid = make_referendum_with_hash(1, ReferendumTier::Ordinary, hash(0)); // topic_id 0
+        activate_citizen(1); // V, the sole direct voter
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(1), rid, true));
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0));
+
+        let end_block = 1 + REFERENDUM_DURATION as u64; // 21
+        let finalize_block = end_block + 1; // 22
+        assert!(PendingFinalization::<Test>::get(finalize_block).contains(&rid));
+
+        // Advance to the block on_initialize runs the scheduled auto-finalization at, WITHOUT
+        // ever calling the finalize_referendum extrinsic — exactly what happens automatically
+        // every block on a real chain.
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+
+        let (_, _, _, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Passed);
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0));
+        assert!(PendingFinalization::<Test>::get(finalize_block).is_empty());
+
+        // An attacker who saw the (already public) tally now delegates a fresh citizen to the
+        // winning voter, on the referendum's own topic — exactly the reaction this fix must
+        // render inert.
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(2), 1, 0, MIN_DELEGATION_DURATION));
+
+        // The referendum is already finalized: the late delegation cannot be pulled into its
+        // tally, and re-running finalization on it is rejected outright.
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0));
+        assert_noop!(
+            Voting::finalize_referendum(RuntimeOrigin::signed(99), rid),
+            Error::<Test>::ReferendumNotActive
+        );
+    });
+}
+
+/// If a block's `PendingFinalization` list is already at `MaxReferendaPerBlock` capacity, a
+/// referendum scheduled to finalize in that same block is simply left unscheduled rather than
+/// failing creation — it must still finalize correctly via the permissionless
+/// `finalize_referendum` extrinsic fallback.
+#[test]
+fn referendum_finalization_scheduling_overflow_falls_back_to_the_manual_extrinsic() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+
+        // Fill this block's PendingFinalization list to capacity with unrelated referenda that
+        // all share the same end_block (created in the same block, same ReferendumDurationBlocks).
+        let mut ids = Vec::new();
+        for i in 0..MAX_REFERENDA_PER_BLOCK {
+            ids.push(make_referendum_with_hash(100 + i, ReferendumTier::Ordinary, hash(1)));
+        }
+        let finalize_block = 1 + REFERENDUM_DURATION as u64 + 1;
+        assert_eq!(
+            PendingFinalization::<Test>::get(finalize_block).len(),
+            MAX_REFERENDA_PER_BLOCK as usize
+        );
+
+        // One more referendum, same finalization block: the schedule is full, so it's left
+        // unscheduled — but creation itself still succeeds.
+        let overflow_rid =
+            make_referendum_with_hash(999, ReferendumTier::Ordinary, hash(1));
+        assert_eq!(
+            PendingFinalization::<Test>::get(finalize_block).len(),
+            MAX_REFERENDA_PER_BLOCK as usize
+        );
+        assert!(!PendingFinalization::<Test>::get(finalize_block).contains(&overflow_rid));
+
+        // The hook still finalizes everything it did schedule...
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+        for id in ids {
+            let (_, _, _, state, _) = Referenda::<Test>::get(id).unwrap();
+            assert_eq!(state, ReferendumState::Failed); // no votes cast
+        }
+
+        // ...and the overflow referendum, never auto-scheduled, is still stuck in `Voting` until
+        // the permissionless fallback extrinsic is called for it explicitly.
+        let (_, _, _, state, _) = Referenda::<Test>::get(overflow_rid).unwrap();
+        assert_eq!(state, ReferendumState::Voting);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), overflow_rid));
+        let (_, _, _, state, _) = Referenda::<Test>::get(overflow_rid).unwrap();
+        assert_eq!(state, ReferendumState::Failed);
+    });
 }
 
 // ── submit_maci_tally ────────────────────────────────────────────────────────
