@@ -138,7 +138,13 @@
       architecturally reworked); desktop's `chain_submit_extrinsic` command exists but nothing
       yet produces its input (no phone→desktop signed-arbitrary-call protocol); desktop's
       `smoldot` dependency remains unwired (confirmed a substantial transport-layer rewrite,
-      not a quick swap, investigated not attempted).
+      not a quick swap, investigated not attempted). **Update (changelog #087, later session)**:
+      this specific gap is closed — `desktop/src/chain/client.ts` embeds smoldot for real via
+      `@polkadot/api`'s `ScProvider`, in the JS frontend (not Rust), and the nine chain-read
+      commands the browsing pages call were migrated to it and proven to sync and answer real
+      queries against a live local `agora-node --dev` chain, headlessly, in a real production
+      browser build. `chain_submit_extrinsic` remains exactly as described above — still
+      unwired to any producer of its input.
     - Every fix above was built by a sub-agent working in a harness-provided git worktree that
       turned out to be cut from a stale branch point 8 commits behind `main` (missing the OPRF
       mailbox, AI model governance, and several other commits) rather than current `main` — a

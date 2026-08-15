@@ -161,12 +161,41 @@ Runs without a server — connects directly to the chain and optionally to a clo
 
 ### Stack
 - **Tauri 2** — Rust backend, React/TS frontend, ships as a small native binary (~10MB)
-- Currently connects via plain JSON-RPC (`reqwest`) to a locally-running full node at a
-  hardcoded `http://127.0.0.1:9944` (`desktop/src-tauri/src/commands/chain.rs`) — run
-  `agora-node --dev` (or similar) alongside the desktop app. An embedded **smoldot** light
-  client, so citizens don't need to run a full node themselves, is the intended long-term
-  architecture — `smoldot` and `@polkadot/api` are already listed in `desktop/package.json` —
-  but that integration has not been built yet: zero smoldot usage anywhere in the Rust code.
+- **Chain connectivity (changelog #087): a real embedded smoldot light client, in the JS
+  frontend, not the Rust backend.** `desktop/src/chain/client.ts` drives `smoldot` via
+  `@polkadot/api`'s `ScProvider` (a small hand-written adapter bridges smoldot's own async-
+  iterator response API to the callback shape `ScProvider` expects — `@substrate/connect`
+  itself isn't a dependency). This was a deliberate JS-side choice, not a default: `smoldot`
+  and `@polkadot/api` were already JS-only dependencies in `desktop/package.json` (smoldot's
+  primary distribution is a JS/WASM package), and a real Rust-embeddable option
+  (`smoldot-light` the crate) was evaluated and passed over in favor of following that
+  existing signal. `desktop/src/lib/invoke.ts` transparently routes the nine chain-read
+  command names (`chain_status`, `fetch_proposals`, `fetch_laws`, `fetch_treasury`,
+  `fetch_department_budgets`, `fetch_rulings`, `fetch_legislature_data`,
+  `fetch_elections_data`, `fetch_anticorruption_data`) to this light client instead of Tauri
+  IPC, so the React pages that call `invoke(...)` needed zero changes. Proven working
+  end-to-end in this environment: a real production Vite build, driven headlessly, synced
+  smoldot against a real local `agora-node --dev` chain over its actual libp2p `/ws` transport
+  and rendered a correct live block number in the app's own `ChainStatusBar` UI — not just "it
+  compiles." Two real, load-bearing caveats: (1) the node must be started with an explicit
+  `--listen-addr /ip4/0.0.0.0/tcp/30333/ws` — smoldot in a webview can only dial WebSocket
+  addresses, not raw TCP, and a plain `agora-node --dev --tmp` (this doc's own "Critical Build
+  Command" section) does not open one by default; (2) `desktop/public/chainspecs/
+  dev-chainspec-raw.json` is a checked-in `agora-node build-spec --dev --raw` snapshot with an
+  empty `bootNodes` that `client.ts` patches at connect time via one plain
+  `system_localListenAddresses` RPC call to the local node (peer-discovery metadata, not a
+  trust-sensitive state read — every actual state query afterward is independently verified by
+  smoldot against finalized GRANDPA consensus) — regenerate that file if the dev genesis ever
+  changes (spec_version bump, new pallet, etc.), or smoldot will fail genesis-hash verification
+  rather than silently serving stale data.
+  The old Rust `reqwest`-based path (`desktop/src-tauri/src/commands/chain.rs`,
+  `desktop/src-tauri/src/rpc.rs`) still exists, still works, and is still covered by its own
+  tests — it wasn't deleted, because it's still the real implementation behind
+  `chain_submit_extrinsic`, `auth_verify_nullifier`, and the QR-auth callback server's internal
+  `lookup_registered_account` lookup, none of which moved to the light client in this pass. See
+  that file's top-of-module comment and changelog #087 for the full accounting, including the
+  still-open trust-boundary gap on `lookup_registered_account` that this change did not close
+  (it documents concretely why not, and what closing it would actually require).
 - **IPFS** — fetches law/proposal content by on-chain hash (via gateway or local node)
 
 ### Authentication
