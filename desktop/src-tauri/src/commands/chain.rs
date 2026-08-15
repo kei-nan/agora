@@ -395,6 +395,28 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
 /// exactly what `commands::auth::verify_challenge_signature` needs to check a QR-auth callback's
 /// signature against the identity that's actually on file — not whatever pubkey the callback
 /// body claims.
+///
+/// TRUST BOUNDARY — NOT YET SOUND (tracked, not fixed here): the `AccountId` this function
+/// returns is trusted at face value. It comes from `RpcClient::get_storage`/`get_keys_paged`
+/// (`rpc.rs`), which is a plain, unauthenticated `state_getStorage`/`state_getKeysPaged` JSON-RPC
+/// call over plaintext HTTP to a hardcoded `NODE_URL` (`http://127.0.0.1:9944`). There is no
+/// Merkle/state-proof verification against finalized chain consensus and no TLS — this code just
+/// believes whatever bytes the endpoint returns. Anything able to control those RPC responses (a
+/// malicious or compromised full node, or a local MITM on that loopback/LAN channel) can return
+/// an attacker-chosen `AccountId` for any `nullifierHash`, and `handle_auth_callback` in
+/// `commands::auth.rs` will verify the callback's signature against *that* attacker-controlled
+/// key and mint a real, valid bearer session bound to an arbitrary victim identity. The sr25519
+/// signature check downstream does not close this gap — it only proves the caller controls
+/// *some* key; this function is what decides *whose* identity that key gets credited as.
+///
+/// The real fix is verifying a state proof against finalized consensus via an embedded light
+/// client — CLAUDE.md's "Desktop App" section already documents this as the intended
+/// architecture (`smoldot` is listed in `desktop/package.json`) but it has not been built: zero
+/// smoldot usage anywhere in this Rust code today. Do not treat this function's return value as
+/// a cryptographically authenticated identity binding until that lands. Anyone wiring
+/// `chain_submit_extrinsic` (or any other session-gated write path) to an actual phone-side flow
+/// MUST NOT assume a session's `nullifier_hash` is trustworthy against a malicious/compromised
+/// RPC endpoint — it currently isn't.
 pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Identity", "NullifierRegistry");
