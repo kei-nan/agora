@@ -1,3 +1,22 @@
+// ARCHITECTURE NOTE (changelog #087): the frontend's actual chain-read path for
+// `chain_status`/`fetch_proposals`/`fetch_laws`/`fetch_treasury`/`fetch_department_budgets`/
+// `fetch_rulings`/`fetch_legislature_data`/`fetch_elections_data`/`fetch_anticorruption_data`
+// no longer goes through these Tauri commands. `desktop/src/lib/invoke.ts` now routes those
+// nine command names to `desktop/src/chain/queries.ts`, which reads the same storage items
+// through an embedded smoldot light client (`desktop/src/chain/client.ts`) instead of this
+// module's plain `reqwest` JSON-RPC. See CLAUDE.md's "Desktop App > Stack" section for why the
+// light client lives in the JS frontend rather than here: `smoldot` and `@polkadot/api` were
+// already JS-only dependencies, and smoldot's primary distribution is a JS/WASM package, not a
+// Rust crate embedded in a host process.
+//
+// The `#[tauri::command]` functions below are kept — not deleted — for two reasons: they're
+// still correct, tested, and behind their own unit tests below; and they remain the actual
+// implementation for `auth_verify_nullifier`'s trust-boundary-flagged callers (see
+// `lookup_registered_account` below) and `chain_submit_extrinsic`, neither of which moved to
+// the JS light client in this pass. If a future change also migrates those, this whole module
+// (and `rpc.rs`) may become fully dead code — check `invoke.ts`'s `LIGHT_CLIENT_COMMANDS` map
+// before assuming that, since it's the actual source of truth for what the frontend still calls
+// here.
 use serde::{Deserialize, Serialize};
 use crate::rpc::{RpcClient, storage_prefix};
 use std::collections::HashMap;
@@ -410,13 +429,20 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
 /// *some* key; this function is what decides *whose* identity that key gets credited as.
 ///
 /// The real fix is verifying a state proof against finalized consensus via an embedded light
-/// client — CLAUDE.md's "Desktop App" section already documents this as the intended
-/// architecture (`smoldot` is listed in `desktop/package.json`) but it has not been built: zero
-/// smoldot usage anywhere in this Rust code today. Do not treat this function's return value as
-/// a cryptographically authenticated identity binding until that lands. Anyone wiring
-/// `chain_submit_extrinsic` (or any other session-gated write path) to an actual phone-side flow
-/// MUST NOT assume a session's `nullifier_hash` is trustworthy against a malicious/compromised
-/// RPC endpoint — it currently isn't.
+/// client. As of changelog #087 that light client exists and is real — `desktop/src/chain/
+/// client.ts` embeds smoldot via `@polkadot/api`'s `ScProvider` and genuinely verifies state
+/// against finalized GRANDPA consensus — but it lives in the JS frontend (see that entry for
+/// why) and this function was NOT migrated to use it: `lookup_registered_account` is called
+/// from `commands::auth::handle_auth_callback`, deep in a Rust-side session-minting flow that
+/// the QR-auth HTTP callback server (also Rust-side, necessarily — a webview can't run an HTTP
+/// server) depends on. Moving this specific lookup onto the light client would mean either
+/// embedding a second, Rust-side light client just for this one call, or restructuring the
+/// auth flow so the already-connected JS light client performs the lookup and hands Rust a
+/// verified result — both are real protocol/architecture work, out of scope for #087. Do not
+/// treat this function's return value as a cryptographically authenticated identity binding
+/// until one of those lands. Anyone wiring `chain_submit_extrinsic` (or any other session-gated
+/// write path) to an actual phone-side flow MUST NOT assume a session's `nullifier_hash` is
+/// trustworthy against a malicious/compromised RPC endpoint — it currently isn't.
 pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Identity", "NullifierRegistry");
