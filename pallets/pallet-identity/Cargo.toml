@@ -24,6 +24,10 @@ scale-info = { features = ["derive"], workspace = true }
 sp-runtime.workspace = true
 
 [dev-dependencies]
+# Used only by this pallet's mock runtime, to test `EmergencyRotationOrigin` against the real
+# `pallet_emergency_council::EnsureActiveEmergency` origin rather than a hand-rolled stand-in —
+# see `src/mock.rs` and the `emergency_rotate_oprf_scheme_*` tests in `src/tests.rs`.
+pallet-emergency-council = { default-features = true, workspace = true }
 sp-core = { default-features = true, workspace = true }
 sp-io = { default-features = true, workspace = true }
 sp-runtime = { default-features = true, workspace = true }

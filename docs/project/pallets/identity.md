@@ -69,7 +69,7 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   another citizen — leaking cross-citizen anchor-registry membership ahead of proof
   authentication.
 - `rotate_oprf_scheme()` — `AdminOrigin`; scheduled-path advance of `OprfSchemeVersion` (the ~4-year cycle)
-- `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin` (currently `EnsureRoot` placeholder); out-of-cycle rotation if the current OPRF scheme is suspected broken
+- `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin`; out-of-cycle rotation if the current OPRF scheme is suspected broken. As of this session, wired in the runtime to `pallet_emergency_council::EnsureActiveEmergency<Runtime>` — **not** the bare `EnsureRoot` placeholder earlier versions of this doc described. Succeeds only when the caller is `Root` *and* `pallet_emergency_council::ActiveEmergency` is currently `Some(..)` (a real, council-declared, not-yet-lifted-or-expired emergency); root alone can no longer force this call. See `pallets/pallet-emergency-council/src/lib.rs`'s `EnsureActiveEmergency` doc comment and `runtime/src/configs/mod.rs` for the full wiring, and this pallet's `EmergencyRotationOrigin` Config-field doc comment above for the rationale.
 - `declare_no_other_passport()` — any registered citizen; records a self-declaration attestation used only as an ex-post basis for a `pallet-courts` `CitizenConduct` case if later found false
 - `set_oprf_committee_key(scheme_version, slot, oprf_pk_hash)` / `remove_oprf_committee_key(scheme_version, slot)` — `AdminOrigin`; governance-approved committee key management
 - `add_committee_member(slot, who)` / `remove_committee_member(slot, who)` — `AdminOrigin`; committee roster management (changelog #82/#83)

@@ -189,10 +189,20 @@ pub mod pallet {
         /// The origin permitted to force an out-of-cycle OPRF scheme-version bump ahead of
         /// the normal 4-year schedule (e.g. a suspected OPRF committee compromise — see
         /// HANDOFF log #67's emergency-rotation mechanics). Distinct from the normal
-        /// scheduled-rotation path (`rotate_oprf_scheme`, gated by `AdminOrigin`). Intended to
-        /// be wired to `pallet_emergency_council`'s emergency-active state in the runtime; see
-        /// runtime/src/configs/mod.rs for the current wiring (no dedicated `EnsureOrigin`
-        /// exists yet on that pallet, so it's a placeholder there for now).
+        /// scheduled-rotation path (`rotate_oprf_scheme`, gated by `AdminOrigin`). Wired in the
+        /// runtime to `pallet_emergency_council::EnsureActiveEmergency<Runtime>` (see
+        /// `runtime/src/configs/mod.rs`), which requires *both* a `Root` origin *and* a
+        /// currently-active, council-declared emergency (`ActiveEmergency` is `Some(..)`) —
+        /// not the bare `EnsureRoot` this was originally a placeholder for. In practice this
+        /// means emergency committee-key rotation can no longer be forced by root
+        /// unilaterally at any time: it requires the Emergency Council to have genuinely
+        /// declared an emergency via its own supermajority-vote path
+        /// (`vote_declare_emergency`), and that emergency must not yet have been lifted
+        /// (`vote_end_emergency`) or auto-sunset-expired (`on_initialize`'s hard-coded
+        /// `expires_at` check — no root shortcut exists around that). A real strengthening of
+        /// the separation-of-powers story: emergency OPRF rotation now requires the same
+        /// checked, time-bounded emergency-declaration process as every other emergency
+        /// power, rather than a single root key acting alone.
         type EmergencyRotationOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
         /// Wall-clock source for the registration-anchor freshness check (HANDOFF log #75):
         /// `register_citizen` rejects an outer proof whose `current_date` public input is

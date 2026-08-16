@@ -275,12 +275,13 @@ impl pallet_identity_zk::Config for Runtime {
 	/// (whether the liveness re-verification cadence should be shorter than the 4-year
 	/// OPRF-rotation cycle). Governance-tunable, not hardcoded logic.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
-	/// No dedicated `EnsureOrigin` exists yet on `pallet-emergency-council` (it gates its own
-	/// calls via council-membership + supermajority-vote checks internally, not via a
-	/// reusable cross-pallet origin type — see its `src/lib.rs`). `EnsureRoot` is a
-	/// placeholder here, same pattern as `pallet_constitution::Config::RevocationOrigin`
-	/// below: replace with a real emergency-council-backed origin once one exists.
-	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
+	/// Wired to `pallet_emergency_council::EnsureActiveEmergency<Runtime>`: succeeds only when
+	/// the caller is `Root` *and* `pallet_emergency_council::ActiveEmergency` is currently
+	/// `Some(..)` — i.e. the Emergency Council has genuinely declared (supermajority vote) an
+	/// emergency that has not yet been lifted or auto-sunset-expired. Root alone is no longer
+	/// sufficient, unlike `pallet_constitution::Config::RevocationOrigin` below, which is still
+	/// a bare `EnsureRoot` placeholder.
+	type EmergencyRotationOrigin = pallet_emergency_council::EnsureActiveEmergency<Runtime>;
 	type Now = Timestamp;
 	/// 1 day: generous relative to how long a real registration flow (mobile proving, then
 	/// submitting) should ever take, while still bounding replay of a stale-but-not-yet-
@@ -336,8 +337,8 @@ impl pallet_identity_zk::Config for Runtime {
 	type AnchorVerifier = crate::anchor_verifier::Poseidon2AnchorVerifier;
 	/// See the `dev-mode` impl above for the placeholder-cadence rationale.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
-	/// See the `dev-mode` impl above for why this is `EnsureRoot` for now.
-	type EmergencyRotationOrigin = EnsureRoot<AccountId>;
+	/// See the `dev-mode` impl above — same `EnsureActiveEmergency` wiring.
+	type EmergencyRotationOrigin = pallet_emergency_council::EnsureActiveEmergency<Runtime>;
 	type Now = Timestamp;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxAnchorProofAge = ConstU64<DAYS_IN_SECONDS>;

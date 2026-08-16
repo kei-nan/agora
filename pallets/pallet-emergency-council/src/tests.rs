@@ -1,8 +1,8 @@
 use crate::{
-    mock::*, ActiveEmergency, Council, DeclareVotes, EndVotes, Error, Event,
-    PendingEmergencyProposal,
+    mock::*, ActiveEmergency, Council, DeclareVotes, EndVotes, EnsureActiveEmergency, Error,
+    Event, PendingEmergencyProposal,
 };
-use frame_support::{assert_noop, assert_ok, traits::Hooks};
+use frame_support::{assert_noop, assert_ok, traits::{EnsureOrigin, Hooks}};
 use sp_runtime::DispatchError;
 
 const REASON_A: [u8; 32] = [1u8; 32];
@@ -533,5 +533,75 @@ fn emergency_auto_expiry_clears_vote_maps_and_pending_proposal() {
             REASON_B,
             10
         ));
+    });
+}
+
+// ─── EnsureActiveEmergency origin ───────────────────────────────────────────
+
+#[test]
+fn ensure_active_emergency_fails_when_no_emergency_active() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        // Root, but no active emergency: must fail.
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_err());
+    });
+}
+
+#[test]
+fn ensure_active_emergency_fails_for_signed_origin_even_with_active_emergency() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+        assert!(ActiveEmergency::<Test>::get().is_some());
+
+        // A signed origin (even a council member who helped declare the emergency) must
+        // not succeed — only Root, combined with an active emergency, may.
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::signed(1)).is_err());
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::none()).is_err());
+    });
+}
+
+#[test]
+fn ensure_active_emergency_succeeds_for_root_when_emergency_active() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+        assert!(ActiveEmergency::<Test>::get().is_some());
+
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_ok());
+    });
+}
+
+#[test]
+fn ensure_active_emergency_fails_again_after_emergency_lifted() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_ok());
+
+        // Lift the emergency early via the real supermajority vote_end_emergency path.
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_err());
+    });
+}
+
+#[test]
+fn ensure_active_emergency_fails_again_after_auto_sunset_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_ok());
+
+        let info = ActiveEmergency::<Test>::get().unwrap();
+        System::set_block_number(info.expires_at);
+        EmergencyCouncil::on_initialize(info.expires_at);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_err());
     });
 }

@@ -6187,6 +6187,7 @@ dependencies = [
  "frame-support",
  "frame-system",
  "hex",
+ "pallet-emergency-council",
  "parity-scale-codec",
  "poseidon2-bn254",
  "scale-info",

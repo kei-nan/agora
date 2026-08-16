@@ -100,11 +100,27 @@ mod runtime {
 
     #[runtime::pallet_index(1)]
     pub type Identity = pallet_identity_zk::Pallet<Test>;
+
+    // Wired only so `EmergencyRotationOrigin` below can be tested against the real
+    // `EnsureActiveEmergency` origin (see its `try_origin` in
+    // `pallet_emergency_council::pallet`), not a hand-rolled stand-in — this mirrors how the
+    // runtime actually wires `EmergencyRotationOrigin` in `runtime/src/configs/mod.rs`.
+    #[runtime::pallet_index(2)]
+    pub type EmergencyCouncil = pallet_emergency_council::Pallet<Test>;
 }
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
     type Block = Block;
+}
+
+impl pallet_emergency_council::Config for Test {
+    type RuntimeEvent = RuntimeEvent;
+    type MaxEmergencyBlocks = frame_support::traits::ConstU32<100>;
+    type MaxCouncilSize = frame_support::traits::ConstU32<10>;
+    type SupermajorityNumerator = frame_support::traits::ConstU32<2>;
+    type SupermajorityDenominator = frame_support::traits::ConstU32<3>;
+    type WeightInfo = ();
 }
 
 impl pallet_identity_zk::Config for Test {
@@ -120,8 +136,14 @@ impl pallet_identity_zk::Config for Test {
     type AnchorVerifier = TestAnchorVerifier;
     // Short period so tests can cross a reverification deadline without huge block numbers.
     type ReverificationPeriod = frame_support::traits::ConstU32<10>;
-    // Same convention as SuspensionOrigin/AdminOrigin above.
-    type EmergencyRotationOrigin = frame_system::EnsureRoot<u64>;
+    // Wired to the real `pallet_emergency_council::EnsureActiveEmergency`, mirroring the
+    // runtime's actual wiring (see `runtime/src/configs/mod.rs`), so this pallet's own tests
+    // can prove `emergency_rotate_oprf_scheme` genuinely requires an active,
+    // council-declared emergency rather than a bare root call. Unlike SuspensionOrigin/
+    // AdminOrigin above (which stay `EnsureRoot` because this pallet's tests aren't meant to
+    // re-exercise pallet-legislature's own call-hash-binding invariant), the entire point of
+    // this Config field's test coverage is the cross-pallet emergency-gating behavior itself.
+    type EmergencyRotationOrigin = pallet_emergency_council::EnsureActiveEmergency<Test>;
     type Now = TestNow;
     // 1 hour — generous enough that every fixture using the default fresh `current_date`
     // (see `tests.rs::public_inputs`) stays comfortably inside the window, while still
