@@ -1,9 +1,10 @@
 use crate::{
     committee_slot_for, mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex,
     CitizenNullifier, CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry,
-    NextQueryId, NullifierRegistry, OprfCommitteeKeys, OprfRound1Commitments, OprfRound2Responses,
-    OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
-    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens,
+    NextQueryId, NullifierRegistry, OprfCommitteeKeys, PendingOprfQueryCountBySubmitter,
+    OprfRound1Commitments, OprfRound2Responses, OprfSchemeVersion, PendingOprfQueries,
+    ReverificationDeadline, SelfDeclaredSingleDocument, SuspendedByJuryReview,
+    SuspendedNullifiers, TotalCitizens,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -1927,6 +1928,195 @@ fn submit_oprf_round2_fails_for_double_submission() {
             Identity::submit_oprf_round2(RuntimeOrigin::signed(42), query_id, 2, [9u8; 32]),
             Error::<Test>::DuplicateResponse
         );
+    });
+}
+
+// ─── prune_oprf_query ──────────────────────────────────────────────────────────────────
+//
+// Mock's OprfQuerySlaBlocks = 10, OprfThreshold = 2, MaxPendingOprfQueriesPerCitizen = 3.
+
+/// Drives round-1 and round-2 to completion (`OprfThreshold` = 2 responses each) on every one
+/// of the `NUM_COMMITTEES` slots for `query_id`, using fresh committee-member accounts per
+/// slot (`100 + slot*10 + {0,1}`) well clear of the citizen accounts (1, 2) used elsewhere in
+/// this file. Mirrors what a real query needs before a citizen's off-chain client can combine
+/// a genuine anchor (`register_citizen` checks all `NUM_COMMITTEES` `oprf_pk_hashes`) — see
+/// `prune_oprf_query`'s "fully answered" condition.
+fn fully_answer_all_slots(query_id: u64) {
+    for slot in 0..crate::NUM_COMMITTEES {
+        let base = 100 + (slot as u64) * 10;
+        let (m1, m2) = (base, base + 1);
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), slot, m1));
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), slot, m2));
+        assert_ok!(submit_round1(m1, query_id, slot, 1));
+        assert_ok!(submit_round1(m2, query_id, slot, 2));
+        assert_ok!(Identity::submit_oprf_round2(RuntimeOrigin::signed(m1), query_id, slot, [slot; 32]));
+        assert_ok!(Identity::submit_oprf_round2(
+            RuntimeOrigin::signed(m2),
+            query_id,
+            slot,
+            [slot.wrapping_add(1); 32]
+        ));
+    }
+}
+
+#[test]
+fn prune_oprf_query_fails_for_nonexistent_query() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Identity::prune_oprf_query(RuntimeOrigin::signed(1), 999),
+            Error::<Test>::QueryNotFound
+        );
+    });
+}
+
+#[test]
+fn prune_oprf_query_fails_when_neither_expired_nor_fully_answered() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+
+        // Still within the SLA window (deadline is block 11) and nothing has been answered.
+        assert_noop!(
+            Identity::prune_oprf_query(RuntimeOrigin::signed(1), query_id),
+            Error::<Test>::QueryNotPrunable
+        );
+    });
+}
+
+#[test]
+fn prune_oprf_query_removes_an_expired_dead_query() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 1);
+
+        // Past the deadline (posted_at 1 + OprfQuerySlaBlocks 10 = 11).
+        System::set_block_number(12);
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(7), query_id));
+
+        assert!(PendingOprfQueries::<Test>::get(query_id).is_none());
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 0);
+        System::assert_last_event(Event::OprfQueryPruned { query_id, submitter: 1 }.into());
+    });
+}
+
+/// An expired query with partial (unlocked) round-1 state is prunable, and pruning clears
+/// that partial state too, not just `PendingOprfQueries` itself.
+#[test]
+fn prune_oprf_query_clears_partial_round1_state_on_an_expired_query() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        assert_ok!(Identity::add_committee_member(RuntimeOrigin::root(), 2, 42));
+        assert_ok!(submit_round1(42, query_id, 2, 1));
+        assert_eq!(OprfRound1Commitments::<Test>::get(query_id, 2).len(), 1);
+
+        System::set_block_number(12);
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(7), query_id));
+
+        assert_eq!(OprfRound1Commitments::<Test>::get(query_id, 2).len(), 0);
+    });
+}
+
+/// A query with every one of the `NUM_COMMITTEES` slots fully answered (each at
+/// `OprfThreshold` round-2 responses) is prunable even before its SLA deadline passes.
+#[test]
+fn prune_oprf_query_removes_a_fully_answered_query_before_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query();
+        fully_answer_all_slots(query_id);
+
+        // Still well within the SLA window.
+        System::set_block_number(5);
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(1), query_id));
+
+        assert!(PendingOprfQueries::<Test>::get(query_id).is_none());
+        for slot in 0..crate::NUM_COMMITTEES {
+            assert_eq!(OprfRound1Commitments::<Test>::get(query_id, slot).len(), 0);
+            assert_eq!(OprfRound2Responses::<Test>::get(query_id, slot).len(), 0);
+        }
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 0);
+    });
+}
+
+/// Pruning one citizen's expired query must not touch a different, unrelated citizen's still-
+/// live query, nor a different (also live) query from the same citizen.
+#[test]
+fn prune_oprf_query_does_not_affect_unrelated_citizen_or_query() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        register(2, NULLIFIER_B, ANCHOR_B);
+
+        // Citizen 1's query (to be pruned) and citizen 2's query (must survive).
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        let query_a = 0u64;
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(2), other_query_point()));
+        let query_b = 1u64;
+        // A second, still-live query from citizen 1 too.
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        let query_c = 2u64;
+
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 2);
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(2), 1);
+
+        System::set_block_number(12); // past every query's deadline
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(1), query_a));
+
+        assert!(PendingOprfQueries::<Test>::get(query_a).is_none());
+        assert!(PendingOprfQueries::<Test>::get(query_b).is_some());
+        assert!(PendingOprfQueries::<Test>::get(query_c).is_some());
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 1);
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(2), 1);
+    });
+}
+
+#[test]
+fn submit_oprf_query_fails_once_per_citizen_cap_is_reached() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        // Mock's MaxPendingOprfQueriesPerCitizen = 3.
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 3);
+
+        assert_noop!(
+            Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()),
+            Error::<Test>::TooManyPendingOprfQueries
+        );
+    });
+}
+
+/// A citizen at the cap can submit a fresh query again once pruning frees up headroom —
+/// confirms the cap tracks currently-open queries, not a lifetime count.
+#[test]
+fn submit_oprf_query_succeeds_again_after_pruning_frees_the_cap() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_noop!(
+            Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()),
+            Error::<Test>::TooManyPendingOprfQueries
+        );
+
+        System::set_block_number(12); // past every query's deadline
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(1), 0));
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 2);
+
+        assert_ok!(Identity::submit_oprf_query(RuntimeOrigin::signed(1), blinded_query()));
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 3);
     });
 }
 

@@ -562,6 +562,53 @@ fn delegate_vote_retargeting_hub_uses_real_transitive_weight_for_cap_check() {
     });
 }
 
+/// Direct positive-path counterpart to
+/// `delegate_vote_retargeting_hub_uses_real_transitive_weight_for_cap_check` above (which only
+/// covers the over-cap *rejection* path): a successful hub re-target must move exactly the
+/// delegation's snapshotted `resolved_weight` off the old hub and onto the new one — no more,
+/// no less — leaving each hub's unrelated, pre-existing weight untouched.
+///
+/// Both B and C already carry baseline weight from an unrelated delegator each, so this checks
+/// genuine hub accounting (additive increment/decrement against a nonzero base), not merely
+/// that a value went from 0 to 1.
+#[test]
+fn delegate_vote_retargeting_hub_successfully_moves_weight_between_hubs() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10); // cap allows at most weight 4 (40%)
+
+        // Hub B (200) starts with baseline weight 1 from an unrelated delegator (101).
+        activate_citizen(200); // B
+        activate_citizen(101);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(101), 200, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 200u64)), 1);
+
+        // A (1) delegates to hub B: B's weight increases by exactly A's own weight (1).
+        activate_citizen(1); // A
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 200, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 200u64)), 2);
+        assert_eq!(Delegations::<Test>::get(0u32, 1u64).unwrap().resolved_weight, 1);
+
+        // Hub C (300) also already carries baseline weight 1 from a different unrelated
+        // delegator (102).
+        activate_citizen(300); // C
+        activate_citizen(102);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(102), 300, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 1);
+
+        // A re-targets from B to C (projected total at C: 1 + 1 = 2, comfortably under the
+        // cap of 4).
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 300, 0, MIN_DELEGATION_DURATION));
+
+        // B lost exactly A's weight (1): 2 -> 1, leaving its unrelated baseline (from 101)
+        // intact. C gained exactly that same amount: 1 -> 2, on top of its own unrelated
+        // baseline (from 102).
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 200u64)), 1);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 2);
+        assert_eq!(Delegations::<Test>::get(0u32, 1u64).unwrap().delegate, 300);
+    });
+}
+
 /// Lazy expiry cleanup (triggered from within `has_delegation_cycle` when walking a
 /// prospective new chain) must restore weight to the account whose expired delegation was
 /// removed, exactly like an explicit `revoke_delegation` does — otherwise an expired link
