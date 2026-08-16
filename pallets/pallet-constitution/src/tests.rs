@@ -766,3 +766,68 @@ fn legislature_call_hash_is_deterministic() {
 	let b = crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Ordinary, h(1)));
 	assert_eq!(a, b);
 }
+
+// ── Tier-aware legislature-motion thresholds (supermajority-bypass fix) ────────
+//
+// `enact_law` derives the required legislature passage percentage from its own `tier`
+// argument via `required_threshold`, and that same `tier` value is part of the preimage
+// hashed into `call_hash` (see the module doc comment). The test below proves the second
+// half of why this can't be gamed: a proposer cannot get a motion approved for an Ordinary
+// enactment and then execute it claiming Foundational (or vice versa) -- doing so changes
+// `call_hash`, so it can never match what the motion actually approved. Combined with
+// `pallet_legislature::tests::ensure_legislature_motion_rejects_mismatched_call_hash` (which
+// proves a mismatched hash is always rejected, regardless of tally) and the
+// `tiered_origin_*` tests in that same suite (which prove the tally is independently
+// re-checked against whatever percentage the calling pallet asks for), this closes the loop:
+// there is no way to enact a Foundational-tier law on Ordinary-tier support.
+#[test]
+fn enact_law_call_hash_differs_by_tier_preventing_bait_and_switch() {
+	let ordinary_hash =
+		crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Ordinary, h(1)));
+	let structural_hash =
+		crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Structural, h(1)));
+	let foundational_hash =
+		crate::pallet::legislature_call_hash(b"pallet-constitution::enact_law", (LawTier::Foundational, h(1)));
+
+	// Same content_hash, three different tiers -- three different call_hash values. A motion
+	// whose members saw and approved the Foundational hash cannot be replayed against
+	// `enact_law(origin, LawTier::Ordinary, h(1))`, because that call computes a different
+	// hash and `EnsureLegislatureMotion` (or any `LegislatureOrigin`) will reject it.
+	assert_ne!(ordinary_hash, structural_hash);
+	assert_ne!(structural_hash, foundational_hash);
+	assert_ne!(ordinary_hash, foundational_hash);
+}
+
+/// `required_threshold` is the pure function `enact_law`/`propose_constitutional_amendment`/
+/// `reaffirm_amendment`/`repeal_law` all use to turn a real tier into the percentage they pass
+/// to `LegislatureOrigin`. Pin it to the runtime-mirroring values this mock's Config wires
+/// (51/67/75, matching pallet-voting's referendum thresholds).
+#[test]
+fn required_threshold_maps_each_tier_to_its_configured_percentage() {
+	assert_eq!(crate::pallet::required_threshold::<Test>(&LawTier::Ordinary), 51);
+	assert_eq!(crate::pallet::required_threshold::<Test>(&LawTier::Structural), 67);
+	assert_eq!(crate::pallet::required_threshold::<Test>(&LawTier::Foundational), 75);
+}
+
+/// `propose_constitutional_amendment`/`reaffirm_amendment`/`repeal_law` derive the required
+/// percentage from the law's *current* tier in `Laws` storage, not from anything the caller
+/// supplies -- so there is nothing for a proposer to mislabel. This confirms the lookup this
+/// pallet's call sites perform (`Laws::<T>::get(law_id).map(|l| l.0)`) actually reflects the
+/// real, previously-enacted tier and feeds `required_threshold` correctly for each tier.
+#[test]
+fn threshold_lookup_from_law_storage_reflects_real_enacted_tier() {
+	new_test_ext().execute_with(|| {
+		let structural_id = enact(LawTier::Structural, 1);
+		let foundational_id = enact(LawTier::Foundational, 2);
+
+		let structural_tier = Laws::<Test>::get(structural_id).unwrap().0;
+		let foundational_tier = Laws::<Test>::get(foundational_id).unwrap().0;
+
+		assert_eq!(crate::pallet::required_threshold::<Test>(&structural_tier), 67);
+		assert_eq!(crate::pallet::required_threshold::<Test>(&foundational_tier), 75);
+		// A caller cannot claim a lower tier for either law_id -- required_threshold is
+		// computed from this lookup, never from a call argument, for these three calls.
+		assert_ne!(structural_tier, LawTier::Ordinary);
+		assert_ne!(foundational_tier, LawTier::Ordinary);
+	});
+}

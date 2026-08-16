@@ -3,6 +3,10 @@
 //! On-chain legislative collective for Agora. A fixed set of members propose and vote on
 //! motions. When a motion reaches `PassageThreshold`% ayes after `MotionDurationBlocks`,
 //! anyone can close it. A closed-passed motion emits `MotionPassed` and marks `executed = true`.
+//! `PassageThreshold` is the *floor*: the minimum support (51%, matching the referendum path's
+//! Ordinary tier) a motion must clear before its approval token is even planted. `close_motion`
+//! freezes the tally (`ayes`, `total_members` at close time) into that token alongside the
+//! call hash, so a consuming pallet can later demand more than the floor for calls that need it.
 //!
 //! `EnsureLegislatureMotion` is the `LegislatureOrigin` type consumed by pallet-constitution
 //! and several other legislature-gated pallets (treasury-ledger, voting, executive, elections,
@@ -11,6 +15,17 @@
 //! hash matches the `call_hash` the passed motion actually approved (see `EnsureLegislatureMotion`'s
 //! own doc comment below for the full contract). This closes a prior HIGH-severity gap where
 //! any passed motion's approval token could be replayed to authorize an unrelated call.
+//!
+//! It *also* implements a second overload, `EnsureOriginWithArg<RuntimeOrigin, ([u8; 32], u8)>`,
+//! for pallets whose calls need more than the floor threshold depending on what they're actually
+//! authorizing (tier-aware law enactment, in pallet-constitution's case). The `u8` is the
+//! required passage percentage; the caller-pallet computes it from its own authentic, unspoofable
+//! data (a call parameter that is itself bound into `call_hash`, or a direct on-chain storage
+//! lookup) — never from a free-form value an untrusted party can pick. `try_origin` checks the
+//! *frozen* `ayes`/`total_members` tally against that required percentage, so the threshold
+//! actually enforced always matches the real thing being authorized, not whatever a proposer
+//! claimed at propose time. See `pallet_constitution`'s call sites for a concrete example, and
+//! that pallet's module doc comment for why this can't be gamed.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;
@@ -65,17 +80,29 @@ pub mod pallet {
     /// it is dispatching the exact call the motion approved.
     ///
     /// `close_motion` writes a `PendingLegislatureApproval` token (the passed `call_hash`,
-    /// paired with the motion's proposer) to storage. `EnsureLegislatureMotion::try_origin`
-    /// consumes that token exactly once, and only if the caller-supplied hash argument
-    /// matches it, so a motion that passed to authorize one call can never be replayed to
-    /// execute a different one — including a different call in a different
-    /// legislature-gated pallet. This is enforced with `EnsureOriginWithArg` (rather than
-    /// plain `EnsureOrigin`) so the check lives inside the origin gate itself: a consuming
-    /// call site cannot forget to verify the token, because there is no path to a
-    /// successful origin without supplying a matching hash. Consuming pallets compute that
-    /// hash from their own call's parameters, domain-separated by a pallet+call tag (see
-    /// e.g. `pallet_constitution`'s `legislature_call_hash` helper) so byte-identical
-    /// parameters can never collide across two different calls.
+    /// the motion's proposer, and the frozen `ayes`/`total_members` tally) to storage.
+    /// `EnsureLegislatureMotion::try_origin` consumes that token exactly once, and only if
+    /// the caller-supplied hash argument matches it, so a motion that passed to authorize
+    /// one call can never be replayed to execute a different one — including a different
+    /// call in a different legislature-gated pallet. This is enforced with
+    /// `EnsureOriginWithArg` (rather than plain `EnsureOrigin`) so the check lives inside
+    /// the origin gate itself: a consuming call site cannot forget to verify the token,
+    /// because there is no path to a successful origin without supplying a matching hash.
+    /// Consuming pallets compute that hash from their own call's parameters,
+    /// domain-separated by a pallet+call tag (see e.g. `pallet_constitution`'s
+    /// `legislature_call_hash` helper) so byte-identical parameters can never collide
+    /// across two different calls.
+    ///
+    /// Two `EnsureOriginWithArg` overloads are implemented below:
+    ///   - `Arg = [u8; 32]` — the original, hash-only check. A token is usable here as long
+    ///     as it exists at all (i.e. the motion cleared the pallet-wide `PassageThreshold`
+    ///     floor at close time). Used by pallets whose calls don't need more than that floor
+    ///     (treasury-ledger, executive, elections, identity, voting).
+    ///   - `Arg = ([u8; 32], u8)` — hash *and* a required percentage. The token must also
+    ///     meet that higher bar, checked against the tally frozen at close time. Used by
+    ///     pallet-constitution to enforce tier-aware supermajorities (Structural/Foundational
+    ///     laws need more than a bare Ordinary majority) — see that pallet's doc comments for
+    ///     why the required-percentage argument can't be gamed by a proposer.
     pub struct EnsureLegislatureMotion<T>(core::marker::PhantomData<T>);
 
     impl<T: Config> frame_support::traits::EnsureOriginWithArg<T::RuntimeOrigin, [u8; 32]>
@@ -94,8 +121,12 @@ pub mod pallet {
                     // motion actually passed for. Any other member, or a mismatched
                     // hash, is rejected — preventing both a hostile member from
                     // hijacking the queued action and a passed motion for call A from
-                    // being replayed against unrelated call B.
-                    if let Some((approved_hash, authorized)) = PendingLegislatureApproval::<T>::get() {
+                    // being replayed against unrelated call B. The frozen tally is not
+                    // re-checked here — a planted token already cleared the floor
+                    // threshold at close time.
+                    if let Some((approved_hash, authorized, _ayes, _total)) =
+                        PendingLegislatureApproval::<T>::get()
+                    {
                         if authorized == who && approved_hash == *call_hash {
                             PendingLegislatureApproval::<T>::kill();
                             return Ok(());
@@ -109,8 +140,47 @@ pub mod pallet {
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin(call_hash: &[u8; 32]) -> Result<T::RuntimeOrigin, ()> {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
-            // Plant a token so the benchmark-generated origin validates.
-            PendingLegislatureApproval::<T>::put((*call_hash, member.clone()));
+            // Plant a token so the benchmark-generated origin validates (100% tally, so
+            // both overloads accept it regardless of required percentage).
+            PendingLegislatureApproval::<T>::put((*call_hash, member.clone(), 1u32, 1u32));
+            Ok(frame_system::RawOrigin::Signed(member).into())
+        }
+    }
+
+    impl<T: Config>
+        frame_support::traits::EnsureOriginWithArg<T::RuntimeOrigin, ([u8; 32], u8)>
+        for EnsureLegislatureMotion<T>
+    {
+        type Success = ();
+        fn try_origin(
+            o: T::RuntimeOrigin,
+            arg: &([u8; 32], u8),
+        ) -> Result<Self::Success, T::RuntimeOrigin> {
+            use frame_system::RawOrigin;
+            let (call_hash, required_pct) = *arg;
+            match o.clone().into() {
+                Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
+                    if let Some((approved_hash, authorized, ayes, total)) =
+                        PendingLegislatureApproval::<T>::get()
+                    {
+                        let meets_required = (ayes as u64).saturating_mul(100)
+                            >= (required_pct as u64).saturating_mul(total as u64);
+                        if authorized == who && approved_hash == call_hash && meets_required {
+                            PendingLegislatureApproval::<T>::kill();
+                            return Ok(());
+                        }
+                    }
+                    Err(o)
+                }
+                _ => Err(o),
+            }
+        }
+        #[cfg(feature = "runtime-benchmarks")]
+        fn try_successful_origin(arg: &([u8; 32], u8)) -> Result<T::RuntimeOrigin, ()> {
+            let (call_hash, _required_pct) = *arg;
+            let member = Members::<T>::get().first().cloned().ok_or(())?;
+            // 100/100 satisfies any required percentage up to 100.
+            PendingLegislatureApproval::<T>::put((call_hash, member.clone(), 100u32, 100u32));
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -133,8 +203,13 @@ pub mod pallet {
         /// How many blocks a motion stays open for voting (e.g. 7 * DAYS).
         #[pallet::constant]
         type MotionDurationBlocks: Get<u32>;
-        /// Percentage of *total members* that must vote aye for a motion to pass (e.g. 50).
-        /// Evaluated at close time: ayes * 100 >= PassageThreshold * total_members.
+        /// Floor percentage of *total members* that must vote aye for a motion to pass at all
+        /// (e.g. 51, matching the referendum path's Ordinary tier). Evaluated at close time:
+        /// ayes * 100 >= PassageThreshold * total_members. This is only the minimum a motion's
+        /// approval token needs to be planted — a consuming pallet may demand more via the
+        /// `([u8; 32], u8)` `EnsureOriginWithArg` overload on `EnsureLegislatureMotion` (see
+        /// that type's doc comment); the frozen tally is re-checked there against whatever
+        /// higher bar the specific call being authorized actually requires.
         #[pallet::constant]
         type PassageThreshold: Get<u8>;
         /// Checks whether a member is an active executive minister.
@@ -165,12 +240,16 @@ pub mod pallet {
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool>;
 
     /// Set by `close_motion` when a motion passes; consumed by `EnsureLegislatureMotion`.
-    /// Stores `(call_hash, proposer)` — only the motion's proposer can consume the token,
-    /// preventing any other member from hijacking a passed motion's approval.
+    /// Stores `(call_hash, proposer, ayes, total_members)` — only the motion's proposer can
+    /// consume the token, preventing any other member from hijacking a passed motion's
+    /// approval. `ayes`/`total_members` are the tally frozen at close time, so a consuming
+    /// pallet's tier-aware `EnsureOriginWithArg<_, ([u8; 32], u8)>` check (see
+    /// `EnsureLegislatureMotion`'s doc comment) can verify the *real* support a motion
+    /// received meets whatever higher threshold the call being authorized actually requires.
     /// Cleared after it is consumed — each passed motion authorizes exactly one action.
     #[pallet::storage]
     pub type PendingLegislatureApproval<T: Config> =
-        StorageValue<_, ([u8; 32], T::AccountId), OptionQuery>;
+        StorageValue<_, ([u8; 32], T::AccountId, u32, u32), OptionQuery>;
 
     // ── Events ───────────────────────────────────────────────────────────────────
 
@@ -329,6 +408,10 @@ pub mod pallet {
         /// Close a motion after its voting window has ended.
         /// Anyone may call this. If ayes * 100 >= PassageThreshold * total_members,
         /// the motion is marked executed and `MotionPassed` is emitted; otherwise `MotionFailed`.
+        /// `MotionPassed` only means the motion cleared the floor (`PassageThreshold`) — the
+        /// `ayes`/`total_members` tally is frozen into the approval token, and a consuming
+        /// pallet's call may additionally require a higher, call-specific percentage of that
+        /// same tally at authorization time (see `EnsureLegislatureMotion`'s doc comment).
         #[pallet::call_index(4)]
         #[pallet::weight(T::WeightInfo::close_motion())]
         pub fn close_motion(origin: OriginFor<T>, motion_id: u32) -> DispatchResult {
@@ -360,7 +443,12 @@ pub mod pallet {
                     PendingLegislatureApproval::<T>::get().is_none(),
                     Error::<T>::ApprovalPending
                 );
-                PendingLegislatureApproval::<T>::put((motion.call_hash, motion.proposer.clone()));
+                PendingLegislatureApproval::<T>::put((
+                    motion.call_hash,
+                    motion.proposer.clone(),
+                    motion.ayes,
+                    total_members as u32,
+                ));
                 Self::deposit_event(Event::MotionPassed { motion_id, call_hash: motion.call_hash });
             } else {
                 Self::deposit_event(Event::MotionFailed { motion_id });
