@@ -562,14 +562,38 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
     Ok(rulings)
 }
 
+/// Public IPFS gateway used to resolve law/proposal/ruling content by CID.
+const IPFS_GATEWAY_BASE: &str = "https://ipfs.io/ipfs";
+
+/// Cap on how much of a gateway response `fetch_ipfs_content` will buffer. Law and proposal
+/// text (plus a ruling's reasoning) is realistically well under this; 8 MiB gives generous
+/// headroom for long constitutional documents while still bounding memory use against a
+/// malicious or misbehaving gateway that tries to stream an unbounded response.
+const MAX_IPFS_CONTENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Fetches IPFS content for a law, proposal, or ruling by its on-chain SHA-256 hash.
 /// Converts the 32-byte digest to a CIDv0 and fetches from the public IPFS gateway.
+///
+/// TRUST BOUNDARY: an IPFS gateway is just an HTTP relay — it is not obligated to (and a
+/// malicious or compromised one will not) actually return the content addressed by the
+/// requested CID. Before this returns content to the frontend, it recomputes the SHA-256 digest
+/// of the fetched bytes and checks it against `hash_bytes` (the same on-chain hash the CID was
+/// derived from in `hash_to_cid`) — a mismatch is treated as a hard error, not degraded content.
 #[tauri::command]
 pub async fn fetch_ipfs_content(hash_hex: String) -> Result<String, String> {
+    fetch_ipfs_content_from(IPFS_GATEWAY_BASE, hash_hex).await
+}
+
+/// Core of `fetch_ipfs_content`, parameterized on the gateway base URL so it can be exercised
+/// against a local mock server in tests without reaching the real network.
+async fn fetch_ipfs_content_from(gateway_base: &str, hash_hex: String) -> Result<String, String> {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+
     let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
         .map_err(|e| format!("invalid hash hex: {e}"))?;
     let cid = hash_to_cid(&hash_bytes).ok_or("hash must be exactly 32 bytes")?;
-    let url = format!("https://ipfs.io/ipfs/{cid}");
+    let url = format!("{gateway_base}/{cid}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -579,7 +603,38 @@ pub async fn fetch_ipfs_content(hash_hex: String) -> Result<String, String> {
     if !resp.status().is_success() {
         return Err(format!("gateway returned {}", resp.status()));
     }
-    resp.text().await.map_err(|e| e.to_string())
+
+    // A malicious gateway can lie about (or omit) Content-Length, so this is only a fast-path
+    // rejection, not the enforcement mechanism — the real cap is applied while streaming below.
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_IPFS_CONTENT_BYTES {
+            return Err(format!(
+                "gateway response too large: {len} bytes exceeds {MAX_IPFS_CONTENT_BYTES}-byte cap"
+            ));
+        }
+    }
+
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("error reading gateway response: {e}"))?;
+        if body.len() + chunk.len() > MAX_IPFS_CONTENT_BYTES {
+            return Err(format!(
+                "gateway response exceeds {MAX_IPFS_CONTENT_BYTES}-byte cap"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let digest = Sha256::digest(&body);
+    if digest.as_slice() != hash_bytes.as_slice() {
+        return Err(
+            "IPFS content integrity check failed: fetched content does not match on-chain hash"
+                .to_string(),
+        );
+    }
+
+    String::from_utf8(body).map_err(|e| format!("IPFS content is not valid UTF-8: {e}"))
 }
 
 // ── Legislature + Elections commands ─────────────────────────────────────────
@@ -1075,6 +1130,71 @@ mod tests {
         assert!(
             result.is_err(),
             "expected an Err distinct from a fake {{best: 0, finalized: 0}} success when unreachable"
+        );
+    }
+
+    /// Binds an ephemeral local HTTP server that always responds `200 OK` with `body`,
+    /// regardless of the requested path. Used to stand in for an IPFS gateway so
+    /// `fetch_ipfs_content_from` can be exercised without reaching the real network.
+    async fn spawn_mock_gateway(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n\r\n{body}",
+                    len = body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// A gateway that returns content matching the requested hash must succeed, and the
+    /// integrity check must not reject legitimate content.
+    #[tokio::test]
+    async fn fetch_ipfs_content_accepts_content_matching_the_on_chain_hash() {
+        use sha2::{Digest, Sha256};
+
+        let body = "the actual law text";
+        let base = spawn_mock_gateway(body).await;
+        let hash_hex = hex::encode(Sha256::digest(body.as_bytes()));
+
+        let result = fetch_ipfs_content_from(&base, hash_hex).await;
+        assert_eq!(result, Ok(body.to_string()));
+    }
+
+    /// The core of the security fix: a gateway (malicious or compromised) that returns content
+    /// NOT matching the on-chain hash the CID was derived from must have that content rejected,
+    /// not silently passed through to the frontend.
+    #[tokio::test]
+    async fn fetch_ipfs_content_rejects_content_not_matching_the_on_chain_hash() {
+        use sha2::{Digest, Sha256};
+
+        let real_body = "the real, honest law text";
+        let substituted_body = "attacker-substituted content from a compromised gateway";
+        let base = spawn_mock_gateway(substituted_body).await;
+        // Hash corresponds to `real_body`, but the mock gateway serves `substituted_body`.
+        let hash_hex = hex::encode(Sha256::digest(real_body.as_bytes()));
+
+        let result = fetch_ipfs_content_from(&base, hash_hex).await;
+        assert!(result.is_err(), "mismatched content must be rejected, not returned");
+        assert!(
+            result.unwrap_err().contains("integrity check failed"),
+            "error should identify this as a hash-integrity failure"
         );
     }
 

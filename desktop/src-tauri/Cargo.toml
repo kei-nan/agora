@@ -25,12 +25,19 @@ tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 twox-hash = "1.6"
 hex = "0.4"
 bs58 = "0.5"
+# Recomputes the SHA-256 digest of fetched IPFS content in fetch_ipfs_content (chain.rs) so it
+# can be checked against the on-chain hash the CIDv0 was derived from before the content is
+# trusted and returned to the frontend — an IPFS gateway is not itself a trust boundary.
+sha2 = "0.10"
+# Lets fetch_ipfs_content enforce a response-size cap while streaming the gateway response,
+# instead of buffering an attacker-controlled Content-Length fully into memory first.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Verifies the sr25519 signatures the mobile app actually produces (`getSigningKeypair()` in
 # mobile/src/chain/identity.ts uses an sr25519 `@polkadot/keyring` KeyringPair) — see
 # commands/auth.rs's QR-auth callback signature verification.
