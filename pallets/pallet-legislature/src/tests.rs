@@ -408,7 +408,7 @@ fn close_motion_passes_at_exact_threshold_boundary_with_abstentions() {
         );
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1))
+            Some((CALL_HASH_A, 1, 2, 4))
         );
     });
 }
@@ -511,7 +511,7 @@ fn close_motion_fails_with_approval_pending_when_prior_token_unconsumed() {
         assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1))
+            Some((CALL_HASH_A, 1, 1, 1))
         );
 
         // Motion B is proposed and also reaches passage, but closing it must
@@ -527,7 +527,7 @@ fn close_motion_fails_with_approval_pending_when_prior_token_unconsumed() {
         // The original token from motion A must be untouched.
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1))
+            Some((CALL_HASH_A, 1, 1, 1))
         );
     });
 }
@@ -589,7 +589,7 @@ fn ensure_legislature_motion_rejects_mismatched_call_hash() {
 
         // The mismatched attempt must not consume the token -- it's still there, and
         // still only good for the call it was actually approved for (A).
-        assert_eq!(PendingLegislatureApproval::<Test>::get(), Some((CALL_HASH_A, 1)));
+        assert_eq!(PendingLegislatureApproval::<Test>::get(), Some((CALL_HASH_A, 1, 1, 1)));
         let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
         assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_ok());
         assert!(PendingLegislatureApproval::<Test>::get().is_none());
@@ -624,5 +624,141 @@ fn ensure_legislature_motion_rejects_root_origin() {
 
         let origin: RuntimeOrigin = RuntimeOrigin::root();
         assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_err());
+    });
+}
+
+// ─── EnsureLegislatureMotion tier-aware ([u8; 32], u8) overload ────────────
+//
+// These exercise the mechanism pallet-constitution relies on for tier-aware supermajorities:
+// the required percentage is checked against the *real* ayes/total tally frozen when the
+// motion closed, independent of whether the motion cleared the pallet's own baseline
+// `PassageThreshold` floor. See that pallet's module doc comment for how it derives the
+// percentage it passes in from data that can't be spoofed by a proposer.
+
+/// A motion with 60% support (3 of 5) clears the mock's 50% floor and closes as
+/// `MotionPassed`, but must NOT be able to authorize a call that requires 75% — a real-world
+/// stand-in for "a Foundational-tier enactment only got Ordinary-level support."
+#[test]
+fn tiered_origin_rejects_motion_below_required_percentage() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+        add(3);
+        add(4);
+        add(5);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(3), 0, true));
+        // ayes = 3 (proposer + 2 voters), total_members = 5 -> 60%.
+
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+        System::assert_last_event(
+            Event::MotionPassed { motion_id: 0, call_hash: CALL_HASH_A }.into(),
+        );
+        assert_eq!(
+            PendingLegislatureApproval::<Test>::get(),
+            Some((CALL_HASH_A, 1, 3, 5))
+        );
+
+        // 60% < 75% required -- rejected even though the motion "passed" at the floor.
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        let result = <EnsureLegislatureMotion<Test> as frame_support::traits::EnsureOriginWithArg<
+            RuntimeOrigin,
+            ([u8; 32], u8),
+        >>::try_origin(origin, &(CALL_HASH_A, 75));
+        assert!(result.is_err());
+        // A rejected attempt must not consume the token -- it might still legitimately
+        // authorize a lower-tier call.
+        assert!(PendingLegislatureApproval::<Test>::get().is_some());
+    });
+}
+
+/// The same mechanism accepts a tally that meets or exceeds the required percentage: 80%
+/// support (4 of 5) clears a 75% requirement.
+#[test]
+fn tiered_origin_accepts_motion_at_or_above_required_percentage() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+        add(3);
+        add(4);
+        add(5);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(3), 0, true));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(4), 0, true));
+        // ayes = 4 (proposer + 3 voters), total_members = 5 -> 80%.
+
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        let result = <EnsureLegislatureMotion<Test> as frame_support::traits::EnsureOriginWithArg<
+            RuntimeOrigin,
+            ([u8; 32], u8),
+        >>::try_origin(origin, &(CALL_HASH_A, 75));
+        assert!(result.is_ok());
+        // Consumed on success, same as the hash-only overload.
+        assert!(PendingLegislatureApproval::<Test>::get().is_none());
+    });
+}
+
+/// The critical tier-awareness property: the *exact same* 60% tally that fails a 75%
+/// (Foundational-equivalent) requirement above succeeds against a 51% (Ordinary-equivalent)
+/// requirement -- the mechanism enforces whatever the calling pallet says it needs, it doesn't
+/// silently apply one flat bar to every call.
+#[test]
+fn tiered_origin_ordinary_requirement_satisfied_by_same_tally_that_fails_higher_tier() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+        add(3);
+        add(4);
+        add(5);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(3), 0, true));
+        // ayes = 3, total_members = 5 -> 60%, same tally as the rejection test above.
+
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        let result = <EnsureLegislatureMotion<Test> as frame_support::traits::EnsureOriginWithArg<
+            RuntimeOrigin,
+            ([u8; 32], u8),
+        >>::try_origin(origin, &(CALL_HASH_A, 51));
+        assert!(result.is_ok());
+    });
+}
+
+/// Gaming resistance at the mechanism level: presenting a *different* call_hash than the one
+/// the motion actually approved is rejected regardless of the required percentage supplied --
+/// even a trivially-low required percentage (1%) cannot substitute for hash-binding. This is
+/// the piece pallet-constitution's tier derivation leans on: swapping the tier at execution
+/// time changes the recomputed call_hash (tier is part of its preimage for `enact_law`), so it
+/// can never match what the motion approved, independent of any threshold check.
+#[test]
+fn tiered_origin_rejects_mismatched_call_hash_even_with_trivial_required_percentage() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        // 100% support (single member) would clear any percentage requirement -- but the
+        // caller presents CALL_HASH_B, not the approved CALL_HASH_A.
+        let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
+        let result = <EnsureLegislatureMotion<Test> as frame_support::traits::EnsureOriginWithArg<
+            RuntimeOrigin,
+            ([u8; 32], u8),
+        >>::try_origin(origin, &(CALL_HASH_B, 1));
+        assert!(result.is_err());
+        assert!(PendingLegislatureApproval::<Test>::get().is_some());
     });
 }

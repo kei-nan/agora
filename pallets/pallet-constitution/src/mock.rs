@@ -150,6 +150,14 @@ impl pallet_constitution::Config for Test {
 	type RevocationOrigin = EnsureRoot<u64>;
 	type CourtOrigin = EnsureRoot<u64>;
 
+	// Tier-aware legislature passage thresholds (see `required_threshold` in lib.rs). Values
+	// mirror the runtime's real wiring (51/67/75) even though this mock's `LegislatureOrigin`
+	// ignores the threshold argument (Root-authorized regardless) — pallet-legislature's own
+	// test suite is what exercises the actual threshold-checking logic end to end.
+	type OrdinaryPassageThreshold = frame_support::traits::ConstU8<51>;
+	type ConstitutionalPassageThreshold = frame_support::traits::ConstU8<67>;
+	type FoundationalPassageThreshold = frame_support::traits::ConstU8<75>;
+
 	type OrdinaryAmendmentDeliberationBlocks = frame_support::traits::ConstU32<ORDINARY_DELIBERATION_BLOCKS>;
 	type ProvisioningPeriodBlocks = frame_support::traits::ConstU32<PROVISIONING_PERIOD_BLOCKS>;
 	type ConfirmationPeriodBlocks = frame_support::traits::ConstU32<CONFIRMATION_PERIOD_BLOCKS>;

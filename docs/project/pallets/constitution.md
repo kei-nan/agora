@@ -4,11 +4,32 @@
 
 Three-tier law system — no HRC (removed; opposition uses court challenges instead):
 
-| Tier | Description | Amendment pipeline |
-|---|---|---|
-| `Ordinary` | Legislature simple-majority; standard laws | Propose + ratify after `OrdinaryAmendmentDeliberationBlocks` |
-| `Structural` | High-threshold; separation-of-powers, electoral rules | Provisional (0–2yr) → Confirmed (2–6yr, fresh legislature reaffirmation required) → Entrenched (6yr+) |
-| `Foundational` | Highest protection; basic rights, democratic principles | Same pipeline as Structural; higher passage threshold enforced by referendum |
+| Tier | Description | Amendment pipeline | Legislature-motion passage threshold |
+|---|---|---|---|
+| `Ordinary` | Legislature simple-majority; standard laws | Propose + ratify after `OrdinaryAmendmentDeliberationBlocks` | 51% (`OrdinaryPassageThreshold`) |
+| `Structural` | High-threshold; separation-of-powers, electoral rules | Provisional (0–2yr) → Confirmed (2–6yr, fresh legislature reaffirmation required) → Entrenched (6yr+) | 67% (`ConstitutionalPassageThreshold`) |
+| `Foundational` | Highest protection; basic rights, democratic principles | Same pipeline as Structural | 75% (`FoundationalPassageThreshold`) |
+
+These are the exact same three percentages the referendum path in pallet-voting uses
+(`PassageThreshold`/`ConstitutionalPassageThreshold`/`FoundationalPassageThreshold` there) — a
+direct legislature motion needs the same supermajority as a citizen referendum to enact, amend,
+or repeal a law of a given tier. **Fixed 2026-08-16**: until then, `close_motion` enforced a
+single flat ~50% threshold for every motion regardless of subject, so a Foundational-tier law
+could in principle be enacted via the legislature-motion path on bare-majority support even
+though the referendum path already required 75% for the same tier. See
+`docs/project/pallets/legislature.md` for the mechanism (`EnsureLegislatureMotion`'s
+`([u8; 32], u8)` origin overload) and the module doc comment in
+`pallets/pallet-constitution/src/lib.rs` for the full non-gameability argument.
+
+**How the right threshold gets picked, per call** (`required_threshold` in `lib.rs`):
+- `enact_law` — from its own `tier` argument, which is part of the hash `LegislatureOrigin`
+  checks against the approved motion, so it can't be swapped at execution time without
+  invalidating that hash.
+- `propose_constitutional_amendment` / `reaffirm_amendment` / `repeal_law` — from the law's
+  *current* tier read directly out of `Laws` storage (never from a caller-supplied value).
+- `propose_amendment` / `ratify_amendment` — always `OrdinaryPassageThreshold` (51%), since
+  both calls are unconditionally rejected downstream (`UseConstitutionalAmendmentCall`) if the
+  law isn't actually Ordinary.
 
 Law statuses: `Active`, `Paused` (court-invalidated), `Repealed`
 
@@ -20,7 +41,8 @@ Storage:
 - `PetitionSignatures`: `(petition_id, AccountId)` → `bool`
 - `NextLawId`, `NextPetitionId`
 
-Config constants: `ProvisioningPeriodBlocks = 2 * 365 * DAYS`, `ConfirmationPeriodBlocks = 4 * 365 * DAYS`
+Config constants: `ProvisioningPeriodBlocks = 2 * 365 * DAYS`, `ConfirmationPeriodBlocks = 4 * 365 * DAYS`,
+`OrdinaryPassageThreshold = 51`, `ConstitutionalPassageThreshold = 67`, `FoundationalPassageThreshold = 75`
 
 Calls:
 - `enact_law(tier, content_hash)` — `LegislatureOrigin`; Structural/Foundational auto-opens a court case via `AutoChallengeHook`

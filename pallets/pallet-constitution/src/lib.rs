@@ -1,9 +1,38 @@
 //! # Constitution Pallet
 //!
 //! Versioned on-chain law ledger with three tiers:
-//!   - Ordinary: legislature simple-majority; amendments take effect after OrdinaryAmendmentDeliberationBlocks.
-//!   - Structural: high-threshold tier; amendments enter the Provisional → Confirmed → Entrenched pipeline.
-//!   - Foundational: same pipeline as Structural; higher passage thresholds enforced by the legislature origin.
+//!   - Ordinary: legislature simple-majority (`OrdinaryPassageThreshold`, 51%); amendments take
+//!     effect after OrdinaryAmendmentDeliberationBlocks.
+//!   - Structural: high-threshold tier (`ConstitutionalPassageThreshold`, 67%); amendments enter
+//!     the Provisional → Confirmed → Entrenched pipeline.
+//!   - Foundational: highest tier (`FoundationalPassageThreshold`, 75%); same pipeline as
+//!     Structural.
+//!
+//! These are the same three percentages the referendum path in pallet-voting uses
+//! (`PassageThreshold`/`ConstitutionalPassageThreshold`/`FoundationalPassageThreshold` there),
+//! so a citizen referendum and a direct legislature motion need the same supermajority to
+//! enact/amend/repeal a law of a given tier — there is no lower-threshold back door through
+//! the legislature-motion path.
+//!
+//! **How the right threshold gets enforced, and why it can't be gamed:** `enact_law`,
+//! `propose_constitutional_amendment`, `reaffirm_amendment`, and `repeal_law` each compute the
+//! required percentage from the *real* tier of what they're acting on — never from a value a
+//! proposer merely asserts — before calling `T::LegislatureOrigin::ensure_origin`:
+//!   - `enact_law`'s `tier` argument is itself part of the domain-separated preimage hashed into
+//!     `call_hash` (see `legislature_call_hash` below). A motion's `call_hash` is fixed at
+//!     `propose_motion` time and is what legislature members actually vote on; if whoever
+//!     executes the passed motion supplied a different `tier` than the one that was proposed
+//!     (e.g. to claim Ordinary while enacting a Foundational law), the recomputed hash would no
+//!     longer match the motion's approved `call_hash` and `EnsureLegislatureMotion` would reject
+//!     the origin outright — independent of the threshold check. So the tier used to compute the
+//!     required percentage is cryptographically pinned to the tier that was actually voted on.
+//!   - `propose_constitutional_amendment`, `reaffirm_amendment`, and `repeal_law` instead read
+//!     the tier directly from `Laws` on-chain storage (the law's *current*, already-enacted
+//!     tier) — ground truth no caller can influence via a call parameter.
+//! `pallet_legislature::EnsureLegislatureMotion`'s `EnsureOriginWithArg<_, ([u8; 32], u8)>`
+//! overload then checks that percentage against the real `ayes`/`total_members` tally frozen
+//! when the motion closed, so authorization only succeeds if the legislature's *actual* recorded
+//! support met the tier-appropriate bar.
 //!
 //! Constitutional (Structural/Foundational) amendment lifecycle:
 //!   1. propose_constitutional_amendment: hash applied immediately, record enters Provisional stage.
@@ -138,6 +167,20 @@ pub mod pallet {
         frame_support::Hashable::blake2_256(&preimage)
     }
 
+    /// Required legislature passage percentage for `tier`, from this pallet's own
+    /// `OrdinaryPassageThreshold`/`ConstitutionalPassageThreshold`/`FoundationalPassageThreshold`
+    /// config constants (kept numerically in sync with pallet-voting's referendum thresholds by
+    /// the runtime wiring — see that pallet's `Config` doc comments). See the module doc comment
+    /// for why the `tier` fed into this can't be spoofed independently of what's actually being
+    /// enacted, amended, or repealed.
+    pub(crate) fn required_threshold<T: Config>(tier: &LawTier) -> u8 {
+        match tier {
+            LawTier::Ordinary => T::OrdinaryPassageThreshold::get(),
+            LawTier::Structural => T::ConstitutionalPassageThreshold::get(),
+            LawTier::Foundational => T::FoundationalPassageThreshold::get(),
+        }
+    }
+
     // ── Pallet ───────────────────────────────────────────────────────────────────
 
     #[pallet::pallet]
@@ -150,12 +193,32 @@ pub mod pallet {
         type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
 
         // ── Legislature ──────────────────────────────────────────────────────────
-        /// Origin representing a passed legislature motion (law enactment + Ordinary amendments).
-        /// `EnsureOriginWithArg` so each call site is *required* to pass the domain-separated
-        /// hash of its own parameters (see `legislature_call_hash` below) — the origin check
-        /// itself then verifies that hash against the motion's approved `call_hash`, so a
-        /// motion passed to authorize one call can never be replayed to execute another.
-        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
+        /// Origin representing a passed legislature motion (law enactment, amendments, repeal).
+        /// `EnsureOriginWithArg<_, ([u8; 32], u8)>` so each call site is *required* to pass both
+        /// the domain-separated hash of its own parameters (see `legislature_call_hash` below)
+        /// and the passage percentage that call actually needs (see `required_threshold` and
+        /// the module doc comment for how that percentage is derived and why it can't be
+        /// spoofed) — the origin check verifies the hash against the motion's approved
+        /// `call_hash` *and* the required percentage against the tally frozen when the motion
+        /// closed. A motion passed to authorize one call can never be replayed to execute
+        /// another, and a motion that didn't reach the real required threshold can never
+        /// authorize a higher-tier action.
+        type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, ([u8; 32], u8)>;
+
+        /// Legislature-motion passage percentage for Ordinary-tier calls (e.g. 51). Matches
+        /// pallet-voting's Ordinary referendum `PassageThreshold`.
+        #[pallet::constant]
+        type OrdinaryPassageThreshold: Get<u8>;
+        /// Legislature-motion passage percentage for Structural-tier calls (e.g. 67). Must be
+        /// higher than `OrdinaryPassageThreshold`. Matches pallet-voting's Structural referendum
+        /// `ConstitutionalPassageThreshold`.
+        #[pallet::constant]
+        type ConstitutionalPassageThreshold: Get<u8>;
+        /// Legislature-motion passage percentage for Foundational-tier calls (e.g. 75). Must be
+        /// higher than `ConstitutionalPassageThreshold`. Matches pallet-voting's Foundational
+        /// referendum `FoundationalPassageThreshold`.
+        #[pallet::constant]
+        type FoundationalPassageThreshold: Get<u8>;
 
         // ── Ordinary amendments ──────────────────────────────────────────────────
         /// Deliberation blocks before an Ordinary amendment can be ratified (may be 0).
@@ -299,8 +362,8 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Enact a new law. Requires LegislatureOrigin.
-        /// For Structural/Foundational laws the runtime should wire a higher-threshold legislature origin.
+        /// Enact a new law. Requires LegislatureOrigin at the passage percentage `tier` demands
+        /// (`required_threshold`) — see the module doc comment for why `tier` can't be spoofed.
         #[pallet::call_index(0)]
         #[pallet::weight(T::WeightInfo::enact_law())]
         pub fn enact_law(
@@ -310,7 +373,10 @@ pub mod pallet {
         ) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-constitution::enact_law", (tier.clone(), content_hash)),
+                &(
+                    legislature_call_hash(b"pallet-constitution::enact_law", (tier.clone(), content_hash)),
+                    required_threshold::<T>(&tier),
+                ),
             )?;
             let id = NextLawId::<T>::get();
             Laws::<T>::insert(id, (tier.clone(), LawStatus::Active, 1u32, content_hash));
@@ -340,6 +406,10 @@ pub mod pallet {
 
         /// Propose an amendment to an Ordinary law. Starts the deliberation clock.
         /// For Structural/Foundational laws use propose_constitutional_amendment.
+        /// Requires `OrdinaryPassageThreshold` — this call is unconditionally Ordinary-only
+        /// (enforced by the `UseConstitutionalAmendmentCall` check below), so there is no tier
+        /// to derive a higher requirement from, and a mismatched real tier is still rejected
+        /// downstream regardless of what threshold authorized the origin.
         #[pallet::call_index(2)]
         #[pallet::weight(T::WeightInfo::propose_amendment())]
         pub fn propose_amendment(
@@ -349,7 +419,10 @@ pub mod pallet {
         ) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-constitution::propose_amendment", (law_id, proposed_hash)),
+                &(
+                    legislature_call_hash(b"pallet-constitution::propose_amendment", (law_id, proposed_hash)),
+                    T::OrdinaryPassageThreshold::get(),
+                ),
             )?;
             let law = Laws::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
             ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
@@ -365,12 +438,17 @@ pub mod pallet {
         }
 
         /// Ratify an Ordinary law amendment after its deliberation period expires.
+        /// Requires `OrdinaryPassageThreshold` — see `propose_amendment`'s doc comment; the
+        /// same "Ordinary-only, rejected downstream otherwise" reasoning applies here.
         #[pallet::call_index(3)]
         #[pallet::weight(T::WeightInfo::ratify_amendment())]
         pub fn ratify_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-constitution::ratify_amendment", law_id),
+                &(
+                    legislature_call_hash(b"pallet-constitution::ratify_amendment", law_id),
+                    T::OrdinaryPassageThreshold::get(),
+                ),
             )?;
             let (new_hash, proposed_at) =
                 PendingAmendments::<T>::take(law_id).ok_or(Error::<T>::AmendmentNotFound)?;
@@ -454,12 +532,22 @@ pub mod pallet {
 
         /// Repeal a law entirely. Terminal — cannot be re-enacted under the same id.
         /// Cleans up any pending Ordinary or Constitutional amendments for this law.
+        /// Requires LegislatureOrigin at the passage percentage the law's *current, on-chain*
+        /// tier demands — repealing a Structural/Foundational law is as significant as enacting
+        /// one, so it needs the same supermajority, read from `Laws` storage (not a caller-
+        /// supplied value) so it can't be understated. If `law_id` doesn't exist the fallback is
+        /// the highest (Foundational) threshold — fail closed; the call rejects with
+        /// `LawNotFound` right after regardless of what threshold authorized the origin.
         #[pallet::call_index(6)]
         #[pallet::weight(T::WeightInfo::repeal_law())]
         pub fn repeal_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
+            let tier = Laws::<T>::get(law_id).map(|l| l.0).unwrap_or(LawTier::Foundational);
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-constitution::repeal_law", law_id),
+                &(
+                    legislature_call_hash(b"pallet-constitution::repeal_law", law_id),
+                    required_threshold::<T>(&tier),
+                ),
             )?;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
@@ -481,6 +569,11 @@ pub mod pallet {
         /// It can be revoked at any stage via RevocationOrigin; the required revocation threshold
         /// grows as the amendment matures (30% Provisional / 35% Confirmed / 40% Entrenched),
         /// enforced externally by the RevocationOrigin's collective configuration.
+        ///
+        /// Requires LegislatureOrigin at the passage percentage the law's *current, on-chain*
+        /// tier demands (read from `Laws` storage, not a caller-supplied value — see the module
+        /// doc comment). Fallback if `law_id` doesn't exist is the highest (Foundational)
+        /// threshold — fail closed; the call rejects with `LawNotFound` right after regardless.
         #[pallet::call_index(7)]
         #[pallet::weight(T::WeightInfo::propose_constitutional_amendment())]
         pub fn propose_constitutional_amendment(
@@ -488,11 +581,15 @@ pub mod pallet {
             law_id: u32,
             new_hash: [u8; 32],
         ) -> DispatchResult {
+            let tier = Laws::<T>::get(law_id).map(|l| l.0).unwrap_or(LawTier::Foundational);
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(
-                    b"pallet-constitution::propose_constitutional_amendment",
-                    (law_id, new_hash),
+                &(
+                    legislature_call_hash(
+                        b"pallet-constitution::propose_constitutional_amendment",
+                        (law_id, new_hash),
+                    ),
+                    required_threshold::<T>(&tier),
                 ),
             )?;
             let law = Laws::<T>::get(law_id).ok_or(Error::<T>::LawNotFound)?;
@@ -542,12 +639,20 @@ pub mod pallet {
         ///
         /// Must be called by a legislature that held at least one election after the proposal block.
         /// Advances the amendment from Provisional → Confirmed.
+        ///
+        /// Requires LegislatureOrigin at the passage percentage the law's *current, on-chain*
+        /// tier demands (read from `Laws` storage — same pattern as `propose_constitutional_amendment`
+        /// and `repeal_law`; see the module doc comment).
         #[pallet::call_index(8)]
         #[pallet::weight(T::WeightInfo::reaffirm_amendment())]
         pub fn reaffirm_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
+            let tier = Laws::<T>::get(law_id).map(|l| l.0).unwrap_or(LawTier::Foundational);
             T::LegislatureOrigin::ensure_origin(
                 origin,
-                &legislature_call_hash(b"pallet-constitution::reaffirm_amendment", law_id),
+                &(
+                    legislature_call_hash(b"pallet-constitution::reaffirm_amendment", law_id),
+                    required_threshold::<T>(&tier),
+                ),
             )?;
             ConstitutionalAmendments::<T>::try_mutate(law_id, |maybe_record| {
                 let record =

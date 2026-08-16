@@ -698,7 +698,21 @@ impl pallet_constitution::FreshLegislatureChecker<BlockNumber> for Runtime {
 
 impl pallet_constitution::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
+	/// `EnsureLegislatureMotion`'s `([u8; 32], u8)` overload — the same origin type used
+	/// elsewhere, but here the required-percentage argument is checked against the tally
+	/// frozen when the authorizing motion closed (see that overload's doc comment in
+	/// pallet-legislature, and `pallet_constitution`'s module doc comment for the full
+	/// tier-aware-threshold rationale).
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Ordinary-tier legislature motions: 51%, matching pallet-voting's Ordinary referendum
+	/// `PassageThreshold` below.
+	type OrdinaryPassageThreshold = ConstU8<51>;
+	/// Structural-tier legislature motions: 67%, matching pallet-voting's
+	/// `ConstitutionalPassageThreshold` below.
+	type ConstitutionalPassageThreshold = ConstU8<67>;
+	/// Foundational-tier legislature motions: 75%, matching pallet-voting's
+	/// `FoundationalPassageThreshold` below.
+	type FoundationalPassageThreshold = ConstU8<75>;
 	/// Ordinary law amendments take effect immediately (no deliberation window).
 	type OrdinaryAmendmentDeliberationBlocks = ConstU32<0>;
 	/// Structural/Foundational amendments stay Provisional for ~2 years before reaffirmation opens.
@@ -751,8 +765,11 @@ impl pallet_legislature::Config for Runtime {
 	type MaxMembers = ConstU32<500>;
 	/// Members have 7 days to vote on a motion.
 	type MotionDurationBlocks = ConstU32<{ 7 * DAYS }>;
-	/// Simple majority (50%+1) required to pass a motion.
-	type PassageThreshold = ConstU8<50>;
+	/// Floor: 51% of total members required to plant an approval token at all, matching the
+	/// referendum path's Ordinary tier. This is only the minimum — pallet-constitution demands
+	/// more for Structural/Foundational calls via `EnsureLegislatureMotion`'s tier-aware
+	/// `([u8; 32], u8)` origin overload (see `pallet_constitution::Config::LegislatureOrigin`).
+	type PassageThreshold = ConstU8<51>;
 	/// Active ministers are blocked from legislature votes (incompatibility rule).
 	type MinisterChecker = Cabinet;
 	type WeightInfo = pallet_legislature::weights::SubstrateWeight<Runtime>;
