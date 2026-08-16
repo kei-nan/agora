@@ -33,6 +33,7 @@ use config::Config;
 use context::SubjectContext;
 use rpc::RpcClient;
 
+use anyhow::Context as _;
 use codec::{Decode, Encode};
 use serde::Serialize;
 use sp_core::crypto::{AccountId32, Ss58Codec};
@@ -420,18 +421,51 @@ async fn fetch_law(rpc: &RpcClient, law_id: u32) -> anyhow::Result<Option<LawRec
 /// Best-effort fetch of a law's full text from the public IPFS gateway, mirroring
 /// `desktop/src-tauri/src/commands/chain.rs`'s `fetch_ipfs_content`/`hash_to_cid` convention
 /// (the on-chain hash is treated as a raw SHA-256 digest, wrapped in a CIDv0 header). Returns
-/// `None` on any failure (unreachable gateway, non-200, non-UTF8 body) rather than propagating
-/// an error — a missing law text should not abort ruling on the case, just leave that context
-/// honestly marked unavailable (see `context::render_case_context`).
+/// `None` on any failure — unreachable gateway, non-200, non-UTF8 body, **or a content-hash
+/// mismatch** (see `fetch_and_verify_ipfs_content` below) — rather than propagating an error: a
+/// missing law text should not abort ruling on the case, just leave that context honestly
+/// marked unavailable (see `context::render_case_context`). Critically, a hash mismatch is
+/// treated the same as "unavailable," never as "available" — the caller never sees content that
+/// failed verification, only `None` or genuinely-verified text.
 async fn fetch_ipfs_gateway_content(content_hash: &[u8; 32]) -> Option<String> {
+    match fetch_and_verify_ipfs_content(content_hash).await {
+        Ok(text) => Some(text),
+        Err(e) => {
+            // A hash mismatch specifically is worth a louder log than "gateway timed out" — it
+            // can mean a misbehaving/malicious gateway, or content that was altered after the
+            // law's content_hash was committed on-chain. Either way it's worth an operator's
+            // attention even though this service still degrades gracefully by ruling without
+            // the full text (see doc comment above).
+            if e.to_string().contains("hash mismatch") {
+                tracing::error!(content_hash = %hex::encode(content_hash), error = %e, "IPFS gateway returned content that does not match the on-chain hash — refusing to use it");
+            } else {
+                tracing::debug!(content_hash = %hex::encode(content_hash), error = %e, "IPFS content fetch failed — ruling without full law text");
+            }
+            None
+        }
+    }
+}
+
+/// Does the actual gateway fetch and, unlike the bug this replaced, verifies the fetched
+/// content's SHA-256 digest against `content_hash` before returning it — see
+/// `ipfs::verify_content_hash`'s doc comment for why a gateway response must never be trusted
+/// on a bare 200 status alone. Returns `Err` (not a silently-accepted body) on any failure,
+/// including a hash mismatch, so unverified content structurally cannot reach
+/// `context::render_case_context` / the Claude prompt.
+async fn fetch_and_verify_ipfs_content(content_hash: &[u8; 32]) -> anyhow::Result<String> {
     let cid = ipfs::digest_to_cidv0(content_hash);
     let url = format!("https://ipfs.io/ipfs/{cid}");
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().ok()?;
-    let resp = client.get(&url).send().await.ok()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build IPFS gateway HTTP client")?;
+    let resp = client.get(&url).send().await.context("IPFS gateway unreachable")?;
     if !resp.status().is_success() {
-        return None;
+        anyhow::bail!("IPFS gateway returned HTTP {}", resp.status());
     }
-    resp.text().await.ok()
+    let bytes = resp.bytes().await.context("failed to read IPFS gateway response body")?;
+    ipfs::verify_content_hash(&bytes, content_hash)?;
+    String::from_utf8(bytes.to_vec()).context("IPFS content was not valid UTF-8")
 }
 
 async fn fetch_u128_value(

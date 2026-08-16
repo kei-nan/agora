@@ -50,5 +50,11 @@ age = "0.10"
 # on-chain-hash <-> CIDv0 convention `fetch_ipfs_content` already established.
 bs58 = "0.5"
 
+# --- content-hash verification for IPFS gateway fetches (see ipfs.rs's `verify_content_hash`)
+# — same crate + version desktop/src-tauri already depends on (desktop/src-tauri/Cargo.toml),
+# though desktop does not yet use it to actually verify fetched content against the on-chain
+# hash (see ipfs.rs's doc comment on `verify_content_hash`).
+sha2 = "0.10"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

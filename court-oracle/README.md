@@ -209,16 +209,35 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 ## Test coverage — what's real, what isn't
 
-`cargo test` (42 tests, all passing in this environment): case-context rendering for all four
-`CaseSubject` variants; Claude request formatting and `VERDICT:`/`REASONING:` response parsing,
-including a realistic-shaped JSON fixture and a refusal fixture; IPFS CID digest math
-(round-trip, rejection of malformed input); SCALE encode/decode round-trips for the mirrored
-`CaseStatus`/`CaseSubject`/`Verdict` enums; the `submit_ai_ruling` (now 4-argument, including
-`verdict`) and `finalize_ruling` (now argument-free beyond `case_id`) extrinsic call-byte
-layouts; storage-key prefix/hashing including the `twox128("System")` known-answer vector; and
-`should_finalize`'s appeal-window/status gating (window still open, exactly at the deadline
-block, one block past it, every non-`AIRulingIssued` status including appealed ones, and a
-missing `AIRulingBlock` entry).
+`cargo test` (47 tests, all passing in this environment): case-context rendering for all four
+`CaseSubject` variants, including that IPFS-sourced law text is wrapped in
+`<untrusted_external_content>` delimiters (prompt-injection mitigation, see below); Claude
+request formatting and `VERDICT:`/`REASONING:` response parsing, including a realistic-shaped
+JSON fixture, a refusal fixture, and that the system prompt actually carries the matching
+untrusted-content instruction; IPFS CID digest math (round-trip, rejection of malformed input)
+and content-hash verification (`verify_content_hash` accepts a matching digest, rejects a
+mismatched one, and rejects same-length tampered content — this is what closes the "any 200
+response is trusted" gap in `fetch_ipfs_gateway_content`, see below); SCALE encode/decode
+round-trips for the mirrored `CaseStatus`/`CaseSubject`/`Verdict` enums; the `submit_ai_ruling`
+(now 4-argument, including `verdict`) and `finalize_ruling` (now argument-free beyond `case_id`)
+extrinsic call-byte layouts; storage-key prefix/hashing including the `twox128("System")`
+known-answer vector; and `should_finalize`'s appeal-window/status gating (window still open,
+exactly at the deadline block, one block past it, every non-`AIRulingIssued` status including
+appealed ones, and a missing `AIRulingBlock` entry).
+
+**IPFS content integrity and prompt injection**: `fetch_ipfs_gateway_content` used to return any
+200 response body from the public gateway unchecked, with no re-hash against the on-chain
+`content_hash` it was fetched for — a malicious or misconfigured gateway could substitute
+arbitrary content. It now routes through `fetch_and_verify_ipfs_content`, which recomputes the
+SHA-256 digest of the fetched bytes and rejects (returns `Err`, never a silently-accepted body)
+on any mismatch via `ipfs::verify_content_hash`; a mismatch is logged at `error` level
+(distinct from an ordinary fetch failure at `debug`) since it can indicate gateway tampering.
+Separately, because that fetched text is still attacker-influenceable content (whoever authored
+the law's IPFS content controls it, even if it's hash-verified as unmodified since publication),
+`context::render_case_context` wraps it in `<untrusted_external_content>` tags and
+`claude::SYSTEM_PROMPT` instructs the model to treat tagged content as data to analyze, never as
+instructions — a defense-in-depth mitigation against prompt injection, not a guarantee (see the
+doc comments in `context.rs` and `claude.rs` for the caveat).
 
 **Not covered, and cannot be covered in this environment**: the live chain RPC round trip, the
 live Claude API call, the live IPFS daemon/gateway call, and therefore the full

@@ -34,6 +34,7 @@
 use anyhow::Context;
 use reqwest::Client;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 pub struct IpfsClient {
     api_url: String,
@@ -113,9 +114,69 @@ pub fn digest_to_cidv0(digest: &[u8; 32]) -> String {
     bs58::encode(multihash).into_string()
 }
 
+/// Verifies that `content`'s SHA-256 digest matches `expected_hash` — the check a public IPFS
+/// gateway fetch must not skip. A gateway is not a trusted party: it can be slow, lied to by a
+/// pinning node, or outright malicious, and content-addressing only actually protects the
+/// caller if the caller *itself* re-derives the digest and compares, rather than trusting a 200
+/// response body on faith (the bug this function exists to close — see `main.rs`'s
+/// `fetch_ipfs_gateway_content`, which used to return any 200 response body unchecked).
+///
+/// This assumes the same convention this crate's other IPFS code already documents (see this
+/// module's header comment and `digest_to_cidv0`/`cidv0_to_digest`): the on-chain hash is a raw
+/// SHA-256 digest of the plaintext content, not a digest of some UnixFS/dag-pb wrapping — true
+/// only if whatever published the content to IPFS did so as a raw block. If a law's content was
+/// published via a standard `ipfs add` (dag-pb wrapped), this check will correctly reject it as
+/// a "mismatch" even though the gateway served the right bytes for the requested CID — that's a
+/// publishing-convention bug elsewhere, not a false positive in this function: the whole point
+/// of this project's convention is that `content_hash` must be independently recomputable from
+/// the plaintext, which a dag-pb wrapping would break anyway.
+///
+/// Returns `Err` (never silently `Ok`) on any mismatch, with both digests in the message for
+/// debugging — the *content* itself is deliberately not included in the error (it can be large,
+/// and if this fired because the content is attacker-controlled, echoing it into logs unbounded
+/// is its own minor risk).
+pub fn verify_content_hash(content: &[u8], expected_hash: &[u8; 32]) -> anyhow::Result<()> {
+    let actual: [u8; 32] = Sha256::digest(content).into();
+    anyhow::ensure!(
+        actual == *expected_hash,
+        "IPFS content hash mismatch: expected 0x{}, got 0x{} over {} bytes — refusing to use \
+         this content (gateway may be misbehaving, content may not have been published as a raw \
+         block, or the content may have been tampered with)",
+        hex::encode(expected_hash),
+        hex::encode(actual),
+        content.len(),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_content_hash_accepts_matching_digest() {
+        let content = b"Article 1: citizens have the right to...";
+        let expected: [u8; 32] = Sha256::digest(content).into();
+        assert!(verify_content_hash(content, &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_content_hash_rejects_mismatched_digest() {
+        let content = b"Article 1: citizens have the right to...";
+        let wrong_hash = [0xAAu8; 32];
+        let err = verify_content_hash(content, &wrong_hash).unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn verify_content_hash_rejects_tampered_content_even_with_correct_length() {
+        // Same length, different bytes — a mismatch must not be masked by any length-only check.
+        let original = b"VERDICT: Overturned. The law is invalid.......";
+        let tampered = b"VERDICT: Upheld. The law is valid.............";
+        assert_eq!(original.len(), tampered.len());
+        let expected: [u8; 32] = Sha256::digest(original).into();
+        assert!(verify_content_hash(tampered, &expected).is_err());
+    }
 
     #[test]
     fn digest_cidv0_round_trips() {
