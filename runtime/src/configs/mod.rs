@@ -307,6 +307,11 @@ impl pallet_identity_zk::Config for Runtime {
 	/// committee sizing (see `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`).
 	/// Must stay `<= MaxCommitteeSize` above.
 	type OprfThreshold = ConstU32<12>;
+	/// Generous headroom over a realistic number of concurrent in-flight registration/
+	/// reverification/migration attempts a single citizen would ever have open at once
+	/// (retries included), while still bounding per-citizen mailbox growth — see
+	/// `pallet_identity_zk::Config::MaxPendingOprfQueriesPerCitizen`'s doc comment.
+	type MaxPendingOprfQueriesPerCitizen = ConstU32<20>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -344,6 +349,8 @@ impl pallet_identity_zk::Config for Runtime {
 	type OprfQuerySlaBlocks = ConstU32<{ 6 * DAYS }>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type OprfThreshold = ConstU32<12>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MaxPendingOprfQueriesPerCitizen = ConstU32<20>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as

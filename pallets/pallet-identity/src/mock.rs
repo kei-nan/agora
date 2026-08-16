@@ -140,6 +140,9 @@ impl pallet_identity_zk::Config for Test {
     // Strictly less than MaxCommitteeSize (3) so tests can distinguish "set locked at
     // threshold" from "roster physically full" as two different conditions.
     type OprfThreshold = frame_support::traits::ConstU32<2>;
+    // Small on purpose (mirrors MaxCommitteeSize's convention above): big enough for tests to
+    // submit a handful of queries and exercise the over-cap rejection without a large fixture.
+    type MaxPendingOprfQueriesPerCitizen = frame_support::traits::ConstU32<3>;
 }
 
 // Build genesis storage according to the mock runtime.

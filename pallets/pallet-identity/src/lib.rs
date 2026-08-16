@@ -248,6 +248,15 @@ pub mod pallet {
         /// Must be `<= MaxCommitteeSize` for any slot expected to actually reach quorum.
         #[pallet::constant]
         type OprfThreshold: Get<u32>;
+        /// Maximum number of `PendingOprfQueries` entries a single citizen may have open
+        /// (not yet pruned) at once, tracked via `PendingOprfQueryCountBySubmitter`. Bounds
+        /// per-citizen mailbox growth: unlike most extrinsics, an open OPRF query has no
+        /// forced resolution besides the SLA-expiry / full-completion prune paths
+        /// (`prune_oprf_query`), which someone has to remember to call — without this cap a
+        /// single signed account could call `submit_oprf_query` an unbounded number of times
+        /// and grow chain state at ordinary transaction-fee cost with no ceiling.
+        #[pallet::constant]
+        type MaxPendingOprfQueriesPerCitizen: Get<u32>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -507,6 +516,13 @@ pub mod pallet {
         ValueQuery,
     >;
 
+    /// Count of currently-open (posted but not yet pruned) `PendingOprfQueries` entries per
+    /// submitter. Incremented in `submit_oprf_query`, decremented in `prune_oprf_query` —
+    /// enforces `T::MaxPendingOprfQueriesPerCitizen`.
+    #[pallet::storage]
+    pub type PendingOprfQueryCountBySubmitter<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -549,6 +565,11 @@ pub mod pallet {
         OprfRound1SetLocked { query_id: u64, committee_slot: u8 },
         /// A member of an already-locked round-1 set submitted their round-2 response.
         OprfRound2Submitted { query_id: u64, committee_slot: u8, member: T::AccountId },
+        /// A dead (SLA-expired, never completed) or fully-answered (every committee slot
+        /// reached `OprfThreshold` round-2 responses) OPRF mailbox entry was pruned, freeing
+        /// `PendingOprfQueries`/`OprfRound1Commitments`/`OprfRound2Responses` state for
+        /// `query_id`.
+        OprfQueryPruned { query_id: u64, submitter: T::AccountId },
     }
 
     #[pallet::error]
@@ -632,6 +653,13 @@ pub mod pallet {
         /// this `(query_id, committee_slot)`, so they are not part of its (now locked)
         /// qualifying set and may not submit a round-2 response for it.
         NotInLockedSet,
+        /// The caller already has `T::MaxPendingOprfQueriesPerCitizen` open (un-pruned)
+        /// `PendingOprfQueries` entries.
+        TooManyPendingOprfQueries,
+        /// `prune_oprf_query`: this query is neither past its `OprfQuerySlaBlocks` deadline
+        /// nor fully answered (every committee slot at `T::OprfThreshold` round-2 responses),
+        /// so it is still potentially live and must not be pruned yet.
+        QueryNotPrunable,
     }
 
     #[pallet::call]
@@ -1135,6 +1163,11 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_citizen(&who), Error::<T>::NotRegistered);
+            let open_count = PendingOprfQueryCountBySubmitter::<T>::get(&who);
+            ensure!(
+                open_count < T::MaxPendingOprfQueriesPerCitizen::get(),
+                Error::<T>::TooManyPendingOprfQueries
+            );
             let query_id = NextQueryId::<T>::get();
             let next_id = query_id.checked_add(1).ok_or(Error::<T>::QueryIdOverflow)?;
             NextQueryId::<T>::put(next_id);
@@ -1146,6 +1179,7 @@ pub mod pallet {
                     posted_at: frame_system::Pallet::<T>::block_number(),
                 },
             );
+            PendingOprfQueryCountBySubmitter::<T>::insert(&who, open_count.saturating_add(1));
             Self::deposit_event(Event::OprfQuerySubmitted { query_id, submitter: who });
             Ok(())
         }
@@ -1260,6 +1294,61 @@ pub mod pallet {
             )?;
 
             Self::deposit_event(Event::OprfRound2Submitted { query_id, committee_slot, member: who });
+            Ok(())
+        }
+
+        /// Prune a dead or fully-answered OPRF mailbox entry, freeing the chain state
+        /// `submit_oprf_query`/`submit_oprf_round1`/`submit_oprf_round2` accumulated for
+        /// `query_id`. Permissionless — anyone may call it once one of two safe-to-prune
+        /// conditions holds (this pallet has no existing per-block sweep hook to piggyback
+        /// on, so this follows the pallet's existing style of explicit, unprivileged
+        /// maintenance calls rather than adding new unbounded `on_initialize` iteration):
+        ///
+        /// 1. **Expired and dead**: the query's `OprfQuerySlaBlocks` deadline (from
+        ///    `posted_at`) has passed. `submit_oprf_round1` already refuses new round-1
+        ///    submissions once that deadline passes (`Error::QueryExpired`), so whatever
+        ///    partial round-1/round-2 state exists at that point can never grow further and is
+        ///    safe to discard.
+        /// 2. **Fully answered**: every one of the `NUM_COMMITTEES` committee slots has
+        ///    reached `T::OprfThreshold` round-2 responses for this `query_id`. This mailbox
+        ///    is read off-chain (the querying citizen's own client combines the round-1/
+        ///    round-2 data into the final anchor proof — see `OprfRound2Response`'s doc
+        ///    comment; this pallet never reads it back itself), so pruning does not happen
+        ///    automatically the instant this condition is reached: the caller (typically the
+        ///    querying citizen, once their client has retrieved and combined the data) decides
+        ///    the timing, so pruning can never race a legitimate read.
+        ///
+        /// Removes `PendingOprfQueries[query_id]` and, for every slot in `0..NUM_COMMITTEES`,
+        /// `OprfRound1Commitments[query_id, slot]` and `OprfRound2Responses[query_id, slot]`,
+        /// and decrements the submitter's `PendingOprfQueryCountBySubmitter`.
+        #[pallet::call_index(18)]
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn prune_oprf_query(origin: OriginFor<T>, query_id: u64) -> DispatchResult {
+            ensure_signed(origin)?;
+            let query = PendingOprfQueries::<T>::get(query_id).ok_or(Error::<T>::QueryNotFound)?;
+
+            let deadline = query
+                .posted_at
+                .saturating_add(BlockNumberFor::<T>::from(T::OprfQuerySlaBlocks::get()));
+            let expired = frame_system::Pallet::<T>::block_number() > deadline;
+
+            let fully_answered = (0..NUM_COMMITTEES).all(|slot| {
+                (OprfRound2Responses::<T>::get(query_id, slot).len() as u32)
+                    == T::OprfThreshold::get()
+            });
+
+            ensure!(expired || fully_answered, Error::<T>::QueryNotPrunable);
+
+            PendingOprfQueries::<T>::remove(query_id);
+            for slot in 0..NUM_COMMITTEES {
+                OprfRound1Commitments::<T>::remove(query_id, slot);
+                OprfRound2Responses::<T>::remove(query_id, slot);
+            }
+            PendingOprfQueryCountBySubmitter::<T>::mutate(&query.submitter, |count| {
+                *count = count.saturating_sub(1);
+            });
+
+            Self::deposit_event(Event::OprfQueryPruned { query_id, submitter: query.submitter });
             Ok(())
         }
     }
