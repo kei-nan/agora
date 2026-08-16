@@ -62,6 +62,64 @@ pub mod pallet {
     #[pallet::pallet]
     pub struct Pallet<T>(_);
 
+    // ── Origin ───────────────────────────────────────────────────────────────
+
+    /// Origin that succeeds only when both hold: the underlying origin is `Root`, *and* an
+    /// emergency is currently active (`ActiveEmergency::<T>::get().is_some()`). Mirrors the
+    /// structural pattern of `pallet_legislature::EnsureLegislatureMotion` (a marker struct
+    /// generic over `T`, implementing the relevant `EnsureOrigin*` trait, with a
+    /// `#[cfg(feature = "runtime-benchmarks")] fn try_successful_origin` for benchmarking) but
+    /// needs no extra argument via `EnsureOriginWithArg`: unlike a legislature motion, which
+    /// must be tied to a specific approved call, "is an emergency active right now" is a
+    /// single global fact read directly from storage, not a per-call approval token.
+    ///
+    /// This is deliberately layered on top of `Root`, not a replacement for it. An origin that
+    /// accepted *any* signed (or unsigned) caller as long as `ActiveEmergency` were `Some`
+    /// would let arbitrary accounts force an OPRF rotation during a real emergency — a *larger*
+    /// attack surface than the bare-root gate it replaces, not a smaller one. Requiring `Root`
+    /// as well means the set of accounts that can ever succeed through this origin is a strict
+    /// subset of who could succeed before (still gated by however `Root` is reached in this
+    /// runtime); what changes is that even `Root` can no longer act unilaterally at will — it
+    /// must wait for the Emergency Council to have genuinely declared (via its own
+    /// council-membership + supermajority-vote path in `vote_declare_emergency`) an emergency
+    /// that has not yet been lifted (`vote_end_emergency`) or auto-sunset-expired
+    /// (`on_initialize`). There is no way to make `ActiveEmergency` read `Some` other than
+    /// through that real declaration path — this pallet exposes no other writer of that
+    /// storage item.
+    pub struct EnsureActiveEmergency<T>(core::marker::PhantomData<T>);
+
+    impl<T: Config> frame_support::traits::EnsureOrigin<T::RuntimeOrigin>
+        for EnsureActiveEmergency<T>
+    {
+        type Success = ();
+
+        fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
+            use frame_system::RawOrigin;
+            match o.clone().into() {
+                Ok(RawOrigin::Root) if ActiveEmergency::<T>::get().is_some() => Ok(()),
+                _ => Err(o),
+            }
+        }
+
+        #[cfg(feature = "runtime-benchmarks")]
+        fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
+            // Plant a minimal active emergency so the benchmark-generated Root origin
+            // validates, mirroring how `EnsureLegislatureMotion::try_successful_origin`
+            // plants a `PendingLegislatureApproval` token for its own benchmarks.
+            let now = frame_system::Pallet::<T>::block_number();
+            ActiveEmergency::<T>::put(EmergencyInfo {
+                declared_at: now,
+                expires_at: now
+                    .saturating_add(BlockNumberFor::<T>::from(T::MaxEmergencyBlocks::get())),
+                reason_hash: [0u8; 32],
+                votes_to_declare: 0,
+                votes_to_end: 0,
+                _phantom: core::marker::PhantomData,
+            });
+            Ok(frame_system::RawOrigin::Root.into())
+        }
+    }
+
     // ── Config ───────────────────────────────────────────────────────────────
 
     #[pallet::config]

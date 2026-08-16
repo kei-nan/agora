@@ -1309,10 +1309,31 @@ fn rotate_oprf_scheme_fails_for_unauthorized_origin() {
     });
 }
 
+/// Declares a genuine, council-voted emergency in the mock's wired-in
+/// `pallet_emergency_council` instance, via its own real supermajority-vote path — the only
+/// way `EnsureActiveEmergency` (bound to `EmergencyRotationOrigin` below) can ever succeed.
+fn declare_active_emergency() {
+    assert_ok!(EmergencyCouncil::add_council_member(RuntimeOrigin::root(), 1));
+    assert_ok!(EmergencyCouncil::add_council_member(RuntimeOrigin::root(), 2));
+    assert_ok!(EmergencyCouncil::add_council_member(RuntimeOrigin::root(), 3));
+    assert_ok!(EmergencyCouncil::vote_declare_emergency(
+        RuntimeOrigin::signed(1),
+        [7u8; 32],
+        50
+    ));
+    assert_ok!(EmergencyCouncil::vote_declare_emergency(
+        RuntimeOrigin::signed(2),
+        [7u8; 32],
+        50
+    ));
+    assert!(pallet_emergency_council::ActiveEmergency::<Test>::get().is_some());
+}
+
 #[test]
-fn emergency_rotate_oprf_scheme_works() {
+fn emergency_rotate_oprf_scheme_works_when_emergency_active() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        declare_active_emergency();
         assert_eq!(OprfSchemeVersion::<Test>::get(), 0);
 
         assert_ok!(Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::root()));
@@ -1324,12 +1345,57 @@ fn emergency_rotate_oprf_scheme_works() {
     });
 }
 
+/// The core security property this wiring exists for: `EmergencyRotationOrigin` is no longer
+/// a bare `EnsureRoot` — a root call with *no* active, council-declared emergency must now be
+/// rejected, where previously (plain `EnsureRoot`) it would have succeeded.
+#[test]
+fn emergency_rotate_oprf_scheme_fails_for_root_without_active_emergency() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert!(pallet_emergency_council::ActiveEmergency::<Test>::get().is_none());
+
+        assert_noop!(
+            Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::root()),
+            DispatchError::BadOrigin
+        );
+        assert_eq!(OprfSchemeVersion::<Test>::get(), 0);
+    });
+}
+
 #[test]
 fn emergency_rotate_oprf_scheme_fails_for_unauthorized_origin() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        // Signed origin fails regardless of emergency state.
         assert_noop!(
             Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::signed(1)),
+            DispatchError::BadOrigin
+        );
+
+        declare_active_emergency();
+        assert_noop!(
+            Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::signed(1)),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn emergency_rotate_oprf_scheme_fails_again_after_emergency_lifted() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency();
+        assert_ok!(Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::root()));
+
+        // Lift the emergency via the real supermajority end-vote path.
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(pallet_emergency_council::ActiveEmergency::<Test>::get().is_none());
+
+        // A second emergency rotation is refused now that the emergency has ended, even
+        // though the first one succeeded moments earlier under the same root key.
+        assert_noop!(
+            Identity::emergency_rotate_oprf_scheme(RuntimeOrigin::root()),
             DispatchError::BadOrigin
         );
     });
