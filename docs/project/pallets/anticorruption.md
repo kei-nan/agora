@@ -17,17 +17,36 @@ Storage:
 `ReportStatus` enum: `Pending` → `Flagged` → `UnderInvestigation` → `Cleared` | `ReferredToCourts`
 
 Enforcement: `Pallet::has_current_disclosure(who)` returns `true` only if `who` has an
-`AssetDisclosures` entry whose `update_due_at` has not yet passed. pallet-elections calls this
-(via its `DisclosureChecker` config trait, wired to `Runtime` in `runtime/src/configs/mod.rs`) to
-require a current disclosure before `register_candidate` succeeds — so letting a disclosure lapse
-past its due date blocks future candidacy, not just future disclosures.
+`AssetDisclosures` entry whose `update_due_at` has not yet passed. Nothing currently calls it
+to gate anything — it's exercised only by this pallet's own unit tests
+(`pallets/pallet-anticorruption/src/tests.rs`). There is no `DisclosureChecker` config trait
+anywhere in the codebase (`grep -rn "DisclosureChecker" pallets/ runtime/` returns nothing), and
+pallet-elections has no `register_candidate` call to gate in the first place — that call
+belonged to the Elections Commission subsystem removed in commit `7d9a753` (see
+`docs/project/pallets/elections.md`); legislature seats now fill automatically by liquid-
+democracy backing, with no candidate-registration step at all. So as things stand, letting a
+disclosure lapse past its due date has no on-chain consequence beyond `has_current_disclosure`
+itself reporting `false` — nothing currently reads that to block candidacy or anything else.
 
 Calls:
 - `submit_asset_disclosure(ipfs_hash)` — any signed; mandatory annual renewal
 - `register_conflict(entity_id, conflict_type)` — any signed
 - `clear_conflict(entity_id)` — any signed (self-removal)
-- `submit_whistleblower_report(content_hash, zk_proof, public_inputs)` — gated by ZK citizenship proof;
-  stores `public_inputs[0]` as nullifier; `(nullifier, content_hash)` unique per citizen per report.
+- `submit_whistleblower_report(content_hash, zk_proof, public_inputs)` — gated by ZK citizenship
+  proof. Requires `public_inputs.len() >= MIN_PUBLIC_INPUTS` (checked before indexing anything or
+  calling the verifier), then checks `public_inputs[SERVICE_SCOPE_INDEX]` /
+  `[SERVICE_SUBSCOPE_INDEX]` against this call's own `WHISTLEBLOWER_REPORT_SERVICE_SCOPE`/
+  `SUBSCOPE` constants — domain separation so a proof generated for a different purpose (e.g.
+  `pallet-identity::register_citizen`) can't be replayed here even though it's a valid,
+  observable-on-chain ZK proof of citizenship. Only after both of those and the verifier call
+  (`T::ZkVerifier::verify`) succeed does it extract the per-citizen nullifier — from
+  `public_inputs[public_inputs.len() - 2]` (`scoped_nullifier`), the same extraction
+  `pallet_identity::Pallet::register_citizen` uses, **not** `public_inputs[0]`
+  (`certificate_registry_root`, shared by every citizen at a given registry state, which was the
+  bug fixed in commit `1f3941e`: using it as the dedup key would have collapsed dedup to
+  essentially just `content_hash`, since `public_inputs[0]` doesn't vary per citizen at all).
+  `(nullifier, content_hash)` is then checked/stored unique per citizen per report via
+  `ReportNullifiers`.
   **Not sender-anonymous** despite the module doc's original "anonymous ZK whistleblower" framing
   and `CLAUDE.md`'s "ZK whistleblower" label: it's a normal `ensure_signed` extrinsic, so the
   reporter's `AccountId` is public block data, and pallet-identity's `CitizenNullifier` map

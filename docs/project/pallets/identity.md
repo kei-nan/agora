@@ -41,6 +41,15 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
     argument — it's extracted directly from the proof's own public inputs
     (`scoped_nullifier`, see the module doc comment)
   - Checks passport expiry and country allowlist from public inputs, same as before
+  - Freshness (`check_outer_proof_freshness`, shared with `reverify_citizen`/
+    `migrate_oprf_scheme`): rejects a proof whose `current_date` public input is more than
+    `MaxAnchorProofAge` older than chain time (`AnchorProofStale`) *and*, as of commit `0034e33`,
+    more than `MaxAnchorProofClockSkew` in the future (`AnchorProofFuture`). `current_date` is a
+    fully prover-controlled public input — the in-circuit check only constrains it against the
+    passport's own expiry, never against real time — so before this upper-bound check, a single
+    future-dated proof would make the staleness check's `now.saturating_sub(current_date)` clamp
+    to 0 and pass the freshness check forever, keeping a citizen "verified" indefinitely off one
+    proof.
   - Requires a mandatory OPRF identity-anchor check (`anchor` + `oprf_pk_hashes`, verified via
     `AnchorVerifier`) as the Sybil-resistance gate, rejecting if `anchor` already exists under
     the current `OprfSchemeVersion` in `IdentityAnchorRegistry`
@@ -49,7 +58,16 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
 - `restore_citizen_rights(nullifier)` — `SuspensionOrigin`; clears both `SuspendedNullifiers` and `SuspendedByJuryReview`
 - `add_allowed_merkle_root(root)` / `remove_allowed_merkle_root(root)` — `AdminOrigin`
 - `reverify_citizen(proof)` — any registered citizen; extends `ReverificationDeadline` via `AnchorVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep)
-- `migrate_oprf_scheme(old_anchor_proof, new_anchor_proof, consistency_proof)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own on-file scheme version + 1
+- `migrate_oprf_scheme(zk_proof, public_inputs, new_anchor, old_oprf_pk_hashes,
+  new_oprf_pk_hashes)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own
+  on-file scheme version + 1. Verifies the outer proof and its freshness, then checks committee
+  keys and the migration proof itself, and only *after* all of that checks whether `new_anchor`
+  is already taken (`NewAnchorAlreadyUsed`) — this verify-then-check ordering was a fix (commit
+  `0034e33`): checking `NewAnchorAlreadyUsed` first would have let an attacker submit a bogus
+  `zk_proof` with a guessed `new_anchor` and learn, from the returned error alone and at zero
+  real proof-computation cost, whether that `(new_version, new_anchor)` pair already belongs to
+  another citizen — leaking cross-citizen anchor-registry membership ahead of proof
+  authentication.
 - `rotate_oprf_scheme()` — `AdminOrigin`; scheduled-path advance of `OprfSchemeVersion` (the ~4-year cycle)
 - `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin` (currently `EnsureRoot` placeholder); out-of-cycle rotation if the current OPRF scheme is suspected broken
 - `declare_no_other_passport()` — any registered citizen; records a self-declaration attestation used only as an ex-post basis for a `pallet-courts` `CitizenConduct` case if later found false

@@ -15,19 +15,27 @@ Storage:
 - `MinisterPortfolio`: `AccountId` → `portfolio_id` (enables O(1) is_active_minister)
 - `NextPortfolioId`: `u32`
 - `PendingMinisterNomination`: `portfolio_id` → `AccountId` — PM's staged pick, awaiting legislature confirmation
-- `PmConsecutiveTerms`: `AccountId` → `u32` — consecutive-term counter, reset to 0 the instant anyone else holds the office
+- `PmTenureHistory`: `BoundedVec<PmTenureRecord<AccountId, BlockNumber>, MaxPmTenureHistory>` —
+  closed-out past PM tenures (start/end block per holder), used together with the in-progress
+  tenure to compute how much of the trailing `PmOccupancyWindowBlocks` window any account has
+  occupied
+- `CurrentPmTenureStart`: `Option<BlockNumber>` — start block of the sitting PM's in-progress tenure
 - `InvestitureRound`: `Option<InvestitureRoundInfo { nomination_end, voting_end }>` — the currently open PM investiture round, if any
 - `PmNominees`: `BoundedVec<AccountId, MaxPmCandidates>` — nomination order also serves as the deterministic tie-break order
 - `PmBallots`: `AccountId` (voter) → `BoundedVec<AccountId, MaxPmCandidates>` — ranked ballot, most-preferred first
 - `NextVacancySweepBlock`: `BlockNumber` — when the conviction-vacancy sweep next runs
+- `EndVotes`: `AccountId` → `bool` — cabinet members' votes to end an active emergency early (`vote_end_emergency`)
 
 Config: `LegislatureOrigin = EnsureLegislatureMotion<Runtime>`, `MaxPortfolios = 20`,
 `MaxEmergencyBlocks = 30 * DAYS` (= 216,000 blocks at this chain's real 12s/block time —
 previously a hardcoded `432_000`, which was 30 days at a stale 6s/block assumption and
 actually enforced a 60-day cap; fixed 2026-08-09), `RatificationWindowBlocks = 3 * DAYS`,
 `SupermajorityNumerator/Denominator = 2/3`, `PmNominationWindowBlocks = 7 * DAYS`,
-`PmVotingWindowBlocks = 7 * DAYS`, `MaxPmCandidates = 20`, `MaxConsecutivePmTerms = 2`
-(matches pallet-elections' delegate term-limit philosophy), `VacancySweepIntervalBlocks = 1 * DAYS`.
+`PmVotingWindowBlocks = 7 * DAYS`, `MaxPmCandidates = 20`,
+`VacancySweepIntervalBlocks = 1 * DAYS`, `PmOccupancyWindowBlocks = 365 * DAYS`,
+`MaxPmOccupancyBlocks = 270 * DAYS`, `MaxPmTenureHistory = 128` (see "Term limits" below —
+these replaced an earlier `PmConsecutiveTerms`/`MaxConsecutivePmTerms = 2` pair that no longer
+exist in the code).
 
 ### PM investiture (ranked-choice among legislature members)
 
@@ -40,7 +48,8 @@ process whenever convenient. A vacancy is now always filled by an instant-runoff
   that needs a legislature vote. Opens a `PmNominationWindowBlocks`-long nomination window,
   immediately followed by a `PmVotingWindowBlocks`-long voting window.
 - `nominate_pm(candidate)` — caller and candidate must both currently hold a legislature seat;
-  rejects a candidate already at `MaxConsecutivePmTerms`; bounded by `MaxPmCandidates`.
+  rejects a candidate who would exceed `MaxPmOccupancyBlocks` of PM tenure within the trailing
+  `PmOccupancyWindowBlocks` window (see "Term limits" below); bounded by `MaxPmCandidates`.
 - `cast_pm_ballot(ranked_candidates)` — legislature member only, during the voting window;
   every ranked candidate must be a nominee this round, no duplicates; a later call replaces an
   earlier ballot from the same voter.
@@ -60,8 +69,8 @@ process whenever convenient. A vacancy is now always filled by an instant-runoff
   majority topple a government for purely obstructive reasons with no obligation to agree on a
   replacement. Requiring the successor to be named in the same vote means the office is never
   left vacant by this path, and removal is only possible when a replacement already has
-  support. `successor` must be a current legislature member and must not already be at
-  `MaxConsecutivePmTerms`.
+  support. `successor` must be a current legislature member and must not already be at the
+  `MaxPmOccupancyBlocks` occupancy cap (same check as `nominate_pm`).
 - `resign_as_pm()` — sitting PM only. Vacates the office immediately (no successor named) and
   opens the seat for a fresh `open_pm_investiture()` round.
 
@@ -86,11 +95,25 @@ incompatibility rule without circular dependencies.
 
 ### Term limits
 
-`MaxConsecutivePmTerms` caps only *consecutive* re-selection, not a lifetime bar:
-`PmConsecutiveTerms` increments when the same account is re-installed with nobody else having
-held the office in between, and resets to 0 for the outgoing holder the instant anyone else
-takes the seat (`install_pm`). Both `nominate_pm` and `remove_and_replace_prime_minister` reject
-a candidate/successor already at the cap.
+A rolling-window occupancy cap, not a consecutive-terms counter: no account may hold the PM
+office for more than `MaxPmOccupancyBlocks` out of the trailing `PmOccupancyWindowBlocks` blocks
+(default: no more than 270 of the trailing 365 days, ~74%). This replaced an earlier
+`PmConsecutiveTerms`/`MaxConsecutivePmTerms` pair that no longer exist in the code — a plain
+consecutive-term counter resets to 0 the instant anyone else holds the office even briefly, so a
+one-block puppet reinstall (install a cooperating placeholder for a single block, then reinstall
+the real incumbent) would have reset the counter and let occupancy continue indefinitely; a
+rolling window can't be reset that way, since it sums actual time occupied rather than counting
+discrete "terms."
+
+`CurrentPmTenureStart` tracks the sitting PM's in-progress tenure; every path that ends a tenure
+(resignation, removal, conviction-triggered vacancy) calls `close_current_pm_tenure`, which
+closes it into `PmTenureHistory` (bounded by `MaxPmTenureHistory`, with the oldest record dropped
+as a last-resort safety valve if that bound is hit) and clears `CurrentPmTenureStart`.
+`pm_occupancy_in_window` sums, over `PmTenureHistory` plus the in-progress tenure if the account
+being checked is the sitting PM, however much of each tenure falls inside
+`[now - PmOccupancyWindowBlocks, now]`. Both `nominate_pm` and
+`remove_and_replace_prime_minister` reject a candidate/successor whose occupancy would exceed
+`MaxPmOccupancyBlocks`.
 
 ### Conviction-triggered vacancy sweep
 
@@ -137,3 +160,19 @@ the legislature's role is to ratify after the fact or let the declaration lapse,
 also vote (via ordinary cabinet-supermajority mechanics) to end an emergency early. Do not
 confuse this with `pallet-emergency-council`'s time-locked powers, which are a separate pallet
 with its own sunset clause.
+
+**Quorum floor (commit `98c5040`)**: both `vote_declare_emergency` and `vote_end_emergency` now
+require `cabinet_size() >= 2` before evaluating the supermajority ratio at all (rejected with
+`CabinetTooSmallForEmergencyVote` otherwise). Before this, a freshly-invested PM with no
+confirmed ministers yet had `cabinet_size() == 1`, and a single vote trivially satisfies "2/3 of
+1" — letting a lone PM unilaterally declare (or end) an emergency with no real supermajority
+involved.
+
+**`EndVotes` purged on every office-vacating path (same commit)**: `EndVotes` (a cabinet member's
+pending vote to end an active emergency early) is now cleared alongside the existing
+`DeclareVotes` purge everywhere an office empties out — `resign_as_pm`, `dismiss_minister`,
+minister `resign()`, `appoint_minister`'s outgoing-minister branch, `install_pm`'s displacement
+branch, and both branches of `run_vacancy_sweep` (PM and minister). Previously only
+`DeclareVotes` was purged on these paths, so a departed member's stale "end emergency" vote kept
+counting toward `vote_end_emergency`'s tally even as the live-computed cabinet-size denominator
+shrank around it — inflating the effective vote share left behind by anyone who exited office.

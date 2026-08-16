@@ -36,6 +36,19 @@ Delegation guards:
   later check on that stale terminal too permissive, never let the cap-violating edge itself go
   undetected. See `DelegatedWeight`'s doc comment in `pallets/pallet-voting/src/lib.rs` for the
   full reasoning.
+  - Re-targeting an existing delegation (`who` already has an outgoing `Delegations` record for
+    the topic, to a *different* delegate than before) uses the old record's own snapshotted
+    `resolved_weight` — not `1 + DelegatedWeight[who]` — as `who`'s real contribution: per
+    `DelegatedWeight`'s documented invariant, `DelegatedWeight[who]` is always 0 while `who` has
+    an active outgoing delegation, so it does not reflect `who`'s real transitively resolved
+    weight in the re-target case the way it does for a first-time delegator. That snapshotted
+    `resolved_weight` is used both to decrement the old hub's `DelegatedWeight` when the old edge
+    is torn down and to increment the new hub's `DelegatedWeight` (and is itself re-snapshotted
+    into the new `Delegations` record for next time). This was fixed in commit `65c326a`: the
+    previous code used `1 + DelegatedWeight[who]` for the re-target case too, which — since
+    `DelegatedWeight[who]` is always 0 mid-delegation — silently collapsed a re-targeting
+    delegator's real weight down to 1, undercounting delegation concentration and letting the
+    cap check for the new edge pass too easily.
 
 `Delegations` is only resolved into an actual tally for System 3 (Referenda) below, via
 `finalize_referendum`/`apply_delegated_weight` — a non-voting delegator's weight counts toward
@@ -82,7 +95,14 @@ Config:
 
 Calls:
 - `vote_referendum(referendum_id, in_favor: bool)` — one vote per active citizen; requires active epoch
-- `finalize_referendum(referendum_id)` — anyone, after `end_block`; enacts law if passed
+- `finalize_referendum(referendum_id)` — anyone, after `end_block`; enacts law if passed. In the
+  common case this never needs to be called at all: `on_initialize` auto-finalizes any referendum
+  scheduled (via `PendingFinalization`, populated when the referendum is created) at the first
+  block after its `end_block`, running the same `do_finalize_referendum` logic. This call remains
+  as a permissionless backstop for anything the hook misses — e.g. a block whose
+  `PendingFinalization` list was already full when the referendum was created (bounded by
+  `MaxReferendaPerBlock`) — so a referendum can never get permanently stuck in `Voting` if the
+  automatic path doesn't reach it.
 - `create_constitutional_referendum(topic_hash)` — `LegislatureOrigin`; Constitutional-tier (67%); no petition path
 - `create_foundational_referendum(topic_hash)` — `LegislatureOrigin`; Foundational-tier (75%); no petition path
 - `open_voting_epoch(duration_blocks)` — `LegislatureOrigin`; opens a Swiss-model voting window

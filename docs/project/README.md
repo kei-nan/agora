@@ -40,7 +40,7 @@ democracy-chain/
 │   │   └── vk_sha1.bin            # STALE — ditto
 │   └── src/
 │       ├── configs/mod.rs         # all pallet Config impls + cross-pallet trait wiring
-│       ├── lib.rs                 # runtime construction (construct_runtime!)
+│       ├── lib.rs                 # runtime construction (#[frame_support::runtime] macro, not the legacy construct_runtime!)
 │       └── verifier.rs            # ZkPassportUltraHonkVerifier (!dev-mode) — verifying, see changelog #72
 ├── pallets/                       # see pallets/ below, one file per pallet
 ├── scripts/

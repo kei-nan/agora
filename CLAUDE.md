@@ -17,8 +17,8 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
   if it matters for what you're doing.)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
-  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (140 tests
-  across 11 suites, up from the 77 changelog #80 originally verified); no JDK/Android SDK in
+  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (197 tests
+  across 14 suites, up from the 77 changelog #80 originally verified); no JDK/Android SDK in
   this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
   exist (see `docs/project/apps/mobile.md`, changelog #80)
 
@@ -254,11 +254,17 @@ authoritative version of this list; treat this section as a summary, not the sou
    existing Claude integration remains a separate, read-only citizen Q&A feature, not this.
    `court-oracle` now also schedules `finalize_ruling`: it polls cases in `AIRulingIssued`
    status, and once the current block passes `AIRulingBlock[case_id] + AppealWindowBlocks` with
-   no appeal filed (status still `AIRulingIssued`, not moved to `InJuryAppeal`), it recovers the
-   verdict from the ruling document it originally published to IPFS and submits
-   `finalize_ruling`, signed by the same oracle key `submit_ai_ruling` already uses (both calls
-   share the same `OracleOrigin` gate). Still PARTIAL, not done: never run against a real
-   chain/Claude API/IPFS daemon (unit-tested at the pure-logic level only, 47/47 passing); and
+   no appeal filed (status still `AIRulingIssued`, not moved to `InJuryAppeal`), it submits
+   `finalize_ruling(case_id)`, signed by the same oracle key `submit_ai_ruling` already uses
+   (both calls share the same `OracleOrigin` gate). Verdict binding moved earlier, at commit
+   `ad30aa3`: `submit_ai_ruling` is now a 4-arg call (`case_id, ruling_hash, model_version,
+   verdict`) that stores `verdict` on-chain in `AIRulingVerdict` at submission time, and
+   `finalize_ruling` takes no verdict argument of its own — it just applies whatever was already
+   committed, closing the hole where a compromised oracle key could publish reasoning saying one
+   thing and finalize with a different verdict. Still PARTIAL, not done: never run against a real
+   chain/Claude API/IPFS daemon (unit-tested at the pure-logic level only, 47/47 passing — added
+   IPFS content-hash verification and Claude prompt-injection delimiting after a 2026-08-16
+   review; see `court-oracle/README.md`); and
    `Courts::set_oracle_account` has never been called on a real chain. See
    `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full accounting.
 3. **Mobile app native build** — `android/` and its NFC module already exist and are committed;

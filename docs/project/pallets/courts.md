@@ -34,13 +34,27 @@ Calls:
   the case reaches a final status) to price the spam risk free Level-0 rulings would otherwise
   create; `auto_file_case(subject)` (system-initiated, e.g. `AutoChallengeHook`) is the
   bond-free internal equivalent, not directly callable
-- `submit_ai_ruling(case_id, ruling_hash, model_version)` — `OracleOrigin`; `ruling_hash` is
-  the IPFS CID of the full reasoning document; `model_version` must match
+- `submit_ai_ruling(case_id, ruling_hash, model_version, verdict)` — `OracleOrigin`; `ruling_hash`
+  is the IPFS CID of the full reasoning document; `model_version` must match
   `CurrentAIModelVersion` (rejected with `NoApprovedAIModel`/`UnapprovedAIModel` otherwise) —
-  the actual on-chain enforcement of "AI model updates require on-chain governance vote"
-- `appeal_ruling(case_id)` — within 7-day window; triggers `select_jury`
+  the actual on-chain enforcement of "AI model updates require on-chain governance vote";
+  `verdict` is committed on-chain here, in `AIRulingVerdict`, at submission time — this is the
+  binding between the published reasoning and the verdict `finalize_ruling`'s no-appeal path
+  will later apply, closing the hole where a compromised oracle key could publish reasoning
+  saying one thing and finalize with the opposite verdict
+- `appeal_ruling(case_id)` — within 7-day window; triggers `select_jury`. Restricted to the
+  case's filer, the designated oracle, or (for system-filed cases with no natural filer) any
+  active citizen (`is_filer_or_oracle`, the same rule `select_jury` uses) — plus, separately,
+  the verified losing party of a `CaseSubject::CitizenConduct` case, matched by registered
+  identity nullifier (`is_ruled_against_party`): a genuine appeal right for the person actually
+  ruled against, not just whoever filed. Before this check existed, any signed account could
+  force a case into `InJuryAppeal` and hijack it into permanent limbo. `LawChallenge`/
+  `TreasuryDispute` cases don't get an equivalent ruled-against-party right yet — they don't
+  identify a specific ruled-against citizen the way `CitizenConduct` does.
 - `select_jury(case_id, jury_size)` — filer, oracle, or (for system-filed cases) any active citizen; size validated against case subject; only callable once `JurySeedDelayBlocks` blocks have elapsed since `appeal_ruling`
-- `finalize_ruling(case_id, verdict)` — `OracleOrigin`; for un-appealed Level 0 cases
+- `finalize_ruling(case_id)` — `OracleOrigin`; for un-appealed Level 0 cases. Takes no verdict
+  argument of its own — applies whatever `submit_ai_ruling` already committed in
+  `AIRulingVerdict`
 - `cast_jury_vote(case_id, verdict)` — seated juror only; auto-finalizes on majority
 - `set_oracle_account(account)` — root; rotatable without runtime upgrade
 - `add_ai_governance_member(account)` / `remove_ai_governance_member(account)` — root; manages

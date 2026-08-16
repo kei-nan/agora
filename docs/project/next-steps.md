@@ -71,18 +71,27 @@
     scheduling`)**: the `finalize_ruling` gap below is closed. `poll_once` now has a second
     branch for cases in `CaseStatus::AIRulingIssued`: once the current block passes
     `AIRulingBlock[case_id] + AppealWindowBlocks` with no appeal filed (status still
-    `AIRulingIssued`, not moved to `InJuryAppeal` by `appeal_ruling`), it recovers the verdict
-    from the ruling document originally published to IPFS (`submit_ai_ruling` never records a
-    verdict on-chain, only `ruling_hash`) and submits `finalize_ruling(case_id, verdict)`, signed
-    by the same oracle key `submit_ai_ruling` already uses — both calls share the same
-    `T::OracleOrigin` gate (`EnsureOracle`), so no separate signer/origin was needed.
-    `cargo test` now passes 47/47 (13 new tests: `should_finalize`'s appeal-window/status gating,
-    `parse_verdict_from_ruling_document`'s parsing, `Verdict`'s SCALE round-trip, and the
-    `finalize_ruling` call-byte layout). **Still marked PARTIAL, not DONE**: (a) never run
-    against a real chain, Claude API, or IPFS daemon — the live RPC/API/daemon round trips and
-    the full orchestration loop (both branches, and `fetch_ruling_verdict`'s gateway fetch) are
-    unit-tested at the pure-logic level only; (b) `Courts::set_oracle_account` (root-only) was
-    never called, so no real chain currently accepts this service's signed calls. See
+    `AIRulingIssued`, not moved to `InJuryAppeal` by `appeal_ruling`), it submits
+    `finalize_ruling(case_id, verdict)`, signed by the same oracle key `submit_ai_ruling` already
+    uses — both calls share the same `T::OracleOrigin` gate (`EnsureOracle`), so no separate
+    signer/origin was needed. **Update, commit `ad30aa3`**: verdict binding moved to submission
+    time. `submit_ai_ruling` is now a 4-arg call (`case_id, ruling_hash, model_version, verdict`)
+    that commits `verdict` on-chain in `AIRulingVerdict` when the ruling is first submitted, not
+    reconstructed later from the published IPFS document; `finalize_ruling` correspondingly
+    dropped its own `verdict` argument (`finalize_ruling(case_id)`) and just applies whatever was
+    already committed. This closes the hole where a compromised oracle key could publish
+    reasoning saying one thing and finalize with a different verdict — there is nothing left for
+    the caller to choose at finalization time. `court-oracle`'s `extrinsic.rs` was updated to
+    match both call signatures. `cargo test` passed 42/42 immediately after this fix (the
+    IPFS-verdict-recovery tests the old scheme needed — `parse_verdict_from_ruling_document`'s
+    parsing, the old 3-arg `finalize_ruling` call-byte layout — were removed as obsolete; the
+    appeal-window/status gating tests remained). A follow-up 2026-08-16 review then added IPFS
+    content-hash verification and Claude prompt-injection delimiting (5 new tests), bringing the
+    current count to 47/47 — see `court-oracle/README.md`. **Still marked PARTIAL, not DONE**:
+    (a) never run against a real chain,
+    Claude API, or IPFS daemon — the live RPC/API/daemon round trips and the full orchestration
+    loop are unit-tested at the pure-logic level only; (b) `Courts::set_oracle_account` (root-
+    only) was never called, so no real chain currently accepts this service's signed calls. See
     `court-oracle/README.md` and `docs/project/changelog/086.md` for the full accounting.
 11. [DONE] **Multi-agent security review fixes (2026-08-08/09)** — a 7-agent parallel review of
     the whole repo found several real bugs, landed as reconciled, tested branches
