@@ -3,38 +3,63 @@
  * instance, mirroring `mobile/src/chain/identity.test.ts` and `voting.test.ts`'s
  * approach (a fake `ApiPromise`-shaped object, no real network, no live chain).
  *
- * Covers:
+ * Covers the two-round migration (`submit_oprf_round1`/`submit_oprf_round2`, call
+ * indices 16/17 — the old `submit_oprf_response`/`oprfResponses` this file used to
+ * test no longer exist on-chain):
  *  - `getMemberCommitteeSlots` reads `committeeMembers` for every slot and returns
- *    only the ones containing the given address;
+ *    only the ones containing the given address (unchanged by the migration);
  *  - `fetchPendingDuties` cross-references `pendingOprfQueries` against
- *    `committeeMembers` and `oprfResponses` (a presence check per `(query, slot)`
- *    pair — see `oprfCommittee.ts`'s doc comment on why this isn't per-address),
- *    producing one duty per outstanding pair and skipping already-answered ones;
- *  - `fulfillDuty` calls the injected `CommitteeCrypto` with the whole 64-byte
- *    blinded query and this member's secret key, then submits `submitOprfResponse`
- *    with the returned evaluation and proof unchanged, in the pallet's argument
- *    order;
+ *    `committeeMembers` and the new `oprfRound1Commitments`/`oprfRound2Responses`
+ *    double-maps plus the `oprfThreshold` constant, producing one duty per pair the
+ *    member still owes a round-1 or round-2 submission for, tagged with the right
+ *    `phase`;
+ *  - `submitRound1` calls the injected `CommitteeCrypto.round1` with the whole
+ *    64-byte blinded query, the secret share, and the given seed, then submits
+ *    `submitOprfRound1` with the returned five points in argument order;
+ *  - `submitRound2` calls the injected `CommitteeCrypto.round2Response` with the
+ *    secret share, seed, and the three public aggregation values, then submits
+ *    `submitOprfRound2` with the returned `z_i`;
  *  - local validation (bad committee slot, wrong-length blinded query) rejects before
  *    ever calling the crypto stub or the chain.
  *
  * What's NOT covered, honestly: this app still has no real Wasm-loading
- * `CommitteeCrypto` implementation (see `CommitteeCrypto.ts`'s doc comment) — this
- * only proves the app-side orchestration matches the real, now-landed pallet
- * interface, not a real crypto core.
+ * `CommitteeCrypto` implementation wired at the module level by default (see
+ * `CommitteeCrypto.ts`'s doc comment) — this only proves the app-side orchestration
+ * matches the real, now-landed pallet interface, not a real crypto core. It also does
+ * not (and cannot) exercise real `rhoI`/`lambdaI`/`e` values for round 2 — this app has
+ * no aggregation-math implementation to produce them (see `submitRound2`'s doc
+ * comment in `oprfCommittee.ts`); tests supply arbitrary fixture bytes for those,
+ * proving only that they're passed through to the crypto core and the chain call
+ * unchanged.
  */
 jest.mock('./api', () => ({
   getApi: jest.fn(),
 }));
 
 import { getApi } from './api';
-import { fetchPendingDuties, fulfillDuty, getMemberCommitteeSlots } from './oprfCommittee';
-import type { CommitteeCrypto, OprfEvaluationResult } from '../crypto/CommitteeCrypto';
+import {
+  fetchPendingDuties,
+  getMemberCommitteeSlots,
+  submitRound1,
+  submitRound2,
+} from './oprfCommittee';
+import type { CommitteeCrypto, OprfRound1Commitment, OprfRound2Response } from '../crypto/CommitteeCrypto';
 
 const ADDRESS = '5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY';
 const OTHER_ADDRESS = '5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty';
+const THIRD_ADDRESS = '5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y';
 
 function bytes(len: number, seed: number): Uint8Array {
   return new Uint8Array(len).fill(seed);
+}
+
+function fixtureCrypto(overrides: Partial<CommitteeCrypto> = {}): CommitteeCrypto {
+  return {
+    evaluateQuery: jest.fn(),
+    round1: jest.fn(),
+    round2Response: jest.fn(),
+    ...overrides,
+  };
 }
 
 interface RecordedCall {
@@ -76,22 +101,25 @@ function pendingOprfQueriesFake(records: FakeQueryRecord[]) {
 }
 
 /**
- * `oprfResponses(queryId, slot)` fake — `OprfResponses` is a `StorageDoubleMap` holding
- * at most one record per `(query, slot)` pair (real pallet shape, confirmed in
- * `oprfCommittee.ts`'s doc comment), so this fake takes a simple set of "pairs that
- * already have a response", not per-address data.
+ * `oprfRound1Commitments(queryId, slot)` / `oprfRound2Responses(queryId, slot)` fake —
+ * both are `StorageDoubleMap<(query_id, committee_slot), BoundedVec<{ member, ... }>>`,
+ * `ValueQuery` (absent key decodes as an empty vec). `membersByPair` maps
+ * `"${queryId}:${slot}"` to the list of member addresses who have submitted for that
+ * pair.
  */
-function oprfResponsesFake(respondedPairs: Set<string>) {
+function roundStorageFake(membersByPair: Record<string, string[]>) {
   return (queryId: number, slot: number) => {
-    const has = respondedPairs.has(`${queryId}:${slot}`);
-    return Promise.resolve({ isNone: !has, isEmpty: !has });
+    const members = membersByPair[`${queryId}:${slot}`] ?? [];
+    return Promise.resolve({ toJSON: () => members.map((member) => ({ member })) });
   };
 }
 
 function fakeApi(options: {
   rosterBySlot?: Record<number, string[]>;
   queries?: FakeQueryRecord[];
-  respondedPairs?: Set<string>;
+  round1ByPair?: Record<string, string[]>;
+  round2ByPair?: Record<string, string[]>;
+  threshold?: number;
   dispatchError?: unknown;
 } = {}) {
   const calls: RecordedCall[] = [];
@@ -121,12 +149,19 @@ function fakeApi(options: {
         identity: {
           committeeMembers: committeeMembersFake(options.rosterBySlot ?? {}),
           pendingOprfQueries: pendingOprfQueriesFake(options.queries ?? []),
-          oprfResponses: oprfResponsesFake(options.respondedPairs ?? new Set()),
+          oprfRound1Commitments: roundStorageFake(options.round1ByPair ?? {}),
+          oprfRound2Responses: roundStorageFake(options.round2ByPair ?? {}),
+        },
+      },
+      consts: {
+        identity: {
+          oprfThreshold: { toNumber: () => options.threshold ?? 3 },
         },
       },
       tx: {
         identity: {
-          submitOprfResponse: makeCall('submitOprfResponse'),
+          submitOprfRound1: makeCall('submitOprfRound1'),
+          submitOprfRound2: makeCall('submitOprfRound2'),
         },
       },
     },
@@ -172,55 +207,91 @@ describe('fetchPendingDuties', () => {
     expect(await fetchPendingDuties(ADDRESS)).toEqual([]);
   });
 
-  it('returns one duty per outstanding (query, slot) pair for the member\'s own slot(s)', async () => {
+  it('reports phase "round1" when the member has not yet submitted round 1 and the set is still open', async () => {
     const { api } = fakeApi({
       rosterBySlot: { 2: [ADDRESS] },
       queries: [
         { queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 },
         { queryId: 2, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x22), postedAt: 200 },
       ],
+      threshold: 3,
     });
     mockedGetApi.mockResolvedValue(api as any);
 
     const duties = await fetchPendingDuties(ADDRESS);
     expect(duties).toEqual([
-      { queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100, committeeSlot: 2 },
-      { queryId: 2, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x22), postedAt: 200, committeeSlot: 2 },
+      { queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100, committeeSlot: 2, phase: 'round1' },
+      { queryId: 2, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x22), postedAt: 200, committeeSlot: 2, phase: 'round1' },
     ]);
   });
 
-  it('omits a (query, slot) pair that already has a response recorded', async () => {
+  it('omits a pair whose round-1 set already locked without this member', async () => {
     const { api } = fakeApi({
       rosterBySlot: { 2: [ADDRESS] },
-      queries: [
-        { queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 },
-        { queryId: 2, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x22), postedAt: 200 },
-      ],
-      respondedPairs: new Set(['1:2']),
+      queries: [{ queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 }],
+      round1ByPair: { '1:2': [OTHER_ADDRESS, THIRD_ADDRESS, '5SomeoneElse'] },
+      threshold: 3,
+    });
+    mockedGetApi.mockResolvedValue(api as any);
+
+    expect(await fetchPendingDuties(ADDRESS)).toEqual([]);
+  });
+
+  it('omits a pair the member already submitted round 1 for when the set has not locked yet', async () => {
+    const { api } = fakeApi({
+      rosterBySlot: { 2: [ADDRESS] },
+      queries: [{ queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 }],
+      round1ByPair: { '1:2': [ADDRESS, OTHER_ADDRESS] },
+      threshold: 3,
+    });
+    mockedGetApi.mockResolvedValue(api as any);
+
+    expect(await fetchPendingDuties(ADDRESS)).toEqual([]);
+  });
+
+  it('reports phase "round2" once round 1 is locked and this member is in the set but has not submitted round 2', async () => {
+    const { api } = fakeApi({
+      rosterBySlot: { 2: [ADDRESS] },
+      queries: [{ queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 }],
+      round1ByPair: { '1:2': [ADDRESS, OTHER_ADDRESS, THIRD_ADDRESS] },
+      threshold: 3,
     });
     mockedGetApi.mockResolvedValue(api as any);
 
     const duties = await fetchPendingDuties(ADDRESS);
-    expect(duties.map((d) => d.queryId)).toEqual([2]);
+    expect(duties).toEqual([
+      { queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100, committeeSlot: 2, phase: 'round2' },
+    ]);
+  });
+
+  it('omits a pair where this member has already submitted both rounds', async () => {
+    const { api } = fakeApi({
+      rosterBySlot: { 2: [ADDRESS] },
+      queries: [{ queryId: 1, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x11), postedAt: 100 }],
+      round1ByPair: { '1:2': [ADDRESS, OTHER_ADDRESS, THIRD_ADDRESS] },
+      round2ByPair: { '1:2': [ADDRESS] },
+      threshold: 3,
+    });
+    mockedGetApi.mockResolvedValue(api as any);
+
+    expect(await fetchPendingDuties(ADDRESS)).toEqual([]);
   });
 
   it('produces a separate duty per committee slot the member serves on', async () => {
     const { api } = fakeApi({
       rosterBySlot: { 0: [ADDRESS], 3: [ADDRESS] },
       queries: [{ queryId: 5, submitter: OTHER_ADDRESS, blindedQuery: bytes(64, 0x33), postedAt: 300 }],
+      threshold: 3,
     });
     mockedGetApi.mockResolvedValue(api as any);
 
     const duties = await fetchPendingDuties(ADDRESS);
     expect(duties.map((d) => d.committeeSlot)).toEqual([0, 3]);
+    expect(duties.every((d) => d.phase === 'round1')).toBe(true);
   });
 });
 
-describe('fulfillDuty', () => {
-  function fixtureCrypto(result: OprfEvaluationResult): CommitteeCrypto {
-    return { evaluateQuery: jest.fn().mockResolvedValue(result) };
-  }
-
+describe('submitRound1', () => {
   const duty = {
     queryId: 7,
     committeeSlot: 2,
@@ -232,74 +303,90 @@ describe('fulfillDuty', () => {
     })(),
   };
 
-  const evalResult: OprfEvaluationResult = {
-    pk: bytes(64, 0xff),
-    evaluation: (() => {
-      const b = new Uint8Array(64);
-      b.set(bytes(32, 0xcc), 0);
-      b.set(bytes(32, 0xdd), 32);
-      return b;
-    })(),
-    dlogProof: new Uint8Array([1, 2, 3]),
+  const commitment: OprfRound1Commitment = {
+    rI: bytes(64, 0x01),
+    dG: bytes(64, 0x02),
+    dQ: bytes(64, 0x03),
+    eG: bytes(64, 0x04),
+    eQ: bytes(64, 0x05),
   };
 
-  it('calls the injected crypto with the whole 64-byte blinded query and the secret key', async () => {
+  it('calls the injected crypto\'s round1 with secret share, blinded query, and seed', async () => {
     const { api } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
-    const crypto = fixtureCrypto(evalResult);
-    const secretKeyBytes = bytes(32, 0x99);
+    const crypto = fixtureCrypto({ round1: jest.fn().mockResolvedValue(commitment) });
+    const secretShareBytes = bytes(32, 0x99);
+    const seed = bytes(32, 0x77);
 
-    await fulfillDuty({ duty, secretKeyBytes, pair: {} as any, crypto });
+    await submitRound1({ duty, secretShareBytes, pair: {} as any, crypto, seed });
 
-    expect(crypto.evaluateQuery).toHaveBeenCalledWith(secretKeyBytes, duty.blindedQuery);
+    expect(crypto.round1).toHaveBeenCalledWith(secretShareBytes, duty.blindedQuery, seed);
   });
 
-  it('submits submitOprfResponse with query id, slot, evaluation, and dlog proof unchanged', async () => {
+  it('submits submitOprfRound1 with query id, slot, and the five points in argument order', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
-    const crypto = fixtureCrypto(evalResult);
+    const crypto = fixtureCrypto({ round1: jest.fn().mockResolvedValue(commitment) });
 
-    await fulfillDuty({ duty, secretKeyBytes: bytes(32, 0x99), pair: {} as any, crypto });
+    await submitRound1({ duty, secretShareBytes: bytes(32, 0x99), pair: {} as any, crypto, seed: bytes(32, 0x77) });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0].name).toBe('submitOprfResponse');
-    const [queryId, committeeSlot, evaluation, dlogProof] = calls[0].args as [number, number, Uint8Array, Uint8Array];
+    expect(calls[0].name).toBe('submitOprfRound1');
+    const [queryId, committeeSlot, rI, dG, dQ, eG, eQ] = calls[0].args as [
+      number,
+      number,
+      Uint8Array,
+      Uint8Array,
+      Uint8Array,
+      Uint8Array,
+      Uint8Array,
+    ];
     expect(queryId).toBe(7);
     expect(committeeSlot).toBe(2);
-    expect(evaluation).toEqual(evalResult.evaluation);
-    expect(dlogProof).toEqual(evalResult.dlogProof);
+    expect(rI).toEqual(commitment.rI);
+    expect(dG).toEqual(commitment.dG);
+    expect(dQ).toEqual(commitment.dQ);
+    expect(eG).toEqual(commitment.eG);
+    expect(eQ).toEqual(commitment.eQ);
   });
 
   it('rejects an out-of-range committee slot before calling the crypto stub or the chain', async () => {
-    const crypto = fixtureCrypto(evalResult);
+    const crypto = fixtureCrypto({ round1: jest.fn().mockResolvedValue(commitment) });
     await expect(
-      fulfillDuty({ duty: { ...duty, committeeSlot: 5 }, secretKeyBytes: bytes(32, 0x99), pair: {} as any, crypto }),
+      submitRound1({
+        duty: { ...duty, committeeSlot: 5 },
+        secretShareBytes: bytes(32, 0x99),
+        pair: {} as any,
+        crypto,
+        seed: bytes(32, 0x77),
+      }),
     ).rejects.toThrow(RangeError);
-    expect(crypto.evaluateQuery).not.toHaveBeenCalled();
+    expect(crypto.round1).not.toHaveBeenCalled();
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects a wrong-length blinded query before calling the crypto stub or the chain', async () => {
-    const crypto = fixtureCrypto(evalResult);
+    const crypto = fixtureCrypto({ round1: jest.fn().mockResolvedValue(commitment) });
     await expect(
-      fulfillDuty({
+      submitRound1({
         duty: { ...duty, blindedQuery: new Uint8Array(10) },
-        secretKeyBytes: bytes(32, 0x99),
+        secretShareBytes: bytes(32, 0x99),
         pair: {} as any,
         crypto,
+        seed: bytes(32, 0x77),
       }),
     ).rejects.toThrow(/blindedQuery is 10 bytes/);
-    expect(crypto.evaluateQuery).not.toHaveBeenCalled();
+    expect(crypto.round1).not.toHaveBeenCalled();
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects when the chain reports a dispatch error', async () => {
     const { api } = fakeApi({ dispatchError: { toString: () => 'identity.NotCommitteeMember' } });
     mockedGetApi.mockResolvedValue(api as any);
-    const crypto = fixtureCrypto(evalResult);
+    const crypto = fixtureCrypto({ round1: jest.fn().mockResolvedValue(commitment) });
 
     await expect(
-      fulfillDuty({ duty, secretKeyBytes: bytes(32, 0x99), pair: {} as any, crypto }),
+      submitRound1({ duty, secretShareBytes: bytes(32, 0x99), pair: {} as any, crypto, seed: bytes(32, 0x77) }),
     ).rejects.toThrow('identity.NotCommitteeMember');
   });
 
@@ -308,7 +395,105 @@ describe('fulfillDuty', () => {
     mockedGetApi.mockResolvedValue(api as any);
 
     await expect(
-      fulfillDuty({ duty, secretKeyBytes: bytes(32, 0x99), pair: {} as any }),
+      submitRound1({ duty, secretShareBytes: bytes(32, 0x99), pair: {} as any, seed: bytes(32, 0x77) }),
+    ).rejects.toThrow(/not implemented/);
+  });
+});
+
+describe('submitRound2', () => {
+  const duty = { queryId: 7, committeeSlot: 2 };
+  const response: OprfRound2Response = { zI: bytes(32, 0x0a) };
+
+  it('calls the injected crypto\'s round2Response with secret share, seed, and the three public values', async () => {
+    const { api } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+    const crypto = fixtureCrypto({ round2Response: jest.fn().mockResolvedValue(response) });
+    const secretShareBytes = bytes(32, 0x99);
+    const seed = bytes(32, 0x77);
+    const rhoI = bytes(32, 0x11);
+    const lambdaI = bytes(32, 0x22);
+    const e = bytes(32, 0x33);
+
+    await submitRound2({ duty, secretShareBytes, pair: {} as any, crypto, seed, rhoI, lambdaI, e });
+
+    expect(crypto.round2Response).toHaveBeenCalledWith(secretShareBytes, seed, rhoI, lambdaI, e);
+  });
+
+  it('submits submitOprfRound2 with query id, slot, and z_i unchanged', async () => {
+    const { api, calls } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+    const crypto = fixtureCrypto({ round2Response: jest.fn().mockResolvedValue(response) });
+
+    await submitRound2({
+      duty,
+      secretShareBytes: bytes(32, 0x99),
+      pair: {} as any,
+      crypto,
+      seed: bytes(32, 0x77),
+      rhoI: bytes(32, 0x11),
+      lambdaI: bytes(32, 0x22),
+      e: bytes(32, 0x33),
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe('submitOprfRound2');
+    const [queryId, committeeSlot, zI] = calls[0].args as [number, number, Uint8Array];
+    expect(queryId).toBe(7);
+    expect(committeeSlot).toBe(2);
+    expect(zI).toEqual(response.zI);
+  });
+
+  it('rejects an out-of-range committee slot before calling the crypto stub or the chain', async () => {
+    const crypto = fixtureCrypto({ round2Response: jest.fn().mockResolvedValue(response) });
+    await expect(
+      submitRound2({
+        duty: { ...duty, committeeSlot: 5 },
+        secretShareBytes: bytes(32, 0x99),
+        pair: {} as any,
+        crypto,
+        seed: bytes(32, 0x77),
+        rhoI: bytes(32, 0x11),
+        lambdaI: bytes(32, 0x22),
+        e: bytes(32, 0x33),
+      }),
+    ).rejects.toThrow(RangeError);
+    expect(crypto.round2Response).not.toHaveBeenCalled();
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the chain reports a dispatch error', async () => {
+    const { api } = fakeApi({ dispatchError: { toString: () => 'identity.OprfRound1NotLocked' } });
+    mockedGetApi.mockResolvedValue(api as any);
+    const crypto = fixtureCrypto({ round2Response: jest.fn().mockResolvedValue(response) });
+
+    await expect(
+      submitRound2({
+        duty,
+        secretShareBytes: bytes(32, 0x99),
+        pair: {} as any,
+        crypto,
+        seed: bytes(32, 0x77),
+        rhoI: bytes(32, 0x11),
+        lambdaI: bytes(32, 0x22),
+        e: bytes(32, 0x33),
+      }),
+    ).rejects.toThrow('identity.OprfRound1NotLocked');
+  });
+
+  it('propagates the crypto stub\'s "not implemented" error when no crypto override is given', async () => {
+    const { api } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+
+    await expect(
+      submitRound2({
+        duty,
+        secretShareBytes: bytes(32, 0x99),
+        pair: {} as any,
+        seed: bytes(32, 0x77),
+        rhoI: bytes(32, 0x11),
+        lambdaI: bytes(32, 0x22),
+        e: bytes(32, 0x33),
+      }),
     ).rejects.toThrow(/not implemented/);
   });
 });

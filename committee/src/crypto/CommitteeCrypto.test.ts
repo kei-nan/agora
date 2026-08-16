@@ -24,7 +24,15 @@ import {
   setCommitteeCrypto,
   type CommitteeCrypto,
 } from './CommitteeCrypto';
-import { buildOprfInput, evaluateQueryWithSeed, wasmCommitteeCrypto } from './wasmCommitteeCrypto';
+import {
+  buildOprfInput,
+  buildRound1Input,
+  buildRound2Input,
+  evaluateQueryWithSeed,
+  round1WithSeed,
+  round2ResponseWithSeed,
+  wasmCommitteeCrypto,
+} from './wasmCommitteeCrypto';
 
 /** hex string -> Uint8Array. Throws on odd-length input (a real bug, not a valid fixture). */
 function hexToBytes(hex: string): Uint8Array {
@@ -56,10 +64,40 @@ afterEach(() => {
   resetCommitteeCrypto();
 });
 
+/** A fixture satisfying the full `CommitteeCrypto` interface, for tests that only care
+ * about one method — jest.fn() stubs for the rest so TypeScript is satisfied without
+ * every test needing to restate the whole shape. */
+function fixtureCrypto(overrides: Partial<CommitteeCrypto> = {}): CommitteeCrypto {
+  return {
+    evaluateQuery: jest.fn(),
+    round1: jest.fn(),
+    round2Response: jest.fn(),
+    ...overrides,
+  };
+}
+
 describe('notImplementedCommitteeCrypto', () => {
-  it('rejects with a "not implemented" error rather than returning a fabricated result', async () => {
+  it('rejects evaluateQuery with a "not implemented" error rather than a fabricated result', async () => {
     await expect(
       notImplementedCommitteeCrypto.evaluateQuery(new Uint8Array(32), new Uint8Array(64)),
+    ).rejects.toThrow(/not implemented/);
+  });
+
+  it('rejects round1 with a "not implemented" error rather than a fabricated result', async () => {
+    await expect(
+      notImplementedCommitteeCrypto.round1(new Uint8Array(32), new Uint8Array(64), new Uint8Array(32)),
+    ).rejects.toThrow(/not implemented/);
+  });
+
+  it('rejects round2Response with a "not implemented" error rather than a fabricated result', async () => {
+    await expect(
+      notImplementedCommitteeCrypto.round2Response(
+        new Uint8Array(32),
+        new Uint8Array(32),
+        new Uint8Array(32),
+        new Uint8Array(32),
+        new Uint8Array(32),
+      ),
     ).rejects.toThrow(/not implemented/);
   });
 });
@@ -70,19 +108,19 @@ describe('getCommitteeCrypto / setCommitteeCrypto / resetCommitteeCrypto', () =>
   });
 
   it('returns whatever implementation was installed via setCommitteeCrypto', () => {
-    const fixture: CommitteeCrypto = {
+    const fixture = fixtureCrypto({
       evaluateQuery: jest.fn().mockResolvedValue({
         pk: new Uint8Array(64),
         evaluation: new Uint8Array(64),
         dlogProof: new Uint8Array(64),
       }),
-    };
+    });
     setCommitteeCrypto(fixture);
     expect(getCommitteeCrypto()).toBe(fixture);
   });
 
   it('resetCommitteeCrypto restores the default stub', () => {
-    setCommitteeCrypto({ evaluateQuery: jest.fn() });
+    setCommitteeCrypto(fixtureCrypto());
     resetCommitteeCrypto();
     expect(getCommitteeCrypto()).toBe(notImplementedCommitteeCrypto);
   });
@@ -182,5 +220,157 @@ describe('wasmCommitteeCrypto (public async interface, fresh randomness)', () =>
     await expect(
       wasmCommitteeCrypto.evaluateQuery(new Uint8Array(32), GROUND_TRUTH_BLINDED_QUERY),
     ).rejects.toThrow(/ERR_ZERO_SECRET_KEY/);
+  });
+});
+
+// ── Threshold round 1 / round 2 ────────────────────────────────────────────────────
+//
+// Mirrors `committee-node/src/wasm_host.rs`'s own round1/round2 test suite: these prove
+// this file's byte marshaling against the real, compiled `oprf-committee-dev` wasm2js
+// artifact, not the threshold cryptography itself (which is proven once, natively, by
+// `oprf-committee-dev/src/ffi.rs`'s own
+// `round1_then_round2_ffi_calls_produce_a_verifiable_combined_proof`). `rho_i`/
+// `lambda_i`/`e` are opaque pass-through bytes as far as this ABI is concerned, so
+// arbitrary fixture values (matching `ffi.rs`'s own round-2 tests) are enough to pin
+// the marshaling without needing this app's own threshold-aggregation math (which
+// doesn't exist — see `CommitteeCrypto.ts`'s module doc).
+
+/** The BabyJubJub base point, big-endian `x` then `y` — copied byte-for-byte from
+ * `committee-node/src/wasm_host.rs`'s identical `GENERATOR_XY` fixture, itself from
+ * `oprf-committee-dev/src/babyjubjub.rs::Point::generator`. The one genuinely valid,
+ * on-curve, in-subgroup point available without doing curve math in this file. */
+const GENERATOR_XY = new Uint8Array([
+  // x = 5299619240641551281634865583518297030282874472190772894086521144482721001553
+  0x0b, 0xb7, 0x7a, 0x6a, 0xd6, 0x3e, 0x73, 0x9b, 0x4e, 0xac, 0xb2, 0xe0, 0x9d, 0x62, 0x77, 0xc1,
+  0x2a, 0xb8, 0xd8, 0x01, 0x05, 0x34, 0xe0, 0xb6, 0x28, 0x93, 0xf3, 0xf6, 0xbb, 0x95, 0x70, 0x51,
+  // y = 16950150798460657717958625567821834550301663161624707787222815936182638968203
+  0x25, 0x79, 0x72, 0x03, 0xf7, 0xa0, 0xb2, 0x49, 0x25, 0x57, 0x2e, 0x1c, 0xd1, 0x6b, 0xf9, 0xed,
+  0xfc, 0xe0, 0x05, 0x1f, 0xb9, 0xe1, 0x33, 0x77, 0x4b, 0x3c, 0x25, 0x7a, 0x87, 0x2d, 0x7d, 0x8b,
+]);
+
+/** A nonzero 32-byte secret share — copied byte-for-byte from `wasm_host.rs`'s `SHARE`
+ * fixture (`committee-node/src/wasm_host.rs`, in its threshold round1/round2 tests):
+ * 27 zero bytes followed by `2e 3b 9a c9 f1`. Built via `Array(27).fill(0)` rather than
+ * spelled out zero-by-zero, so the byte count is provably right rather than
+ * eyeballed. */
+const SHARE = new Uint8Array([...new Array(27).fill(0), 0x2e, 0x3b, 0x9a, 0xc9, 0xf1]);
+
+describe('round1WithSeed / round2ResponseWithSeed (real crypto core)', () => {
+  it('produces real, non-stub, deterministic output for a given seed', () => {
+    const seed = new Uint8Array(32).fill(0x5a);
+    const c1 = round1WithSeed(SHARE, GENERATOR_XY, seed);
+
+    for (const [name, p] of [
+      ['rI', c1.rI],
+      ['dG', c1.dG],
+      ['dQ', c1.dQ],
+      ['eG', c1.eG],
+      ['eQ', c1.eQ],
+    ] as const) {
+      expect(p).toHaveLength(64);
+      expect(p.some((b) => b !== 0)).toBe(true) /* not all-zero */;
+    }
+
+    // Determinism: same inputs, same seed, byte-identical output.
+    const repeat = round1WithSeed(SHARE, GENERATOR_XY, seed);
+    expect(bytesToHex(repeat.rI)).toBe(bytesToHex(c1.rI));
+    expect(bytesToHex(repeat.dG)).toBe(bytesToHex(c1.dG));
+    expect(bytesToHex(repeat.eQ)).toBe(bytesToHex(c1.eQ));
+
+    // Seed-sensitivity split (see `wasm_host.rs`'s identical assertion and its
+    // reasoning): r_i = s_i * b_q does not involve the nonces, so it must be
+    // unaffected by the seed, while every nonce commitment must change with it.
+    const other = round1WithSeed(SHARE, GENERATOR_XY, new Uint8Array(32).fill(0xa5));
+    expect(bytesToHex(other.rI)).toBe(bytesToHex(c1.rI));
+    expect(bytesToHex(other.dG)).not.toBe(bytesToHex(c1.dG));
+    expect(bytesToHex(other.eQ)).not.toBe(bytesToHex(c1.eQ));
+  });
+
+  it('rejects a zero secret share with the real module\'s ERR_ZERO_SECRET_KEY', () => {
+    expect(() => round1WithSeed(new Uint8Array(32), GENERATOR_XY, new Uint8Array(32).fill(1))).toThrow(
+      /ERR_ZERO_SECRET_KEY/,
+    );
+  });
+
+  it('rejects an off-curve blindedQuery with the real module\'s ERR_BLINDED_QUERY_NOT_ON_CURVE', () => {
+    const offCurve = new Uint8Array(64);
+    offCurve[31] = 0x01;
+    offCurve[63] = 0x01;
+    expect(() => round1WithSeed(SHARE, offCurve, new Uint8Array(32).fill(1))).toThrow(
+      /ERR_BLINDED_QUERY_NOT_ON_CURVE/,
+    );
+  });
+
+  it('round2ResponseWithSeed is deterministic and sensitive to every public input', () => {
+    const seed = new Uint8Array(32).fill(0x5a);
+    const rhoI = new Uint8Array(32).fill(0x11);
+    const lambdaI = new Uint8Array(32).fill(0x22);
+    const e = new Uint8Array(32).fill(0x33);
+
+    const r2 = round2ResponseWithSeed(SHARE, seed, rhoI, lambdaI, e);
+    expect(r2.zI).toHaveLength(32);
+    expect(r2.zI.some((b) => b !== 0)).toBe(true);
+
+    const again = round2ResponseWithSeed(SHARE, seed, rhoI, lambdaI, e);
+    expect(bytesToHex(again.zI)).toBe(bytesToHex(r2.zI));
+
+    const changedSeed = round2ResponseWithSeed(SHARE, new Uint8Array(32).fill(0xa5), rhoI, lambdaI, e);
+    expect(bytesToHex(changedSeed.zI)).not.toBe(bytesToHex(r2.zI));
+    const changedRho = round2ResponseWithSeed(SHARE, seed, new Uint8Array(32).fill(0x44), lambdaI, e);
+    expect(bytesToHex(changedRho.zI)).not.toBe(bytesToHex(r2.zI));
+    const changedLambda = round2ResponseWithSeed(SHARE, seed, rhoI, new Uint8Array(32).fill(0x44), e);
+    expect(bytesToHex(changedLambda.zI)).not.toBe(bytesToHex(r2.zI));
+    const changedE = round2ResponseWithSeed(SHARE, seed, rhoI, lambdaI, new Uint8Array(32).fill(0x44));
+    expect(bytesToHex(changedE.zI)).not.toBe(bytesToHex(r2.zI));
+  });
+
+  it('rejects a zero secret share for round2Response too', () => {
+    expect(() =>
+      round2ResponseWithSeed(
+        new Uint8Array(32),
+        new Uint8Array(32).fill(1),
+        new Uint8Array(32).fill(2),
+        new Uint8Array(32).fill(3),
+        new Uint8Array(32).fill(4),
+      ),
+    ).toThrow(/ERR_ZERO_SECRET_KEY/);
+  });
+});
+
+describe('buildRound1Input / buildRound2Input (marshaling only)', () => {
+  it('buildRound1Input rejects a blindedQuery that is not exactly 64 bytes', () => {
+    expect(() => buildRound1Input(SHARE, new Uint8Array(63), new Uint8Array(32))).toThrow(/64/);
+  });
+
+  it('buildRound1Input rejects a seed that is not exactly 32 bytes', () => {
+    expect(() => buildRound1Input(SHARE, GENERATOR_XY, new Uint8Array(31))).toThrow(/32/);
+  });
+
+  it('buildRound2Input rejects a wrong-length public input', () => {
+    const ok32 = new Uint8Array(32);
+    expect(() => buildRound2Input(SHARE, new Uint8Array(31), ok32, ok32, ok32)).toThrow(/seed/);
+    expect(() => buildRound2Input(SHARE, ok32, new Uint8Array(31), ok32, ok32)).toThrow(/rhoI/);
+    expect(() => buildRound2Input(SHARE, ok32, ok32, new Uint8Array(31), ok32)).toThrow(/lambdaI/);
+    expect(() => buildRound2Input(SHARE, ok32, ok32, ok32, new Uint8Array(31))).toThrow(/e /);
+  });
+});
+
+describe('wasmCommitteeCrypto.round1 / round2Response (public async interface)', () => {
+  it('round1 takes the given seed as-is (no internal randomness) and matches round1WithSeed', async () => {
+    const seed = new Uint8Array(32).fill(0x5a);
+    const viaInterface = await wasmCommitteeCrypto.round1(SHARE, GENERATOR_XY, seed);
+    const direct = round1WithSeed(SHARE, GENERATOR_XY, seed);
+    expect(bytesToHex(viaInterface.rI)).toBe(bytesToHex(direct.rI));
+    expect(bytesToHex(viaInterface.dG)).toBe(bytesToHex(direct.dG));
+  });
+
+  it('round2Response matches round2ResponseWithSeed', async () => {
+    const seed = new Uint8Array(32).fill(0x5a);
+    const rhoI = new Uint8Array(32).fill(0x11);
+    const lambdaI = new Uint8Array(32).fill(0x22);
+    const e = new Uint8Array(32).fill(0x33);
+    const viaInterface = await wasmCommitteeCrypto.round2Response(SHARE, seed, rhoI, lambdaI, e);
+    const direct = round2ResponseWithSeed(SHARE, seed, rhoI, lambdaI, e);
+    expect(bytesToHex(viaInterface.zI)).toBe(bytesToHex(direct.zI));
   });
 });

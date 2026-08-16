@@ -44,7 +44,12 @@
  * #084).
  */
 import * as core from './generated/oprfCommitteeCore';
-import type { CommitteeCrypto, OprfEvaluationResult } from './CommitteeCrypto';
+import type {
+  CommitteeCrypto,
+  OprfEvaluationResult,
+  OprfRound1Commitment,
+  OprfRound2Response,
+} from './CommitteeCrypto';
 
 /** `sk || b_q.x || b_q.y || ds_dlog || seed`, each field 32 bytes. Must match
  * `oprf-committee-dev/src/ffi.rs::INPUT_LEN`. */
@@ -53,6 +58,20 @@ const INPUT_LEN = 160;
  * `oprf-committee-dev/src/ffi.rs::OUTPUT_LEN`. */
 const OUTPUT_LEN = 192;
 const FIELD_LEN = 32;
+
+/** `sk || b_q.x || b_q.y || seed`, each field 32 bytes. Must match
+ * `oprf-committee-dev/src/ffi.rs::ROUND1_INPUT_LEN`. No `ds_dlog` field — round 1
+ * computes no proof yet. */
+const ROUND1_INPUT_LEN = 128;
+/** `r_i.x/y || d_g.x/y || d_q.x/y || e_g.x/y || e_q.x/y` — five points. Must match
+ * `oprf-committee-dev/src/ffi.rs::ROUND1_OUTPUT_LEN`. */
+const ROUND1_OUTPUT_LEN = 320;
+/** `sk || seed || rho_i || lambda_i || e`, each field 32 bytes. Must match
+ * `oprf-committee-dev/src/ffi.rs::ROUND2_INPUT_LEN`. */
+const ROUND2_INPUT_LEN = 160;
+/** `z_i` — one big-endian BN254 `Fr`. Must match
+ * `oprf-committee-dev/src/ffi.rs::ROUND2_OUTPUT_LEN`. */
+const ROUND2_OUTPUT_LEN = 32;
 
 /**
  * `DS_DLOG` — ASCII "DLOG Equality Proof" read as a big-endian integer. Copied
@@ -68,16 +87,23 @@ const DS_DLOG_BE = new Uint8Array([
   0x47, 0x20, 0x45, 0x71, 0x75, 0x61, 0x6c, 0x69, 0x74, 0x79, 0x20, 0x50, 0x72, 0x6f, 0x6f, 0x66,
 ]);
 
-/** Mirrors `oprf-committee-dev/src/ffi.rs`'s `ERR_*` constants, for a human-readable
- * error rather than a bare negative number when `oprf_evaluate_query` rejects an input. */
-function describeErrorCode(code: number): string {
+/**
+ * Mirrors `oprf-committee-dev/src/ffi.rs`'s `ERR_*` constants, for a human-readable
+ * error rather than a bare negative number when one of the module's exports rejects an
+ * input. Shared by `oprf_evaluate_query`, `oprf_round1`, and `oprf_round2_response` —
+ * confirmed against `ffi.rs`: the threshold round functions introduce no new error
+ * codes, they return the same five. The two length messages therefore can't name a
+ * single expected length any more (it depends which export was called); callers pass
+ * `exportName` to say which one.
+ */
+function describeErrorCode(code: number, exportName: string): string {
   switch (code) {
     case -1:
-      return 'ERR_BAD_INPUT_LEN — input was not exactly 160 bytes';
+      return `ERR_BAD_INPUT_LEN — input was not the exact length ${exportName} expects (oprf_evaluate_query: 160, oprf_round1: 128, oprf_round2_response: 160)`;
     case -2:
-      return 'ERR_BAD_OUTPUT_LEN — output buffer was not exactly 192 bytes';
+      return `ERR_BAD_OUTPUT_LEN — output buffer was not the exact length ${exportName} expects (oprf_evaluate_query: 192, oprf_round1: 320, oprf_round2_response: 32)`;
     case -3:
-      return 'ERR_ZERO_SECRET_KEY — this member\'s configured OPRF secret key is all-zero';
+      return 'ERR_ZERO_SECRET_KEY — this member\'s configured OPRF secret key/share is all-zero';
     case -4:
       return 'ERR_BLINDED_QUERY_NOT_ON_CURVE — the blinded query point is malformed';
     case -5:
@@ -151,7 +177,9 @@ export function evaluateQueryWithSeed(
 
     const code = core.oprf_evaluate_query(inputPtr, INPUT_LEN, outputPtr, OUTPUT_LEN);
     if (code !== 0) {
-      throw new Error(`oprf_evaluate_query returned error code ${code} (${describeErrorCode(code)})`);
+      throw new Error(
+        `oprf_evaluate_query returned error code ${code} (${describeErrorCode(code, 'oprf_evaluate_query')})`,
+      );
     }
 
     const output = new Uint8Array(core.memory.buffer).slice(outputPtr, outputPtr + OUTPUT_LEN);
@@ -163,6 +191,153 @@ export function evaluateQueryWithSeed(
   } finally {
     core.oprf_dealloc(inputPtr, INPUT_LEN);
     core.oprf_dealloc(outputPtr, OUTPUT_LEN);
+  }
+}
+
+/**
+ * Builds the fixed 128-byte `oprf_round1` wire-format input: `secretShareBytes`
+ * (left-padded to 32 bytes) || `blindedQuery` (already 64 bytes) || `seed`. No
+ * `DS_DLOG` field — round 1 computes no proof yet (see `ffi.rs::round1`'s doc comment).
+ * Exported for {@link CommitteeCrypto.test.ts}'s own marshaling checks.
+ */
+export function buildRound1Input(
+  secretShareBytes: Uint8Array,
+  blindedQuery: Uint8Array,
+  seed: Uint8Array,
+): Uint8Array {
+  if (secretShareBytes.length > FIELD_LEN) {
+    throw new RangeError(
+      `buildRound1Input: secretShareBytes is ${secretShareBytes.length} bytes, expected at most ${FIELD_LEN} (big-endian BN254 Fr)`,
+    );
+  }
+  if (blindedQuery.length !== 2 * FIELD_LEN) {
+    throw new RangeError(
+      `buildRound1Input: blindedQuery is ${blindedQuery.length} bytes, expected ${2 * FIELD_LEN}`,
+    );
+  }
+  if (seed.length !== FIELD_LEN) {
+    throw new RangeError(`buildRound1Input: seed is ${seed.length} bytes, expected ${FIELD_LEN}`);
+  }
+
+  const input = new Uint8Array(ROUND1_INPUT_LEN);
+  input.set(secretShareBytes, FIELD_LEN - secretShareBytes.length); // left-pad into [0, 32)
+  input.set(blindedQuery, FIELD_LEN); // [32, 96)
+  input.set(seed, 3 * FIELD_LEN); // [96, 128)
+  return input;
+}
+
+/**
+ * The synchronous core of threshold round 1: marshals through
+ * `oprf_alloc`/`oprf_round1`/`oprf_dealloc` and decodes the 320-byte output (five
+ * consecutive 64-byte BabyJubJub points, `ffi.rs::round1`'s write order) into an
+ * {@link OprfRound1Commitment}. Exported for `CommitteeCrypto.test.ts`'s own fixture
+ * checks; the public {@link wasmCommitteeCrypto} below wraps this with the
+ * `CommitteeCrypto` interface unchanged (round 1's `seed` is always caller-supplied,
+ * never generated in here — see `CommitteeCrypto.ts`'s doc comment on why).
+ */
+export function round1WithSeed(
+  secretShareBytes: Uint8Array,
+  blindedQuery: Uint8Array,
+  seed: Uint8Array,
+): OprfRound1Commitment {
+  const input = buildRound1Input(secretShareBytes, blindedQuery, seed);
+
+  const inputPtr = core.oprf_alloc(ROUND1_INPUT_LEN);
+  const outputPtr = core.oprf_alloc(ROUND1_OUTPUT_LEN);
+  try {
+    new Uint8Array(core.memory.buffer).set(input, inputPtr);
+
+    const code = core.oprf_round1(inputPtr, ROUND1_INPUT_LEN, outputPtr, ROUND1_OUTPUT_LEN);
+    if (code !== 0) {
+      throw new Error(`oprf_round1 returned error code ${code} (${describeErrorCode(code, 'oprf_round1')})`);
+    }
+
+    const output = new Uint8Array(core.memory.buffer).slice(outputPtr, outputPtr + ROUND1_OUTPUT_LEN);
+    const point = (i: number) => output.slice(i * 64, (i + 1) * 64);
+    return {
+      rI: point(0),
+      dG: point(1),
+      dQ: point(2),
+      eG: point(3),
+      eQ: point(4),
+    };
+  } finally {
+    core.oprf_dealloc(inputPtr, ROUND1_INPUT_LEN);
+    core.oprf_dealloc(outputPtr, ROUND1_OUTPUT_LEN);
+  }
+}
+
+/**
+ * Builds the fixed 160-byte `oprf_round2_response` wire-format input:
+ * `secretShareBytes` (left-padded to 32 bytes) || `seed` || `rhoI` || `lambdaI` || `e`.
+ * `seed` must be byte-identical to the one given to the matching {@link
+ * buildRound1Input}/`round1WithSeed` call for this query — see `CommitteeCrypto.ts`'s
+ * doc comment. Exported for `CommitteeCrypto.test.ts`'s own marshaling checks.
+ */
+export function buildRound2Input(
+  secretShareBytes: Uint8Array,
+  seed: Uint8Array,
+  rhoI: Uint8Array,
+  lambdaI: Uint8Array,
+  e: Uint8Array,
+): Uint8Array {
+  if (secretShareBytes.length > FIELD_LEN) {
+    throw new RangeError(
+      `buildRound2Input: secretShareBytes is ${secretShareBytes.length} bytes, expected at most ${FIELD_LEN} (big-endian BN254 Fr)`,
+    );
+  }
+  for (const [name, value] of [
+    ['seed', seed],
+    ['rhoI', rhoI],
+    ['lambdaI', lambdaI],
+    ['e', e],
+  ] as const) {
+    if (value.length !== FIELD_LEN) {
+      throw new RangeError(`buildRound2Input: ${name} is ${value.length} bytes, expected ${FIELD_LEN}`);
+    }
+  }
+
+  const input = new Uint8Array(ROUND2_INPUT_LEN);
+  input.set(secretShareBytes, FIELD_LEN - secretShareBytes.length); // left-pad into [0, 32)
+  input.set(seed, FIELD_LEN); // [32, 64)
+  input.set(rhoI, 2 * FIELD_LEN); // [64, 96)
+  input.set(lambdaI, 3 * FIELD_LEN); // [96, 128)
+  input.set(e, 4 * FIELD_LEN); // [128, 160)
+  return input;
+}
+
+/**
+ * The synchronous core of threshold round 2: marshals through
+ * `oprf_alloc`/`oprf_round2_response`/`oprf_dealloc` and decodes the 32-byte output
+ * (`z_i`) into an {@link OprfRound2Response}. Exported for `CommitteeCrypto.test.ts`'s
+ * own fixture checks.
+ */
+export function round2ResponseWithSeed(
+  secretShareBytes: Uint8Array,
+  seed: Uint8Array,
+  rhoI: Uint8Array,
+  lambdaI: Uint8Array,
+  e: Uint8Array,
+): OprfRound2Response {
+  const input = buildRound2Input(secretShareBytes, seed, rhoI, lambdaI, e);
+
+  const inputPtr = core.oprf_alloc(ROUND2_INPUT_LEN);
+  const outputPtr = core.oprf_alloc(ROUND2_OUTPUT_LEN);
+  try {
+    new Uint8Array(core.memory.buffer).set(input, inputPtr);
+
+    const code = core.oprf_round2_response(inputPtr, ROUND2_INPUT_LEN, outputPtr, ROUND2_OUTPUT_LEN);
+    if (code !== 0) {
+      throw new Error(
+        `oprf_round2_response returned error code ${code} (${describeErrorCode(code, 'oprf_round2_response')})`,
+      );
+    }
+
+    const zI = new Uint8Array(core.memory.buffer).slice(outputPtr, outputPtr + ROUND2_OUTPUT_LEN);
+    return { zI };
+  } finally {
+    core.oprf_dealloc(inputPtr, ROUND2_INPUT_LEN);
+    core.oprf_dealloc(outputPtr, ROUND2_OUTPUT_LEN);
   }
 }
 
@@ -199,11 +374,45 @@ function freshSeed(): Uint8Array {
 
 /**
  * The real `CommitteeCrypto`. Install once at app startup via `setCommitteeCrypto`
- * (see `index.js`) — see {@link evaluateQueryWithSeed} for the synchronous core this
- * wraps with fresh randomness.
+ * (see `index.js`).
+ *
+ * `round1`/`round2Response` do NOT source their own randomness the way `evaluateQuery`
+ * does — both take `seed` as a required parameter and pass it straight through to
+ * {@link round1WithSeed}/{@link round2ResponseWithSeed}. This mirrors
+ * `committee-node/src/wasm_host.rs`'s `CryptoCore::round1`/`round2_response`: the seed
+ * must be identical across the two calls for one query, so the caller
+ * (`chain/oprfCommittee.ts`, which persists it between rounds) has to own generating
+ * and supplying it — this wrapper has no way to know which later `round2Response` call
+ * belongs to a given `round1` call, so it cannot safely draw the randomness itself.
  */
 export const wasmCommitteeCrypto: CommitteeCrypto = {
   async evaluateQuery(secretKeyBytes: Uint8Array, blindedQuery: Uint8Array): Promise<OprfEvaluationResult> {
     return evaluateQueryWithSeed(secretKeyBytes, blindedQuery, freshSeed());
   },
+  async round1(
+    secretShareBytes: Uint8Array,
+    blindedQuery: Uint8Array,
+    seed: Uint8Array,
+  ): Promise<OprfRound1Commitment> {
+    return round1WithSeed(secretShareBytes, blindedQuery, seed);
+  },
+  async round2Response(
+    secretShareBytes: Uint8Array,
+    seed: Uint8Array,
+    rhoI: Uint8Array,
+    lambdaI: Uint8Array,
+    e: Uint8Array,
+  ): Promise<OprfRound2Response> {
+    return round2ResponseWithSeed(secretShareBytes, seed, rhoI, lambdaI, e);
+  },
 };
+
+/**
+ * Sources 32 bytes of fresh randomness the same way {@link freshSeed} does, exported
+ * for callers outside this module that need to generate a round-1 seed themselves
+ * (`chain/oprfCommittee.ts::submitRound1`, which must hold onto the value it draws in
+ * order to replay it into round 2 — see this file's `wasmCommitteeCrypto` doc comment).
+ */
+export function freshOprfSeed(): Uint8Array {
+  return freshSeed();
+}

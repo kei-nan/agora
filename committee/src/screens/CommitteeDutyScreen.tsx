@@ -14,7 +14,7 @@
  * exercised manually/via a real app run, and the logic they call
  * (`chain/oprfCommittee.ts`) carries the real test coverage instead.
  */
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -26,14 +26,25 @@ import {
   Text,
   View,
 } from 'react-native';
-import { fetchPendingDuties, fulfillDuty, PendingDuty } from '../chain/oprfCommittee';
+import { fetchPendingDuties, PendingDuty, submitRound1 } from '../chain/oprfCommittee';
+import { freshOprfSeed } from '../crypto/wasmCommitteeCrypto';
 import { devOprfSecretShare, devSigningKeypair } from '../storage/keyStorage';
+
+/** `${queryId}:${committeeSlot}` -> the round-1 seed used for that pair, held only for
+ * the lifetime of this screen (matches `committee-node/src/main.rs`'s own in-memory,
+ * lost-on-restart `QueryProgress` — see that file's doc comment for the accepted
+ * limitation this mirrors: a query already past round 1 simply cannot be resumed here
+ * after a restart until it expires and a fresh one is posted). */
+function dutyKey(duty: Pick<PendingDuty, 'queryId' | 'committeeSlot'>): string {
+  return `${duty.queryId}:${duty.committeeSlot}`;
+}
 
 export default function CommitteeDutyScreen() {
   const [duties, setDuties] = useState<PendingDuty[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [fulfillingId, setFulfillingId] = useState<number | null>(null);
+  const round1Seeds = useRef<Map<string, Uint8Array>>(new Map());
 
   const load = useCallback(async () => {
     try {
@@ -61,10 +72,39 @@ export default function CommitteeDutyScreen() {
     async (duty: PendingDuty) => {
       setFulfillingId(duty.queryId);
       try {
-        const [pair, secretKeyBytes] = await Promise.all([devSigningKeypair(), devOprfSecretShare()]);
-        await fulfillDuty({ duty, secretKeyBytes, pair });
-        Alert.alert('Duty fulfilled', `Responded to query #${duty.queryId} on committee slot ${duty.committeeSlot}.`);
-        setDuties((prev) => prev.filter((d) => !(d.queryId === duty.queryId && d.committeeSlot === duty.committeeSlot)));
+        const [pair, secretShareBytes] = await Promise.all([devSigningKeypair(), devOprfSecretShare()]);
+
+        if (duty.phase === 'round1') {
+          const seed = freshOprfSeed();
+          await submitRound1({ duty, secretShareBytes, pair, seed });
+          round1Seeds.current.set(dutyKey(duty), seed);
+          Alert.alert(
+            'Round 1 submitted',
+            `Submitted round 1 for query #${duty.queryId} on committee slot ${duty.committeeSlot}. ` +
+              'Round 2 opens once enough other members have also submitted round 1 — refresh later to check.',
+          );
+        } else {
+          // phase === 'round2'. Round 2 needs this member's binding factor, Lagrange
+          // coefficient, and the shared challenge — public values computed from the
+          // locked round-1 set (see `chain/oprfCommittee.ts::submitRound2`'s doc
+          // comment). This app has no JS/TS port of that aggregation math yet (it's
+          // native-Rust-only today, in `oprf-committee-dev::threshold`), so round 2
+          // cannot actually be submitted from here — surfacing that honestly rather
+          // than fabricating placeholder values and submitting garbage on-chain.
+          const seed = round1Seeds.current.get(dutyKey(duty));
+          if (!seed) {
+            throw new Error(
+              'This screen only tracks a round-1 seed for the lifetime of the app session — ' +
+                'restart or a missed round 1 means round 2 cannot be completed for this query ' +
+                '(same limitation committee-node documents for its own in-memory query progress).',
+            );
+          }
+          throw new Error(
+            'Round 2 submission is not implemented yet: it needs this member\'s binding factor, ' +
+              "Lagrange coefficient, and the shared challenge, computed from the locked round-1 " +
+              'set. No JS/TS port of that math exists in this app (see oprfCommittee.ts::submitRound2).',
+          );
+        }
       } catch (e) {
         Alert.alert('Failed to fulfill duty', String(e));
       } finally {
@@ -93,11 +133,11 @@ export default function CommitteeDutyScreen() {
         renderItem={({ item }) => (
           <View style={styles.row}>
             <Text style={styles.rowText}>
-              Query #{item.queryId} · committee slot {item.committeeSlot}
+              Query #{item.queryId} · committee slot {item.committeeSlot} · {item.phase === 'round1' ? 'round 1' : 'round 2'}
             </Text>
             <Text style={styles.rowSubText}>from {item.submitter.slice(0, 10)}… · posted at block {item.postedAt}</Text>
             <Button
-              title={fulfillingId === item.queryId ? 'Fulfilling…' : 'Fulfill duty'}
+              title={fulfillingId === item.queryId ? 'Fulfilling…' : item.phase === 'round1' ? 'Submit round 1' : 'Submit round 2'}
               onPress={() => onFulfill(item)}
               disabled={fulfillingId !== null}
             />

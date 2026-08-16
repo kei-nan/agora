@@ -2,34 +2,37 @@
  * OPRF committee-duty pallet integration — the "check for pending duties" /
  * "fulfill duty" flow described in `docs/project/changelog/082.md` entry 82.
  *
- * # Reconciled against the real, now-landed pallet-identity mailbox
+ * # Migrated to the real two-round protocol
  *
- * This module was originally built against a provisional/guessed interface, before
- * `pallets/pallet-identity/src/lib.rs` had any of these primitives. **All of it has
- * since been confirmed against the real pallet**:
+ * `pallet-identity` was rewritten from a single-response design
+ * (`submit_oprf_response`, call index 16, and its `pendingOprfQueries`/`oprfResponses`
+ * storage) into a genuine `t`-of-`n` threshold protocol — Option B in
+ * `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`.
+ * `committee-node/src/extrinsic.rs` and `wasm_host.rs` were updated for this already;
+ * this file previously was not (it still called the retired `submitOprfResponse` and
+ * queried the retired `oprfResponses` storage — neither exists on-chain any more).
  *
- *  - extrinsic `submit_oprf_response(query_id: u64, committee_slot: u8, evaluation:
- *    [u8; 64], dlog_proof: BoundedVec<u8, ConstU32<64>>)` — call index 16 (confirmed;
- *    `submit_oprf_query` is 15) — `@polkadot/api` auto-camelCases this to
- *    `submitOprfResponse`, as already assumed.
- *  - storage map `pendingOprfQueries: query_id -> { submitter: AccountId,
- *    blinded_query: [u8; 64], posted_at: BlockNumber }` — field order and the
- *    64-byte x-then-y-big-endian `blinded_query` layout both confirmed correct
- *    against the real `OprfQueryRecord`.
- *  - storage map `committeeMembers: committee_slot (u8, 0..NUM_COMMITTEES) ->
- *    BoundedVec<AccountId>` — confirmed, `Blake2_128Concat`-keyed like every other
- *    numeric-keyed map in this pallet.
+ * The real calls, confirmed against `pallets/pallet-identity/src/lib.rs`:
+ *  - `submit_oprf_round1(query_id: u64, committee_slot: u8, r_i: [u8; 64], d_g: [u8;
+ *    64], d_q: [u8; 64], e_g: [u8; 64], e_q: [u8; 64])` — call index 16.
+ *  - `submit_oprf_round2(query_id: u64, committee_slot: u8, z_i: [u8; 32])` — call
+ *    index 17.
+ *  - storage double-map `oprfRound1Commitments: (query_id, committee_slot) ->
+ *    BoundedVec<OprfRound1Commitment>` — one entry per member who has submitted round 1
+ *    for that pair, `ValueQuery` (empty vec, not `None`, when nothing has been
+ *    submitted yet).
+ *  - storage double-map `oprfRound2Responses: (query_id, committee_slot) ->
+ *    BoundedVec<OprfRound2Response>` — same shape/locking pattern as round 1.
+ *  - pallet constant `oprfThreshold` (`T::OprfThreshold`) — how many round-1
+ *    commitments lock a `(query_id, committee_slot)`'s qualifying set before round 2
+ *    opens. Read via `api.consts.identity.oprfThreshold`, not a storage query — it's a
+ *    `#[pallet::constant]`, part of chain metadata, not chain state.
  *
- * **One correction from the original guess**: the real `OprfResponses` storage is a
- * `StorageDoubleMap<(query_id, committee_slot)> -> OprfResponseRecord { responder,
- * evaluation, dlog_proof }` — **one optional record per `(query, slot)` pair, not a
- * list of accounts to search.** The pallet's own doc comment confirms this is
- * deliberate: "presence of an entry for a given pair is exactly the idempotency guard
- * `submit_oprf_response` uses" — i.e. the question was never "has *this* address
- * responded," it's "has *any* member of this slot's roster already responded" (any
- * one of them fulfilling the duty satisfies it for the whole slot). The original
- * `hasAlreadyResponded` implementation searched a list for a matching address, which
- * doesn't match this shape at all — fixed below to a simple presence check.
+ * `pendingOprfQueries`/`committeeMembers` are unchanged from the original (correct)
+ * implementation — only the response-submission and "is this pair still outstanding"
+ * storage changed. See `getMemberCommitteeSlots`/`fetchPendingDuties`'s own doc
+ * comments: the "poll every slot, cross-reference the roster" shape those two already
+ * used is untouched by this migration.
  */
 import { KeyringPair } from '@polkadot/keyring/types';
 import { getApi } from './api';
@@ -55,9 +58,13 @@ export interface PendingOprfQuery {
   postedAt: number;
 }
 
+/** Which round this member still owes a submission for on a given `(query, slot)` pair. */
+export type DutyPhase = 'round1' | 'round2';
+
 /** A `PendingOprfQuery` this member specifically owes a response for, on one committee slot. */
 export interface PendingDuty extends PendingOprfQuery {
   committeeSlot: number;
+  phase: DutyPhase;
 }
 
 function assertValidCommitteeSlot(slot: number, label: string): void {
@@ -78,6 +85,9 @@ function assertBlindedQueryLength(blindedQuery: Uint8Array, label: string): void
  * `NUM_COMMITTEES` (5) small storage reads, not one query. A member is expected to
  * belong to at most one slot in practice, but this returns every match rather than
  * assuming that.
+ *
+ * Unchanged by the two-round migration — confirmed still correct against the real
+ * pallet, do not modify.
  */
 export async function getMemberCommitteeSlots(address: string): Promise<number[]> {
   const api = await getApi();
@@ -92,41 +102,74 @@ export async function getMemberCommitteeSlots(address: string): Promise<number[]
   return slots;
 }
 
+/** Decodes an `OprfRound1Commitments`/`OprfRound2Responses` `BoundedVec` entry's `member` field. */
+function memberOf(entry: any): string {
+  return String(entry.member);
+}
+
 /**
- * True if this `(queryId, committeeSlot)` pair already has a response recorded —
- * `OprfResponses` is a `StorageDoubleMap` holding at most one `OprfResponseRecord`
- * per pair (see this module's doc comment for why: any one member of a slot's
- * roster fulfilling the duty satisfies it for the whole slot, so this is a presence
- * check, not a per-`address` search). The `address` parameter from the original
- * (wrong) guess is gone — it was never meaningful for this real storage shape.
+ * Which round (if any) `address` still owes a submission for on this `(queryId,
+ * committeeSlot)` pair, given `threshold` (`T::OprfThreshold`):
+ *
+ *  - not yet in the round-1 set, and the set hasn't locked without them -> `'round1'`.
+ *  - not yet in the round-1 set, but the set already locked (reached `threshold`
+ *    members) without them -> `null` (missed it; nothing this member can do for this
+ *    pair, matching `submit_oprf_round1`'s `OprfRound1SetLocked` rejection).
+ *  - in the round-1 set, but it hasn't locked yet -> `null` (round 2 isn't open yet;
+ *    `submit_oprf_round2` would reject with `OprfRound1NotLocked`).
+ *  - in the (locked) round-1 set, and not yet in the round-2 set -> `'round2'`.
+ *  - in both -> `null` (this member's duty for this pair is done).
+ *
+ * Replaces the retired `hasAlreadyResponded`, which checked presence in the (also
+ * retired) `oprfResponses` double-map. Same double-map/`ValueQuery` shape convention
+ * `OprfRound1Commitments`/`OprfRound2Responses` share — an absent entry decodes as an
+ * empty `BoundedVec`, not `None`.
  */
-async function hasAlreadyResponded(
+async function dutyPhaseFor(
   api: Awaited<ReturnType<typeof getApi>>,
   queryId: number,
   committeeSlot: number,
-): Promise<boolean> {
-  const responded = await (api.query.identity as any).oprfResponses(queryId, committeeSlot);
-  return !(responded as any).isNone && !(responded as any).isEmpty;
+  address: string,
+  threshold: number,
+): Promise<DutyPhase | null> {
+  const round1Raw = await (api.query.identity as any).oprfRound1Commitments(queryId, committeeSlot);
+  const round1: any[] = (round1Raw as any).toJSON() ?? [];
+  const inRound1 = round1.some((c) => memberOf(c) === address);
+
+  if (!inRound1) {
+    return round1.length < threshold ? 'round1' : null;
+  }
+  if (round1.length < threshold) {
+    return null; // in the set, but it hasn't locked yet — round 2 isn't open
+  }
+
+  const round2Raw = await (api.query.identity as any).oprfRound2Responses(queryId, committeeSlot);
+  const round2: any[] = (round2Raw as any).toJSON() ?? [];
+  const inRound2 = round2.some((r) => memberOf(r) === address);
+  return inRound2 ? null : 'round2';
 }
 
 /**
  * Polls chain state for this member's pending committee duties: every
  * `pendingOprfQueries` entry, cross-referenced against `committeeMembers` for which
- * slot(s) `address` serves on, filtered down to `(query, slot)` pairs with no response
- * recorded yet in `oprfResponses` (see `hasAlreadyResponded` — a presence check per
- * pair, not per-address, since any one member of the slot's roster answering closes
- * the duty for the whole slot).
+ * slot(s) `address` serves on, filtered down to `(query, slot)` pairs where `address`
+ * currently owes either a round-1 or round-2 submission (see `dutyPhaseFor`).
  *
  * This is the whole "check" side of the poll-on-open pattern changelog 082 specifies
  * — no push notifications, no background service; call this when the app is opened or
  * the screen is refreshed, matching how `pallet-courts`' jury-duty selection is
  * checked by the citizen rather than pushed to them.
+ *
+ * The slot-iteration shape (poll every slot the member serves on, per query) is
+ * unchanged by the two-round migration — confirmed already correct, do not modify;
+ * only `dutyPhaseFor`'s underlying storage changed.
  */
 export async function fetchPendingDuties(address: string): Promise<PendingDuty[]> {
   const api = await getApi();
   const mySlots = await getMemberCommitteeSlots(address);
   if (mySlots.length === 0) return [];
 
+  const threshold = (api.consts.identity as any).oprfThreshold.toNumber();
   const entries = await api.query.identity.pendingOprfQueries.entries();
   const duties: PendingDuty[] = [];
 
@@ -143,9 +186,9 @@ export async function fetchPendingDuties(address: string): Promise<PendingDuty[]
     const postedAt = postedAtRaw.toNumber();
 
     for (const committeeSlot of mySlots) {
-      const responded = await hasAlreadyResponded(api, queryId, committeeSlot);
-      if (!responded) {
-        duties.push({ queryId, submitter, blindedQuery, postedAt, committeeSlot });
+      const phase = await dutyPhaseFor(api, queryId, committeeSlot, address, threshold);
+      if (phase) {
+        duties.push({ queryId, submitter, blindedQuery, postedAt, committeeSlot, phase });
       }
     }
   }
@@ -153,49 +196,111 @@ export async function fetchPendingDuties(address: string): Promise<PendingDuty[]
   return duties.sort((a, b) => a.queryId - b.queryId || a.committeeSlot - b.committeeSlot);
 }
 
-export interface FulfillDutyParams {
+export interface SubmitRound1Params {
   duty: Pick<PendingDuty, 'queryId' | 'committeeSlot' | 'blindedQuery'>;
-  /** This member's OPRF secret key share (see `storage/keyStorage.ts` — DEV-ONLY today). */
-  secretKeyBytes: Uint8Array;
-  /** Signs the `submit_oprf_response` transaction (the chain-account key, distinct from `secretKeyBytes`). */
+  /** This member's OPRF secret share (see `storage/keyStorage.ts` — DEV-ONLY today). */
+  secretShareBytes: Uint8Array;
+  /** Signs the `submit_oprf_round1` transaction (the chain-account key, distinct from `secretShareBytes`). */
   pair: KeyringPair;
   /** Overrides the module-wide `CommitteeCrypto` — tests inject a fixture here. */
   crypto?: CommitteeCrypto;
+  /**
+   * Fresh 32-byte per-query randomness for the FROST-style nonce commitments —
+   * required, not generated internally, because the *caller* must retain this exact
+   * value and replay it into {@link submitRound2} for the same `(queryId,
+   * committeeSlot)` pair (see `CommitteeCrypto.ts`'s doc comment on `round1`). Tests
+   * pass a fixed fixture; real callers should draw this from
+   * `crypto/wasmCommitteeCrypto.ts`'s `freshOprfSeed()`.
+   */
+  seed: Uint8Array;
 }
 
 /**
- * Fulfills one pending duty: evaluates the blinded query under this member's secret
- * share via {@link CommitteeCrypto.evaluateQuery} (still the stub — see
- * `CommitteeCrypto.ts`'s doc comment for what's real vs. not), then submits
- * `submit_oprf_response(query_id, committee_slot, evaluation, dlog_proof)`.
+ * Submits round 1 of the threshold protocol for one pending duty: computes this
+ * member's partial evaluation and nonce commitments via
+ * {@link CommitteeCrypto.round1}, then submits `submit_oprf_round1(query_id,
+ * committee_slot, r_i, d_g, d_q, e_g, e_q)`.
  *
- * `duty.blindedQuery` is now passed to `evaluateQuery` as a single 64-byte value
- * with no split/join step — the real Wasm ABI takes/returns it whole, matching
- * `PendingOprfQueries`/`OprfResponses`' own on-chain layout directly (the earlier
- * guessed ABI needed separate 32-byte X/Y halves; the real one doesn't).
+ * Deliberately does not itself decide whether the duty is still outstanding or which
+ * phase it's in — call `fetchPendingDuties` first and pass one of its `phase ===
+ * 'round1'` results in. Validates `duty.committeeSlot`/`duty.blindedQuery`'s length
+ * before ever calling the crypto core or the chain, mirroring `identity.ts`'s "fail
+ * locally with a specific message" convention.
  *
- * Deliberately does not itself decide whether the duty is still outstanding — call
- * `fetchPendingDuties` first and pass one of its results in. Validates
- * `duty.committeeSlot` and `duty.blindedQuery`'s length before ever calling the (stub)
- * crypto function or the chain, mirroring `identity.ts`'s "fail locally with a
- * specific message" convention.
+ * The caller (not this function) is responsible for holding onto `params.seed` and
+ * passing the *same* bytes into {@link submitRound2} once this pair's round-1 set
+ * locks — a mismatched seed silently fails to combine into a valid proof rather than
+ * erroring anywhere (see `CommitteeCrypto.ts`'s doc comment).
  */
-export async function fulfillDuty(params: FulfillDutyParams): Promise<void> {
-  const { duty, secretKeyBytes, pair } = params;
-  assertValidCommitteeSlot(duty.committeeSlot, 'fulfillDuty');
-  assertBlindedQueryLength(duty.blindedQuery, 'fulfillDuty');
+export async function submitRound1(params: SubmitRound1Params): Promise<void> {
+  const { duty, secretShareBytes, pair, seed } = params;
+  assertValidCommitteeSlot(duty.committeeSlot, 'submitRound1');
+  assertBlindedQueryLength(duty.blindedQuery, 'submitRound1');
 
   const crypto = params.crypto ?? getCommitteeCrypto();
-  const result = await crypto.evaluateQuery(secretKeyBytes, duty.blindedQuery);
+  const commitment = await crypto.round1(secretShareBytes, duty.blindedQuery, seed);
 
   const api = await getApi();
   return submitExtrinsic(
-    (api.tx.identity as any).submitOprfResponse(
+    (api.tx.identity as any).submitOprfRound1(
       duty.queryId,
       duty.committeeSlot,
-      result.evaluation,
-      result.dlogProof,
+      commitment.rI,
+      commitment.dG,
+      commitment.dQ,
+      commitment.eG,
+      commitment.eQ,
     ),
+    pair,
+  );
+}
+
+export interface SubmitRound2Params {
+  duty: Pick<PendingDuty, 'queryId' | 'committeeSlot'>;
+  /** This member's OPRF secret share — the same value passed to `submitRound1`. */
+  secretShareBytes: Uint8Array;
+  /** Signs the `submit_oprf_round2` transaction. */
+  pair: KeyringPair;
+  /** Overrides the module-wide `CommitteeCrypto` — tests inject a fixture here. */
+  crypto?: CommitteeCrypto;
+  /** The exact seed passed to `submitRound1` for this same `(queryId, committeeSlot)` pair. */
+  seed: Uint8Array;
+  /**
+   * This member's binding factor, Lagrange coefficient, and the shared round-2
+   * challenge — public values computed from the now-locked round-1 set via
+   * `oprf-committee-dev::threshold::binding_factor`/`lagrange_coefficient`/
+   * `combined_challenge` (see `committee-node/src/main.rs::try_round2` for the
+   * reference computation). **This app has no JS/TS port of that aggregation math** —
+   * see `crypto/CommitteeCrypto.ts`'s module doc for why (it's deliberately
+   * native-Rust-only, not behind the wasm FFI boundary, since it touches no secret
+   * material). Callers must supply real values from elsewhere until such a port
+   * exists; this function does not compute or default them.
+   */
+  rhoI: Uint8Array;
+  lambdaI: Uint8Array;
+  e: Uint8Array;
+}
+
+/**
+ * Submits round 2 of the threshold protocol for one pending duty: computes this
+ * member's response scalar via {@link CommitteeCrypto.round2Response}, then submits
+ * `submit_oprf_round2(query_id, committee_slot, z_i)`.
+ *
+ * Call only after `fetchPendingDuties` reports `phase === 'round2'` for this pair
+ * (meaning round 1 has locked and this member is in the qualifying set) — see
+ * `dutyPhaseFor`. See `params.rhoI`/`lambdaI`/`e`'s doc comments for the real,
+ * currently-unclosed gap in this app: nothing here computes those three values.
+ */
+export async function submitRound2(params: SubmitRound2Params): Promise<void> {
+  const { duty, secretShareBytes, pair, seed, rhoI, lambdaI, e } = params;
+  assertValidCommitteeSlot(duty.committeeSlot, 'submitRound2');
+
+  const crypto = params.crypto ?? getCommitteeCrypto();
+  const response = await crypto.round2Response(secretShareBytes, seed, rhoI, lambdaI, e);
+
+  const api = await getApi();
+  return submitExtrinsic(
+    (api.tx.identity as any).submitOprfRound2(duty.queryId, duty.committeeSlot, response.zI),
     pair,
   );
 }

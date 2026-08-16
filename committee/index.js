@@ -27,7 +27,8 @@ import { wasmCommitteeCrypto } from './src/crypto/wasmCommitteeCrypto';
 global.Buffer = global.Buffer || Buffer;
 
 // Installs the real OPRF crypto core (changelog #084) — without this, every
-// `fulfillDuty` call would still hit `notImplementedCommitteeCrypto`'s throwing stub.
+// `submitRound1`/`submitRound2` call (`chain/oprfCommittee.ts`) would still hit
+// `notImplementedCommitteeCrypto`'s throwing stub.
 setCommitteeCrypto(wasmCommitteeCrypto);
 
 AppRegistry.registerComponent('AgoraCommittee', () => App);

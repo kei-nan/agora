@@ -4,14 +4,15 @@
  * Two distinct credentials, doing two different jobs (changelog 082, "Two distinct
  * credentials per member device"):
  *
- *  1. The member's chain account signing key — signs `submit_oprf_response` and is
- *     checked against the on-chain committee roster (`committeeMembers`). This is the
- *     *same kind* of key `mobile/src/chain/identity.ts`'s `getSigningKeypair()` already
- *     manages for the citizen-facing app (a `KeyringPair`), so `devSigningKeypair()`
- *     below mirrors that function's approach exactly, rather than inventing a new
- *     storage pattern, per this task's brief.
+ *  1. The member's chain account signing key — signs `submit_oprf_round1`/
+ *     `submit_oprf_round2` (see `chain/oprfCommittee.ts`) and is checked against the
+ *     on-chain committee roster (`committeeMembers`). This is the *same kind* of key
+ *     `mobile/src/chain/identity.ts`'s `getSigningKeypair()` already manages for the
+ *     citizen-facing app (a `KeyringPair`), so `devSigningKeypair()` below mirrors that
+ *     function's approach exactly, rather than inventing a new storage pattern, per
+ *     this task's brief.
  *  2. The OPRF secret key share itself — raw bytes, never a `KeyringPair`, used only as
- *     input to `CommitteeCrypto.evaluateQuery`. Nothing analogous exists elsewhere in
+ *     input to `CommitteeCrypto.round1`/`round2Response`. Nothing analogous exists elsewhere in
  *     this codebase yet (grepped: no Keychain/Keystore/SecureEnclave integration exists
  *     anywhere under `mobile/` either — `identity.ts`'s own doc comment says real key
  *     custody "must live in iOS Secure Enclave / Android Keystore" but that isn't built
