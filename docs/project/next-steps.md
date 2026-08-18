@@ -41,7 +41,7 @@
    mid-ceremony beyond a clean, tested timeout-and-abort; `OprfCommitteeKeys`/`CommitteeMembers`
    remain empty of anything real. See `docs/project/changelog/085.md` and
    `oprf-committee-dev/README.md`'s "Founding-ceremony simulator" section for the full,
-   explicit list of what a real ceremony still needs beyond this tooling.]** [PARTIAL] **Real Rarimo passport ZK flow (mobile)** — architecture researched and decided (log #55), on-device proving toolchain + proof-byte-encoding implemented and unit-tested (log #56), NFC reading researched with a concrete library choice (log #57) and the Android native module implemented (log #58). The `.wcd` witness-graph file blocker is now cleared in principle (log #61: fixed all 4 upstream `circom-witnesscalc` bugs found; `build-circuit` produces a complete, structurally-verified `out.wcd` for the real `registerIdentity_11_256_3_2_336_216_NA` circuit — 49MB, 3.78M nodes) but not yet in practice: the fixes only exist on two PR branches on a fork (`github.com/kei-nan/circom-witnesscalc`), not merged upstream, and the actual `out.wcd` this session produced exists only in this environment's ephemeral scratchpad — nobody has published it anywhere the mobile app could fetch it from yet (the decided plan per log #55/#56 is IPFS, with the desktop app pinning it). DG1/DG15/SOD → circuit-inputs assembly (log #59's "not yet started" item) is now built and tested for its self-contained half (log #62: `sodParser.ts`, cross-checked against the real reference implementation on a synthetic-but-real SOD fixture, wired into `RegisterScreen.tsx`). Log #62 also surfaced a blocker — `slaveMerkleRoot`/`slaveMerkleInclusionBranches` need a live inclusion proof from Rarimo's own `CertificatesSMT` registry — which log #63 resolved architecturally, not just technically: depending on Rarimo's hosted registry for citizen registration was a real vendor-lock-in bug (this chain's registration would depend on infrastructure it doesn't govern), not merely an unresolved integration. We now build and host our own equivalent certificate tree instead (`mobile/src/chain/certificateTree.ts` + `scripts/certificate-registry/`), registered via `pallet-identity`'s already-existing `AllowedMerkleRoots` governance. Still blocked on: actually sourcing a meaningful set of trusted DSC certificates (log #63 — this is a governance/PKI problem, not a coding one); a real (not public-data-derived) `skIdentity` generation scheme; publishing the `.wcd` (or a freshly-rebuilt one, once the upstream PRs land) to IPFS; verifying any of the native/NFC code actually compiles or runs (no JDK, Android SDK, or device in this environment — see log #58); and the iOS side (no `ios/` project exists yet to scaffold into). Separately, log #64 found that Rarimo itself is migrating this whole circuit family from circom/Groth16 to Noir/UltraHonk — recommendation there is to keep building on the current path for now (see log #64 for why) but not treat that as settled long-term. Full writeup in logs #55/#56/#57/#58/#61/#62/#63/#64; summary:
+   explicit list of what a real ceremony still needs beyond this tooling.] **Update, log #088**: both of entry 82's own "Still open" items that named a governance/authorship gap are now closed. (1) **A governance trigger for voluntary/early rotation now exists.** `pallet-identity` gained `trigger_voluntary_oprf_rotation` (call index 18), gated by the same `AdminOrigin`/`legislature_call_hash` pattern `rotate_oprf_scheme` already uses, taking a mandatory `reason: [u8; 32]` (an IPFS content hash, mirroring `pallet_courts`' reasoning pattern) so a voluntary rotation — "move from phones to dedicated servers on our own schedule, nothing's wrong," entry 82's own example — is always distinguishable on-chain, via its own `OprfSchemeVoluntarilyRotated` event, from both the scheduled (`rotate_oprf_scheme`) and emergency (`emergency_rotate_oprf_scheme`) paths. 4 new tests; `cargo test -p pallet-identity-zk`: 112/112 passing (108 pre-existing + 4 new). (2) **Device-update authorship is now decided.** See `docs/project/changelog/088.md` for the full decision record: reproducible builds (so any member or auditor can independently confirm a distributed build's hash matches its published source) plus a small cross-committee update-review sub-quorum (one designated reviewer per each of entry 73's 5 independent committees, attesting on-chain to a build hash via the same poll-and-attest mailbox pattern entry 82 already established) — deliberately neither a single project-controlled signing key (recreates the exact centralization this design avoids elsewhere) nor the full 12-of-35 cryptographic threshold (conflates code-review with OPRF-evaluation competence, and is operationally unworkable per-release). No on-chain storage/extrinsic for the attestation itself, no reproducible-build tooling, and no decision on who sits on each sub-quorum exist yet — this entry is architecture, same as entry 82 was for the node design it complements. **The OPRF committee service itself remains entirely unbuilt, unchanged by either half of this update.**]** [PARTIAL] **Real Rarimo passport ZK flow (mobile)** — architecture researched and decided (log #55), on-device proving toolchain + proof-byte-encoding implemented and unit-tested (log #56), NFC reading researched with a concrete library choice (log #57) and the Android native module implemented (log #58). The `.wcd` witness-graph file blocker is now cleared in principle (log #61: fixed all 4 upstream `circom-witnesscalc` bugs found; `build-circuit` produces a complete, structurally-verified `out.wcd` for the real `registerIdentity_11_256_3_2_336_216_NA` circuit — 49MB, 3.78M nodes) but not yet in practice: the fixes only exist on two PR branches on a fork (`github.com/kei-nan/circom-witnesscalc`), not merged upstream, and the actual `out.wcd` this session produced exists only in this environment's ephemeral scratchpad — nobody has published it anywhere the mobile app could fetch it from yet (the decided plan per log #55/#56 is IPFS, with the desktop app pinning it). DG1/DG15/SOD → circuit-inputs assembly (log #59's "not yet started" item) is now built and tested for its self-contained half (log #62: `sodParser.ts`, cross-checked against the real reference implementation on a synthetic-but-real SOD fixture, wired into `RegisterScreen.tsx`). Log #62 also surfaced a blocker — `slaveMerkleRoot`/`slaveMerkleInclusionBranches` need a live inclusion proof from Rarimo's own `CertificatesSMT` registry — which log #63 resolved architecturally, not just technically: depending on Rarimo's hosted registry for citizen registration was a real vendor-lock-in bug (this chain's registration would depend on infrastructure it doesn't govern), not merely an unresolved integration. We now build and host our own equivalent certificate tree instead (`mobile/src/chain/certificateTree.ts` + `scripts/certificate-registry/`), registered via `pallet-identity`'s already-existing `AllowedMerkleRoots` governance. Still blocked on: actually sourcing a meaningful set of trusted DSC certificates (log #63 — this is a governance/PKI problem, not a coding one); a real (not public-data-derived) `skIdentity` generation scheme; publishing the `.wcd` (or a freshly-rebuilt one, once the upstream PRs land) to IPFS; verifying any of the native/NFC code actually compiles or runs (no JDK, Android SDK, or device in this environment — see log #58); and the iOS side (no `ios/` project exists yet to scaffold into). Separately, log #64 found that Rarimo itself is migrating this whole circuit family from circom/Groth16 to Noir/UltraHonk — recommendation there is to keep building on the current path for now (see log #64 for why) but not treat that as settled long-term. Full writeup in logs #55/#56/#57/#58/#61/#62/#63/#64; summary:
    - **`@rarimo/react-native-passport-reader` does not exist** (was a wrong reference in this file — corrected). `@rarimo/rarime-rn-sdk` is real but the wrong tool: Expo-coupled, generates Noir proofs, registers straight to Rarimo's own EVM contracts — doesn't feed `pallet-identity` at all.
    - **Decided path**: stay on `passport-zk-circuits` (circom + Groth16 BN254) directly — confirmed current/actively maintained, and confirmed byte-for-byte compatible with our existing VK assets and `verifier.rs` (downloaded `registerIdentity_11_256_3_2_336_216_NA`'s real verification key from their latest release: `protocol: groth16, curve: bn128, nPublic: 5` — exact match to our 5-signal layout). Prove on-device with `@iden3/react-native-rapidsnark` (Groth16 prover) + `@iden3/react-native-circom-witnesscalc` (witness calc) — both are real, maintained, **plain bare-RN native modules, no Expo migration needed**. This is the same toolchain Rarimo's own production RariMe app ships (confirmed: their iOS build bundles `librapidsnark.a` + `libwitnesscalc_registerIdentity_20_160_3_3_736_200_NA.a`, named after our exact circuit variant).
    - **Decided: use the Full circuit, not "Light."** Light mode (proving key ~15–22MB vs. Full's 515MB) drops the on-device PKI signature-chain check and defers it to a "trusted Rarimo verifier" server — a centralized, unaccountable trust dependency that contradicts this project's whole point and doesn't match `pallet-identity`'s existing design (`AllowedMerkleRoots`, gated by `AdminOrigin` → legislature vote — i.e., trust anchors decided by on-chain governance, not a vendor's server). The Full circuit verifies everything (passport integrity **and** the PKI chain) inside the SNARK, fully self-contained and verifiable from public data alone. This is a deliberate size-for-trustlessness tradeoff, made on purpose — don't "optimize" this back to Light mode without re-litigating the tradeoff.
@@ -93,6 +93,32 @@
     loop are unit-tested at the pure-logic level only; (b) `Courts::set_oracle_account` (root-
     only) was never called, so no real chain currently accepts this service's signed calls. See
     `court-oracle/README.md` and `docs/project/changelog/086.md` for the full accounting.
+    **Update, log #090: (b) is now done, and (a) is partially done — for real, not simulated.**
+    A real chain was built (per `/CLAUDE.md`'s exact Critical Build Command, no `dev-mode`) and
+    run; a real local Kubo IPFS daemon was stood up (no root needed — a static binary from
+    `dist.ipfs.tech` works fine); `Sudo::sudo(Courts::set_oracle_account(...))` was called for
+    real against a dedicated oracle account, confirmed via storage query — closing (b)
+    outright. A real test case was filed (`Courts.Cases[0]`, confirmed on-chain), which required
+    bootstrapping `CurrentAIModelVersion` off zero via the AI Model Governance Council (real,
+    no shortcut needed — that mechanism resolves instantly, unlike legislature motions) and
+    working around the fact that becoming an `is_active_citizen` normally requires either a real
+    ZKPassport proof (item 1's standing blocker) or a `pallet-legislature` motion with a genuine,
+    non-fast-forwardable 7-day window — worked around with a disclosed `System::set_storage` by
+    root, not a fabricated proof or a code bypass; see log #090 for the full reasoning on why
+    that's the honest option here. `court-oracle` was then built and run for real against all
+    three: it decrypted a real age-encrypted keystore, connected over real RPC and found the real
+    filed case, and called the real Anthropic API — which returned a real `401 Unauthorized`,
+    because **no Claude API key exists anywhere in this sandboxed environment** (checked the env,
+    every reachable `.env*`, and confirmed `~/.claude/.credentials.json` is Claude Code's own
+    unrelated OAuth credential, not usable here). That is where this session's real progress
+    stops: no ruling was ever produced, so `submit_ai_ruling`/`finalize_ruling` were never
+    actually submitted by `court-oracle`, and the IPFS-publish path (`ipfs.rs`'s real `add()`
+    call) never got exercised either, since `poll_once` calls Claude before IPFS. Nothing was
+    mocked to paper over this — the 401 is reported as exactly what it is, a real, live rejection
+    from a real, live endpoint, not a stand-in for success. **Still open, unchanged: item 1 (no
+    real citizen registration is possible without it) and a real Claude API key for this
+    environment; both are prerequisites for actually closing this item.** See
+    `docs/project/changelog/090.md` for the full trail.
 11. [DONE] **Multi-agent security review fixes (2026-08-08/09)** — a 7-agent parallel review of
     the whole repo found several real bugs, landed as reconciled, tested branches
     (`review-fix/*`), pending merge review:
@@ -147,7 +173,13 @@
       architecturally reworked); desktop's `chain_submit_extrinsic` command exists but nothing
       yet produces its input (no phone→desktop signed-arbitrary-call protocol); desktop's
       `smoldot` dependency remains unwired (confirmed a substantial transport-layer rewrite,
-      not a quick swap, investigated not attempted).
+      not a quick swap, investigated not attempted). **Update (changelog #089, later session)**:
+      this specific gap is closed — `desktop/src/chain/client.ts` embeds smoldot for real via
+      `@polkadot/api`'s `ScProvider`, in the JS frontend (not Rust), and the nine chain-read
+      commands the browsing pages call were migrated to it and proven to sync and answer real
+      queries against a live local `agora-node --dev` chain, headlessly, in a real production
+      browser build. `chain_submit_extrinsic` remains exactly as described above — still
+      unwired to any producer of its input.
     - Every fix above was built by a sub-agent working in a harness-provided git worktree that
       turned out to be cut from a stale branch point 8 commits behind `main` (missing the OPRF
       mailbox, AI model governance, and several other commits) rather than current `main` — a
@@ -159,6 +191,24 @@
       re-run clean post-reconciliation). Flagging this here mainly so a future session doesn't
       waste time re-discovering it if worktree-isolated sub-agents produce another
       surprising-looking diff.
+    - **Same class of problem recurred integrating changelog entries 88-90** (the OPRF voluntary
+      rotation trigger, device-update-authorship decision record, and desktop smoldot light
+      client): all three were built in worktrees cut from a branch point 10-11 commits behind
+      `main` (missing, among others, the `EmergencyRotationOrigin`→`pallet-emergency-council`
+      wiring and the OPRF mailbox pruning work). This time it produced a genuine compile error,
+      not just a stale-context risk: `trigger_voluntary_oprf_rotation` and the already-landed
+      `prune_oprf_query` both claimed `#[pallet::call_index(18)]` — reassigned the former to 19.
+      It also produced one genuinely wrong test:
+      `trigger_voluntary_oprf_rotation_is_independent_of_the_other_two_rotation_paths` called
+      `emergency_rotate_oprf_scheme(RuntimeOrigin::root())` directly, which the since-landed
+      `EmergencyRotationOrigin` wiring now rejects with `BadOrigin` (root alone no longer
+      suffices — an active emergency must be genuinely declared first); fixed by reusing the
+      existing `declare_active_emergency()` test helper. `docs/project/changelog/087.md` also
+      collided on file name with this session's own new entry 87 (face match/liveness) —
+      unrelated content, pure numbering coincidence — resolved by moving the incoming
+      court-oracle entry to 090 and fixing its cross-references. Post-reconciliation:
+      `cargo test -p pallet-identity-zk` 122/122, `cargo check -p agora-runtime` clean,
+      `cargo check` clean in `desktop/src-tauri`, `tsc --noEmit` clean in `desktop/`.
 12. [PARTIAL] **On-device face match + liveness detection** — found 2026-08-10 during a
     docs-drift review, not previously tracked here. **Update, log #087**: the TODO is now real
     code. `NfcPassportModule.kt` reads EF.DG2 (JMRTD's `DG2File`/`FaceInfo`/`FaceImageInfo` API,
