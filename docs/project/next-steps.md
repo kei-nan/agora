@@ -159,17 +159,30 @@
       re-run clean post-reconciliation). Flagging this here mainly so a future session doesn't
       waste time re-discovering it if worktree-isolated sub-agents produce another
       surprising-looking diff.
-12. [ ] **On-device face match + liveness detection** — found 2026-08-10 during a docs-drift
-    review, not previously tracked here. CLAUDE.md's Identity System section lists "On-device
-    face match (Apple Vision iOS / MobileFaceNet Android)" and "Liveness detection (blink/turn)"
-    as if built; neither exists in any form. `mobile/src/screens/RegisterScreen.tsx`'s
-    registration flow sets `setStep('liveness')` then immediately hits
-    `// TODO: await FaceMatch.verify(scan.faceImage);` and moves on to `setStep('proving')` —
-    no liveness check (blink/turn) runs, no face-image comparison against the passport's DG2
-    photo happens, on-device or otherwise. No `FaceMatch` module, MobileFaceNet TFLite model, or
-    Apple Vision integration exists anywhere in `mobile/`. Registration currently proceeds from
-    a completed NFC scan straight to ZK proving with no biometric liveness/match gate at all.
-    Scope: an Android TFLite MobileFaceNet pipeline plus a liveness (blink/turn) check wired
-    into `RegisterScreen.tsx` before the `proving` step; iOS has no equivalent yet since
-    `ios/` itself doesn't exist. Not started.
+12. [PARTIAL] **On-device face match + liveness detection** — found 2026-08-10 during a
+    docs-drift review, not previously tracked here. **Update, log #087**: the TODO is now real
+    code. `NfcPassportModule.kt` reads EF.DG2 (JMRTD's `DG2File`/`FaceInfo`/`FaceImageInfo` API,
+    genuinely source-verified against the real `jmrtd-0.8.6-sources.jar` this project pins — see
+    log #087 for the exact classes/methods). A new `com.agora.facematch` native package
+    (`FaceCameraViewManager`/`FaceCaptureModule`/`FaceMatchModule`) — a custom CameraX-based
+    module, deliberately not `react-native-vision-camera` (v4 is JSI-oriented, v5 is
+    New-Architecture-only, and this app has `newArchEnabled=false` — see log #087 for the full
+    reasoning) — drives a 2-shot randomized challenge-response liveness check (frontal
+    eyes-open baseline, then blink or turn, read via ML Kit Face Detection's bundled model) and
+    a MobileFaceNet TFLite embedding comparison against the DG2 photo. `RegisterScreen.tsx`'s
+    TODO line is replaced with a real capture UI gating progression to `proving`; a new
+    `LivenessVerified` pipeline stage was added to `registrationState.ts`/`registrationReconciler.ts`.
+    `mobile/android/app/src/main/assets/mobilefacenet.tflite` is a real, cited, BSD-3-Clause
+    asset (`MCarlomagno/FaceRecognitionAuth`) — its training-data lineage
+    (`sirius-ai/MobileFaceNet_TF`, typically MS1M/MS-Celeb-1M-derived) is documented in
+    `FaceMatchModule.kt`'s doc comment and log #087, not hidden. `npm run type-check`: clean.
+    `npm test`: 210/210 passing (up from 197). **Still not real**: none of the new Kotlin has
+    been compiled or run — no Android SDK/JDK exists in this environment, same standing
+    limitation `NfcPassportModule.kt` itself already carries. Only the DG2/JMRTD API was
+    independently source-verified this session; the CameraX/ML Kit/TFLite calls were written
+    against documented stable APIs but not re-verified against downloaded source. Match/liveness
+    thresholds are unvalidated placeholders (no real calibration corpus). The liveness check is
+    2-shot-still, not continuous video — a prepared attacker with video of the real person could
+    plausibly defeat it, a documented residual risk, not an oversight. iOS has no equivalent
+    since `ios/` itself doesn't exist. See `docs/project/changelog/087.md` for the full record.
 

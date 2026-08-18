@@ -14,6 +14,8 @@ import net.sf.scuba.smartcards.IsoDepCardService
 import org.jmrtd.BACKey
 import org.jmrtd.CardServiceProtocolException
 import org.jmrtd.PassportService
+import org.jmrtd.lds.icao.DG2File
+import java.io.ByteArrayInputStream
 import java.io.IOException
 
 /**
@@ -23,6 +25,18 @@ import java.io.IOException
  * circuit (see `mobile/src/chain/zkProving.ts` / `proofEncoding.ts` for the
  * proving half this feeds; this module is strictly upstream and does not
  * touch those files).
+ *
+ * Also reads EF.DG2 (the passport photo) — unlike the three fields above,
+ * this one genuinely is parsed: `DG2File`/`FaceInfo`/`FaceImageInfo`
+ * (`org.jmrtd.lds.icao`/`org.jmrtd.lds.iso19794`) unwrap the ISO 19794-5
+ * CBEFF biometric header to get at the encoded image bytes + MIME type
+ * themselves (`image/jpeg` or `image/jp2` per `org.jmrtd.lds.ImageInfo`'s
+ * constants — confirmed from the real `jmrtd-0.8.6-sources.jar` this project
+ * pins, not written from memory). Consumed by the face-match pipeline
+ * (`mobile/android/app/src/main/java/com/agora/facematch/FaceMatchModule.kt`),
+ * not the ZK circuit — a passport's first `FaceImageInfo` (the canonical
+ * frontal image ICAO 9303 requires every passport to carry) is compared
+ * on-device against a live selfie, never submitted anywhere.
  *
  * Built on **JMRTD** (`org.jmrtd:jmrtd`, LGPL) — the real, current, standard
  * open-source library for ICAO 9303 chip access, and confirmed (HANDOFF.md
@@ -223,11 +237,24 @@ class NfcPassportModule(reactContext: ReactApplicationContext) : ReactContextBas
         // 9303 and are never ambiguous within a single selected context.
         // sendSelectApplet above means we're reading EF.SOD here.
         val sod = drain(passportService.getInputStream(PassportService.EF_SOD, PassportService.DEFAULT_MAX_BLOCKSIZE))
+        val dg2Raw = drain(passportService.getInputStream(PassportService.EF_DG2, PassportService.DEFAULT_MAX_BLOCKSIZE))
+
+        // A passport may carry more than one FaceInfo/FaceImageInfo (e.g.
+        // multiple capture angles) — the first is the canonical frontal
+        // image ICAO 9303 mandates every passport include. `imageInputStream`
+        // is a fresh stream each call (confirmed from AbstractImageInfo
+        // source), safe to drain and close here without disturbing anything
+        // else DG2File holds.
+        val faceImageInfo = DG2File(ByteArrayInputStream(dg2Raw)).faceInfos.firstOrNull()?.faceImageInfos?.firstOrNull()
+        val dg2Image = faceImageInfo?.let { it.imageInputStream.use { stream -> stream.readBytes() } } ?: ByteArray(0)
+        val dg2MimeType = faceImageInfo?.mimeType ?: ""
 
         val result = Arguments.createMap().apply {
           putString("dg1", Base64.encodeToString(dg1, Base64.NO_WRAP))
           putString("dg15", Base64.encodeToString(dg15, Base64.NO_WRAP))
           putString("sod", Base64.encodeToString(sod, Base64.NO_WRAP))
+          putString("dg2", Base64.encodeToString(dg2Image, Base64.NO_WRAP))
+          putString("dg2MimeType", dg2MimeType)
         }
         promise.resolve(result)
       } catch (e: CardServiceProtocolException) {

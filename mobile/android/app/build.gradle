@@ -137,6 +137,32 @@ dependencies {
     // over matching Rarimo's exact pin.
     implementation("org.jmrtd:jmrtd:0.8.6")
     implementation("net.sf.scuba:scuba-sc-android:0.0.26")
+
+    // Face match + liveness (mobile/android/app/src/main/java/com/agora/facematch/) —
+    // see docs/project/changelog/087.md for why each of these was picked.
+    //
+    // CameraX: a custom native module instead of react-native-vision-camera
+    // (JSI-oriented in v4, New-Architecture-only in v5's Nitro rewrite; this
+    // app has newArchEnabled=false). 1.3.4 is a current stable release
+    // compatible with this project's compileSdk 34 / minSdk 24.
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+
+    // ML Kit Face Detection — the *bundled* model variant
+    // (com.google.mlkit:face-detection), not the Play-Services "unbundled"
+    // variant (com.google.android.gms:play-services-mlkit-face-detection):
+    // keeps liveness detection fully on-device with no dynamic model
+    // download or Play Services dependency, consistent with "nothing leaves
+    // your phone." ~6.9MB APK size cost, accepted the same way this project
+    // already accepts a much larger ZK proving-key footprint elsewhere.
+    implementation("com.google.mlkit:face-detection:16.1.7")
+
+    // TensorFlow Lite interpreter for the MobileFaceNet embedding model
+    // (mobile/android/app/src/main/assets/mobilefacenet.tflite — see
+    // FaceMatchModule.kt's doc comment for the asset's provenance).
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
 }
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle"); applyNativeModulesAppBuildGradle(project)

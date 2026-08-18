@@ -1,6 +1,7 @@
 package com.agora
 
 import android.app.Application
+import com.agora.facematch.FaceMatchPackage
 import com.agora.nfc.NfcPassportPackage
 import com.agora.wallet.KeystoreSigningPackage
 import com.facebook.react.PackageList
@@ -23,6 +24,7 @@ class MainApplication : Application(), ReactApplication {
               // add(MyReactNativePackage())
               add(NfcPassportPackage())
               add(KeystoreSigningPackage())
+              add(FaceMatchPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"

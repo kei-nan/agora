@@ -52,6 +52,15 @@ const REGISTRATION_STATE_FILE_PATH = `${RNFS.DocumentDirectoryPath}/agora-regist
 export type RegistrationStatus =
   | { stage: 'NotStarted' }
   | { stage: 'PassportScanned' }
+  /**
+   * The face-match/liveness gate (`RegisterScreen.tsx`, `../native/faceMatch.ts`)
+   * passed. `faceMatched` is `false` whenever the match itself was `skipped`
+   * (e.g. an undecodable DG2 photo — see `FaceMatchModule.kt`) as well as
+   * whenever it genuinely didn't match; `matchSkippedReason` disambiguates.
+   * Liveness (blink/turn) is required either way — this stage is never
+   * reached at all if the liveness challenges themselves failed.
+   */
+  | { stage: 'LivenessVerified'; faceMatched: boolean; matchSkippedReason?: string }
   | { stage: 'ProofMaterialAssembled' }
   | {
       stage: 'OprfQuerySubmitted';

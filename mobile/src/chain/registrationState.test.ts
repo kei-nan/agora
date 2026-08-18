@@ -55,6 +55,27 @@ describe('writeRegistrationStatus / readRegistrationStatus round-trip', () => {
     await expect(mod.readRegistrationStatus('5Addr1')).resolves.toEqual({ stage: 'PassportScanned' });
   });
 
+  it('round-trips a LivenessVerified record', async () => {
+    const mod = loadModule();
+    const status: RegistrationStateModule.PersistableStatus = {
+      stage: 'LivenessVerified',
+      faceMatched: true,
+    };
+    await mod.writeRegistrationStatus('5Addr1', status);
+    await expect(mod.readRegistrationStatus('5Addr1')).resolves.toEqual(status);
+  });
+
+  it('round-trips a LivenessVerified record with a skipped-match reason', async () => {
+    const mod = loadModule();
+    const status: RegistrationStateModule.PersistableStatus = {
+      stage: 'LivenessVerified',
+      faceMatched: false,
+      matchSkippedReason: 'unsupported DG2 image format: image/jp2',
+    };
+    await mod.writeRegistrationStatus('5Addr1', status);
+    await expect(mod.readRegistrationStatus('5Addr1')).resolves.toEqual(status);
+  });
+
   it('round-trips a record with OPRF tracking fields', async () => {
     const mod = loadModule();
     const status: RegistrationStateModule.PersistableStatus = {

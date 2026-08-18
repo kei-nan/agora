@@ -105,6 +105,7 @@ export async function reconcileRegistrationStatus(address: string): Promise<Reco
   if (
     record.stage === 'NotStarted' ||
     record.stage === 'PassportScanned' ||
+    record.stage === 'LivenessVerified' ||
     record.stage === 'ProofMaterialAssembled' ||
     record.stage === 'ProofReady' ||
     record.stage === 'ChainSubmissionPending' ||

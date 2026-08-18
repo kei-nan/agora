@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
 import { Buffer } from 'buffer';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
@@ -6,6 +6,16 @@ import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { KeyringPair } from '@polkadot/keyring/types';
 import { RootStackParamList } from '../App';
 import { readPassport, cancelPendingScan, RawPassportData } from '../native/nfcPassportReader';
+import FaceCameraView from '../native/FaceCameraView';
+import {
+  isFaceMatchAvailable,
+  hasCameraPermission,
+  requestCameraPermission,
+  capturePhoto,
+  matchAgainstPassport,
+  CapturedPhoto,
+  LivenessChallenge,
+} from '../native/faceMatch';
 import { buildCircuitInputs } from '../chain/sodParser';
 import {
   TEST_PASSPORT_DG1_BASE64,
@@ -70,7 +80,57 @@ function getTestPassportData(): RawPassportData {
     dg1: new Uint8Array(Buffer.from(TEST_PASSPORT_DG1_BASE64, 'base64')),
     dg15: new Uint8Array(Buffer.from(TEST_PASSPORT_DG15_BASE64, 'base64')),
     sod: new Uint8Array(Buffer.from(TEST_PASSPORT_SOD_BASE64, 'base64')),
+    // No DG2 fixture exists (see chain/__fixtures__/testPassport.ts) — same
+    // "empty" convention that file already uses for DG15/Active
+    // Authentication. An empty dg2MimeType makes the liveness gate below
+    // take its normal "unsupported/undecodable DG2 photo" skip path, which
+    // is the honest behavior for a fixture that never had a face photo.
+    dg2: new Uint8Array(0),
+    dg2MimeType: '',
   };
+}
+
+type LivenessSubstep = 'baseline' | 'challenge';
+
+interface LivenessUiState {
+  substep: LivenessSubstep;
+  /** Only meaningful once `substep === 'challenge'` — chosen once per attempt so a static photo/video can't be pre-prepared for a known challenge. */
+  challenge: LivenessChallenge;
+  error: string | null;
+  capturing: boolean;
+}
+
+/**
+ * Thresholds below are unvalidated placeholders (no real capture corpus to
+ * calibrate a false-accept/false-reject tradeoff against) — same honesty
+ * standard as `FaceMatchModule.kt`'s `MATCH_THRESHOLD`. This is a 2-shot
+ * challenge-response liveness check, not continuous video analysis: a
+ * prepared attacker with video of the real person could plausibly defeat
+ * it — a deliberate, documented scope boundary (see
+ * `docs/project/changelog/087.md`), not an oversight.
+ */
+const EYES_OPEN_THRESHOLD = 0.5;
+const EYES_CLOSED_THRESHOLD = 0.3;
+const FRONTAL_ANGLE_MAX_DEGREES = 15;
+const TURN_ANGLE_MIN_DEGREES = 15;
+
+function baselinePassed(photo: CapturedPhoto): boolean {
+  return (
+    photo.leftEyeOpenProbability >= EYES_OPEN_THRESHOLD &&
+    photo.rightEyeOpenProbability >= EYES_OPEN_THRESHOLD &&
+    Math.abs(photo.headEulerAngleY) <= FRONTAL_ANGLE_MAX_DEGREES
+  );
+}
+
+function challengePassed(challenge: LivenessChallenge, photo: CapturedPhoto): boolean {
+  if (challenge === 'blink') {
+    return photo.leftEyeOpenProbability <= EYES_CLOSED_THRESHOLD && photo.rightEyeOpenProbability <= EYES_CLOSED_THRESHOLD;
+  }
+  return Math.abs(photo.headEulerAngleY) >= TURN_ANGLE_MIN_DEGREES;
+}
+
+function pickRandomChallenge(): LivenessChallenge {
+  return Math.random() < 0.5 ? 'blink' : 'turn';
 }
 
 export default function RegisterScreen({ navigation }: Props) {
@@ -84,9 +144,83 @@ export default function RegisterScreen({ navigation }: Props) {
   const [dateOfExpiry, setDateOfExpiry] = useState<Date | null>(null);
   const [activePicker, setActivePicker] = useState<'dob' | 'expiry' | null>(null);
   const [rawPassport, setRawPassport] = useState<RawPassportData | null>(null);
+  const [livenessUi, setLivenessUi] = useState<LivenessUiState | null>(null);
+  const baselineUriRef = useRef<string | null>(null);
+  const livenessResolveRef = useRef<((result: { faceMatched: boolean; matchSkippedReason?: string }) => void) | null>(null);
+  const livenessRejectRef = useRef<((e: Error) => void) | null>(null);
   const { showInfo } = useAppModal();
 
   const mrzComplete = documentNumber.length > 0 && dateOfBirth !== null && dateOfExpiry !== null;
+
+  /**
+   * Shows the capture UI (rendered below, gated on `step === 'liveness' &&
+   * livenessUi`) and blocks until `handleLivenessCapture` — driven by the
+   * user tapping the on-screen "Capture" button, so this genuinely cannot be
+   * a plain sequential `await` chain — settles the returned promise. Mirrors
+   * `start()`'s own error-handling shape: throws a plain `Error` (camera
+   * unavailable/permission denied) that falls into `start()`'s existing
+   * generic "didn't complete, try again" branch, same as any other failure
+   * in this screen.
+   */
+  async function runLivenessGate(): Promise<{ faceMatched: boolean; matchSkippedReason?: string }> {
+    if (!isFaceMatchAvailable()) {
+      throw new Error('Face match/liveness is not available on this device/build.');
+    }
+    const granted = (await hasCameraPermission()) || (await requestCameraPermission());
+    if (!granted) {
+      throw new Error('Camera permission is required to verify your face and liveness.');
+    }
+    baselineUriRef.current = null;
+    setLivenessUi({ substep: 'baseline', challenge: pickRandomChallenge(), error: null, capturing: false });
+    try {
+      return await new Promise<{ faceMatched: boolean; matchSkippedReason?: string }>((resolve, reject) => {
+        livenessResolveRef.current = resolve;
+        livenessRejectRef.current = reject;
+      });
+    } finally {
+      setLivenessUi(null);
+      livenessResolveRef.current = null;
+      livenessRejectRef.current = null;
+    }
+  }
+
+  /**
+   * The baseline shot only gates on eyes-open/frontal-angle; the challenge
+   * shot's face-match comparison against the passport's DG2 photo happens
+   * here too (using the baseline capture, not the challenge one — a
+   * frontal, eyes-open frame is what the embedding model expects, see
+   * `FaceMatchModule.kt`), once liveness itself has already passed.
+   */
+  async function handleLivenessCapture() {
+    if (!livenessUi || livenessUi.capturing) return;
+    setLivenessUi({ ...livenessUi, capturing: true, error: null });
+    try {
+      if (livenessUi.substep === 'baseline') {
+        const photo = await capturePhoto('baseline');
+        if (!baselinePassed(photo)) {
+          setLivenessUi({ ...livenessUi, capturing: false, error: 'Look straight at the camera with both eyes open, then try again.' });
+          return;
+        }
+        baselineUriRef.current = photo.uri;
+        setLivenessUi({ substep: 'challenge', challenge: livenessUi.challenge, error: null, capturing: false });
+        return;
+      }
+      const photo = await capturePhoto(livenessUi.challenge);
+      if (!challengePassed(livenessUi.challenge, photo)) {
+        setLivenessUi({ ...livenessUi, capturing: false, error: "That didn't register — try again." });
+        return;
+      }
+      const dg2 = rawPassport?.dg2 ?? new Uint8Array(0);
+      const dg2MimeType = rawPassport?.dg2MimeType ?? '';
+      const match = await matchAgainstPassport(dg2, dg2MimeType, baselineUriRef.current!);
+      livenessResolveRef.current?.({
+        faceMatched: match.matched,
+        ...(match.skipped ? { matchSkippedReason: match.reason ?? 'unsupported passport photo format' } : {}),
+      });
+    } catch (e: any) {
+      livenessRejectRef.current?.(e instanceof Error ? e : new Error(String(e)));
+    }
+  }
 
   // If the user navigates away mid-scan (e.g. taps back while "Scan passport
   // NFC chip" is active), cancel the native side's pending read rather than
@@ -139,7 +273,18 @@ export default function RegisterScreen({ navigation }: Props) {
       setRawPassport(raw);
       setStep('liveness');
       await writeRegistrationStatus(keypair.address, { stage: 'PassportScanned' });
-      // TODO: await FaceMatch.verify(scan.faceImage);
+      // Real as of this session (../native/faceMatch.ts + the capture UI
+      // rendered below, gated on `step === 'liveness' && livenessUi`) — a
+      // 2-shot randomized challenge-response (frontal-eyes-open baseline,
+      // then blink or turn) read via ML Kit, plus a MobileFaceNet embedding
+      // comparison against `raw.dg2`. See runLivenessGate()'s doc comment
+      // and docs/project/changelog/087.md for the full design/limitations.
+      const { faceMatched, matchSkippedReason } = await runLivenessGate();
+      await writeRegistrationStatus(keypair.address, {
+        stage: 'LivenessVerified',
+        faceMatched,
+        ...(matchSkippedReason ? { matchSkippedReason } : {}),
+      });
       setStep('proving');
       // Real as of this session (../chain/sodParser.ts) — parses the SOD's
       // CMS SignedData structure and assembles the ZKPassport sig-check/
@@ -333,6 +478,35 @@ export default function RegisterScreen({ navigation }: Props) {
         </>
       )}
 
+      {step === 'liveness' && livenessUi && (
+        <View style={s.livenessBox}>
+          <View style={s.cameraFrame}>
+            <FaceCameraView style={s.cameraPreview} />
+          </View>
+          <Text style={s.livenessInstruction}>
+            {livenessUi.substep === 'baseline'
+              ? 'Look straight at the camera with both eyes open.'
+              : livenessUi.challenge === 'blink'
+                ? 'Now blink.'
+                : 'Now turn your head to the side.'}
+          </Text>
+          {livenessUi.error && <Text style={s.livenessError}>{livenessUi.error}</Text>}
+          <TouchableOpacity
+            style={[s.btn, livenessUi.capturing && s.btnDisabled]}
+            onPress={handleLivenessCapture}
+            disabled={livenessUi.capturing}
+            accessibilityRole="button"
+            accessibilityLabel="Capture"
+          >
+            {livenessUi.capturing ? (
+              <ActivityIndicator size="small" color={colors.textPrimary} />
+            ) : (
+              <Text style={s.btnText}>Capture</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
       {step === 'done' && (
         <View style={s.successBox}>
           <Text style={s.successIcon}>✓</Text>
@@ -407,4 +581,17 @@ const s = StyleSheet.create({
   mrzHint: { fontSize: 11, color: colors.textDim, lineHeight: 15, marginTop: 10 },
   scanResult: { fontSize: 12, color: colors.success, textAlign: 'center', marginBottom: 12 },
   btnDisabled: { backgroundColor: colors.textFaint },
+  livenessBox: { alignItems: 'center', gap: 16 },
+  cameraFrame: {
+    width: 240,
+    height: 240,
+    borderRadius: 120,
+    overflow: 'hidden',
+    borderWidth: 2,
+    borderColor: colors.accent,
+    backgroundColor: '#161a23',
+  },
+  cameraPreview: { width: '100%', height: '100%' },
+  livenessInstruction: { fontSize: 16, fontWeight: '600', color: colors.textPrimary, textAlign: 'center' },
+  livenessError: { fontSize: 13, color: colors.danger, textAlign: 'center' },
 });

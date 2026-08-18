@@ -233,6 +233,17 @@ describe('Step 2 — pipeline fallback (no nullifier on file)', () => {
     expect(mockedWriteRegistrationStatus).not.toHaveBeenCalled();
   });
 
+  it('returns a LivenessVerified record unchanged', async () => {
+    const { api } = noNullifierApi();
+    mockedGetApi.mockResolvedValue(api as any);
+    const record: PersistableStatus = { stage: 'LivenessVerified', faceMatched: true };
+    mockedReadRegistrationStatus.mockResolvedValue(record);
+
+    const result = await reconcileRegistrationStatus('5Addr1');
+    expect(result.status).toEqual(record);
+    expect(mockedWriteRegistrationStatus).not.toHaveBeenCalled();
+  });
+
   it('demotes an OPRF-pending record past its SLA deadline to Failed and persists it', async () => {
     const record: PersistableStatus = {
       stage: 'AwaitingCommitteeRound1',

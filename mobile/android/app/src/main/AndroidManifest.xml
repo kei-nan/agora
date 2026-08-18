@@ -6,6 +6,11 @@
     <!-- (they simply can't use passport registration). -->
     <uses-feature android:name="android.hardware.nfc" android:required="false" />
 
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Not required, same reasoning as NFC above: a camera-less device can -->
+    <!-- still install, it just can't complete face match/liveness. -->
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
     <application
       android:name=".MainApplication"
       android:label="@string/app_name"

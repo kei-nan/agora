@@ -39,6 +39,16 @@ export interface RawPassportData {
   dg15: Uint8Array;
   /** EF.SOD — the Document Security Object (signed hashes of all data groups + the issuing country's certificate chain). */
   sod: Uint8Array;
+  /**
+   * EF.DG2's face image, already unwrapped from its ISO 19794-5 CBEFF header
+   * by the native side (`NfcPassportModule.kt`) — not a ZK witness input like
+   * the three fields above; consumed only by the face-match pipeline
+   * (`../native/faceMatch.ts`). Empty if the passport had no parseable
+   * FaceImageInfo.
+   */
+  dg2: Uint8Array;
+  /** MIME type of `dg2`: `'image/jpeg'` or `'image/jp2'` per ICAO 9303 — `''` if `dg2` is empty. */
+  dg2MimeType: string;
 }
 
 /** The native module's actual bridge shape: base64-encoded strings (React Native bridges can't cleanly pass raw binary). */
@@ -47,7 +57,7 @@ interface NfcPassportModuleNative {
     documentNumber: string,
     dateOfBirth: string,
     dateOfExpiry: string,
-  ): Promise<{ dg1: string; dg15: string; sod: string }>;
+  ): Promise<{ dg1: string; dg15: string; sod: string; dg2: string; dg2MimeType: string }>;
   /** Clears a pending `readPassport` call, rejecting it if one is in flight. No-ops if none is pending. */
   cancelPendingRead(): Promise<null>;
 }
@@ -100,7 +110,7 @@ export async function readPassport(
   }, timeoutMs);
 
   try {
-    const { dg1, dg15, sod } = await nativeModule.readPassport(
+    const { dg1, dg15, sod, dg2, dg2MimeType } = await nativeModule.readPassport(
       mrz.documentNumber,
       mrz.dateOfBirth,
       mrz.dateOfExpiry,
@@ -110,6 +120,8 @@ export async function readPassport(
       dg1: new Uint8Array(Buffer.from(dg1, 'base64')),
       dg15: new Uint8Array(Buffer.from(dg15, 'base64')),
       sod: new Uint8Array(Buffer.from(sod, 'base64')),
+      dg2: new Uint8Array(Buffer.from(dg2, 'base64')),
+      dg2MimeType,
     };
   } catch (e) {
     if (timedOut) {

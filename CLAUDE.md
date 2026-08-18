@@ -16,10 +16,10 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
   itself stale by 2026-08-08 — check `runtime/src/lib.rs` directly rather than trusting this note
   if it matters for what you're doing.)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
-- Mobile: `android/` is a real, committed native project (Gradle 8.6, a hand-written
-  `NfcPassportModule.kt` NFC native module) with the JS/TS test suite passing (197 tests
-  across 14 suites, up from the 77 changelog #80 originally verified); no JDK/Android SDK in
-  this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
+- Mobile: `android/` is a real, committed native project (Gradle 8.6, hand-written
+  `NfcPassportModule.kt`/`com.agora.facematch` native modules) with the JS/TS test suite passing
+  (210 tests across 15 suites, up from the 77 changelog #80 originally verified); no JDK/Android
+  SDK in this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
   exist (see `docs/project/apps/mobile.md`, changelog #80)
 
 ## Critical Build Command
@@ -78,12 +78,19 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
 
 ## Identity System
 - Biometric passport NFC scan on mobile (custom JMRTD/NFCPassportReader native modules; ZKPassport Noir circuits for the ZK proof, see HANDOFF.md log #65)
-- On-device face match (Apple Vision iOS / MobileFaceNet Android) — **NOT YET IMPLEMENTED**:
-  `RegisterScreen.tsx`'s registration flow has only a `// TODO: await FaceMatch.verify(...)`
-  where this would go; no `FaceMatch` module or MobileFaceNet/Apple Vision code exists anywhere
-  in `mobile/` (see `docs/project/next-steps.md` item 12)
-- Liveness detection (blink/turn) — **NOT YET IMPLEMENTED**, same gap as face match above:
-  registration currently proceeds straight from NFC scan to ZK proving with no liveness gate
+- On-device face match (MobileFaceNet Android; Apple Vision iOS still not started, no `ios/`
+  project exists) — implemented but **runtime-unverified** (changelog #087): a custom
+  `com.agora.facematch` CameraX-based native module (deliberately not `react-native-vision-camera`
+  — see #087 for why) compares a live-captured selfie against the passport's DG2 photo via a
+  MobileFaceNet TFLite embedding, wired into `RegisterScreen.tsx` in place of the old
+  `// TODO: await FaceMatch.verify(...)`. No Android SDK/JDK exists in this environment, so none
+  of the new Kotlin has been compiled or run — same standing limitation the NFC module already
+  carries. Match threshold is an unvalidated placeholder (no real calibration corpus). See
+  `docs/project/next-steps.md` item 12 and `docs/project/changelog/087.md`.
+- Liveness detection (blink/turn) — same status as face match above (changelog #087): a 2-shot
+  randomized challenge-response (frontal eyes-open baseline, then blink or turn), read via ML Kit
+  Face Detection, gates registration before `proving`. Not video-based/anti-spoofing — a prepared
+  attacker with video of the real person could plausibly defeat it, a documented residual risk.
 - ZK proof generated on device — nothing leaves the phone
 - Vote nullifier = ZKPassport's own `scoped_nullifier` circuit output, extracted verbatim from
   the outer proof's public inputs (see `runtime/src/verifier.rs`) — not a value this codebase
@@ -145,8 +152,8 @@ All enforced by smart contract boundaries:
 ## Mobile App
 - React Native (iOS + Android)
 - Custom native modules (JMRTD/Android, NFCPassportReader/iOS) for NFC passport reading; ZKPassport Noir/UltraHonk circuits for ZK proof generation (see HANDOFF.md log #65 — replaces the earlier Rarimo/circom integration)
-- On-device face match (Apple Vision / MobileFaceNet via TFLite) — **not yet implemented**, see
-  Identity System section below
+- On-device face match (MobileFaceNet via TFLite, Android; Apple Vision iOS not started) —
+  implemented but runtime-unverified (changelog #087), see Identity System section below
 - @polkadot/api for Substrate chain interaction
 - Wallet's Sr25519 signing key is encrypted at rest using a non-exportable, hardware-backed key
   (Android Keystore / iOS Secure Enclave); Android Keystore has no native Sr25519 support, so the
@@ -274,11 +281,12 @@ authoritative version of this list; treat this section as a summary, not the sou
    reveal scheme replaced block-hash selection in `pallet-courts`, closing the worst grinding
    attack; genuine BABE/SASSAFRAS VRF would need a full consensus swap away from Aura.
 5. **Stablecoin bridge** — Phase 2; treasury currently uses native AGR token.
-6. **On-device face match + liveness detection** — listed in the Identity System section above
-   as architectural intent but not built at all: `RegisterScreen.tsx` has only a
-   `// TODO: await FaceMatch.verify(...)` where this would go, no `FaceMatch`/MobileFaceNet/Apple
-   Vision code exists in `mobile/`, and registration currently proceeds from NFC scan straight to
-   ZK proving with no biometric gate. See `docs/project/next-steps.md` item 12.
+6. **On-device face match + liveness detection** — implemented (changelog #087): a custom
+   CameraX-based `com.agora.facematch` native module + MobileFaceNet TFLite embedding comparison
+   + ML Kit liveness challenge, wired into `RegisterScreen.tsx` in place of the old
+   `// TODO: await FaceMatch.verify(...)`. Runtime-unverified — no Android SDK/JDK in this
+   environment to compile/run any of it. iOS (Apple Vision) still not started, no `ios/` project
+   exists. See `docs/project/next-steps.md` item 12.
 
 Already done, despite earlier versions of this list still saying otherwise: QR auth (chain-side
 verification), per-referendum foundational/constitutional threshold, IPFS content fetching on
