@@ -65,6 +65,42 @@ fn enact_law_foundational_fires_auto_challenge() {
 	});
 }
 
+/// When `AutoChallengeHook::auto_challenge_law` fails, the law must still enact (best-effort),
+/// but the failure must not be silently swallowed: `AutoChallengeFilingFailed` is deposited so
+/// off-chain monitors can detect that judicial review never opened.
+#[test]
+fn enact_law_structural_emits_event_when_auto_challenge_fails() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		set_auto_challenge_should_fail(true);
+		let id = enact(LawTier::Structural, 1);
+
+		// The law still enacted successfully.
+		assert_eq!(Laws::<Test>::get(id).map(|l| l.1), Some(LawStatus::Active));
+		// The hook was never recorded as having succeeded.
+		assert_eq!(auto_challenges(), Vec::<u32>::new());
+		// But the failure is visible on-chain.
+		System::assert_has_event(Event::AutoChallengeFilingFailed { law_id: id }.into());
+	});
+}
+
+/// Same failure-visibility guarantee, but via `enact_law_internal` — the path pallet-voting
+/// calls when a referendum passes a Structural/Foundational law (as opposed to `enact_law`,
+/// which is the direct legislature-origin dispatchable).
+#[test]
+fn enact_law_internal_emits_event_when_auto_challenge_fails() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		set_auto_challenge_should_fail(true);
+		let id = NextLawId::<Test>::get();
+		assert_ok!(Constitution::enact_law_internal(LawTier::Foundational, h(1)));
+
+		assert_eq!(Laws::<Test>::get(id).map(|l| l.1), Some(LawStatus::Active));
+		assert_eq!(auto_challenges(), Vec::<u32>::new());
+		System::assert_has_event(Event::AutoChallengeFilingFailed { law_id: id }.into());
+	});
+}
+
 // ── invalidate_law ───────────────────────────────────────────────────────────
 
 #[test]

@@ -19,6 +19,7 @@ thread_local! {
 	static ACTIVE_CITIZENS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 	static FRESH_LEGISLATURE: RefCell<bool> = const { RefCell::new(false) };
 	static AUTO_CHALLENGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+	static AUTO_CHALLENGE_SHOULD_FAIL: RefCell<bool> = const { RefCell::new(false) };
 	static REFERENDA_CREATED: RefCell<Vec<(u32, [u8; 32])>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -44,6 +45,12 @@ pub fn clear_auto_challenges() {
 	AUTO_CHALLENGES.with(|v| v.borrow_mut().clear());
 }
 
+/// Test helper: makes `TestAutoChallengeHook::auto_challenge_law` return `Err(..)` instead of
+/// recording the call, so tests can exercise the `AutoChallengeFilingFailed` event path.
+pub fn set_auto_challenge_should_fail(should_fail: bool) {
+	AUTO_CHALLENGE_SHOULD_FAIL.with(|f| *f.borrow_mut() = should_fail);
+}
+
 /// Test helper: (petition_id, topic_hash) pairs that `TestPetitionApprover::create_referendum`
 /// has been called with, in call order.
 pub fn referenda_created() -> Vec<(u32, [u8; 32])> {
@@ -67,6 +74,9 @@ impl FreshLegislatureChecker<u64> for TestFreshLegislatureChecker {
 pub struct TestAutoChallengeHook;
 impl AutoChallengeHook for TestAutoChallengeHook {
 	fn auto_challenge_law(law_id: u32) -> DispatchResult {
+		if AUTO_CHALLENGE_SHOULD_FAIL.with(|f| *f.borrow()) {
+			return Err(sp_runtime::DispatchError::Other("auto_challenge_law failed (test)"));
+		}
 		AUTO_CHALLENGES.with(|v| v.borrow_mut().push(law_id));
 		Ok(())
 	}
@@ -179,6 +189,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 	set_active_citizens(Vec::new());
 	set_fresh_legislature(false);
 	clear_auto_challenges();
+	set_auto_challenge_should_fail(false);
 	REFERENDA_CREATED.with(|v| v.borrow_mut().clear());
 	frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into()
 }

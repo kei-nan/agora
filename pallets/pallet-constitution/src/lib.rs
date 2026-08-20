@@ -318,6 +318,11 @@ pub mod pallet {
         PetitionSubmitted { petition_id: u32, proposer: T::AccountId, topic_hash: [u8; 32] },
         PetitionSigned { petition_id: u32, signer: T::AccountId, signature_count: u32 },
         PetitionThresholdReached { petition_id: u32, topic_hash: [u8; 32] },
+        /// A Structural/Foundational law enacted successfully, but `AutoChallengeHook::
+        /// auto_challenge_law` returned an error, so the mandatory automatic court review for
+        /// that law was never filed. The law is still Active — this event exists so off-chain
+        /// monitors/indexers can detect the gap and alert or retry out of band.
+        AutoChallengeFilingFailed { law_id: u32 },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────────
@@ -383,8 +388,11 @@ pub mod pallet {
             NextLawId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::LawEnacted { law_id: id, tier: tier.clone(), content_hash });
             if tier == LawTier::Structural || tier == LawTier::Foundational {
-                // Best-effort: a courts pallet error must not prevent law enactment.
-                let _ = T::AutoChallengeHook::auto_challenge_law(id);
+                // Best-effort: a courts pallet error must not prevent law enactment, but a
+                // failure must still be visible on-chain — see `AutoChallengeFilingFailed`.
+                if T::AutoChallengeHook::auto_challenge_law(id).is_err() {
+                    Self::deposit_event(Event::AutoChallengeFilingFailed { law_id: id });
+                }
             }
             Ok(())
         }
@@ -753,8 +761,11 @@ pub mod pallet {
             NextLawId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::LawEnacted { law_id: id, tier: tier.clone(), content_hash });
             if tier == LawTier::Structural || tier == LawTier::Foundational {
-                // Best-effort: a courts pallet error must not prevent law enactment.
-                let _ = T::AutoChallengeHook::auto_challenge_law(id);
+                // Best-effort: a courts pallet error must not prevent law enactment, but a
+                // failure must still be visible on-chain — see `AutoChallengeFilingFailed`.
+                if T::AutoChallengeHook::auto_challenge_law(id).is_err() {
+                    Self::deposit_event(Event::AutoChallengeFilingFailed { law_id: id });
+                }
             }
             Ok(())
         }
