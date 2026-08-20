@@ -235,4 +235,25 @@
     2-shot-still, not continuous video — a prepared attacker with video of the real person could
     plausibly defeat it, a documented residual risk, not an oversight. iOS has no equivalent
     since `ios/` itself doesn't exist. See `docs/project/changelog/087.md` for the full record.
+13. [PARTIAL] **Persona-based review (security researcher / citizen / product manager) + two
+    fixes, 2026-08-20** — user-requested, not `/project-review`. Two concrete security fixes
+    landed: (a) **post-emergency cooldown** in both `pallet-emergency-council` and
+    `pallet-executive` — neither previously enforced any minimum gap between one emergency
+    ending and the next being declared, so the same supermajority could chain back-to-back
+    emergencies into de-facto indefinite emergency powers despite `MaxEmergencyBlocks` capping
+    each individual window; a new `CooldownUntil` storage item + `EmergencyCooldownBlocks` config
+    (wired to 7 days in the runtime) closes this, 132/132 tests passing across both pallets. (b)
+    **`remove_oracle_member` now purges a removed member's stale approvals** from in-flight
+    `PendingOracleProposal`s in `pallet-courts` — previously a compromised-and-removed member's
+    already-cast approval kept counting toward quorum, undercutting the M-of-7 council's whole
+    purpose of surviving exactly that incident-response path; 45/45 `pallet-courts` tests
+    passing including a new regression test. **Left open, not fixed this session**: a
+    court-oracle prompt-injection delimiter that doesn't escape its own closing tag
+    (`court-oracle/src/context.rs`, Medium severity), a narrow delegation-cap staleness gap in
+    `pallet-voting` (Low/informational), and a long list of citizen-UX gaps (mobile shows raw
+    hex instead of proposal/law content since it never fetches IPFS, `SeatingSkippedNoDisclosure`
+    invisible in either app, oracle-council composition invisible to citizens) and PM-level
+    gaps (OPRF committee *formation logistics* — not just the crypto — has no owner or timeline;
+    no pilot-onboarding/compliance/incident-response docs exist anywhere). See
+    `docs/project/changelog/092.md` for the full findings list and fix details.
 

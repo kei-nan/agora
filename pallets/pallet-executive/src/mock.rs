@@ -6,6 +6,9 @@ use std::collections::BTreeSet;
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
+/// Cooldown after an emergency ends before another can be declared, used across tests.
+pub const EMERGENCY_COOLDOWN_BLOCKS: u32 = 20;
+
 // ── Test-only cross-pallet mocks ────────────────────────────────────────────
 //
 // pallet-executive depends on cross-pallet traits normally backed by pallet-identity
@@ -125,6 +128,7 @@ impl pallet_executive::Config for Test {
     type MaxPortfolios = ConstU32<5>;
     type MaxEmergencyBlocks = ConstU32<100>;
     type RatificationWindowBlocks = ConstU32<10>;
+    type EmergencyCooldownBlocks = ConstU32<EMERGENCY_COOLDOWN_BLOCKS>;
     type SupermajorityNumerator = ConstU32<2>;
     type SupermajorityDenominator = ConstU32<3>;
     type CitizenChecker = TestCitizenChecker;

@@ -176,3 +176,15 @@ branch, and both branches of `run_vacancy_sweep` (PM and minister). Previously o
 `DeclareVotes` was purged on these paths, so a departed member's stale "end emergency" vote kept
 counting toward `vote_end_emergency`'s tally even as the live-computed cabinet-size denominator
 shrank around it — inflating the effective vote share left behind by anyone who exited office.
+
+**Post-emergency cooldown (fixed 2026-08-20)**: neither this pallet nor
+`pallet-emergency-council` previously enforced any minimum gap between emergencies — only
+`AlreadyActiveEmergency` blocked a *second concurrent* one. The same cabinet supermajority that
+declares an emergency could therefore redeclare a fresh one the block after the previous one
+ended (lapse, sunset expiry, or early `vote_end_emergency`), chaining into de-facto indefinite
+emergency powers despite `MaxEmergencyBlocks` capping each individual window. A new
+`CooldownUntil` storage item, set to `now + EmergencyCooldownBlocks` on every path that ends an
+emergency, now blocks `vote_declare_emergency` (`EmergencyCooldownActive`) until it elapses.
+`EmergencyCooldownBlocks = 7 * DAYS` (50,400 blocks) in the runtime, mirroring
+`pallet_emergency_council::Config::EmergencyCooldownBlocks`. See
+`docs/project/changelog/092.md`.

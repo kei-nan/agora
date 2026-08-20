@@ -6,6 +6,8 @@ type Block = frame_system::mocking::MockBlock<Test>;
 
 /// Constitutional ceiling on emergency duration used across tests: 100 blocks.
 pub const MAX_EMERGENCY_BLOCKS: u32 = 100;
+/// Cooldown after an emergency ends before another can be declared, used across tests.
+pub const EMERGENCY_COOLDOWN_BLOCKS: u32 = 20;
 /// Maximum council size used across tests.
 pub const MAX_COUNCIL_SIZE: u32 = 10;
 /// Supermajority fraction used across tests: 2/3.
@@ -46,6 +48,7 @@ impl frame_system::Config for Test {
 impl pallet_emergency_council::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     type MaxEmergencyBlocks = ConstU32<MAX_EMERGENCY_BLOCKS>;
+    type EmergencyCooldownBlocks = ConstU32<EMERGENCY_COOLDOWN_BLOCKS>;
     type MaxCouncilSize = ConstU32<MAX_COUNCIL_SIZE>;
     type SupermajorityNumerator = ConstU32<SUPERMAJORITY_NUMERATOR>;
     type SupermajorityDenominator = ConstU32<SUPERMAJORITY_DENOMINATOR>;

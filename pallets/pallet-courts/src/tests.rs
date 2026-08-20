@@ -1090,3 +1090,46 @@ fn removed_oracle_member_can_no_longer_propose_or_approve() {
 		);
 	});
 }
+
+#[test]
+fn remove_oracle_member_purges_stale_approval_from_in_flight_proposal() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// m1 proposes and is auto-approved as the proposer -- 1 of 3, below the 2-of-3
+		// threshold, so the case is still just Filed.
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert!(crate::pallet::OracleApprovals::<Test>::get(case_id).unwrap().contains(&m1));
+
+		// m1's key is compromised; root removes them from the council mid-proposal --
+		// exactly the incident-response path this council exists to survive.
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), m1));
+
+		// The stale approval must be purged from the in-flight proposal, not just m1's
+		// membership.
+		assert!(!crate::pallet::OracleApprovals::<Test>::get(case_id).unwrap().contains(&m1));
+
+		// Remaining council is {m2, m3}: 1/2 strict majority now needs 2 of 2. If m1's
+		// stale approval still counted, m2 approving alone would wrongly reach quorum
+		// (stale m1 + fresh m2 == 2 of a size-2 council).
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id));
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Filed, "m2 alone must not reach quorum on a 2-member council");
+		assert_eq!(ruling_hash, None);
+
+		// A genuine second approval from the remaining council is required to finalize.
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m3), case_id));
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued);
+		assert_eq!(ruling_hash, Some([7u8; 32]));
+	});
+}

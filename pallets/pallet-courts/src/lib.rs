@@ -920,12 +920,18 @@ pub mod pallet {
 
         /// Remove a member from the Oracle Council. Only root may call this.
         ///
-        /// Deliberately does NOT retroactively purge this member's already-cast approvals on
-        /// any in-flight `PendingOracleProposal`s (there is no per-member index into
-        /// `OracleApprovals` to do so cheaply) — the same tradeoff `pallet_legislature`'s
-        /// `remove_member` accepts for a removed member's already-cast votes on still-open
-        /// motions. If this matters for a given removal, resolve or wait out any in-flight
-        /// oracle proposals first.
+        /// Also purges this member's already-cast approvals from every in-flight
+        /// `PendingOracleProposal`, unlike `pallet_legislature`'s `remove_member` (which
+        /// deliberately leaves a removed member's votes on still-open motions in place). That
+        /// tradeoff doesn't hold here: this council exists specifically to survive a compromised
+        /// member, and the expected incident-response path is "member's key is compromised, so
+        /// root removes them" — if their already-cast approval kept counting toward quorum on a
+        /// proposal they (or an attacker using their key) approved, removal wouldn't actually
+        /// shrink the set of approvals a malicious submission/finalization needs, undercutting
+        /// the whole point of the M-of-N design. `OracleApprovals` has no per-member index, so
+        /// this walks every case with an in-flight proposal — acceptable here because the call
+        /// is root-gated and root-initiated removals are rare, incident-driven events, not
+        /// routine traffic.
         #[pallet::call_index(10)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
         pub fn remove_oracle_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
@@ -938,6 +944,14 @@ pub mod pallet {
                 members.remove(pos);
                 Ok::<(), DispatchError>(())
             })?;
+            OracleApprovals::<T>::translate(
+                |_case_id, mut approvers: BoundedVec<T::AccountId, T::MaxOracleMembers>| {
+                    if let Some(pos) = approvers.iter().position(|m| m == &account) {
+                        approvers.remove(pos);
+                    }
+                    Some(approvers)
+                },
+            );
             Self::deposit_event(Event::OracleMemberRemoved { account });
             Ok(())
         }

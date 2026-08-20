@@ -130,7 +130,13 @@ All enforced by smart contract boundaries:
   ratification, a hard-coded `MaxEmergencyBlocks` duration cap, its own `ActiveEmergency`
   storage). The two are not related — see `docs/project/pallets/executive.md`'s "Emergency
   powers" section, which documents it explicitly as "a second, separate mechanism from
-  `pallet-emergency-council`".
+  `pallet-emergency-council`". Both mechanisms now enforce a post-emergency cooldown (fixed
+  2026-08-20): neither previously blocked the same supermajority from redeclaring a fresh
+  emergency the block after the last one ended, which could chain into de-facto indefinite
+  emergency powers despite `MaxEmergencyBlocks` capping each individual window. Each pallet has
+  its own `EmergencyCooldownBlocks` config (7 days in the runtime) and `CooldownUntil` storage
+  item. See `docs/project/pallets/emergency-council.md`, `docs/project/pallets/executive.md`, and
+  `docs/project/changelog/092.md`.
 - **Legislature seating**: fully automatic — no Elections Commission, no candidate certification
   or human-certified result submission. `pallet-elections` seats the top-N delegates by
   liquid-democracy backing directly into `pallet-legislature`; a standalone commissioner-certified
@@ -138,7 +144,15 @@ All enforced by smart contract boundaries:
   a commissioner's say-so — see `docs/project/pallets/elections.md`). The Prime Minister is then
   chosen by the seated legislature itself via `pallet-executive`'s ranked-choice investiture
   (see `docs/project/pallets/executive.md`), not elected directly by citizens.
-- **Anti-Corruption module**: asset disclosure, conflict-of-interest registry, ZK whistleblower
+- **Anti-Corruption module**: asset disclosure, conflict-of-interest registry, ZK whistleblower.
+  Disclosure currency now has real teeth (fixed 2026-08-20, project-review #091 finding 6): a
+  `DisclosureChecker<AccountId>` trait, defined in `pallet-elections` and implemented on
+  `pallet_anticorruption::Pallet<T>`, is checked per candidate at legislature-seating time
+  alongside the existing active-citizen check — a delegate who would otherwise be seated but
+  whose asset disclosure has lapsed or was never filed is skipped (next-highest-backed eligible
+  delegate fills the seat instead), with `SeatingSkippedNoDisclosure` emitted so the skip is
+  visible on-chain. See `docs/project/pallets/anticorruption.md` and
+  `docs/project/pallets/elections.md`.
 - **Audit Office**: financial audit hooks on every treasury transaction
 - **Two placeholder origins still gated by bare `Root`, not a real collective**: in
   `runtime/src/configs/mod.rs`, `pallet_constitution::Config::RevocationOrigin` ("Wire to a
@@ -304,21 +318,30 @@ authoritative version of this list; treat this section as a summary, not the sou
    `court-oracle` now also schedules `finalize_ruling`: it polls cases in `AIRulingIssued`
    status, and once the current block passes `AIRulingBlock[case_id] + AppealWindowBlocks` with
    no appeal filed (status still `AIRulingIssued`, not moved to `InJuryAppeal`), it submits
-   `finalize_ruling(case_id)`, signed by the same oracle key `submit_ai_ruling` already uses
-   (both calls share the same `OracleOrigin` gate). Verdict binding moved earlier, at commit
-   `ad30aa3`: `submit_ai_ruling` is now a 4-arg call (`case_id, ruling_hash, model_version,
-   verdict`) that stores `verdict` on-chain in `AIRulingVerdict` at submission time, and
-   `finalize_ruling` takes no verdict argument of its own — it just applies whatever was already
-   committed, closing the hole where a compromised oracle key could publish reasoning saying one
-   thing and finalize with a different verdict. Still PARTIAL, not done: never run against a real
-   chain/Claude API/IPFS daemon (unit-tested at the pure-logic level only, 47/47 passing — added
-   IPFS content-hash verification and Claude prompt-injection delimiting after a 2026-08-16
-   review; see `court-oracle/README.md`). **Update, log #090**: `Sudo::sudo(Courts::
-   set_oracle_account(...))` was called for real against a dedicated oracle account, confirmed
-   via storage query — `court-oracle` was then built and run for real against a real chain and a
-   real local IPFS daemon and got as far as a genuine (rejected) call to the real Anthropic API;
-   no Claude API key exists anywhere in this environment, so no ruling was ever produced and
-   `submit_ai_ruling`/`finalize_ruling` still haven't been exercised against a live chain. See
+   `finalize_ruling(case_id)` (both calls share the same `OracleOrigin` gate). Verdict binding
+   moved earlier, at commit `ad30aa3`: `submit_ai_ruling` is now a 4-arg call (`case_id,
+   ruling_hash, model_version, verdict`) that stores `verdict` on-chain in `AIRulingVerdict` at
+   submission time, and `finalize_ruling` takes no verdict argument of its own — it just applies
+   whatever was already committed, closing the hole where a compromised oracle credential could
+   publish reasoning saying one thing and finalize with a different verdict. Still PARTIAL, not
+   done: never run against a real chain/Claude API/IPFS daemon (unit-tested at the pure-logic
+   level only, 47/47 passing — added IPFS content-hash verification and Claude prompt-injection
+   delimiting after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
+   `Sudo::sudo(Courts::set_oracle_account(...))` was called for real against a dedicated oracle
+   account, confirmed via storage query — `court-oracle` was then built and run for real against
+   a real chain and a real local IPFS daemon and got as far as a genuine (rejected) call to the
+   real Anthropic API; no Claude API key exists anywhere in this environment, so no ruling was
+   ever produced and `submit_ai_ruling`/`finalize_ruling` still haven't been exercised against a
+   live chain. **Update, 2026-08-20 (project-review #091 finding 3)**: `OracleOrigin` is no
+   longer a single settable `OracleAccount` — `set_oracle_account` is gone, replaced by an
+   `OracleMembers` council (bounded to 7, matching the pallet's own Level-1 jury size) requiring
+   a strict majority (>1/2) before a proposed ruling or finalization takes effect.
+   `submit_ai_ruling`/`finalize_ruling` now *propose* (recording the proposer's own approval)
+   rather than acting immediately; `approve_ai_ruling` lets other members co-sign, rejecting
+   double-approval and non-members. Membership is root-gated via
+   `add_oracle_member`/`remove_oracle_member`. Call indices and argument shapes are unchanged, so
+   `court-oracle` needed no code changes beyond updated doc comments describing the new
+   one-instance-per-council-member deployment model. See `docs/project/pallets/courts.md` and
    `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full accounting.
 3. **Mobile app native build** — `mobile/android/` and its NFC module already exist and are committed;
    blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and

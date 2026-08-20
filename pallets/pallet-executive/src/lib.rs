@@ -25,6 +25,12 @@
 //!
 //! `ActiveEmergency::get().is_some()` is the canonical "is there an emergency?" signal for
 //! other pallets to check. Only ratified emergencies remain in storage past the window.
+//!
+//! A cabinet cannot immediately re-declare after an emergency ends by any path (lapse,
+//! sunset expiry, or early `vote_end_emergency`) — `EmergencyCooldownBlocks` must pass first.
+//! Without this, the same supermajority could chain back-to-back emergencies into de-facto
+//! indefinite emergency powers despite each individual window being capped by
+//! `MaxEmergencyBlocks`.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;
@@ -149,6 +155,10 @@ pub mod pallet {
         /// If they don't pass `ratify_emergency` in time, the emergency lapses.
         #[pallet::constant]
         type RatificationWindowBlocks: Get<u32>;
+        /// Minimum blocks that must pass after an emergency ends (lapse, sunset expiry, or
+        /// early `vote_end_emergency`) before the cabinet can declare another one.
+        #[pallet::constant]
+        type EmergencyCooldownBlocks: Get<u32>;
         /// Numerator of the cabinet supermajority required to declare/end an emergency (e.g. 2).
         #[pallet::constant]
         type SupermajorityNumerator: Get<u32>;
@@ -313,6 +323,13 @@ pub mod pallet {
     #[pallet::storage]
     pub type PendingEmergencyProposal<T: Config> = StorageValue<_, ([u8; 32], u32), OptionQuery>;
 
+    /// Block number before which the cabinet cannot declare a new emergency. Set to
+    /// `now + EmergencyCooldownBlocks` whenever an emergency ends, by any path (lapse or
+    /// sunset expiry in `on_initialize`, or early `vote_end_emergency`). Defaults to zero,
+    /// so the very first emergency this pallet ever sees is never blocked by it.
+    #[pallet::storage]
+    pub type CooldownUntil<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
+
     // ── Storage: minister nomination (PM nominates, legislature confirms) ──────────
 
     /// portfolio_id → the PM's currently staged nominee, awaiting legislature
@@ -362,15 +379,21 @@ pub mod pallet {
                     ActiveEmergency::<T>::kill();
                     let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                     let _ = EndVotes::<T>::clear(u32::MAX, None);
+                    CooldownUntil::<T>::put(
+                        now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
+                    );
                     Self::deposit_event(Event::EmergencyLapsed);
-                    weight = weight.saturating_add(T::DbWeight::get().writes(3));
+                    weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 // Expire: emergency ran its full constitutional duration.
                 } else if now >= info.expires_at {
                     ActiveEmergency::<T>::kill();
                     let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                     let _ = EndVotes::<T>::clear(u32::MAX, None);
+                    CooldownUntil::<T>::put(
+                        now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
+                    );
                     Self::deposit_event(Event::EmergencyExpired { at_block: now });
-                    weight = weight.saturating_add(T::DbWeight::get().writes(3));
+                    weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 }
             }
 
@@ -460,6 +483,9 @@ pub mod pallet {
         NotCabinetMember,
         /// An emergency is already active — only one at a time.
         AlreadyActiveEmergency,
+        /// Cannot declare a new emergency until `EmergencyCooldownBlocks` have passed since
+        /// the previous one ended.
+        EmergencyCooldownActive,
         /// This cabinet member has already voted to declare the current emergency.
         AlreadyVotedToDeclare,
         /// This cabinet member has already voted to end the current emergency.
@@ -831,6 +857,8 @@ pub mod pallet {
             ensure!(Self::is_cabinet_member(&who), Error::<T>::NotCabinetMember);
             ensure!(Self::cabinet_size() >= 2, Error::<T>::CabinetTooSmallForEmergencyVote);
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(now >= CooldownUntil::<T>::get(), Error::<T>::EmergencyCooldownActive);
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
             // Lock in the proposal terms from the first vote. Subsequent voters' args are
@@ -850,7 +878,6 @@ pub mod pallet {
             Self::deposit_event(Event::EmergencyVoteCast { who, vote_count });
 
             if Self::supermajority_reached(vote_count, cabinet_size) {
-                let now = frame_system::Pallet::<T>::block_number();
                 let expires_at = now.saturating_add(BlockNumberFor::<T>::from(clamped));
                 let ratify_by = now.saturating_add(
                     BlockNumberFor::<T>::from(T::RatificationWindowBlocks::get())
@@ -934,6 +961,10 @@ pub mod pallet {
                 let _ = DeclareVotes::<T>::clear(u32::MAX, None);
                 let _ = EndVotes::<T>::clear(u32::MAX, None);
                 PendingEmergencyProposal::<T>::kill();
+                let now = frame_system::Pallet::<T>::block_number();
+                CooldownUntil::<T>::put(
+                    now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
+                );
                 Self::deposit_event(Event::EmergencyLifted);
             }
 

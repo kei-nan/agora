@@ -1,7 +1,7 @@
 use crate::{
-    mock::*, ActiveEmergency, DeclareVotes, EndVotes, Error, Event, InvestitureRound,
-    NextPortfolioId, PendingEmergencyProposal, PendingMinisterNomination, PortfolioMinister,
-    Portfolios, PrimeMinister, VacatedRole,
+    mock::*, ActiveEmergency, CooldownUntil, DeclareVotes, EndVotes, Error, Event,
+    InvestitureRound, NextPortfolioId, PendingEmergencyProposal, PendingMinisterNomination,
+    PortfolioMinister, Portfolios, PrimeMinister, VacatedRole,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
 use pallet_legislature::pallet::MinisterChecker;
@@ -1212,6 +1212,85 @@ fn emergency_expires_at_sunset_block_even_if_ratified() {
 
         assert!(ActiveEmergency::<Test>::get().is_none());
         System::assert_has_event(Event::EmergencyExpired { at_block: 6 }.into());
+    });
+}
+
+// ─── post-emergency cooldown ────────────────────────────────────────────────
+
+#[test]
+fn vote_declare_emergency_fails_during_cooldown_after_lapse() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+
+        // Legislature never ratifies -- emergency lapses at block 12 (ratify_by == 11).
+        System::set_block_number(12);
+        let _ = Executive::on_initialize(12);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+        assert_eq!(CooldownUntil::<Test>::get(), 12 + EMERGENCY_COOLDOWN_BLOCKS as u64);
+
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(2), 50),
+            Error::<Test>::EmergencyCooldownActive
+        );
+    });
+}
+
+#[test]
+fn vote_declare_emergency_fails_during_cooldown_after_sunset_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 5));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 5));
+        assert_ok!(Executive::ratify_emergency(RuntimeOrigin::root()));
+
+        System::set_block_number(6);
+        let _ = Executive::on_initialize(6);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(2), 5),
+            Error::<Test>::EmergencyCooldownActive
+        );
+    });
+}
+
+#[test]
+fn vote_declare_emergency_fails_during_cooldown_after_early_lift() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(3), hash(2), 50),
+            Error::<Test>::EmergencyCooldownActive
+        );
+    });
+}
+
+#[test]
+fn vote_declare_emergency_succeeds_once_cooldown_elapses() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(2)));
+
+        System::set_block_number(CooldownUntil::<Test>::get());
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(3), hash(2), 50));
+        assert!(DeclareVotes::<Test>::get(3));
     });
 }
 

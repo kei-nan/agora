@@ -9,17 +9,33 @@ Storage:
 - `ActiveEmergency`: `Option<EmergencyInfo { declared_at, expires_at, reason_hash, votes_to_declare, votes_to_end }>`
 - `DeclareVotes`: `AccountId` → `bool` (reset each new emergency)
 - `EndVotes`: `AccountId` → `bool`
+- `CooldownUntil`: `BlockNumber` (added 2026-08-20) — block before which `vote_declare_emergency`
+  is rejected; set to `now + EmergencyCooldownBlocks` whenever an emergency ends, by any path
 
 Config:
 - `MaxEmergencyBlocks = 216_000` (30 days at this chain's actual 12s/block time — constitutional ceiling)
+- `EmergencyCooldownBlocks = 50_400` (7 days at 12s/block — added 2026-08-20)
 - `SupermajorityNumerator / Denominator = 2/3`
 
 Calls:
 - `add_council_member(account)` / `remove_council_member(account)` — root
-- `vote_declare_emergency(reason_hash, duration_blocks)` — council member; duration clamped to max; activates on 2/3 supermajority
-- `vote_end_emergency()` — council member; lifts on 2/3 supermajority
+- `vote_declare_emergency(reason_hash, duration_blocks)` — council member; duration clamped to
+  max; rejected with `EmergencyCooldownActive` if called before `CooldownUntil`; activates on 2/3
+  supermajority
+- `vote_end_emergency()` — council member; lifts on 2/3 supermajority, sets `CooldownUntil`
 
-`on_initialize` hook: auto-expires `ActiveEmergency` when `expires_at <= current_block`, emits `EmergencyExpired`.
+`on_initialize` hook: auto-expires `ActiveEmergency` when `expires_at <= current_block`, emits
+`EmergencyExpired`, sets `CooldownUntil`.
+
+**Post-emergency cooldown (fixed 2026-08-20)**: previously, neither this pallet nor
+`pallet-executive`'s independent emergency mechanism enforced any minimum gap between
+emergencies — only `AlreadyActiveEmergency` blocked a *second concurrent* one. The same
+supermajority that declares an emergency could therefore redeclare a fresh one the block after
+the previous one ended (sunset expiry or early `vote_end_emergency`), chaining into de-facto
+indefinite emergency powers despite each individual window being honestly capped by
+`MaxEmergencyBlocks` — defeating the sunset clause's stated purpose. `CooldownUntil` now blocks
+`vote_declare_emergency` for `EmergencyCooldownBlocks` after any emergency ends. See
+`docs/project/changelog/092.md`.
 
 ### `EnsureActiveEmergency<T>` — cross-pallet origin (added this session)
 

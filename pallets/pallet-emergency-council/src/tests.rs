@@ -1,6 +1,6 @@
 use crate::{
-    mock::*, ActiveEmergency, Council, DeclareVotes, EndVotes, EnsureActiveEmergency, Error,
-    Event, PendingEmergencyProposal,
+    mock::*, ActiveEmergency, Council, CooldownUntil, DeclareVotes, EndVotes,
+    EnsureActiveEmergency, Error, Event, PendingEmergencyProposal,
 };
 use frame_support::{assert_noop, assert_ok, traits::{EnsureOrigin, Hooks}};
 use sp_runtime::DispatchError;
@@ -527,12 +527,70 @@ fn emergency_auto_expiry_clears_vote_maps_and_pending_proposal() {
 
         // A member who had already voted to declare the now-expired emergency can
         // immediately participate in declaring a fresh one without a stale
-        // AlreadyVotedToDeclare rejection.
+        // AlreadyVotedToDeclare rejection, once the post-emergency cooldown has passed.
+        System::set_block_number(CooldownUntil::<Test>::get());
         assert_ok!(EmergencyCouncil::vote_declare_emergency(
             RuntimeOrigin::signed(1),
             REASON_B,
             10
         ));
+    });
+}
+
+// ─── post-emergency cooldown ────────────────────────────────────────────────
+
+#[test]
+fn vote_declare_emergency_fails_during_cooldown_after_auto_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+
+        System::set_block_number(51);
+        EmergencyCouncil::on_initialize(51);
+        assert_eq!(CooldownUntil::<Test>::get(), 51 + EMERGENCY_COOLDOWN_BLOCKS as u64);
+
+        // One block before the cooldown lifts: still blocked.
+        System::set_block_number(51 + EMERGENCY_COOLDOWN_BLOCKS as u64 - 1);
+        assert_noop!(
+            EmergencyCouncil::vote_declare_emergency(RuntimeOrigin::signed(1), REASON_B, 10),
+            Error::<Test>::EmergencyCooldownActive
+        );
+    });
+}
+
+#[test]
+fn vote_declare_emergency_fails_during_cooldown_after_early_lift() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_noop!(
+            EmergencyCouncil::vote_declare_emergency(RuntimeOrigin::signed(3), REASON_B, 10),
+            Error::<Test>::EmergencyCooldownActive
+        );
+    });
+}
+
+#[test]
+fn vote_declare_emergency_succeeds_once_cooldown_elapses() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(2)));
+
+        System::set_block_number(CooldownUntil::<Test>::get());
+        assert_ok!(EmergencyCouncil::vote_declare_emergency(
+            RuntimeOrigin::signed(3),
+            REASON_B,
+            10
+        ));
+        assert!(DeclareVotes::<Test>::get(3));
     });
 }
 

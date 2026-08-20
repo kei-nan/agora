@@ -815,6 +815,12 @@ impl pallet_executive::Config for Runtime {
 	/// Legislature has 72 hours to ratify after cabinet declares emergency (`DAYS` is block-time-
 	/// derived, so this stays correct regardless of block time).
 	type RatificationWindowBlocks = ConstU32<{ 3 * DAYS }>;
+	/// 7-day cooldown after an emergency ends (lapse, sunset expiry, or early
+	/// `vote_end_emergency`) before the cabinet can declare another one — mirrors
+	/// `pallet_emergency_council::Config::EmergencyCooldownBlocks` below for the same reason:
+	/// without it, the same supermajority could chain back-to-back emergencies into de-facto
+	/// indefinite emergency powers.
+	type EmergencyCooldownBlocks = ConstU32<{ 7 * DAYS }>;
 	/// 2/3 cabinet supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
 	type SupermajorityDenominator = ConstU32<3>;
@@ -949,6 +955,12 @@ impl pallet_emergency_council::Config for Runtime {
 	/// wall-clock-denominated constants) rather than a hardcoded literal so it stays correct
 	/// if the block time ever changes; this correctly comes out to 216_000 blocks, not 432_000.
 	type MaxEmergencyBlocks = ConstU32<{ 30 * DAYS }>;
+	/// 7-day cooldown after an emergency ends (sunset expiry or early `vote_end_emergency`)
+	/// before the council can declare another one. Without this, the same supermajority that
+	/// declares an emergency could re-declare a fresh one the block after the previous one
+	/// ends, chaining into de-facto indefinite emergency powers despite `MaxEmergencyBlocks`
+	/// capping each individual window.
+	type EmergencyCooldownBlocks = ConstU32<{ 7 * DAYS }>;
 	/// Council capped at 15 members (docs/project/pallets/emergency-council.md).
 	type MaxCouncilSize = ConstU32<15>;
 	/// 2/3 supermajority required to declare or end an emergency.
