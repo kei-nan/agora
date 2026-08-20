@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use tauri::State;
 use uuid::Uuid;
 
+use crate::account_pin::{AccountPinStore, PinCheckResult};
 use crate::commands::chain;
 
 /// How long an issued bearer token stays valid. Matches the previous (unenforced) `expiresAt`
@@ -193,11 +194,13 @@ pub async fn auth_start_callback_server(
     port: u16,
     sessions: State<'_, PendingSessions>,
     session_store: State<'_, SessionStore>,
+    pin_store: State<'_, AccountPinStore>,
 ) -> Result<(), String> {
     let sessions = sessions.0.clone();
     let session_store = session_store.0.clone();
+    let pin_store = pin_store.inner().clone();
     tokio::spawn(async move {
-        run_callback_server(port, sessions, session_store).await;
+        run_callback_server(port, sessions, session_store, pin_store).await;
     });
     Ok(())
 }
@@ -206,6 +209,7 @@ async fn run_callback_server(
     port: u16,
     sessions: Arc<Mutex<HashMap<String, ChallengeEntry>>>,
     session_store: Arc<Mutex<HashMap<String, SessionRecord>>>,
+    pin_store: AccountPinStore,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -226,6 +230,7 @@ async fn run_callback_server(
         };
         let sessions = sessions.clone();
         let session_store = session_store.clone();
+        let pin_store = pin_store.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
             let n = match stream.read(&mut buf).await {
@@ -243,7 +248,7 @@ async fn run_callback_server(
                 .to_string();
 
             let (status, body_text) = match serde_json::from_str::<AuthCallback>(&body) {
-                Ok(cb) => handle_auth_callback(cb, &sessions, &session_store).await,
+                Ok(cb) => handle_auth_callback(cb, &sessions, &session_store, &pin_store).await,
                 Err(_) => ("400 Bad Request", "{\"error\":\"invalid json\"}".to_string()),
             };
 
@@ -278,18 +283,20 @@ async fn run_callback_server(
 /// (see the TRUST BOUNDARY comment on that function in `commands/chain.rs`) — it's a plain,
 /// unauthenticated JSON-RPC call to a hardcoded local node over plaintext HTTP. A
 /// malicious/compromised node, or a local MITM on that channel, can hand this function an
-/// attacker-chosen public key for any nullifier, and this function will faithfully verify the
-/// callback signature against it and mint a real bearer session for a forged identity. The
-/// sr25519 signature check right below is doing exactly what it claims — proving the caller
-/// controls the private key matching the pubkey it was given — it just isn't yet given a pubkey
-/// that's cryptographically bound to the real chain state. Closing this requires the smoldot
-/// light-client integration CLAUDE.md already documents as architected-for-but-not-built; until
-/// then, do not treat a minted session's `nullifier_hash` as a verified identity against a
-/// hostile or compromised RPC endpoint.
+/// attacker-chosen public key for any nullifier. What stops that from silently minting a session
+/// for a forged identity is `finalize_callback` below running every resolved pubkey through
+/// `account_pin::AccountPinStore` — a local trust-on-first-use pin, persisted to disk, keyed by
+/// nullifier — before the sr25519 signature check even runs. A returned pubkey that
+/// contradicts a nullifier's previously-pinned account is rejected outright as a probable
+/// forged/compromised lookup response; see `account_pin.rs`'s module doc for exactly what this
+/// does and does not close (short version: it defends every login after the first for a given
+/// nullifier, not the first one — full closure still needs the smoldot light-client integration
+/// CLAUDE.md documents as architected-for-but-not-built in the Rust backend).
 async fn handle_auth_callback(
     cb: AuthCallback,
     sessions: &Arc<Mutex<HashMap<String, ChallengeEntry>>>,
     session_store: &Arc<Mutex<HashMap<String, SessionRecord>>>,
+    pin_store: &AccountPinStore,
 ) -> (&'static str, String) {
     let challenge_known = sessions
         .lock()
@@ -330,6 +337,43 @@ async fn handle_auth_callback(
         }
     };
 
+    finalize_callback(&cb, pubkey, sessions, session_store, pin_store)
+}
+
+/// Decision core of `handle_auth_callback`, taking the already-resolved `pubkey` as a plain
+/// argument instead of performing the chain lookup itself. Split out specifically so tests can
+/// exercise the full pin-enforcement + signature-verification + session-minting decision chain
+/// — including the security fix, TOFU pin mismatch rejection — without touching the network;
+/// `handle_auth_callback` above is the thin wrapper that does the actual
+/// `chain::lookup_registered_account` RPC call and nothing else beyond that.
+fn finalize_callback(
+    cb: &AuthCallback,
+    pubkey: [u8; 32],
+    sessions: &Arc<Mutex<HashMap<String, ChallengeEntry>>>,
+    session_store: &Arc<Mutex<HashMap<String, SessionRecord>>>,
+    pin_store: &AccountPinStore,
+) -> (&'static str, String) {
+    // SECURITY FIX: reject a resolved account that contradicts what this desktop install has
+    // previously pinned for this nullifier — see `account_pin.rs` for the full reasoning. This
+    // check runs BEFORE the signature check on purpose: a forged lookup response would otherwise
+    // sail through `verify_challenge_signature` (an attacker signing with their own key, which
+    // the forged lookup dutifully returned, verifies just fine against itself).
+    match pin_store.check_and_pin(&cb.nullifier_hash, pubkey) {
+        PinCheckResult::Mismatch { .. } => {
+            eprintln!(
+                "[auth] SECURITY: nullifier {} resolved to an account that contradicts this \
+                 desktop's previously-pinned account for it — rejecting callback (possible \
+                 compromised/MITM'd RPC endpoint, see account_pin.rs)",
+                cb.nullifier_hash
+            );
+            return (
+                "409 Conflict",
+                "{\"error\":\"resolved account does not match previously trusted account for this nullifier\"}".into(),
+            );
+        }
+        PinCheckResult::FirstUsePinned | PinCheckResult::Matched => {}
+    }
+
     if !verify_challenge_signature(&pubkey, &cb.challenge, &cb.signature) {
         eprintln!(
             "[auth] signature verification FAILED for challenge {} — rejecting callback",
@@ -358,7 +402,7 @@ async fn handle_auth_callback(
                     store.insert(
                         token,
                         SessionRecord {
-                            nullifier_hash: cb.nullifier_hash,
+                            nullifier_hash: cb.nullifier_hash.clone(),
                             expires_at,
                         },
                     );
@@ -596,5 +640,136 @@ mod pruning_tests {
         let result = complete_challenge_at(&mut map, "chal".to_string(), mk_session(99_999), 150);
 
         assert_eq!(result, Err("already_completed"));
+    }
+}
+
+#[cfg(test)]
+mod finalize_callback_tests {
+    use super::*;
+    use crate::account_pin::AccountPinStore;
+
+    fn mk_sessions(challenges: &[&str]) -> Arc<Mutex<HashMap<String, ChallengeEntry>>> {
+        let mut map = HashMap::new();
+        let now = unix_now();
+        for c in challenges {
+            map.insert(c.to_string(), ChallengeEntry { created_at: now, session: None });
+        }
+        Arc::new(Mutex::new(map))
+    }
+
+    fn signed_callback(
+        challenge: &str,
+        nullifier_hash: &str,
+        keypair: &schnorrkel::Keypair,
+    ) -> AuthCallback {
+        let signature = keypair.sign_simple(SR25519_SIGNING_CONTEXT, challenge.as_bytes());
+        AuthCallback {
+            challenge: challenge.to_string(),
+            nullifier_hash: nullifier_hash.to_string(),
+            signature: hex::encode(signature.to_bytes()),
+        }
+    }
+
+    /// Sanity check: a brand-new nullifier, valid signature, known challenge → session minted.
+    /// (This also exercises the pin store's `FirstUsePinned` path, which the next test relies on
+    /// having happened.)
+    #[test]
+    fn mints_a_session_on_first_use_and_pins_the_account() {
+        let sessions = mk_sessions(&["chal-1"]);
+        let session_store = Arc::new(Mutex::new(HashMap::new()));
+        let pin_store = AccountPinStore::in_memory();
+        let keypair = schnorrkel::Keypair::generate();
+        let pubkey = keypair.public.to_bytes();
+        let cb = signed_callback("chal-1", "0xaaaa", &keypair);
+
+        let (status, _body) = finalize_callback(&cb, pubkey, &sessions, &session_store, &pin_store);
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(session_store.lock().unwrap().len(), 1);
+    }
+
+    /// THE regression test for this security fix. Before this fix, `lookup_registered_account`'s
+    /// return value (from an unauthenticated, unverified RPC call — see its TRUST BOUNDARY doc
+    /// comment in `commands/chain.rs`) was trusted blind: a compromised/MITM'd RPC endpoint could
+    /// return an attacker-chosen account for any nullifier, and `verify_challenge_signature` would
+    /// happily verify the attacker's own signature against the attacker's own (forged-into-place)
+    /// key, minting a real bearer session bound to a victim's `nullifier_hash`.
+    ///
+    /// This test simulates exactly that: a nullifier that legitimately resolved to one account on
+    /// a first login, later "resolving" (as a compromised RPC lookup would report) to a completely
+    /// different account on a second login attempt for the same nullifier. The account-pin check
+    /// added in this fix must reject the second attempt outright, before signature verification
+    /// even has a chance to rubber-stamp it.
+    #[test]
+    fn rejects_a_forged_lookup_that_contradicts_a_previously_pinned_account() {
+        let sessions = mk_sessions(&["chal-legit", "chal-attack"]);
+        let session_store = Arc::new(Mutex::new(HashMap::new()));
+        let pin_store = AccountPinStore::in_memory();
+
+        // Legitimate first login: nullifier N resolves to the real citizen's own account, and the
+        // real citizen signs with their own key.
+        let legit_keypair = schnorrkel::Keypair::generate();
+        let legit_pubkey = legit_keypair.public.to_bytes();
+        let legit_cb = signed_callback("chal-legit", "0xaaaa", &legit_keypair);
+        let (status1, _) =
+            finalize_callback(&legit_cb, legit_pubkey, &sessions, &session_store, &pin_store);
+        assert_eq!(status1, "200 OK", "legitimate first login must succeed");
+
+        // Attack: a later callback for the SAME nullifier, where the (now compromised/MITM'd) RPC
+        // lookup returns a DIFFERENT, attacker-controlled account. The attacker signs with their
+        // own key — which is exactly what a forged lookup response would let them get away with if
+        // this pin check didn't exist, since `verify_challenge_signature` alone can't distinguish
+        // "the real owner" from "whoever the lookup claims owns it."
+        let attacker_keypair = schnorrkel::Keypair::generate();
+        let attacker_pubkey = attacker_keypair.public.to_bytes();
+        let attack_cb = signed_callback("chal-attack", "0xaaaa", &attacker_keypair);
+        let (status2, body2) =
+            finalize_callback(&attack_cb, attacker_pubkey, &sessions, &session_store, &pin_store);
+
+        assert_ne!(
+            status2, "200 OK",
+            "a forged lookup for an already-pinned nullifier must be rejected, not minted into a session"
+        );
+        assert!(
+            body2.contains("does not match"),
+            "error should identify this as an account-pin mismatch, got: {body2}"
+        );
+        assert_eq!(
+            session_store.lock().unwrap().len(),
+            1,
+            "no new session should have been minted for the rejected forged lookup"
+        );
+    }
+
+    /// A pin that already matches must NOT bypass the signature check — a matching pin only
+    /// asserts "this account is consistent with this desktop's history for this nullifier," it is
+    /// not itself proof that today's caller controls the corresponding private key.
+    #[test]
+    fn matching_pin_still_requires_a_valid_signature() {
+        let sessions = mk_sessions(&["chal-1", "chal-2"]);
+        let session_store = Arc::new(Mutex::new(HashMap::new()));
+        let pin_store = AccountPinStore::in_memory();
+        let keypair = schnorrkel::Keypair::generate();
+        let pubkey = keypair.public.to_bytes();
+
+        let cb1 = signed_callback("chal-1", "0xaaaa", &keypair);
+        let (status1, _) = finalize_callback(&cb1, pubkey, &sessions, &session_store, &pin_store);
+        assert_eq!(status1, "200 OK");
+
+        // Second callback claiming the same (now-pinned, matching) account, but with a garbage
+        // signature instead of a real one.
+        let cb2 = AuthCallback {
+            challenge: "chal-2".to_string(),
+            nullifier_hash: "0xaaaa".to_string(),
+            signature: hex::encode([0x42u8; 64]),
+        };
+        let (status2, _) = finalize_callback(&cb2, pubkey, &sessions, &session_store, &pin_store);
+
+        assert_eq!(status2, "401 Unauthorized");
+        assert_eq!(
+            session_store.lock().unwrap().len(),
+            1,
+            "invalid signature must not mint a session even when the account pin matches"
+        );
     }
 }

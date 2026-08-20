@@ -428,21 +428,39 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
 /// signature check downstream does not close this gap — it only proves the caller controls
 /// *some* key; this function is what decides *whose* identity that key gets credited as.
 ///
-/// The real fix is verifying a state proof against finalized consensus via an embedded light
-/// client. As of changelog #087 that light client exists and is real — `desktop/src/chain/
-/// client.ts` embeds smoldot via `@polkadot/api`'s `ScProvider` and genuinely verifies state
-/// against finalized GRANDPA consensus — but it lives in the JS frontend (see that entry for
-/// why) and this function was NOT migrated to use it: `lookup_registered_account` is called
-/// from `commands::auth::handle_auth_callback`, deep in a Rust-side session-minting flow that
-/// the QR-auth HTTP callback server (also Rust-side, necessarily — a webview can't run an HTTP
-/// server) depends on. Moving this specific lookup onto the light client would mean either
-/// embedding a second, Rust-side light client just for this one call, or restructuring the
-/// auth flow so the already-connected JS light client performs the lookup and hands Rust a
-/// verified result — both are real protocol/architecture work, out of scope for #087. Do not
-/// treat this function's return value as a cryptographically authenticated identity binding
-/// until one of those lands. Anyone wiring `chain_submit_extrinsic` (or any other session-gated
+/// The structurally correct fix is verifying a state proof against finalized consensus via an
+/// embedded light client. As of changelog #087 that light client exists and is real —
+/// `desktop/src/chain/client.ts` embeds smoldot via `@polkadot/api`'s `ScProvider` and genuinely
+/// verifies state against finalized GRANDPA consensus — but it lives in the JS frontend (see that
+/// entry for why) and this function was NOT migrated to use it: `lookup_registered_account` is
+/// called from `commands::auth::handle_auth_callback`, deep in a Rust-side session-minting flow
+/// that the QR-auth HTTP callback server (also Rust-side, necessarily — a webview can't run an
+/// HTTP server) depends on. Moving this specific lookup onto the light client would mean either
+/// embedding a second, Rust-side light client just for this one call (a new major dependency —
+/// genuine GRANDPA-justification verification, not something to add unilaterally), or
+/// restructuring the callback server so it blocks on a round trip to the JS light client instead
+/// of answering synchronously (a real threading/UX trade-off: the phone's HTTP POST would then
+/// wait on a frontend that may not be warmed up or focused) — both remain real protocol/
+/// architecture work, out of scope for this pass same as #087.
+///
+/// SECURITY FIX (this pass): this function's return value is still not a cryptographically
+/// authenticated identity binding on its own — do not treat it as one. What changed is that its
+/// caller, `handle_auth_callback`, no longer trusts it blind: every returned `AccountId` is run
+/// through `account_pin::AccountPinStore`, a local trust-on-first-use pin keyed by nullifier and
+/// persisted to disk. The first time this desktop ever sees a given nullifier, whatever account
+/// this function returns is pinned; every subsequent callback for that same nullifier must return
+/// the *same* account or `handle_auth_callback` rejects it outright. This closes the realistic,
+/// high-value case — a node that becomes malicious/compromised *after* a citizen has already
+/// logged in here once can no longer silently redirect their future logins to an attacker
+/// account. It does **not** close the first-use case: if the RPC endpoint is already
+/// malicious/compromised the very first time a nullifier is looked up here, that forged account
+/// gets pinned as genuine. See `account_pin.rs`'s module doc for the full accounting of what this
+/// does and does not defend against, and why the two structurally-complete options above weren't
+/// implemented in this pass. Anyone wiring `chain_submit_extrinsic` (or any other session-gated
 /// write path) to an actual phone-side flow MUST NOT assume a session's `nullifier_hash` is
-/// trustworthy against a malicious/compromised RPC endpoint — it currently isn't.
+/// trustworthy against an RPC endpoint that was already hostile/compromised before that
+/// nullifier's first login — it still isn't, past that point it now is (for as long as this
+/// desktop install's pin file survives).
 pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Identity", "NullifierRegistry");
