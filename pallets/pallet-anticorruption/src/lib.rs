@@ -572,3 +572,17 @@ pub mod pallet {
         }
     }
 }
+
+// ── DisclosureChecker implementation (pallet-elections seating gate) ──────────
+//
+// pallet-elections defines `DisclosureChecker<AccountId>` (the consumer) and this pallet (the
+// provider) implements it directly on its own `Pallet<T>`, wrapping `has_current_disclosure`
+// unchanged — the same idiom already used for `pallet_treasury_ledger::AuditHook` (implemented
+// on `pallet_audit::Pallet<T>`) and `pallet_elections::SeatLegislature` (implemented on
+// `pallet_legislature::Pallet<T>`). The runtime just wires `pallet_elections::Config::
+// DisclosureChecker` to this pallet's type alias — no `Runtime`-level delegating impl needed.
+impl<T: Config> pallet_elections::DisclosureChecker<T::AccountId> for Pallet<T> {
+    fn has_current_disclosure(who: &T::AccountId) -> bool {
+        Pallet::<T>::has_current_disclosure(who)
+    }
+}

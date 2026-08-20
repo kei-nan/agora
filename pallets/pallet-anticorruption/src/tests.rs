@@ -169,6 +169,26 @@ fn has_current_disclosure_false_once_past_due_date() {
     });
 }
 
+// ─── DisclosureChecker (pallet-elections seating gate) ──────────────────────
+//
+// Exercises the trait impl itself (`pallet_elections::DisclosureChecker::has_current_disclosure`
+// on `Pallet<T>`), not just the underlying inherent function it wraps -- confirms the impl is
+// actually wired to the same logic and reachable through the trait object pallet-elections uses.
+
+#[test]
+fn disclosure_checker_trait_impl_matches_inherent_function() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert!(!<AntiCorruption as pallet_elections::DisclosureChecker<u64>>::has_current_disclosure(&1));
+
+        assert_ok!(AntiCorruption::submit_asset_disclosure(RuntimeOrigin::signed(1), [5u8; 32]));
+        assert!(<AntiCorruption as pallet_elections::DisclosureChecker<u64>>::has_current_disclosure(&1));
+
+        System::set_block_number(1 + RENEWAL_BLOCKS as u64 + 1);
+        assert!(!<AntiCorruption as pallet_elections::DisclosureChecker<u64>>::has_current_disclosure(&1));
+    });
+}
+
 // ─── register_conflict / clear_conflict ─────────────────────────────────────
 
 #[test]

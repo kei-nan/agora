@@ -18,6 +18,7 @@ type Block = frame_system::mocking::MockBlock<Test>;
 thread_local! {
     static ACTIVE_CITIZENS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
     static SEAT_CALLS: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
+    static CURRENT_DISCLOSURES: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or removes them.
@@ -36,10 +37,30 @@ pub fn seat_calls() -> Vec<Vec<u64>> {
     SEAT_CALLS.with(|s| s.borrow().clone())
 }
 
+/// Marks `who` as having a current asset disclosure on file, or removes them (lapsed/never
+/// filed). Defaults to false (not current) for any account never passed here, mirroring
+/// `set_active_citizen`'s default -- tests that seat delegates must opt them in explicitly.
+pub fn set_current_disclosure(who: u64, current: bool) {
+    CURRENT_DISCLOSURES.with(|c| {
+        if current {
+            c.borrow_mut().insert(who);
+        } else {
+            c.borrow_mut().remove(&who);
+        }
+    });
+}
+
 pub struct TestCitizenChecker;
 impl pallet_elections::CitizenChecker<u64> for TestCitizenChecker {
     fn is_active_citizen(who: &u64) -> bool {
         ACTIVE_CITIZENS.with(|c| c.borrow().contains(who))
+    }
+}
+
+pub struct TestDisclosureChecker;
+impl pallet_elections::DisclosureChecker<u64> for TestDisclosureChecker {
+    fn has_current_disclosure(who: &u64) -> bool {
+        CURRENT_DISCLOSURES.with(|c| c.borrow().contains(who))
     }
 }
 
@@ -120,6 +141,7 @@ impl pallet_elections::Config for Test {
     type GovernanceOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
     type ConstitutionalOrigin = EnsureRoot<u64>;
     type LegislatureSeating = TestSeatLegislature;
+    type DisclosureChecker = TestDisclosureChecker;
     type DefaultLegislatureSeats = ConstU32<DEFAULT_LEGISLATURE_SEATS>;
     type DefaultElectionCycleBlocks = ConstU32<DEFAULT_ELECTION_CYCLE_BLOCKS>;
     type DefaultMaxBackingsPerCitizen = ConstU32<DEFAULT_MAX_BACKINGS_PER_CITIZEN>;

@@ -82,6 +82,23 @@ pub mod pallet {
         fn replace_members(winners: alloc::vec::Vec<AccountId>) -> DispatchResult;
     }
 
+    /// Gate: returns `false` if `who` does not have a *current* asset disclosure on file
+    /// (never filed, or filed but past its `AssetDisclosureRenewalBlocks` renewal deadline).
+    /// Checked in `run_election`, at the moment a delegate would actually be seated into
+    /// pallet-legislature — not at `register_as_delegate`/`back_delegate` time — for the same
+    /// reason `CitizenChecker` is re-checked there rather than trusted from whenever `Active`
+    /// status was last crossed: a delegate can hold backing for years, and their disclosure
+    /// can lapse at any point in between, so seating time is the only point that reflects
+    /// current reality. Implemented directly on `pallet_anticorruption::Pallet<T>` (wrapping
+    /// its own `has_current_disclosure`), following the same idiom this pallet already uses
+    /// for `SeatLegislature` above: the *consumer* (this pallet) defines the trait, the
+    /// *provider* implements it directly on its own `Pallet<T>`, and the runtime just aliases
+    /// `Config::DisclosureChecker` to the provider's pallet type — no `Runtime`-level
+    /// delegating impl needed.
+    pub trait DisclosureChecker<AccountId> {
+        fn has_current_disclosure(who: &AccountId) -> bool;
+    }
+
     /// Benchmark-only hook: makes an account satisfy `CitizenChecker::is_active_citizen` for
     /// extrinsics gated on citizen status (`register_candidate`, `register_as_delegate`,
     /// `back_delegate`). Real citizen registration goes through pallet-identity-zk's full
@@ -158,6 +175,10 @@ pub mod pallet {
 
         /// Cross-pallet hook: called at the end of each election cycle to install winners.
         type LegislatureSeating: SeatLegislature<Self::AccountId>;
+
+        /// Cross-pallet gate: checked per-candidate during seating (see `run_election`) so an
+        /// account without a current asset disclosure is skipped rather than seated.
+        type DisclosureChecker: DisclosureChecker<Self::AccountId>;
 
         /// Default number of legislature seats (constitutional, default 100).
         #[pallet::constant]
@@ -343,6 +364,12 @@ pub mod pallet {
         // ── Legislature elections ──
         /// Periodic election ran; `seated` delegates installed into the legislature.
         LegislatureElectionRun { at_block: BlockNumberFor<T>, seated: u32 },
+        /// A delegate would otherwise have been seated this cycle (Active, active citizen, and
+        /// ranked within the top `LegislatureSeats` by backing) but was skipped because they do
+        /// not have a current asset disclosure on file. The next-highest-backed eligible
+        /// delegate takes the seat instead — see `run_election`'s doc comment for why this is a
+        /// skip-and-fall-through rather than a hard error.
+        SeatingSkippedNoDisclosure { account: T::AccountId },
         /// Constitutional election parameters were updated.
         ElectionParamsChanged { seats: u32, cycle_blocks: u32, max_backings_per_citizen: u32 },
 
@@ -753,6 +780,21 @@ pub mod pallet {
         }
 
         /// Run a legislature election: rank Active delegates by backing count, seat the top N.
+        ///
+        /// ## Asset-disclosure gate: skip-and-fall-through, not hard-error
+        /// A delegate without a *current* asset disclosure (see `DisclosureChecker`) is
+        /// excluded from the candidate pool entirely — not seated, and not counted against the
+        /// `LegislatureSeats` cap — so the next-highest-backed eligible delegate fills the seat
+        /// instead. This deliberately mirrors the existing `CitizenChecker` re-check just below
+        /// rather than making the whole `run_election` call (an `on_initialize` hook, not even
+        /// a fallible extrinsic a citizen could retry) fail outright: `on_initialize` runs
+        /// unconditionally every block past the cycle boundary, so an error here would mean the
+        /// election *never* runs again until someone manually intervenes — one official's
+        /// lapsed paperwork should not be able to freeze legislature seating for everyone else.
+        /// It also matches the real-world remedy: the affected delegate files an up-to-date
+        /// disclosure and is eligible again next cycle, no governance action required. The skip
+        /// is not silent, though — `Event::SeatingSkippedNoDisclosure` is emitted per skipped
+        /// account so it is visible on-chain.
         fn run_election(now: BlockNumberFor<T>) -> Weight {
             let seats = LegislatureSeats::<T>::get() as usize;
 
@@ -768,13 +810,21 @@ pub mod pallet {
                     // years, and may have been suspended since (e.g. an Overturned
                     // CitizenConduct court ruling) without ever re-registering. This is the
                     // point power is actually granted, so it's the point that must be checked.
-                    if info.status == DelegateStatus::Active
-                        && T::CitizenChecker::is_active_citizen(&addr)
+                    if info.status != DelegateStatus::Active
+                        || !T::CitizenChecker::is_active_citizen(&addr)
                     {
-                        Some((addr.clone(), BackingCount::<T>::get(&addr)))
-                    } else {
-                        None
+                        return None;
                     }
+                    // Same reasoning, for asset-disclosure currency — see this function's doc
+                    // comment for why this is a skip (excluded from the pool, next-highest
+                    // eligible delegate takes the seat) rather than a hard error.
+                    if !T::DisclosureChecker::has_current_disclosure(&addr) {
+                        Self::deposit_event(Event::SeatingSkippedNoDisclosure {
+                            account: addr.clone(),
+                        });
+                        return None;
+                    }
+                    Some((addr.clone(), BackingCount::<T>::get(&addr)))
                 })
                 .collect();
 
