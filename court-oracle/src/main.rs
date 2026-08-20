@@ -70,9 +70,12 @@ async fn main() -> anyhow::Result<()> {
         AccountId32::from(<sp_core::sr25519::Pair as sp_core::Pair>::from_seed(&seed).public().to_raw());
     tracing::info!(oracle_account = %account_id.to_ss58check(), "loaded oracle signing key");
     tracing::warn!(
-        "this account must be registered on-chain via `Courts::set_oracle_account` (root-only) \
-         before submit_ai_ruling calls signed by it will be accepted — this service does not do \
-         that itself, see README.md"
+        "this account must be registered on-chain as an Oracle Council member via \
+         `Courts::add_oracle_member` (root-only) before submit_ai_ruling/finalize_ruling calls \
+         signed by it will even be accepted as proposals -- and, under the M-of-N design, a \
+         ruling only actually takes effect once enough OTHER council members' instances \
+         approve the same case too. This service does not register itself or coordinate with \
+         other instances, see README.md's 'Oracle Council' section"
     );
 
     let rpc = RpcClient::new(config.node_rpc_url.clone());

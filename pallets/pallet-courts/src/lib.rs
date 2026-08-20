@@ -76,9 +76,23 @@ pub mod pallet {
 
     // ── Oracle origin ────────────────────────────────────────────────────────────
 
-    /// Accepts a `Signed` origin only if the signer matches the stored `OracleAccount`.
-    /// Returns `Err(origin)` if no oracle account is set or the signer doesn't match.
-    /// Governance can rotate the oracle via `set_oracle_account` without a runtime upgrade.
+    /// Accepts a `Signed` origin only if the signer is a current member of `OracleMembers`.
+    /// Returns `Err(origin)` if the account isn't (or no longer is) a member.
+    ///
+    /// This is the M-of-N Oracle Council replacement for the earlier single-`OracleAccount`
+    /// design: previously this origin accepted exactly one designated account, so a single
+    /// compromised or lost oracle signing key fully controlled Level-0 AI court rulings and
+    /// their finalization for the entire court system, with no secondary approval. `EnsureOracle`
+    /// itself now only answers "is this signer allowed to participate in oracle actions at
+    /// all" — it does *not* by itself authorize a ruling to take effect. The actual M-of-N
+    /// gate lives in `submit_ai_ruling`/`approve_ai_ruling`/`finalize_ruling`: any single
+    /// member can *propose* a ruling submission or finalization, but it only takes effect once
+    /// `OracleApprovalNumerator`/`Denominator` of the council has approved the same pending
+    /// action (see `PendingOracleProposal`, `OracleApprovals`, `try_resolve_oracle_action`).
+    /// `Success = T::AccountId` (not `()`) because the M-of-N flow needs to know *which*
+    /// member is acting, to record their approval and reject a repeat approval from the same
+    /// member. Governance manages membership via `add_oracle_member`/`remove_oracle_member`
+    /// (root-gated, same as the `set_oracle_account` this replaces) without a runtime upgrade.
     pub struct EnsureOracle<T>(core::marker::PhantomData<T>);
 
     impl<T: Config> frame_support::traits::EnsureOrigin<T::RuntimeOrigin> for EnsureOracle<T> {
@@ -86,12 +100,8 @@ pub mod pallet {
 
         fn try_origin(o: T::RuntimeOrigin) -> Result<Self::Success, T::RuntimeOrigin> {
             use frame_system::RawOrigin;
-            let oracle = match OracleAccount::<T>::get() {
-                Some(a) => a,
-                None => return Err(o),
-            };
             match o.clone().into() {
-                Ok(RawOrigin::Signed(who)) if who == oracle => Ok(who),
+                Ok(RawOrigin::Signed(who)) if OracleMembers::<T>::get().contains(&who) => Ok(who),
                 _ => Err(o),
             }
         }
@@ -106,8 +116,8 @@ pub mod pallet {
         // `runtime/Cargo.toml`, and writing an actual `#[benchmarks]` module.
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin() -> Result<T::RuntimeOrigin, ()> {
-            let oracle = OracleAccount::<T>::get().ok_or(())?;
-            Ok(frame_system::RawOrigin::Signed(oracle).into())
+            let member = OracleMembers::<T>::get().first().cloned().ok_or(())?;
+            Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
 
@@ -145,6 +155,24 @@ pub mod pallet {
         CitizenConduct { nullifier: [u8; 32], suspension_blocks: Option<u32> },
     }
 
+    /// What a pending Oracle Council proposal for a case will do once approvals reach the
+    /// configured M-of-N threshold — either commit a fresh Level-0 AI ruling (mirrors the old
+    /// single-signer `submit_ai_ruling`'s effect) or apply the verdict already committed in
+    /// `AIRulingVerdict` (mirrors the old single-signer `finalize_ruling`'s effect). A case can
+    /// have at most one pending oracle action at a time: a `Submission` only makes sense while
+    /// status is `Filed`, a `Finalization` only while status is `AIRulingIssued` past the
+    /// appeal window — so both variants share one map keyed by `case_id`
+    /// (`PendingOracleProposal`) rather than needing two separate maps.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum PendingOracleAction {
+        /// Committing a fresh Level-0 AI ruling for a `Filed` case — the frozen arguments
+        /// `submit_ai_ruling`'s proposer originally supplied.
+        Submission { ruling_hash: [u8; 32], model_version: u32, verdict: Verdict },
+        /// Applying the verdict already bound in `AIRulingVerdict` for an unappealed
+        /// `AIRulingIssued` case whose appeal window has closed.
+        Finalization,
+    }
+
     /// A governance-approved AI model version, referenced by `submit_ai_ruling`'s
     /// `model_version` parameter (see `CurrentAIModelVersion` / `AIModelVersions`).
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
@@ -174,9 +202,41 @@ pub mod pallet {
         type LawEnforcer: LawEnforcer;
         /// Hook called to freeze a department when an Overturned treasury verdict is issued.
         type TreasuryEnforcer: TreasuryEnforcer;
-        /// The origin permitted to submit AI rulings and finalize un-appealed cases.
-        /// Configure as EnsureRoot for dev; wire to a dedicated oracle account in production.
-        type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// The origin permitted to propose or approve AI ruling submission/finalization — any
+        /// Oracle Council member (`OracleMembers`). `Success = Self::AccountId` (not `()`)
+        /// because the M-of-N flow needs to know *which* member is acting: it's recorded in
+        /// `OracleApprovals` and checked to reject a repeat approval from the same member.
+        /// Configure as `EnsureOracle<Runtime>` in production; a mock can use anything that
+        /// yields a distinct `AccountId` per caller.
+        type OracleOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin, Success = Self::AccountId>;
+        /// Maximum size of the Oracle Council — the M-of-N body that jointly authorizes Level-0
+        /// AI ruling submission and finalization (see `OracleMembers`, `submit_ai_ruling`,
+        /// `approve_ai_ruling`, `finalize_ruling`). Replaces the earlier single `OracleAccount`
+        /// design, which a project review flagged as a single point of failure: one compromised
+        /// or lost oracle key fully controlled every Level-0 ruling and its finalization, with
+        /// no secondary approval. Sized at 7 in the runtime — the same as a Level-1 appeal jury
+        /// (`select_jury`'s non-`LawChallenge` branch); small enough that each member is a real,
+        /// individually-run signing key/Claude-API instance to be tractable (see
+        /// `court-oracle/README.md`'s multi-instance deployment note), large enough that losing
+        /// any one member's key doesn't stall the court system.
+        #[pallet::constant]
+        type MaxOracleMembers: Get<u32>;
+        /// Numerator of the fraction of Oracle Council members whose approval a pending action
+        /// (`PendingOracleProposal`) needs before it takes effect. The check is
+        /// `approvals * OracleApprovalDenominator > council_size * OracleApprovalNumerator` —
+        /// **strict** inequality, because "majority" means *more than* half, not "at least
+        /// half" (contrast this pallet's own `ai_model_supermajority_reached` and
+        /// pallet-emergency-council's `supermajority_reached`, which both use `>=` because they
+        /// gate genuine supermajorities, e.g. 2/3, rather than a plain majority). Set to 1/2 in
+        /// the runtime — a simple majority is what closes the reviewed single-point-of-failure
+        /// gap; nothing here stops a future change to a higher bar (e.g. 2/3) by adjusting
+        /// these two constants, the same way `AIModelSupermajorityNumerator`/`Denominator` are
+        /// independently configurable for the separate AI-model-approval council below.
+        #[pallet::constant]
+        type OracleApprovalNumerator: Get<u32>;
+        /// Denominator of the oracle-approval fraction (see `OracleApprovalNumerator`).
+        #[pallet::constant]
+        type OracleApprovalDenominator: Get<u32>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// Number of blocks, starting the block *after* a case enters jury appeal, whose
@@ -297,11 +357,32 @@ pub mod pallet {
     pub type JuryTally<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, (u32, u32), ValueQuery>;
 
-    /// The designated AI oracle account. Only this account may call `submit_ai_ruling`
-    /// and `finalize_ruling`. Set by root via `set_oracle_account`; rotatable without
-    /// a runtime upgrade.
+    /// The Oracle Council — the M-of-N body whose members may propose/approve AI ruling
+    /// submission (`submit_ai_ruling`) and finalization (`finalize_ruling`). Replaces the
+    /// earlier single `OracleAccount`. Managed by root via `add_oracle_member`/
+    /// `remove_oracle_member`, mirroring `AIGovernanceCouncil`'s management calls in this same
+    /// pallet (see those calls' doc comments).
     #[pallet::storage]
-    pub type OracleAccount<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
+    pub type OracleMembers<T: Config> =
+        StorageValue<_, BoundedVec<T::AccountId, T::MaxOracleMembers>, ValueQuery>;
+
+    /// case_id -> the oracle action awaiting `OracleApprovalNumerator`/`Denominator` approval,
+    /// if any. Cleared (alongside `OracleApprovals`) the moment the action resolves — either by
+    /// taking effect once the threshold is reached, or by being dropped as stale if the case's
+    /// status no longer matches what the action expects (e.g. a `Finalization` proposal whose
+    /// case got appealed by someone else in the interim) — see `try_resolve_oracle_action`.
+    #[pallet::storage]
+    pub type PendingOracleProposal<T: Config> = StorageMap<_, Blake2_128Concat, u32, PendingOracleAction>;
+
+    /// case_id -> Oracle Council members who have approved the current `PendingOracleProposal`
+    /// for that case. Single-use per member per action: `approve_ai_ruling` rejects a repeat
+    /// approval from the same member (`Error::AlreadyApprovedOracleAction`), and both this map
+    /// and `PendingOracleProposal` are cleared together once the action resolves, so a member's
+    /// past approval never silently counts toward a *later*, different proposal for the same
+    /// case_id.
+    #[pallet::storage]
+    pub type OracleApprovals<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, BoundedVec<T::AccountId, T::MaxOracleMembers>>;
 
     /// case_id -> bond reserved from the filer by `file_case`. Only ever populated for
     /// citizen-filed cases — `auto_file_case` (system-initiated) never inserts an entry here,
@@ -426,7 +507,22 @@ pub mod pallet {
         /// (law paused, department frozen, or citizen suspended).
         RulingEnforced { case_id: u32 },
         JuryVoteCast { case_id: u32, juror: T::AccountId, verdict: Verdict },
-        OracleAccountSet { account: T::AccountId },
+        /// A new member was added to the Oracle Council.
+        OracleMemberAdded { account: T::AccountId },
+        /// A member was removed from the Oracle Council.
+        OracleMemberRemoved { account: T::AccountId },
+        /// An Oracle Council member proposed committing a fresh Level-0 AI ruling for a case
+        /// (their own approval is recorded immediately, same as a legislature motion's proposer).
+        AIRulingProposed { case_id: u32, proposer: T::AccountId },
+        /// An Oracle Council member proposed finalizing an unappealed case.
+        RulingFinalizationProposed { case_id: u32, proposer: T::AccountId },
+        /// An Oracle Council member cast an approval on a case's pending oracle action.
+        OracleApprovalCast { case_id: u32, member: T::AccountId },
+        /// A pending oracle action reached its approval threshold but could not be applied
+        /// because the case's status had moved on in the interim (e.g. a `Finalization`
+        /// proposal whose case was appealed by someone else before the last approval landed).
+        /// The stale proposal was dropped rather than applied or left dangling forever.
+        OracleActionExpired { case_id: u32 },
         /// A new member was added to the AI Model Governance Council.
         AIGovernanceMemberAdded { who: T::AccountId },
         /// A member was removed from the AI Model Governance Council.
@@ -478,6 +574,20 @@ pub mod pallet {
         /// Too many cases have their jury-seed capture scheduled for the same block; this
         /// `appeal_ruling` call would exceed `MaxCasesPerBlock` for its capture block.
         TooManyCasesInBlock,
+        /// This case already has a pending oracle action (submission or finalization) awaiting
+        /// approval; it must resolve before another can be proposed.
+        OracleActionAlreadyProposed,
+        /// `approve_ai_ruling` was called for a case with no pending oracle action.
+        NoPendingOracleAction,
+        /// This Oracle Council member has already approved the case's current pending action.
+        AlreadyApprovedOracleAction,
+        /// Cannot add member/approval: Oracle Council (or its per-case approval list) is at
+        /// maximum capacity.
+        OracleCouncilAtCapacity,
+        /// The account is already an Oracle Council member.
+        AlreadyOracleMember,
+        /// The account is not in the Oracle Council member list.
+        OracleMemberNotFound,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -509,23 +619,33 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Submit an AI ruling. ruling_hash is the IPFS CID of the full reasoning document.
-        /// `verdict` is committed on-chain here, at submission time — this is the actual
+        /// Propose an AI ruling. ruling_hash is the IPFS CID of the full reasoning document.
+        /// `verdict` is frozen into the proposal here, at proposal time — this is the actual
         /// on-chain binding between the published reasoning and the verdict that will later
-        /// be applied: `finalize_ruling`'s no-appeal path applies exactly this stored value
-        /// and no longer accepts a free-form verdict argument of its own, closing the hole
-        /// where a compromised oracle key could publish reasoning saying one thing and
-        /// finalize with the opposite verdict. See `AIRulingVerdict`.
+        /// be applied: once the proposal resolves, `AIRulingVerdict` holds exactly this value,
+        /// and `finalize_ruling`'s no-appeal path applies exactly that stored value with no
+        /// free-form verdict argument of its own — closing the hole where a compromised oracle
+        /// key could publish reasoning saying one thing and finalize with the opposite verdict.
+        /// See `AIRulingVerdict`.
         ///
-        /// `model_version` must match `CurrentAIModelVersion` — this is the actual on-chain
-        /// enforcement of CLAUDE.md's "AI model updates require on-chain governance vote
-        /// (supermajority)" claim: a ruling can only be attributed to a model version that
-        /// has actually been approved via `vote_approve_ai_model`. Rejected with
+        /// `model_version` must match `CurrentAIModelVersion` at proposal time — this is the
+        /// actual on-chain enforcement of CLAUDE.md's "AI model updates require on-chain
+        /// governance vote (supermajority)" claim: a ruling can only be attributed to a model
+        /// version that has actually been approved via `vote_approve_ai_model`. Rejected with
         /// `Error::NoApprovedAIModel` if no model has ever been approved, or
         /// `Error::UnapprovedAIModel` if `model_version` doesn't match the current one
-        /// (including a stale, previously-approved-but-since-superseded version).
+        /// (including a stale, previously-approved-but-since-superseded version). Not
+        /// re-checked at resolution time — like the verdict, the model version is frozen into
+        /// the proposal the instant it's created.
         ///
-        /// Only callable by the designated AI oracle account (root for now).
+        /// Only callable by an Oracle Council member (`OracleMembers`). This call both
+        /// *proposes* the ruling (creating `PendingOracleProposal`) and casts the proposer's
+        /// own approval, exactly like `pallet_legislature::propose_motion` counting the
+        /// proposer's aye immediately. The case moves to `AIRulingIssued` (and `AIRulingIssued`
+        /// fires) only once `OracleApprovalNumerator`/`Denominator` of the council has approved
+        /// — via this call alone if the council has just one member (trivially satisfies any
+        /// majority, preserving the old single-oracle behavior for a 1-member council), or via
+        /// subsequent `approve_ai_ruling` calls from other members otherwise.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn submit_ai_ruling(
@@ -535,21 +655,49 @@ pub mod pallet {
             model_version: u32,
             verdict: Verdict,
         ) -> DispatchResult {
-            T::OracleOrigin::ensure_origin(origin)?;
+            let who = T::OracleOrigin::ensure_origin(origin)?;
             let current_model_version = CurrentAIModelVersion::<T>::get();
             ensure!(current_model_version != 0, Error::<T>::NoApprovedAIModel);
             ensure!(model_version == current_model_version, Error::<T>::UnapprovedAIModel);
-            Cases::<T>::try_mutate(case_id, |maybe_case| {
-                let case = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
-                ensure!(case.1 == CaseStatus::Filed, Error::<T>::InvalidStatus);
-                case.1 = CaseStatus::AIRulingIssued;
-                case.2 = Some(ruling_hash);
-                Ok::<(), DispatchError>(())
+            let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+            ensure!(case.1 == CaseStatus::Filed, Error::<T>::InvalidStatus);
+            ensure!(
+                PendingOracleProposal::<T>::get(case_id).is_none(),
+                Error::<T>::OracleActionAlreadyProposed
+            );
+            PendingOracleProposal::<T>::insert(
+                case_id,
+                PendingOracleAction::Submission { ruling_hash, model_version, verdict },
+            );
+            let mut approvals: BoundedVec<T::AccountId, T::MaxOracleMembers> = BoundedVec::default();
+            approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)?;
+            OracleApprovals::<T>::insert(case_id, approvals);
+            Self::deposit_event(Event::AIRulingProposed { case_id, proposer: who });
+            Self::try_resolve_oracle_action(case_id)?;
+            Ok(())
+        }
+
+        /// Cast an Oracle Council approval on `case_id`'s current pending action (a
+        /// `submit_ai_ruling` submission or a `finalize_ruling` finalization — whichever is
+        /// pending; see `PendingOracleAction`). Any member may call once per pending action;
+        /// a repeat approval from the same member is rejected (`Error::AlreadyApprovedOracleAction`).
+        /// Once approvals reach the configured threshold, the action is applied immediately in
+        /// this same call — see `try_resolve_oracle_action`.
+        #[pallet::call_index(11)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn approve_ai_ruling(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
+            let who = T::OracleOrigin::ensure_origin(origin)?;
+            ensure!(
+                PendingOracleProposal::<T>::contains_key(case_id),
+                Error::<T>::NoPendingOracleAction
+            );
+            OracleApprovals::<T>::try_mutate(case_id, |maybe_approvals| {
+                let approvals = maybe_approvals.get_or_insert_with(BoundedVec::default);
+                ensure!(!approvals.contains(&who), Error::<T>::AlreadyApprovedOracleAction);
+                approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)
             })?;
-            AIRulingBlock::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
-            AIRulingModelVersion::<T>::insert(case_id, model_version);
-            AIRulingVerdict::<T>::insert(case_id, verdict);
-            Self::deposit_event(Event::AIRulingIssued { case_id, ruling_hash, model_version });
+            Self::deposit_event(Event::OracleApprovalCast { case_id, member: who });
+            Self::try_resolve_oracle_action(case_id)?;
             Ok(())
         }
 
@@ -671,19 +819,25 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Finalize a ruling for the no-appeal path (AI ruling expires without appeal).
-        /// Only callable when status is AIRulingIssued (InJuryAppeal cases auto-finalize via jury).
-        /// Automatically enforces: pauses laws, freezes treasury departments.
+        /// Propose finalizing a ruling for the no-appeal path (AI ruling expires without
+        /// appeal). Only callable when status is AIRulingIssued (InJuryAppeal cases
+        /// auto-finalize via jury). Once the proposal resolves, finalization automatically
+        /// enforces: pauses laws, freezes treasury departments.
         ///
         /// Applies the verdict `submit_ai_ruling` committed on-chain (`AIRulingVerdict`) —
         /// this call deliberately takes no `verdict` argument of its own. That's the fix for
         /// the "compromised oracle key finalizes with a different verdict than the reasoning
-        /// it published" hole: there is nothing left for the caller to choose here, only
+        /// it published" hole: there is nothing left for any caller to choose here, only
         /// whether to apply the already-bound verdict.
+        ///
+        /// Only callable by an Oracle Council member. Like `submit_ai_ruling`, this both
+        /// proposes the finalization and casts the proposer's own approval; it resolves
+        /// immediately for a 1-member council, or once enough `approve_ai_ruling` calls land
+        /// otherwise. See `PendingOracleAction::Finalization` and `try_resolve_oracle_action`.
         #[pallet::call_index(4)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn finalize_ruling(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
-            T::OracleOrigin::ensure_origin(origin)?;
+            let who = T::OracleOrigin::ensure_origin(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
             ensure!(case.1 == CaseStatus::AIRulingIssued, Error::<T>::InvalidStatus);
             let ruling_block = AIRulingBlock::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
@@ -693,8 +847,16 @@ pub mod pallet {
                 frame_system::Pallet::<T>::block_number() > appeal_deadline,
                 Error::<T>::AppealWindowClosed
             );
-            let verdict = AIRulingVerdict::<T>::get(case_id).ok_or(Error::<T>::NoRulingVerdict)?;
-            Self::auto_finalize(case_id, verdict)?;
+            ensure!(
+                PendingOracleProposal::<T>::get(case_id).is_none(),
+                Error::<T>::OracleActionAlreadyProposed
+            );
+            PendingOracleProposal::<T>::insert(case_id, PendingOracleAction::Finalization);
+            let mut approvals: BoundedVec<T::AccountId, T::MaxOracleMembers> = BoundedVec::default();
+            approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)?;
+            OracleApprovals::<T>::insert(case_id, approvals);
+            Self::deposit_event(Event::RulingFinalizationProposed { case_id, proposer: who });
+            Self::try_resolve_oracle_action(case_id)?;
             Ok(())
         }
 
@@ -740,14 +902,43 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Set the designated AI oracle account. Only root may call this.
-        /// After this call, `submit_ai_ruling` and `finalize_ruling` require the oracle's signature.
+        /// Add a member to the Oracle Council. Only root may call this — the same gating level
+        /// `set_oracle_account` (the single-account design this replaces) used, preserved
+        /// deliberately rather than silently loosened by this fix. Mirrors
+        /// `add_ai_governance_member`'s shape.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
-        pub fn set_oracle_account(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
+        pub fn add_oracle_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
-            OracleAccount::<T>::put(account.clone());
-            Self::deposit_event(Event::OracleAccountSet { account });
+            OracleMembers::<T>::try_mutate(|members| {
+                ensure!(!members.contains(&account), Error::<T>::AlreadyOracleMember);
+                members.try_push(account.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)
+            })?;
+            Self::deposit_event(Event::OracleMemberAdded { account });
+            Ok(())
+        }
+
+        /// Remove a member from the Oracle Council. Only root may call this.
+        ///
+        /// Deliberately does NOT retroactively purge this member's already-cast approvals on
+        /// any in-flight `PendingOracleProposal`s (there is no per-member index into
+        /// `OracleApprovals` to do so cheaply) — the same tradeoff `pallet_legislature`'s
+        /// `remove_member` accepts for a removed member's already-cast votes on still-open
+        /// motions. If this matters for a given removal, resolve or wait out any in-flight
+        /// oracle proposals first.
+        #[pallet::call_index(10)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn remove_oracle_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
+            ensure_root(origin)?;
+            OracleMembers::<T>::try_mutate(|members| {
+                let pos = members
+                    .iter()
+                    .position(|m| m == &account)
+                    .ok_or(Error::<T>::OracleMemberNotFound)?;
+                members.remove(pos);
+                Ok::<(), DispatchError>(())
+            })?;
+            Self::deposit_event(Event::OracleMemberRemoved { account });
             Ok(())
         }
 
@@ -868,7 +1059,7 @@ pub mod pallet {
         /// Shared by `appeal_ruling` and `select_jury` so both calls that gate on "who may
         /// move this case along" apply exactly the same rule.
         fn is_filer_or_oracle(who: &T::AccountId, case: &CaseOf<T>) -> bool {
-            let oracle_ok = OracleAccount::<T>::get().map_or(false, |o| &o == who);
+            let oracle_ok = OracleMembers::<T>::get().contains(who);
             let system_case = case.0 == T::AutoChallengeAccount::get();
             who == &case.0 || oracle_ok || (system_case && T::CitizenChecker::is_active_citizen(who))
         }
@@ -1041,6 +1232,94 @@ pub mod pallet {
             }
             votes.saturating_mul(T::AIModelSupermajorityDenominator::get())
                 >= council_size.saturating_mul(T::AIModelSupermajorityNumerator::get())
+        }
+
+        /// Returns true if `approvals` meets the configured Oracle Council approval threshold.
+        /// Unlike `ai_model_supermajority_reached` (and pallet-emergency-council's
+        /// `supermajority_reached`), this uses **strict** `>` — a plain majority means *more*
+        /// than half, not "at least half" — see `Config::OracleApprovalNumerator`'s doc comment.
+        fn oracle_approval_reached(approvals: u32, council_size: u32) -> bool {
+            if council_size == 0 {
+                return false;
+            }
+            approvals.saturating_mul(T::OracleApprovalDenominator::get())
+                > council_size.saturating_mul(T::OracleApprovalNumerator::get())
+        }
+
+        /// If `case_id`'s pending oracle action has reached its approval threshold, apply it
+        /// and clear `PendingOracleProposal`/`OracleApprovals`. Otherwise a no-op (the action
+        /// stays pending for more approvals). Called at the end of both `submit_ai_ruling`/
+        /// `finalize_ruling` (the proposer's own approval may already be enough for a
+        /// small/1-member council) and `approve_ai_ruling`.
+        ///
+        /// If the threshold is reached but the case's status no longer matches what the
+        /// pending action expects — the one legitimate race this can hit: a `Finalization`
+        /// proposal whose case was independently appealed by someone else after it was
+        /// proposed but before the last approval landed — the stale proposal is dropped (not
+        /// applied, not left dangling) and `OracleActionExpired` is emitted instead of erroring
+        /// out the approver whose call happened to cross the threshold. A `Submission`
+        /// proposal's `Filed` precondition can't actually change out from under it this way
+        /// (nothing else moves a case out of `Filed`), but is handled identically for defense
+        /// in depth. Every *other* failure (missing verdict, appeal window not yet closed,
+        /// case vanished) is a genuine error and is propagated normally via `?` — Substrate's
+        /// transactional dispatch means that reverts this whole call's storage writes,
+        /// including the `PendingOracleProposal`/`OracleApprovals` entries inserted earlier in
+        /// the same call, so nothing is left half-applied.
+        fn try_resolve_oracle_action(case_id: u32) -> DispatchResult {
+            let approvals = OracleApprovals::<T>::get(case_id).unwrap_or_default();
+            let council_size = OracleMembers::<T>::get().len() as u32;
+            if !Self::oracle_approval_reached(approvals.len() as u32, council_size) {
+                return Ok(());
+            }
+            let action = match PendingOracleProposal::<T>::get(case_id) {
+                Some(a) => a,
+                None => return Ok(()),
+            };
+            let applied = match action {
+                PendingOracleAction::Submission { ruling_hash, model_version, verdict } => {
+                    let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+                    if case.1 != CaseStatus::Filed {
+                        false
+                    } else {
+                        Cases::<T>::try_mutate(case_id, |maybe_case| {
+                            let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
+                            c.1 = CaseStatus::AIRulingIssued;
+                            c.2 = Some(ruling_hash);
+                            Ok::<(), DispatchError>(())
+                        })?;
+                        AIRulingBlock::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
+                        AIRulingModelVersion::<T>::insert(case_id, model_version);
+                        AIRulingVerdict::<T>::insert(case_id, verdict.clone());
+                        Self::deposit_event(Event::AIRulingIssued { case_id, ruling_hash, model_version });
+                        true
+                    }
+                }
+                PendingOracleAction::Finalization => {
+                    let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+                    if case.1 != CaseStatus::AIRulingIssued {
+                        false
+                    } else {
+                        let ruling_block =
+                            AIRulingBlock::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+                        let appeal_deadline = ruling_block
+                            .saturating_add(BlockNumberFor::<T>::from(T::AppealWindowBlocks::get()));
+                        ensure!(
+                            frame_system::Pallet::<T>::block_number() > appeal_deadline,
+                            Error::<T>::AppealWindowClosed
+                        );
+                        let verdict =
+                            AIRulingVerdict::<T>::get(case_id).ok_or(Error::<T>::NoRulingVerdict)?;
+                        Self::auto_finalize(case_id, verdict)?;
+                        true
+                    }
+                }
+            };
+            if !applied {
+                Self::deposit_event(Event::OracleActionExpired { case_id });
+            }
+            PendingOracleProposal::<T>::remove(case_id);
+            OracleApprovals::<T>::remove(case_id);
+            Ok(())
         }
     }
 }

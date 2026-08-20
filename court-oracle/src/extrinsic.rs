@@ -94,9 +94,11 @@ pub struct SubmitAiRuling {
 /// longer needs to reconstruct the verdict at finalize time (previously done by re-fetching
 /// the published IPFS ruling document — see README.md's history of that gap and its fix).
 /// Gated by the same `T::OracleOrigin` as `submit_ai_ruling` — see this pallet's
-/// `EnsureOracle`, which checks the signer against `OracleAccount` storage — so this crate's
-/// existing oracle signing key (already used for `submit_ai_ruling`) is also the correct signer
-/// here; no separate key or origin is needed.
+/// `EnsureOracle`, which checks the signer against `OracleMembers` (an Oracle Council, since the
+/// M-of-N fix — see README.md) — so this crate's existing oracle signing key (already used for
+/// `submit_ai_ruling`) is also the correct signer here; no separate key or origin is needed.
+/// Like `submit_ai_ruling`, this call only *proposes* finalization now; it takes effect once
+/// enough council members approve (`approve_ai_ruling`), which this crate doesn't submit itself.
 pub struct FinalizeRuling {
     pub case_id: u32,
 }

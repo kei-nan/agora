@@ -27,16 +27,22 @@ pub struct Config {
     /// `submit_ai_ruling`'s call index within pallet-courts. `#[pallet::call_index(1)]` in
     /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
     /// real call is `submit_ai_ruling(case_id: u32, ruling_hash: [u8; 32], model_version: u32,
-    /// verdict: Verdict)`, gated by `T::OracleOrigin` (checks the signer against
-    /// `OracleAccount` storage) and requiring `model_version == CurrentAIModelVersion`
+    /// verdict: Verdict)`, gated by `T::OracleOrigin` (checks the signer against `OracleMembers`
+    /// — an Oracle Council, not a single account, since the M-of-N fix; see README.md's "Oracle
+    /// Council" section) and requiring `model_version == CurrentAIModelVersion`
     /// (governance-set via `vote_approve_ai_model`) — `main.rs` fetches that value fresh from
-    /// chain before every submission rather than caching or guessing it. `verdict` is
-    /// committed on-chain here (`AIRulingVerdict`) — `finalize_ruling` below applies exactly
-    /// this value later and no longer takes a verdict argument of its own.
+    /// chain before every submission rather than caching or guessing it. `verdict` is frozen
+    /// into the pending proposal here (`PendingOracleProposal`/eventually `AIRulingVerdict`
+    /// once the council's approval threshold is reached) — `finalize_ruling` below applies
+    /// exactly that value later and takes no verdict argument of its own. This call's shape
+    /// (case_id, ruling_hash, model_version, verdict) and index were NOT changed by the M-of-N
+    /// fix — only its on-chain *effect* changed, from immediate to threshold-gated; see
+    /// README.md for what that means for a single running instance of this service.
     pub submit_ai_ruling_call_index: u8,
     /// `finalize_ruling`'s call index within pallet-courts. `#[pallet::call_index(4)]` in
     /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
-    /// real call is `finalize_ruling(case_id: u32)` — no verdict argument; it applies whatever
+    /// real call is `finalize_ruling(case_id: u32)` — no verdict argument; once the Oracle
+    /// Council's approval threshold for this proposal is reached, it applies whatever
     /// `submit_ai_ruling` already committed to `AIRulingVerdict` — gated by the *same*
     /// `T::OracleOrigin` as `submit_ai_ruling` (see `EnsureOracle`), and additionally requires
     /// `Cases[case_id].status == AIRulingIssued` and the current block to be strictly past
