@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Debug-only network security config. Lives in src/debug, so it is never
-  merged into a release build -- see src/debug/AndroidManifest.xml, which
+  merged into a release build — see src/debug/AndroidManifest.xml, which
   references this file via android:networkSecurityConfig.
 
   Why this exists: mobile/src/chain/api.ts's NODE_WS_URL points at a local
-  `--dev` chain node over plain ws://, not wss://. Android blocks cleartext
+  `‑‑dev` chain node over plain ws://, not wss://. Android blocks cleartext
   (unencrypted) traffic by default from targetSdkVersion 28+ (this app
   targets 34, see android/build.gradle), so without an exception a debug
   build cannot open that WebSocket at all and fails with "CLEARTEXT
@@ -15,7 +15,7 @@
   reached at, instead of a blanket android:usesCleartextTraffic="true"
   (which would permit cleartext to ANY host the app talks to):
     - 10.0.2.2            the Android emulator's documented alias for the
-                           host machine's loopback interface -- the default
+                           host machine's loopback interface — the default
                            NODE_WS_URL target (AVD-only address).
     - localhost / 127.0.0.1  a physical device reached via
                            `adb reverse tcp:9944 tcp:9944`, forwarding the
