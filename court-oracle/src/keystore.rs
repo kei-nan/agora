@@ -1,8 +1,11 @@
 //! Key storage — **explicit placeholder, not real tamper-resistant storage.**
 //!
-//! This service needs one credential: the sr25519 seed for the oracle account configured on
-//! `pallet-courts::OracleAccount` (via `set_oracle_account`, root-only — that governance step
-//! is outside this service's job, see README.md). It's kept off disk in plaintext using a
+//! This service needs one credential: the sr25519 seed for the oracle account registered as an
+//! Oracle Council member on `pallet-courts::OracleMembers` (via `add_oracle_member`, root-only
+//! — that governance step is outside this service's job, see README.md). Under the M-of-N
+//! Oracle Council design this seed is one *member's* key, not a sole controller — see
+//! README.md's "Oracle Council (M-of-N ruling approval)" section. It's kept off disk in
+//! plaintext using a
 //! real, standard encryption format (`age`, age-encryption.org/v1) rather than stored raw or
 //! behind a bespoke scheme. That is a modest speed bump against casual disk inspection, not a
 //! defense against a motivated attacker with access to a running or powered-off host — the

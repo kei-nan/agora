@@ -16,6 +16,22 @@ fn approve_first_ai_model(model_hash: [u8; 32]) -> u32 {
 	crate::CurrentAIModelVersion::<Test>::get()
 }
 
+/// The account used as the sole Oracle Council member in tests that don't care about the M-of-N
+/// mechanics themselves — mirrors `approve_first_ai_model`'s single-member shortcut for the
+/// (separate) AI Model Governance Council. A 1-member council trivially satisfies the mock's
+/// 1/2 majority threshold (`1 * 2 > 1 * 1`), so a lone `add_oracle_member` + one signed call
+/// from this account resolves a ruling submission/finalization immediately — the same
+/// observable behavior these tests were originally written against back when there was a single
+/// `OracleAccount` and calls were signed `RuntimeOrigin::root()`.
+const DEFAULT_ORACLE: AccountId = 50;
+
+/// Registers `DEFAULT_ORACLE` as an Oracle Council member (idempotent per fresh `new_test_ext()`)
+/// and returns it, ready to sign `submit_ai_ruling`/`approve_ai_ruling`/`finalize_ruling` calls.
+fn setup_oracle_member() -> AccountId {
+	assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), DEFAULT_ORACLE));
+	DEFAULT_ORACLE
+}
+
 /// File a case, submit an AI ruling (with an arbitrary `Verdict::Upheld` — the jury-appeal
 /// tests that use this helper always re-derive the real verdict from actual jury votes, so
 /// the AI-submitted one is just a placeholder here), and appeal it — leaving the case in
@@ -24,8 +40,9 @@ fn file_ai_rule_and_appeal(filer: AccountId, subject: CaseSubject) -> u32 {
 	let case_id = crate::NextCaseId::<Test>::get();
 	assert_ok!(Courts::file_case(RuntimeOrigin::signed(filer), subject));
 	let model_version = approve_first_ai_model([7u8; 32]);
+	let oracle = setup_oracle_member();
 	assert_ok!(Courts::submit_ai_ruling(
-		RuntimeOrigin::root(),
+		RuntimeOrigin::signed(oracle),
 		case_id,
 		[7u8; 32],
 		model_version,
@@ -283,8 +300,9 @@ fn select_jury_system_case_requires_active_citizen() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::auto_file_case(CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -361,8 +379,9 @@ fn unappealed_ai_ruling_suspends_citizen_without_jury_review_flag() {
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(50) },
 		));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -373,7 +392,7 @@ fn unappealed_ai_ruling_suspends_citizen_without_jury_review_flag() {
 		// finalize_ruling no longer takes a verdict argument -- it applies the Overturned
 		// verdict committed above by submit_ai_ruling.
 		System::set_block_number(200);
-		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::signed(oracle), case_id));
 
 		assert_eq!(suspended_citizens(), vec![(nullifier, Some(200 + 50), false)]);
 	});
@@ -511,8 +530,9 @@ fn file_case_bond_is_released_when_finalized_without_appeal() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -523,7 +543,7 @@ fn file_case_bond_is_released_when_finalized_without_appeal() {
 		// Let the appeal window (100 blocks in the mock) lapse, then finalize. finalize_ruling
 		// applies the Upheld verdict committed above, with no argument of its own.
 		System::set_block_number(200);
-		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::signed(oracle), case_id));
 
 		assert_eq!(Balances::reserved_balance(1), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
@@ -548,12 +568,13 @@ fn submit_ai_ruling_rejects_when_no_model_approved() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let oracle = setup_oracle_member();
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 0, Verdict::Upheld),
+			Courts::submit_ai_ruling(RuntimeOrigin::signed(oracle), case_id, [7u8; 32], 0, Verdict::Upheld),
 			Error::<Test>::NoApprovedAIModel
 		);
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1, Verdict::Upheld),
+			Courts::submit_ai_ruling(RuntimeOrigin::signed(oracle), case_id, [7u8; 32], 1, Verdict::Upheld),
 			Error::<Test>::NoApprovedAIModel
 		);
 	});
@@ -594,8 +615,9 @@ fn submit_ai_ruling_rejects_stale_model_version() {
 		assert_eq!(crate::CurrentAIModelVersion::<Test>::get(), 2);
 
 		// Citing the now-stale version 1 is rejected even though it was once valid.
+		let oracle = setup_oracle_member();
 		assert_noop!(
-			Courts::submit_ai_ruling(RuntimeOrigin::root(), case_id, [7u8; 32], 1, Verdict::Upheld),
+			Courts::submit_ai_ruling(RuntimeOrigin::signed(oracle), case_id, [7u8; 32], 1, Verdict::Upheld),
 			Error::<Test>::UnapprovedAIModel
 		);
 	});
@@ -622,9 +644,10 @@ fn submit_ai_ruling_succeeds_with_current_approved_version() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([9u8; 32]);
+		let oracle = setup_oracle_member();
 
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -653,8 +676,9 @@ fn finalize_ruling_applies_the_verdict_committed_at_submission_not_a_caller_supp
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::LawChallenge { law_id: 7 }));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -662,7 +686,7 @@ fn finalize_ruling_applies_the_verdict_committed_at_submission_not_a_caller_supp
 		));
 
 		System::set_block_number(200);
-		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::root(), case_id));
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::signed(oracle), case_id));
 
 		// The Overturned verdict committed at submission time was applied and enforced (law 7
 		// invalidated), even though finalize_ruling's call site above supplied no verdict.
@@ -680,8 +704,9 @@ fn finalize_ruling_fails_if_no_verdict_was_ever_recorded() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -692,7 +717,7 @@ fn finalize_ruling_fails_if_no_verdict_was_ever_recorded() {
 
 		System::set_block_number(200);
 		assert_noop!(
-			Courts::finalize_ruling(RuntimeOrigin::root(), case_id),
+			Courts::finalize_ruling(RuntimeOrigin::signed(oracle), case_id),
 			Error::<Test>::NoRulingVerdict
 		);
 	});
@@ -706,8 +731,9 @@ fn appeal_ruling_rejects_unrelated_signed_account() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -732,18 +758,22 @@ fn appeal_ruling_allows_the_designated_oracle() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		// DEFAULT_ORACLE (account 50) is registered as an Oracle Council member here, replacing
+		// the old `set_oracle_account` — membership alone (via `is_filer_or_oracle`) is what
+		// grants the independent appeal right tested below, regardless of who proposed/approved
+		// this particular case's ruling.
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
 			Verdict::Upheld
 		));
-		assert_ok!(Courts::set_oracle_account(RuntimeOrigin::root(), 50));
 
-		// Account 50 is neither the filer nor a CitizenConduct nullifier match, but it is the
-		// configured oracle, which is independently sufficient.
-		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(50), case_id));
+		// Account 50 is neither the filer nor a CitizenConduct nullifier match, but it is an
+		// Oracle Council member, which is independently sufficient.
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(oracle), case_id));
 	});
 }
 
@@ -756,8 +786,9 @@ fn appeal_ruling_rejects_suspended_citizen_for_system_case() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		assert_ok!(Courts::auto_file_case(CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -790,8 +821,9 @@ fn appeal_ruling_allows_verified_ruled_against_party_for_citizen_conduct_case() 
 		));
 		set_citizen_nullifier(5, nullifier);
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -819,8 +851,9 @@ fn appeal_ruling_rejects_nullifier_mismatch_for_citizen_conduct_case() {
 		// Account 5 is registered under a *different* nullifier than the one this case names.
 		set_citizen_nullifier(5, other_nullifier);
 		let model_version = approve_first_ai_model([7u8; 32]);
+		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
-			RuntimeOrigin::root(),
+			RuntimeOrigin::signed(oracle),
 			case_id,
 			[7u8; 32],
 			model_version,
@@ -830,6 +863,230 @@ fn appeal_ruling_rejects_nullifier_mismatch_for_citizen_conduct_case() {
 		assert_noop!(
 			Courts::appeal_ruling(RuntimeOrigin::signed(5), case_id),
 			Error::<Test>::NotAuthorized
+		);
+	});
+}
+
+// ─── Oracle Council (M-of-N ruling approval) ───────────────────────────────────────────────
+//
+// Replaces the earlier single-`OracleAccount` design: `submit_ai_ruling`/`finalize_ruling`
+// now only *propose* an action (and cast the proposer's own approval); it only takes effect
+// once `OracleApprovalNumerator`/`Denominator` (1/2 -- strict majority -- in this mock, see
+// mock.rs) of `OracleMembers` has approved via `approve_ai_ruling`. These tests use a
+// 3-member council (accounts 60/61/62) so `DEFAULT_ORACLE`'s 1-member shortcut (which
+// resolves on the very first call) doesn't mask the threshold logic: 1 of 3 approvals is
+// `1*2=2 > 3*1=3`? false (not reached), 2 of 3 is `2*2=4 > 3` true (reached).
+
+fn setup_three_member_oracle_council() -> (AccountId, AccountId, AccountId) {
+	assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 60));
+	assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 61));
+	assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 62));
+	(60, 61, 62)
+}
+
+#[test]
+fn oracle_single_approval_does_not_trigger_ruling_below_threshold() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+
+		// Only 1 of 3 approvals so far -- the case must still be Filed, not AIRulingIssued.
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Filed);
+		assert_eq!(ruling_hash, None);
+		assert!(crate::pallet::AIRulingVerdict::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
+fn oracle_threshold_reached_triggers_ruling() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		// Second approval reaches the 1/2 strict-majority threshold (2 of 3).
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id));
+
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued);
+		assert_eq!(ruling_hash, Some([7u8; 32]));
+		assert_eq!(crate::pallet::AIRulingVerdict::<Test>::get(case_id), Some(Verdict::Upheld));
+		System::assert_has_event(
+			Event::AIRulingIssued { case_id, ruling_hash: [7u8; 32], model_version }.into(),
+		);
+		// The pending proposal/approval bookkeeping is cleared once resolved.
+		assert!(crate::pallet::PendingOracleProposal::<Test>::get(case_id).is_none());
+		assert!(crate::pallet::OracleApprovals::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
+fn oracle_approve_ai_ruling_rejects_double_approval_from_same_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		// m1's proposal already counted as their approval -- calling approve_ai_ruling again
+		// with the same member is rejected, not silently double-counted.
+		assert_noop!(
+			Courts::approve_ai_ruling(RuntimeOrigin::signed(m1), case_id),
+			Error::<Test>::AlreadyApprovedOracleAction
+		);
+	});
+}
+
+#[test]
+fn oracle_approve_ai_ruling_rejects_non_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		// Account 999 was never added to the Oracle Council.
+		assert_noop!(
+			Courts::approve_ai_ruling(RuntimeOrigin::signed(999), case_id),
+			DispatchError::BadOrigin
+		);
+	});
+}
+
+#[test]
+fn oracle_approve_ai_ruling_rejects_when_no_pending_action() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		// No case has ever been filed/proposed for id 0.
+		assert_noop!(
+			Courts::approve_ai_ruling(RuntimeOrigin::signed(m1), 0),
+			Error::<Test>::NoPendingOracleAction
+		);
+	});
+}
+
+#[test]
+fn oracle_finalize_ruling_requires_threshold_approval() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// Get the case to AIRulingIssued first (2-of-3 submission).
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id));
+
+		System::set_block_number(200); // past the 100-block appeal window in the mock.
+
+		// m1 proposes finalization alone -- only 1 of 3 approvals, must not resolve yet.
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::signed(m1), case_id));
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued, "still pending: only 1 of 3 approved");
+		assert!(crate::pallet::Rulings::<Test>::get(case_id).is_none());
+
+		// Second approval reaches threshold and actually finalizes.
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id));
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::FinalRuling);
+		assert_eq!(crate::pallet::Rulings::<Test>::get(case_id), Some(Verdict::Upheld));
+	});
+}
+
+#[test]
+fn add_oracle_member_works_and_rejects_duplicate() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 60));
+		assert!(crate::pallet::OracleMembers::<Test>::get().contains(&60));
+		assert_noop!(
+			Courts::add_oracle_member(RuntimeOrigin::root(), 60),
+			Error::<Test>::AlreadyOracleMember
+		);
+	});
+}
+
+#[test]
+fn add_oracle_member_requires_root() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Courts::add_oracle_member(RuntimeOrigin::signed(1), 60),
+			DispatchError::BadOrigin
+		);
+	});
+}
+
+#[test]
+fn remove_oracle_member_works_and_rejects_unknown_member() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 60));
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), 60));
+		assert!(!crate::pallet::OracleMembers::<Test>::get().contains(&60));
+
+		assert_noop!(
+			Courts::remove_oracle_member(RuntimeOrigin::root(), 60),
+			Error::<Test>::OracleMemberNotFound
+		);
+	});
+}
+
+#[test]
+fn removed_oracle_member_can_no_longer_propose_or_approve() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), m2));
+
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_noop!(
+			Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id),
+			DispatchError::BadOrigin
 		);
 	});
 }

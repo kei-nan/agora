@@ -627,8 +627,22 @@ impl pallet_courts::Config for Runtime {
 	type CitizenChecker = Runtime;
 	type LawEnforcer = Runtime;
 	type TreasuryEnforcer = Runtime;
-	/// Oracle account stored in OracleAccount storage; set via set_oracle_account (root-only).
+	/// Oracle Council membership stored in OracleMembers; managed via add_oracle_member /
+	/// remove_oracle_member (root-only). `EnsureOracle<Runtime>` accepts a signed member; the
+	/// actual M-of-N gate is enforced separately by submit_ai_ruling/approve_ai_ruling/
+	/// finalize_ruling against OracleApprovalNumerator/Denominator below — see
+	/// pallet_courts::Config::OracleOrigin's doc comment for why this replaced the earlier
+	/// single-OracleAccount design (a project review flagged it as a single point of failure).
 	type OracleOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// Oracle Council capped at 7 seats — matches a Level-1 appeal jury's size
+	/// (`select_jury`'s non-LawChallenge branch); see `pallet_courts::Config::MaxOracleMembers`.
+	type MaxOracleMembers = ConstU32<7>;
+	/// Simple majority (strictly more than half) of the Oracle Council must approve a ruling
+	/// submission or finalization before it takes effect — see
+	/// `pallet_courts::Config::OracleApprovalNumerator`'s doc comment for why this uses `>`
+	/// rather than the `>=` this pallet's own AI-model-approval supermajority below uses.
+	type OracleApprovalNumerator = ConstU32<1>;
+	type OracleApprovalDenominator = ConstU32<2>;
 	type CitizenSuspender = Runtime;
 	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`

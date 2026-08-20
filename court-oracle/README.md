@@ -91,10 +91,13 @@ against a live chain in this sandboxed environment, only unit-tested at the call
   never been run against anything real — only compiled. Everything above marked "real" is real in
   the sense of "compiles, and its pure logic is unit tested against literal fixtures," not
   "observed working end-to-end."
-- **A real deployment needs `Courts::set_oracle_account` called by root**, naming this service's
-  signing account, before any `submit_ai_ruling` it signs will be accepted. This service does not
-  do that itself — it's a governance/root action outside this service's job (per the task this
-  was built against), and this README says so rather than silently assuming it's been done.
+- **A real deployment needs `Courts::add_oracle_member` called by root**, naming this service's
+  signing account as an Oracle Council member, before any `submit_ai_ruling`/`finalize_ruling`
+  it signs will even be accepted as a proposal — and (see "Oracle Council" below) a real ruling
+  or finalization additionally needs enough *other* independently-run instances to approve the
+  same case before it takes effect. This service does not register itself — it's a
+  governance/root action outside this service's job (per the task this was built against), and
+  this README says so rather than silently assuming it's been done.
 - **A real deployment needs a reachable IPFS daemon with its HTTP API exposed** at
   `IPFS_API_URL` (default `http://127.0.0.1:5001`, the standard Kubo default). No IPFS publishing
   client existed anywhere in this codebase before this crate — confirmed by grep; every existing
@@ -173,6 +176,50 @@ submits both in the one `submit_ai_ruling` call; the finalize branch just calls
 published IPFS document at finalize time) has been removed entirely — it has no remaining
 purpose once the chain enforces the same binding on its own.
 
+## Oracle Council (M-of-N ruling approval) — what changed under this service and what didn't
+
+A 2026-08 security review flagged the original design (a single `OracleAccount` root could
+rotate) as a single point of failure: one compromised or lost oracle signing key fully
+controlled every Level-0 AI ruling and its finalization for the entire court system, with no
+secondary approval. The fix, in `pallets/pallet-courts/src/lib.rs`, replaces that single account
+with an M-of-N **Oracle Council** (`OracleMembers`, capped at 7 seats — `MaxOracleMembers` in
+`runtime/src/configs/mod.rs` — with a strict-majority approval threshold,
+`OracleApprovalNumerator`/`Denominator` = 1/2, i.e. more than half the council). `submit_ai_ruling`
+and `finalize_ruling` no longer take effect the instant they're called — they *propose* a
+ruling/finalization and cast the caller's own approval; a new `approve_ai_ruling(case_id)` call
+lets other council members co-sign, and the action only actually applies (case moves to
+`AIRulingIssued`, or the verdict finalizes and enforces) once enough members have approved.
+
+**This service's Rust code did not need to change to keep working.** `submit_ai_ruling` and
+`finalize_ruling` kept the exact same call indices and argument shapes (see
+`extrinsic.rs` and the round-trip tests below) — only their on-chain *effect* changed, from
+"apply immediately" to "propose, and apply only once threshold is reached." A single running
+instance of this service, signing with one registered Oracle Council member's key, still submits
+correctly-shaped `submit_ai_ruling`/`finalize_ruling` calls; the chain just won't act on them
+alone unless the council currently has only 1 member (which trivially satisfies any majority) or
+enough *other* instances also approve the same case.
+
+**The real deployment model this implies — not built here, out of scope for this pass**: run one
+independent `court-oracle` instance per Oracle Council member, each with its own signing key
+(its own `KEYS_FILE`) and, ideally, its own Claude API key/account, so a single compromised
+Claude API key or prompt-injected model output can't unilaterally decide a case either — the
+whole point of the M-of-N design is that no single instance's output is trusted alone. Each
+instance independently polls the same chain state, asks its own Claude for a ruling, and submits
+`submit_ai_ruling`; because Claude is not deterministic, independent instances will not always
+reach byte-identical `ruling_hash`/`verdict` — this service does **not** attempt any
+cross-instance ruling-content consensus (a genuinely hard problem: reconciling differing IPFS
+hashes or split verdicts is a design question of its own). What's actually enforced on-chain
+today is coarser: `approve_ai_ruling` requires approving the *same already-proposed* action for
+that case_id, so in practice the realistic path to threshold is either (a) a human/process step
+picks one proposed ruling per case for other members to co-sign (this service has no code for
+that — no polling loop watches for and approves *other* accounts' proposals), or (b) this is run
+with a small council where quicker/majority-model-agreement rulings naturally coincide. Building
+real (a) — a mode where an instance polls `PendingOracleProposal` for cases *other* accounts
+already proposed and independently decides whether to add its approval — is genuine future work,
+not attempted in this pass; this README flags it rather than silently assuming it exists. The
+single-instance path (all existing code, all 47 tests) is exactly what a 1-member council, or the
+proposer's own call reaching threshold in a small council, already exercises correctly.
+
 ## Configuration
 
 All environment variables, see `src/config.rs` for defaults and full doc comments:
@@ -200,8 +247,13 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 ## Explicitly out of scope (per the task this was built against)
 
-- Calling `Courts::set_oracle_account` to register this service's key on a real chain — a
+- Calling `Courts::add_oracle_member` to register this service's key on a real chain — a
   governance/root action.
+- Multi-instance orchestration for the Oracle Council (running N independent instances, one per
+  council member, and/or polling for and approving other members' proposals via
+  `approve_ai_ruling`) — see "Oracle Council (M-of-N ruling approval)" above. This service
+  correctly plays the role of *one* council member's instance; coordinating several was not
+  built.
 - Jury-vote-driven finalization (`cast_jury_vote`'s own auto-finalize on reaching a majority) —
   that path is entirely on-chain and needs no off-chain scheduler. Only the no-appeal path
   (`finalize_ruling`) needed an off-chain caller, and that's what this service now does — see

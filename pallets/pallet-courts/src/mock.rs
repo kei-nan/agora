@@ -1,7 +1,6 @@
 use crate as pallet_courts;
 use crate::pallet::{CitizenChecker, CitizenSelector, CitizenSuspender, LawEnforcer, TreasuryEnforcer};
 use frame_support::{derive_impl, traits::{ConstU32, ConstU64}};
-use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
 
@@ -175,7 +174,14 @@ impl pallet_courts::Config for Test {
 	type CitizenChecker = MockCitizenChecker;
 	type LawEnforcer = MockLawEnforcer;
 	type TreasuryEnforcer = MockTreasuryEnforcer;
-	type OracleOrigin = EnsureRoot<AccountId>;
+	// Real M-of-N Oracle Council origin (not EnsureRoot) so tests exercise the actual
+	// membership + threshold gate, the same way production does. Tests use `setup_oracle_member`
+	// / `DEFAULT_ORACLE` (see tests.rs) to add a member and sign with `RuntimeOrigin::signed(_)`.
+	type OracleOrigin = pallet_courts::EnsureOracle<Test>;
+	type MaxOracleMembers = ConstU32<5>;
+	// Simple majority (more than half) — see Config::OracleApprovalNumerator's doc comment.
+	type OracleApprovalNumerator = ConstU32<1>;
+	type OracleApprovalDenominator = ConstU32<2>;
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;
