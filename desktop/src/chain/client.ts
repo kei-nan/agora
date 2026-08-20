@@ -57,7 +57,7 @@ function getSmoldotClient(): SmoldotClient {
  * (`chain.jsonRpcResponses`) rather than a callback, so this adapter's only real job is
  * pumping that iterator into the callback shape `ScProvider` expects.
  */
-const ScShim = {
+export const ScShim = {
   // Never used — Agora is never a `WellKnownChain`, only ever connected via its own raw chain
   // spec, but `ScProvider`'s constructor asserts this is an object.
   WellKnownChain: {},
@@ -101,7 +101,7 @@ const ScShim = {
  * call, a malicious answer here can at worst make the light client fail to find a peer, not
  * lie about chain state.
  */
-async function discoverWsBootnode(nodeUrl: string): Promise<string> {
+export async function discoverWsBootnode(nodeUrl: string): Promise<string> {
   let res: Response;
   try {
     res = await fetch(nodeUrl, {
