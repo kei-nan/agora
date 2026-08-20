@@ -16,7 +16,7 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
   itself stale by 2026-08-08 — check `runtime/src/lib.rs` directly rather than trusting this note
   if it matters for what you're doing.)
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
-- Mobile: `android/` is a real, committed native project (Gradle 8.6, hand-written
+- Mobile: `mobile/android/` is a real, committed native project (Gradle 8.6, hand-written
   `NfcPassportModule.kt`/`com.agora.facematch` native modules) with the JS/TS test suite passing
   (210 tests across 15 suites, up from the 77 changelog #80 originally verified); no JDK/Android
   SDK in this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
@@ -123,7 +123,14 @@ All enforced by smart contract boundaries:
   law automatically opens a court challenge (`AutoChallengeHook`) that an AI judge reviews
   immediately, with the normal human jury appeal path available from there. No separate HRC
   origin or veto call exists in the codebase.
-- **Emergency Council**: time-locked powers with hard coded sunset clause
+- **Emergency Council**: time-locked powers with hard coded sunset clause (`pallet-emergency-
+  council`). A second, fully independent emergency mechanism also exists at the cabinet level:
+  `pallet-executive` has its own `vote_declare_emergency`/`ratify_emergency`/`vote_end_emergency`
+  flow (2/3 cabinet supermajority to declare, `LegislatureOrigin` only for after-the-fact
+  ratification, a hard-coded `MaxEmergencyBlocks` duration cap, its own `ActiveEmergency`
+  storage). The two are not related — see `docs/project/pallets/executive.md`'s "Emergency
+  powers" section, which documents it explicitly as "a second, separate mechanism from
+  `pallet-emergency-council`".
 - **Legislature seating**: fully automatic — no Elections Commission, no candidate certification
   or human-certified result submission. `pallet-elections` seats the top-N delegates by
   liquid-democracy backing directly into `pallet-legislature`; a standalone commissioner-certified
@@ -133,6 +140,12 @@ All enforced by smart contract boundaries:
   (see `docs/project/pallets/executive.md`), not elected directly by citizens.
 - **Anti-Corruption module**: asset disclosure, conflict-of-interest registry, ZK whistleblower
 - **Audit Office**: financial audit hooks on every treasury transaction
+- **Two placeholder origins still gated by bare `Root`, not a real collective**: in
+  `runtime/src/configs/mod.rs`, `pallet_constitution::Config::RevocationOrigin` ("Wire to a
+  minority collective (30–40%) for mainnet") and `pallet_elections::Config::ConstitutionalOrigin`
+  ("Production should wire this to a dedicated constitutional collective with a 2/3 supermajority
+  threshold") are both honestly commented as dev-only `EnsureRoot<AccountId>` stand-ins pending
+  that mainnet wiring.
 
 ## Court System (AI-First)
 - Level 0: AI judge (instant, cites specific laws, reasoning stored on IPFS hash on-chain)
@@ -300,10 +313,14 @@ authoritative version of this list; treat this section as a summary, not the sou
    thing and finalize with a different verdict. Still PARTIAL, not done: never run against a real
    chain/Claude API/IPFS daemon (unit-tested at the pure-logic level only, 47/47 passing — added
    IPFS content-hash verification and Claude prompt-injection delimiting after a 2026-08-16
-   review; see `court-oracle/README.md`); and
-   `Courts::set_oracle_account` has never been called on a real chain. See
+   review; see `court-oracle/README.md`). **Update, log #090**: `Sudo::sudo(Courts::
+   set_oracle_account(...))` was called for real against a dedicated oracle account, confirmed
+   via storage query — `court-oracle` was then built and run for real against a real chain and a
+   real local IPFS daemon and got as far as a genuine (rejected) call to the real Anthropic API;
+   no Claude API key exists anywhere in this environment, so no ruling was ever produced and
+   `submit_ai_ruling`/`finalize_ruling` still haven't been exercised against a live chain. See
    `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full accounting.
-3. **Mobile app native build** — `android/` and its NFC module already exist and are committed;
+3. **Mobile app native build** — `mobile/android/` and its NFC module already exist and are committed;
    blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and
    (b) the OPRF committee service above, which gates on-device ZK proof generation.
 4. **VRF jury randomness** — deliberately descoped, not simply unstarted: a commit-then-delayed-
