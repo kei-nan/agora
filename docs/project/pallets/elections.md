@@ -42,6 +42,17 @@ so a delegate suspended since (e.g. an Overturned `CitizenConduct` court ruling)
 seated on stale status. Defaults: 100 seats, 2-year cycle (`DefaultElectionCycleBlocks`), max 5
 backings per citizen.
 
+Asset-disclosure currency is checked the same way, alongside citizenship: `T::DisclosureChecker`
+(implemented by pallet-anticorruption — see `docs/project/pallets/anticorruption.md`) must
+return `true` for a candidate to be seated. A delegate who is Active, an active citizen, and
+ranked within the top `LegislatureSeats` by backing, but whose asset disclosure has lapsed or
+was never filed, is skipped — excluded from the candidate pool entirely, so the next-highest-
+backed eligible delegate fills the freed seat instead, and `Event::SeatingSkippedNoDisclosure {
+account }` is emitted per skipped account. This is deliberately a skip, not a hard error on the
+whole `run_election` call: `on_initialize` runs unconditionally every block past the cycle
+boundary, so failing outright would freeze legislature seating for everyone until manual
+intervention, over one official's lapsed paperwork.
+
 ### Term limits / anti-entrenchment
 
 A real, deployed term-limit system prevents a backed delegate from holding a legislature seat
@@ -140,3 +151,7 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
 - `SeatLegislature<AccountId>` — implemented by pallet-legislature; `replace_members(winners)`
   is called at the end of each election cycle to install the winning delegates as the full
   legislature membership.
+- `DisclosureChecker<AccountId>` — implemented directly on `pallet_anticorruption::Pallet<T>`
+  (wrapping its `has_current_disclosure`); re-checked per candidate at election time in
+  `run_election`, same as `CitizenChecker` above. Wired in the runtime as
+  `type DisclosureChecker = PalletAntiCorruption`.

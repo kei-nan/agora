@@ -40,9 +40,10 @@ use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
-	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce, PalletInfo,
-	Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin,
-	RuntimeTask, System, Timestamp, DAYS, EXISTENTIAL_DEPOSIT, MINUTES, SLOT_DURATION, VERSION,
+	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce,
+	PalletAntiCorruption, PalletInfo, Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason,
+	RuntimeHoldReason, RuntimeOrigin, RuntimeTask, System, Timestamp, DAYS, EXISTENTIAL_DEPOSIT,
+	MINUTES, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -892,6 +893,11 @@ impl pallet_elections::Config for Runtime {
 	type ConstitutionalOrigin = EnsureRoot<AccountId>;
 	/// Seats the top-N backed delegates into pallet-legislature at each election.
 	type LegislatureSeating = Legislature;
+	/// Gates seating on a current pallet-anticorruption asset disclosure — an account without
+	/// one is skipped in favor of the next-highest-backed eligible delegate (see
+	/// `pallet_elections::DisclosureChecker`'s doc comment for the full rationale). Points at
+	/// the real pallet-anticorruption implementation, not a no-op.
+	type DisclosureChecker = PalletAntiCorruption;
 	/// 100 legislature seats (constitutional, changeable via set_election_params).
 	type DefaultLegislatureSeats = ConstU32<100>;
 	/// 2-year election cycle: 2 * 365 * 7200 blocks at 12 s/block.

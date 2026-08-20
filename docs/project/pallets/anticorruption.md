@@ -17,16 +17,28 @@ Storage:
 `ReportStatus` enum: `Pending` → `Flagged` → `UnderInvestigation` → `Cleared` | `ReferredToCourts`
 
 Enforcement: `Pallet::has_current_disclosure(who)` returns `true` only if `who` has an
-`AssetDisclosures` entry whose `update_due_at` has not yet passed. Nothing currently calls it
-to gate anything — it's exercised only by this pallet's own unit tests
-(`pallets/pallet-anticorruption/src/tests.rs`). There is no `DisclosureChecker` config trait
-anywhere in the codebase (`grep -rn "DisclosureChecker" pallets/ runtime/` returns nothing), and
-pallet-elections has no `register_candidate` call to gate in the first place — that call
-belonged to the Elections Commission subsystem removed in commit `7d9a753` (see
-`docs/project/pallets/elections.md`); legislature seats now fill automatically by liquid-
-democracy backing, with no candidate-registration step at all. So as things stand, letting a
-disclosure lapse past its due date has no on-chain consequence beyond `has_current_disclosure`
-itself reporting `false` — nothing currently reads that to block candidacy or anything else.
+`AssetDisclosures` entry whose `update_due_at` has not yet passed. **Now wired with teeth**
+(previously it was pure record-keeping, exercised only by this pallet's own unit tests):
+`pallet_elections::DisclosureChecker<AccountId>` is a trait defined in pallet-elections (the
+consumer) — `fn has_current_disclosure(who: &AccountId) -> bool` — that this pallet implements
+directly on its own `Pallet<T>` (wrapping the inherent function above unchanged), the same
+"consumer defines, provider implements on `Pallet<T>`" idiom already used for
+`pallet_elections::SeatLegislature`/`pallet_legislature::Pallet<T>` and
+`pallet_treasury_ledger::AuditHook`/`pallet_audit::Pallet<T>`. `runtime/src/configs/mod.rs` wires
+`pallet_elections::Config::DisclosureChecker = PalletAntiCorruption` (the real implementation, not
+a no-op). pallet-elections' `run_election` (its periodic `on_initialize` legislature-seating hook
+— there's still no `register_candidate` call to gate; the Elections Commission subsystem that had
+one was removed in commit `7d9a753`, see `docs/project/pallets/elections.md`) now checks
+`T::DisclosureChecker::has_current_disclosure` per candidate alongside the existing
+`CitizenChecker` re-check, at the same seating-time point: a delegate who would otherwise be
+seated (Active, active citizen, ranked in the top `LegislatureSeats` by backing) but lacks a
+current disclosure is **skipped, not hard-errored** — excluded from the candidate pool so the
+next-highest-backed eligible delegate fills the seat instead, and
+`Event::SeatingSkippedNoDisclosure { account }` is emitted so the skip is visible on-chain. Skip-
+and-fall-through rather than failing the whole `on_initialize` call was a deliberate choice: this
+hook runs unconditionally every block past the cycle boundary, so an error would freeze
+legislature seating entirely until manual intervention, over one official's lapsed paperwork —
+see `run_election`'s doc comment in `pallets/pallet-elections/src/lib.rs` for the full rationale.
 
 Calls:
 - `submit_asset_disclosure(ipfs_hash)` — any signed; mandatory annual renewal

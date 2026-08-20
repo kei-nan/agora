@@ -21,6 +21,12 @@ fn ipfs(byte: u8) -> [u8; 32] {
 
 fn register_delegate(who: u64) {
     set_active_citizen(who, true);
+    // Registration itself doesn't check disclosure currency (only seating does), but every
+    // existing seating-focused test in this file assumes a registered delegate is otherwise
+    // eligible to be seated, same as it already assumes them an active citizen -- so default
+    // registered delegates to a current disclosure here too. Tests that specifically exercise
+    // the disclosure gate call `set_current_disclosure(who, false)` afterward to override this.
+    set_current_disclosure(who, true);
     assert_ok!(Elections::register_as_delegate(RuntimeOrigin::signed(who), name(), ipfs(2)));
 }
 
@@ -870,6 +876,84 @@ fn on_initialize_election_excludes_suspended_delegates() {
         let _ = Elections::on_initialize(System::block_number());
 
         assert_eq!(seat_calls(), vec![vec![5]]);
+    });
+}
+
+#[test]
+fn on_initialize_election_skips_delegate_without_current_disclosure_and_falls_through() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // 4 delegates, LegislatureSeats = 3 (default). Backing ranks them 1 > 2 > 3 > 4.
+        for d in 1..=4u64 {
+            register_delegate(d);
+        }
+        let backers: [u64; 6] = [5, 6, 7, 8, 9, 10];
+        for &b in &backers[0..6] {
+            back(b, 1);
+        }
+        for &b in &backers[0..5] {
+            back(b, 2);
+        }
+        for &b in &backers[0..4] {
+            back(b, 3);
+        }
+        for &b in &backers[0..3] {
+            back(b, 4);
+        }
+        assert_eq!(BackingCount::<Test>::get(1), 6);
+        assert_eq!(BackingCount::<Test>::get(2), 5);
+        assert_eq!(BackingCount::<Test>::get(3), 4);
+        assert_eq!(BackingCount::<Test>::get(4), 3);
+
+        // Delegate 1 would win the top seat by backing alone, but their disclosure has lapsed
+        // (or was never filed) -- they must be skipped, and delegate 4 (next-highest after the
+        // top 3) should fall through into the freed seat instead of the seat simply going unfilled.
+        set_current_disclosure(1, false);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        // 2, 3, 4 seated (3 seats) -- 1 skipped, 4 falls through to fill the freed seat.
+        assert_eq!(seat_calls(), vec![vec![2, 3, 4]]);
+        System::assert_has_event(Event::SeatingSkippedNoDisclosure { account: 1 }.into());
+        // Only the ineligible delegate is skipped -- no spurious skip events for eligible ones.
+        assert_eq!(
+            System::events()
+                .into_iter()
+                .filter(|r| matches!(
+                    r.event,
+                    RuntimeEvent::Elections(Event::SeatingSkippedNoDisclosure { .. })
+                ))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn on_initialize_election_seats_normally_when_disclosure_current() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        assert_eq!(seat_calls(), vec![vec![1]]);
+        assert_eq!(
+            System::events()
+                .into_iter()
+                .filter(|r| matches!(
+                    r.event,
+                    RuntimeEvent::Elections(Event::SeatingSkippedNoDisclosure { .. })
+                ))
+                .count(),
+            0
+        );
     });
 }
 
