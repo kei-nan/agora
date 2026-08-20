@@ -17,6 +17,7 @@ import {
   LivenessChallenge,
 } from '../native/faceMatch';
 import { buildCircuitInputs } from '../chain/sodParser';
+import { shouldBlockOnFaceMismatch } from './faceMatchGating';
 import {
   TEST_PASSPORT_DG1_BASE64,
   TEST_PASSPORT_DG15_BASE64,
@@ -213,6 +214,23 @@ export default function RegisterScreen({ navigation }: Props) {
       const dg2 = rawPassport?.dg2 ?? new Uint8Array(0);
       const dg2MimeType = rawPassport?.dg2MimeType ?? '';
       const match = await matchAgainstPassport(dg2, dg2MimeType, baselineUriRef.current!);
+      // A real mismatch must not silently let registration continue. Mirror
+      // the challenge-failure branch above: reset back to the baseline
+      // substep with an error and don't resolve runLivenessGate()'s promise,
+      // so `start()` simply never proceeds past `await runLivenessGate()`
+      // until this passes (or is legitimately skipped) — no separate gate
+      // needed in `start()` itself. See faceMatchGating.ts for what counts
+      // as a block vs. a legitimate skip.
+      if (shouldBlockOnFaceMismatch(match)) {
+        baselineUriRef.current = null;
+        setLivenessUi({
+          substep: 'baseline',
+          challenge: pickRandomChallenge(),
+          error: "That doesn't look like a match for your passport photo. Please try again.",
+          capturing: false,
+        });
+        return;
+      }
       livenessResolveRef.current?.({
         faceMatched: match.matched,
         ...(match.skipped ? { matchSkippedReason: match.reason ?? 'unsupported passport photo format' } : {}),
