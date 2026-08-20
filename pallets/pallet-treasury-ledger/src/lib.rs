@@ -88,6 +88,21 @@ pub mod pallet {
     pub type ExpenditureLog<T: Config> =
         StorageMap<_, Blake2_128Concat, u64, (u32, T::Balance, [u8; 32])>;
 
+    /// Secondary index over `ExpenditureLog`, keyed `(department_id, expenditure_index) -> ()`.
+    /// `ExpenditureLog` itself is keyed by a global monotonic counter, not by department, so
+    /// "give me this department's expenditures" has no way to scope a chain read without this
+    /// index — the alternative is scanning the entire log and filtering client-side, which is
+    /// exactly what `court-oracle`'s `fetch_expenditures_for_department` used to do (documented
+    /// there as a real scaling problem it never fixed). Populated in the same
+    /// `record_expenditure` call that writes the primary log entry, so the two can never drift
+    /// apart. The value is `()`: this map exists purely so its *keys* can be enumerated via a
+    /// department-scoped `state_getKeysPaged` prefix — nothing is ever read out of the value
+    /// itself, so `Blake2_128Concat` on both keys (rather than a cheaper unkeyed hasher) is
+    /// fine, and no `T::Balance`/amount duplication is needed here.
+    #[pallet::storage]
+    pub type DepartmentExpenditures<T: Config> =
+        StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, u64, (), OptionQuery>;
+
     #[pallet::storage]
     pub type NextExpenditureIndex<T: Config> = StorageValue<_, u64, ValueQuery>;
 
@@ -205,6 +220,7 @@ pub mod pallet {
             DepartmentSpent::<T>::insert(department_id, new_spent);
             let idx = NextExpenditureIndex::<T>::get();
             ExpenditureLog::<T>::insert(idx, (department_id, amount, metadata_hash));
+            DepartmentExpenditures::<T>::insert(department_id, idx, ());
             NextExpenditureIndex::<T>::put(idx.saturating_add(1));
             // Notify the audit pallet (or no-op if AuditHook = NoopAuditHook).
             // idx is u64 — the AuditHook trait accepts u64 to avoid truncation.

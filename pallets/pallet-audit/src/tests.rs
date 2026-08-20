@@ -1,4 +1,6 @@
-use crate::{mock::*, AuditLog, AuditStatus, Auditors, Error, Event, OpenFlags};
+use crate::{
+    mock::*, AuditLog, AuditStatus, Auditors, DepartmentAuditEntries, Error, Event, OpenFlags,
+};
 use frame_support::{assert_noop, assert_ok};
 use pallet_treasury_ledger::AuditHook;
 use sp_runtime::DispatchError;
@@ -67,6 +69,74 @@ fn on_expenditure_overwrites_existing_index() {
         assert_eq!(entry.dept_id, 99);
         assert_eq!(entry.amount, 42);
         assert!(entry.status == AuditStatus::Pending);
+    });
+}
+
+// ─── DepartmentAuditEntries — secondary index consistency with AuditLog ────────────
+//
+// Mirrors pallet-treasury-ledger's DepartmentExpenditures tests: court-oracle's
+// `fetch_audit_entries_for_department` used to scan the entire AuditLog and filter
+// client-side. This index lets a caller scope a chain read to one department instead;
+// these tests confirm it never drifts from the primary log it mirrors.
+
+#[test]
+fn on_expenditure_populates_department_audit_entries_index() {
+    new_test_ext().execute_with(|| {
+        record_expenditure(0);
+        assert!(DepartmentAuditEntries::<Test>::contains_key(DEPT, 0));
+        assert_eq!(DepartmentAuditEntries::<Test>::get(DEPT, 0), Some(()));
+    });
+}
+
+#[test]
+fn department_audit_entries_index_only_lists_that_departments_indices() {
+    new_test_ext().execute_with(|| {
+        const OTHER_DEPT: u32 = 8;
+        record_expenditure(0); // DEPT
+        <crate::Pallet<Test> as AuditHook>::on_expenditure(1, OTHER_DEPT, AMOUNT, IPFS_HASH);
+        record_expenditure(2); // DEPT again
+
+        let mut dept_indices: Vec<u64> =
+            DepartmentAuditEntries::<Test>::iter_prefix(DEPT).map(|(idx, _)| idx).collect();
+        dept_indices.sort();
+        assert_eq!(dept_indices, vec![0, 2]);
+
+        let other_indices: Vec<u64> =
+            DepartmentAuditEntries::<Test>::iter_prefix(OTHER_DEPT).map(|(idx, _)| idx).collect();
+        assert_eq!(other_indices, vec![1]);
+
+        // Every index reachable through the secondary index must resolve to a primary
+        // AuditLog entry tagged with the same department.
+        for idx in DepartmentAuditEntries::<Test>::iter_prefix(DEPT).map(|(idx, _)| idx) {
+            let entry = AuditLog::<Test>::get(idx).expect("log entry must exist");
+            assert_eq!(entry.dept_id, DEPT);
+        }
+    });
+}
+
+#[test]
+fn on_expenditure_reindexes_when_index_reused_under_a_different_department() {
+    // Regression test for the stale-index cleanup in `on_expenditure`: if the hook fires
+    // twice at the same index under different departments (shouldn't happen on a real
+    // chain since the index is treasury-ledger's own monotonic counter, but the hook has
+    // no guard against it), the old department's entry in the secondary index must be
+    // removed, not left dangling and pointing at an index that no longer belongs to it.
+    new_test_ext().execute_with(|| {
+        const OTHER_DEPT: u32 = 8;
+        record_expenditure(0); // DEPT
+        assert!(DepartmentAuditEntries::<Test>::contains_key(DEPT, 0));
+
+        <crate::Pallet<Test> as AuditHook>::on_expenditure(0, OTHER_DEPT, 1, [2u8; 32]);
+
+        assert!(!DepartmentAuditEntries::<Test>::contains_key(DEPT, 0));
+        assert!(DepartmentAuditEntries::<Test>::contains_key(OTHER_DEPT, 0));
+    });
+}
+
+#[test]
+fn department_audit_entries_index_stays_empty_when_no_entry_recorded() {
+    new_test_ext().execute_with(|| {
+        assert_eq!(DepartmentAuditEntries::<Test>::iter_prefix(DEPT).count(), 0);
     });
 }
 

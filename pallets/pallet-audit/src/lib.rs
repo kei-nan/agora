@@ -101,6 +101,16 @@ pub mod pallet {
     pub type AuditLog<T: Config> =
         StorageMap<_, Blake2_128Concat, u64, AuditEntry<T::AccountId>>;
 
+    /// Secondary index over `AuditLog`, keyed `(dept_id, expenditure_index) -> ()`. Mirrors
+    /// `pallet_treasury_ledger::DepartmentExpenditures` exactly — same rationale (`AuditLog` is
+    /// keyed by the global expenditure index, not by department, so a department-scoped read
+    /// needs its own index rather than a full-log scan), same "value is `()`, only the keys
+    /// matter" shape. Populated in `on_expenditure` below, the only place `AuditLog` entries are
+    /// ever created, so the two storage items can never drift apart.
+    #[pallet::storage]
+    pub type DepartmentAuditEntries<T: Config> =
+        StorageDoubleMap<_, Blake2_128Concat, u32, Blake2_128Concat, u64, (), OptionQuery>;
+
     /// The current set of registered auditors.
     #[pallet::storage]
     pub type Auditors<T: Config> =
@@ -327,6 +337,18 @@ pub mod pallet {
 
 impl<T: Config> pallet_treasury_ledger::AuditHook for Pallet<T> {
     fn on_expenditure(index: u64, dept_id: u32, amount: u128, ipfs_hash: [u8; 32]) {
+        // In real chain operation `index` is `pallet-treasury-ledger`'s own monotonic counter,
+        // so this hook only ever fires once per index and this branch never runs. It exists so
+        // the index stays consistent even in the hypothetical (test-only, see
+        // `on_expenditure_overwrites_existing_index`) case of the hook firing twice for the same
+        // index under a different department — without this, the stale `(old_dept, index)`
+        // entry in `DepartmentAuditEntries` would linger forever, pointing at an index whose
+        // `AuditLog` entry no longer belongs to that department.
+        if let Some(old) = pallet::AuditLog::<T>::get(index) {
+            if old.dept_id != dept_id {
+                pallet::DepartmentAuditEntries::<T>::remove(old.dept_id, index);
+            }
+        }
         let entry = pallet::AuditEntry {
             dept_id,
             amount,
@@ -336,5 +358,6 @@ impl<T: Config> pallet_treasury_ledger::AuditHook for Pallet<T> {
             flagged_by: None,
         };
         pallet::AuditLog::<T>::insert(index, entry);
+        pallet::DepartmentAuditEntries::<T>::insert(dept_id, index, ());
     }
 }

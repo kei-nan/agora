@@ -1,6 +1,7 @@
 use crate::{
 	mock::*, AuditFrozenDepartments, CourtFrozenDepartments, DepartmentBudgets,
-	DepartmentSpenders, DepartmentSpent, Error, Event, ExpenditureLog, NextExpenditureIndex,
+	DepartmentExpenditures, DepartmentSpenders, DepartmentSpent, Error, Event, ExpenditureLog,
+	NextExpenditureIndex,
 };
 use frame_support::{assert_noop, assert_ok};
 
@@ -402,6 +403,88 @@ fn record_expenditure_budget_check_uses_post_transaction_total_not_pre_transacti
 		);
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
 		assert!(audit_calls().is_empty());
+	});
+}
+
+// ---------------------------------------------------------------------
+// DepartmentExpenditures — secondary index consistency with ExpenditureLog
+//
+// court-oracle's `fetch_expenditures_for_department` used to scan the entire ExpenditureLog
+// and filter client-side (a real scaling problem for a long-lived chain, flagged in that
+// crate's own doc comments). This index lets a caller scope a chain read to one department
+// instead. These tests confirm it never drifts from the primary log it mirrors.
+// ---------------------------------------------------------------------
+
+#[test]
+fn record_expenditure_populates_department_expenditures_index() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 400, HASH_A));
+
+		assert!(DepartmentExpenditures::<Test>::contains_key(DEPT, 0));
+		assert_eq!(DepartmentExpenditures::<Test>::get(DEPT, 0), Some(()));
+	});
+}
+
+#[test]
+fn department_expenditures_index_only_lists_that_departments_indices() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
+		assert_ok!(TreasuryLedger::allocate_budget(root(), OTHER_DEPT, 1_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), OTHER_DEPT, NOT_SPENDER));
+
+		// Interleaved expenditures across two departments — indices 0, 2 belong to DEPT;
+		// index 1 belongs to OTHER_DEPT.
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
+		assert_ok!(TreasuryLedger::record_expenditure(signed(NOT_SPENDER), OTHER_DEPT, 200, HASH_B));
+		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 300, HASH_A));
+
+		let dept_indices: Vec<u64> = DepartmentExpenditures::<Test>::iter_prefix(DEPT)
+			.map(|(idx, _)| idx)
+			.collect();
+		let mut dept_indices = dept_indices;
+		dept_indices.sort();
+		assert_eq!(dept_indices, vec![0, 2]);
+
+		let other_indices: Vec<u64> = DepartmentExpenditures::<Test>::iter_prefix(OTHER_DEPT)
+			.map(|(idx, _)| idx)
+			.collect();
+		assert_eq!(other_indices, vec![1]);
+
+		// Every index reachable through the secondary index must resolve to a primary
+		// ExpenditureLog entry tagged with the same department — the invariant the index
+		// exists to preserve.
+		for idx in DepartmentExpenditures::<Test>::iter_prefix(DEPT).map(|(idx, _)| idx) {
+			let (logged_dept, _, _) = ExpenditureLog::<Test>::get(idx).expect("log entry must exist");
+			assert_eq!(logged_dept, DEPT);
+		}
+	});
+}
+
+#[test]
+fn department_expenditures_index_stays_empty_when_no_expenditure_recorded() {
+	new_test_ext().execute_with(|| {
+		assert_eq!(DepartmentExpenditures::<Test>::iter_prefix(DEPT).count(), 0);
+	});
+}
+
+#[test]
+fn record_expenditure_index_grows_one_entry_per_call_never_a_scan_of_everything() {
+	// Not a perf benchmark, but a structural check: the index for a department must have
+	// exactly as many entries as expenditures recorded against it, proving a department-scoped
+	// read (iter_prefix) returns precisely that department's rows rather than requiring the
+	// caller to walk the whole ExpenditureLog and filter.
+	new_test_ext().execute_with(|| {
+		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 10_000));
+		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
+		for _ in 0..5 {
+			assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 1, HASH_A));
+		}
+		assert_eq!(DepartmentExpenditures::<Test>::iter_prefix(DEPT).count(), 5);
+		assert_eq!(NextExpenditureIndex::<Test>::get(), 5);
 	});
 }
 
