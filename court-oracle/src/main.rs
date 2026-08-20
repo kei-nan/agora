@@ -490,51 +490,81 @@ async fn fetch_bool_value(
     Ok(bool::decode(&mut &bytes[..]).ok())
 }
 
-/// Scans the entire `TreasuryLedger::ExpenditureLog` map and returns entries tagged with
-/// `department_id`. **This does not scale** — `ExpenditureLog` is keyed by a monotonic
-/// expenditure counter, not by department, so there is no way to query "just this department's
-/// entries" without either scanning the whole log (what this does) or the chain adding a
-/// department-indexed secondary map. Documented plainly as a real limitation, not silently
-/// left to degrade — see README.md.
+/// Reads `TreasuryLedger::DepartmentExpenditures[department_id]` — a `department_id ->
+/// expenditure_index` secondary index pallet-treasury-ledger now maintains alongside
+/// `ExpenditureLog`, populated by the same `record_expenditure` call that writes the primary
+/// log entry (see that pallet's storage doc comment for why the two can never drift apart) —
+/// to find which expenditure indices belong to this department, then batch-fetches just those
+/// entries from `ExpenditureLog` itself.
+///
+/// This replaces an earlier full-`ExpenditureLog`-scan-and-filter implementation, whose own doc
+/// comment plainly flagged it as "does not scale" — a `/project-review` pass caught it and this
+/// is the fix. A `state_getKeysPaged` call scoped to this department's prefix returns only this
+/// department's keys server-side (the department id is the double map's first key, so its scoped prefix is
+/// exactly `map_key_u32`'s output for `DepartmentExpenditures`), so this now costs O(this
+/// department's expenditure count) per case, not O(every expenditure ever recorded on the
+/// chain) — the thing that mattered given this runs once per TreasuryDispute case ruling, for
+/// however many cases accumulate over the chain's lifetime, not once ever.
 async fn fetch_expenditures_for_department(
     rpc: &RpcClient,
     department_id: u32,
 ) -> anyhow::Result<Vec<(u64, u128, [u8; 32])>> {
-    let prefix = rpc::storage_prefix("TreasuryLedger", "ExpenditureLog");
-    let keys = rpc.get_keys_paged(&prefix).await?;
-    if keys.is_empty() {
+    let dept_prefix = map_key_u32("TreasuryLedger", "DepartmentExpenditures", department_id);
+    let index_keys = rpc.get_keys_paged(&dept_prefix).await?;
+    if index_keys.is_empty() {
         return Ok(vec![]);
     }
-    let values = rpc.query_storage_at(&keys).await?;
+    // The double map's second key (`Blake2_128Concat`, like the first) also appends the raw
+    // key at the tail, so `decode_u64_map_key` — written for a plain single-key map — still
+    // extracts it correctly here.
+    let mut indices: Vec<u64> =
+        index_keys.iter().filter_map(|k| cases::decode_u64_map_key(k)).collect();
+    indices.sort_unstable();
+
+    let log_keys: Vec<String> =
+        indices.iter().map(|idx| map_key_u64("TreasuryLedger", "ExpenditureLog", *idx)).collect();
+    let values = rpc.query_storage_at(&log_keys).await?;
+
     let mut out = Vec::new();
-    for (key_hex, value_hex) in keys.iter().zip(values.iter()) {
+    for (index, value_hex) in indices.iter().zip(values.iter()) {
         let Some(value_hex) = value_hex else { continue };
-        let Some(index) = cases::decode_u64_map_key(key_hex) else { continue };
         let Ok(bytes) = hex::decode(value_hex.trim_start_matches("0x")) else { continue };
         let Ok((dept, amount, ipfs_hash)) = <(u32, u128, [u8; 32])>::decode(&mut &bytes[..]) else {
             continue;
         };
-        if dept == department_id {
-            out.push((index, amount, ipfs_hash));
+        // Defensive, not load-bearing: `index` came from the department-scoped secondary
+        // index, so this should always match. A mismatch would mean the index and the primary
+        // log drifted on-chain (shouldn't happen — both are written together in
+        // `record_expenditure`), and skipping is safer than mis-attributing the entry.
+        if dept != department_id {
+            continue;
         }
+        out.push((*index, amount, ipfs_hash));
     }
-    out.sort_by_key(|(index, _, _)| *index);
     Ok(out)
 }
 
-/// Same scan-and-filter approach and the same scaling caveat as
-/// `fetch_expenditures_for_department`, over `PalletAudit::AuditLog`.
+/// Same department-scoped-index approach as `fetch_expenditures_for_department`, over
+/// `PalletAudit::AuditLog` via its own secondary index, `PalletAudit::DepartmentAuditEntries`
+/// (populated in `on_expenditure`, the only place `AuditLog` entries are created).
 async fn fetch_audit_entries_for_department(
     rpc: &RpcClient,
     _config: &Config,
     department_id: u32,
 ) -> anyhow::Result<Vec<AuditEntry>> {
-    let prefix = rpc::storage_prefix("PalletAudit", "AuditLog");
-    let keys = rpc.get_keys_paged(&prefix).await?;
-    if keys.is_empty() {
+    let dept_prefix = map_key_u32("PalletAudit", "DepartmentAuditEntries", department_id);
+    let index_keys = rpc.get_keys_paged(&dept_prefix).await?;
+    if index_keys.is_empty() {
         return Ok(vec![]);
     }
-    let values = rpc.query_storage_at(&keys).await?;
+    let mut indices: Vec<u64> =
+        index_keys.iter().filter_map(|k| cases::decode_u64_map_key(k)).collect();
+    indices.sort_unstable();
+
+    let log_keys: Vec<String> =
+        indices.iter().map(|idx| map_key_u64("PalletAudit", "AuditLog", *idx)).collect();
+    let values = rpc.query_storage_at(&log_keys).await?;
+
     let mut out = Vec::new();
     for value_hex in values.iter().flatten() {
         let Ok(bytes) = hex::decode(value_hex.trim_start_matches("0x")) else { continue };
@@ -546,8 +576,18 @@ async fn fetch_audit_entries_for_department(
     Ok(out)
 }
 
-/// Builds a full storage key for a `Blake2_128Concat`-hashed map with a `u32` key.
+/// Builds a full storage key for a `Blake2_128Concat`-hashed map with a `u32` key. Also used to
+/// build the department-scoped *prefix* of a `(u32, u64)` double map — a double map's first-key
+/// segment is encoded identically to a single-key map's, so this same function serves both.
 fn map_key_u32(pallet: &str, item: &str, key: u32) -> String {
+    let prefix = rpc::storage_prefix(pallet, item);
+    let hash = rpc::blake2_128(&key.encode());
+    format!("{prefix}{}{}", hex::encode(hash), hex::encode(key.encode()))
+}
+
+/// Same as `map_key_u32`, for a `Blake2_128Concat`-hashed map with a `u64` key
+/// (`ExpenditureLog`, `AuditLog`).
+fn map_key_u64(pallet: &str, item: &str, key: u64) -> String {
     let prefix = rpc::storage_prefix(pallet, item);
     let hash = rpc::blake2_128(&key.encode());
     format!("{prefix}{}{}", hex::encode(hash), hex::encode(key.encode()))
@@ -623,5 +663,80 @@ mod tests {
         // written together by submit_ai_ruling), but must fail safe (not finalize) rather than
         // guess a deadline.
         assert!(!should_finalize(&CaseStatus::AIRulingIssued, None, 1_000_000, APPEAL_WINDOW));
+    }
+
+    // ── map_key_u32 / map_key_u64 — department-scoped secondary-index key math ─────────────
+    //
+    // `fetch_expenditures_for_department`/`fetch_audit_entries_for_department` now read
+    // `TreasuryLedger::DepartmentExpenditures`/`PalletAudit::DepartmentAuditEntries` (double
+    // maps) instead of scanning `ExpenditureLog`/`AuditLog` in full. These tests pin the pure
+    // key-building math those functions depend on, without needing a live chain.
+
+    #[test]
+    fn map_key_u32_is_64_hex_chars_plus_0x_plus_the_encoded_key() {
+        let key = map_key_u32("TreasuryLedger", "DepartmentExpenditures", 7u32);
+        // "0x" + 32-byte prefix (64 hex chars) + 16-byte blake2_128 hash (32 hex chars) +
+        // 4-byte raw u32 key (8 hex chars).
+        assert_eq!(key.len(), 2 + 64 + 32 + 8);
+        assert!(key.starts_with("0x"));
+        // The raw (un-hashed) key is appended verbatim at the tail — Blake2_128Concat's
+        // defining property, and what `decode_u64_map_key` relies on elsewhere.
+        assert!(key.ends_with(&hex::encode(7u32.encode())));
+    }
+
+    #[test]
+    fn map_key_u32_differs_for_different_departments_and_different_storage_items() {
+        let dept_a = map_key_u32("TreasuryLedger", "DepartmentExpenditures", 1u32);
+        let dept_b = map_key_u32("TreasuryLedger", "DepartmentExpenditures", 2u32);
+        assert_ne!(dept_a, dept_b, "different departments must scope to different prefixes");
+
+        let audit_dept_a = map_key_u32("PalletAudit", "DepartmentAuditEntries", 1u32);
+        assert_ne!(
+            dept_a, audit_dept_a,
+            "the same department id under a different pallet/item must not collide"
+        );
+    }
+
+    #[test]
+    fn map_key_u64_round_trips_through_decode_u64_map_key() {
+        // The full single-key (ExpenditureLog/AuditLog) storage key this crate builds to fetch
+        // an entry by index must itself decode back to that same index via the same helper used
+        // to extract indices out of the double map's keys — confirming both call sites agree on
+        // the "raw key appended at the tail" shape.
+        let index: u64 = 424_242;
+        let key = map_key_u64("TreasuryLedger", "ExpenditureLog", index);
+        assert_eq!(cases::decode_u64_map_key(&key), Some(index));
+    }
+
+    #[test]
+    fn department_scoped_prefix_is_a_strict_prefix_of_the_full_double_map_key() {
+        // Confirms the load-bearing assumption `fetch_expenditures_for_department` relies on:
+        // `map_key_u32(pallet, "DepartmentExpenditures", dept)` (used as the
+        // `state_getKeysPaged` prefix) is exactly the leading portion of what a full
+        // `(dept, index)` double-map key looks like — i.e. scoping by department really does
+        // scope to that department's entries and nothing else, because a double map's first-key
+        // segment is encoded identically to a single-key map's.
+        let dept: u32 = 3;
+        let index: u64 = 99;
+        let dept_prefix = map_key_u32("TreasuryLedger", "DepartmentExpenditures", dept);
+
+        // Hand-build a full double-map key the same way pallet storage would encode it:
+        // prefix(32B) ++ blake2_128(dept)(16B) ++ dept(4B) ++ blake2_128(index)(16B) ++ index(8B).
+        let full_prefix = rpc::storage_prefix("TreasuryLedger", "DepartmentExpenditures");
+        let dept_hash = rpc::blake2_128(&dept.encode());
+        let index_hash = rpc::blake2_128(&index.encode());
+        let full_key = format!(
+            "{full_prefix}{}{}{}{}",
+            hex::encode(dept_hash),
+            hex::encode(dept.encode()),
+            hex::encode(index_hash),
+            hex::encode(index.encode()),
+        );
+
+        assert!(
+            full_key.starts_with(&dept_prefix),
+            "dept_prefix={dept_prefix} must be a strict prefix of full_key={full_key}"
+        );
+        assert_eq!(cases::decode_u64_map_key(&full_key), Some(index));
     }
 }
