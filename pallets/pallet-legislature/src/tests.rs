@@ -408,7 +408,7 @@ fn close_motion_passes_at_exact_threshold_boundary_with_abstentions() {
         );
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1, 2, 4))
+            Some((CALL_HASH_A, 1, 2, 4, 1 + MOTION_DURATION as u64))
         );
     });
 }
@@ -511,7 +511,7 @@ fn close_motion_fails_with_approval_pending_when_prior_token_unconsumed() {
         assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1, 1, 1))
+            Some((CALL_HASH_A, 1, 1, 1, 1 + MOTION_DURATION as u64))
         );
 
         // Motion B is proposed and also reaches passage, but closing it must
@@ -527,7 +527,7 @@ fn close_motion_fails_with_approval_pending_when_prior_token_unconsumed() {
         // The original token from motion A must be untouched.
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1, 1, 1))
+            Some((CALL_HASH_A, 1, 1, 1, 1 + MOTION_DURATION as u64))
         );
     });
 }
@@ -550,13 +550,6 @@ fn ensure_legislature_motion_succeeds_only_after_motion_passes_for_proposer() {
         System::set_block_number(1 + MOTION_DURATION as u64);
         assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
 
-        // A different member (not the proposer) must not be able to consume
-        // the token, even though they are an enrolled member.
-        let other_origin: RuntimeOrigin = RuntimeOrigin::signed(2);
-        assert!(EnsureLegislatureMotion::<Test>::try_origin(other_origin, &CALL_HASH_A).is_err());
-        // Token must still be present -- the failed attempt above must not consume it.
-        assert!(PendingLegislatureApproval::<Test>::get().is_some());
-
         // The proposer's origin succeeds when it presents the hash the motion approved.
         let proposer_origin: RuntimeOrigin = RuntimeOrigin::signed(1);
         EnsureLegislatureMotion::<Test>::try_origin(proposer_origin, &CALL_HASH_A)
@@ -568,6 +561,29 @@ fn ensure_legislature_motion_succeeds_only_after_motion_passes_for_proposer() {
             EnsureLegislatureMotion::<Test>::try_origin(proposer_origin_again, &CALL_HASH_A)
                 .is_err()
         );
+        assert!(PendingLegislatureApproval::<Test>::get().is_none());
+    });
+}
+
+/// The deadlock fix: any current legislature member -- not only the original
+/// proposer -- can consume a passed motion's approval token. The vote that
+/// passed the motion is what legitimizes the action, so a proposer who goes
+/// offline or is later removed must not be able to permanently block it.
+#[test]
+fn ensure_legislature_motion_allows_any_current_member_to_consume_token() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        // Member 2, who is not the proposer, successfully consumes the token.
+        let other_origin: RuntimeOrigin = RuntimeOrigin::signed(2);
+        EnsureLegislatureMotion::<Test>::try_origin(other_origin, &CALL_HASH_A)
+            .expect("any current member should be able to execute a passed motion");
         assert!(PendingLegislatureApproval::<Test>::get().is_none());
     });
 }
@@ -589,7 +605,10 @@ fn ensure_legislature_motion_rejects_mismatched_call_hash() {
 
         // The mismatched attempt must not consume the token -- it's still there, and
         // still only good for the call it was actually approved for (A).
-        assert_eq!(PendingLegislatureApproval::<Test>::get(), Some((CALL_HASH_A, 1, 1, 1)));
+        assert_eq!(
+            PendingLegislatureApproval::<Test>::get(),
+            Some((CALL_HASH_A, 1, 1, 1, 1 + MOTION_DURATION as u64))
+        );
         let origin: RuntimeOrigin = RuntimeOrigin::signed(1);
         assert!(EnsureLegislatureMotion::<Test>::try_origin(origin, &CALL_HASH_A).is_ok());
         assert!(PendingLegislatureApproval::<Test>::get().is_none());
@@ -659,7 +678,7 @@ fn tiered_origin_rejects_motion_below_required_percentage() {
         );
         assert_eq!(
             PendingLegislatureApproval::<Test>::get(),
-            Some((CALL_HASH_A, 1, 3, 5))
+            Some((CALL_HASH_A, 1, 3, 5, 1 + MOTION_DURATION as u64))
         );
 
         // 60% < 75% required -- rejected even though the motion "passed" at the floor.
@@ -759,6 +778,103 @@ fn tiered_origin_rejects_mismatched_call_hash_even_with_trivial_required_percent
             ([u8; 32], u8),
         >>::try_origin(origin, &(CALL_HASH_B, 1));
         assert!(result.is_err());
+        assert!(PendingLegislatureApproval::<Test>::get().is_some());
+    });
+}
+
+// ─── clear_stale_approval ───────────────────────────────────────────────────
+
+#[test]
+fn clear_stale_approval_fails_when_not_yet_expired() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+
+        // Still within the expiry window (APPROVAL_EXPIRY = 20 blocks after planting).
+        System::set_block_number(1 + MOTION_DURATION as u64 + APPROVAL_EXPIRY as u64 - 1);
+        assert_noop!(
+            Legislature::clear_stale_approval(RuntimeOrigin::signed(1)),
+            Error::<Test>::ApprovalNotYetStale
+        );
+        assert!(PendingLegislatureApproval::<Test>::get().is_some());
+    });
+}
+
+#[test]
+fn clear_stale_approval_fails_when_none_pending() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_noop!(
+            Legislature::clear_stale_approval(RuntimeOrigin::signed(1)),
+            Error::<Test>::NoPendingApproval
+        );
+    });
+}
+
+#[test]
+fn clear_stale_approval_fails_for_non_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+        System::set_block_number(1 + MOTION_DURATION as u64 + APPROVAL_EXPIRY as u64);
+
+        assert_noop!(
+            Legislature::clear_stale_approval(RuntimeOrigin::signed(999)),
+            Error::<Test>::NotAMember
+        );
+    });
+}
+
+/// The deadlock recovery this fix adds: once a passed motion's token sits unconsumed past
+/// `PendingApprovalExpiryBlocks`, *any* current member (not necessarily the stuck proposer)
+/// can clear it, and a subsequent motion is then free to pass and plant a new token --
+/// proving the legislature is no longer permanently stuck.
+#[test]
+fn clear_stale_approval_unblocks_a_new_motion_after_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+
+        // Motion A passes and plants a token that nobody ever consumes (simulating an
+        // offline/removed proposer).
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+        let planted_at = 1 + MOTION_DURATION as u64;
+
+        // Before expiry, a second passed motion cannot plant its own token.
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(2), CALL_HASH_B));
+        System::set_block_number(planted_at + MOTION_DURATION as u64);
+        assert_noop!(
+            Legislature::close_motion(RuntimeOrigin::signed(2), 1),
+            Error::<Test>::ApprovalPending
+        );
+
+        // Move past the expiry window and clear the stale token -- called by member 2,
+        // who is not the original proposer.
+        System::set_block_number(planted_at + APPROVAL_EXPIRY as u64);
+        assert_ok!(Legislature::clear_stale_approval(RuntimeOrigin::signed(2)));
+        System::assert_last_event(
+            Event::PendingApprovalExpired { call_hash: CALL_HASH_A }.into(),
+        );
+        assert!(PendingLegislatureApproval::<Test>::get().is_none());
+
+        // Motion B, already closed as executed=false path retried: close it again isn't
+        // possible (already executed=true was NOT set on the failed attempt above, since
+        // `close_motion` only marks executed after the ApprovalPending check -- re-propose
+        // a fresh motion C instead to prove the legislature is unblocked).
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        System::set_block_number(planted_at + APPROVAL_EXPIRY as u64 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 2));
+
         assert!(PendingLegislatureApproval::<Test>::get().is_some());
     });
 }

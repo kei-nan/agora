@@ -103,5 +103,32 @@ mod benchmarks {
 		assert!(Motions::<T>::get(0u32).unwrap().executed);
 	}
 
+	#[benchmark]
+	fn clear_stale_approval() {
+		// Only the proposer and the eventual clearer are members, and both vote aye, so the
+		// motion clears 100% of the tally -- guaranteed to pass regardless of `PassageThreshold`.
+		let proposer: T::AccountId = account("proposer", 0, 0);
+		let clearer: T::AccountId = whitelisted_caller();
+		let existing = alloc::vec![proposer.clone(), clearer.clone()];
+		Members::<T>::put(BoundedVec::<T::AccountId, T::MaxMembers>::try_from(existing).unwrap());
+		Pallet::<T>::propose_motion(RawOrigin::Signed(proposer).into(), [3u8; 32]).unwrap();
+		Pallet::<T>::vote_motion(RawOrigin::Signed(clearer.clone()).into(), 0u32, true).unwrap();
+
+		let end_block = Motions::<T>::get(0u32).unwrap().end_block;
+		frame_system::Pallet::<T>::set_block_number(end_block);
+		let closer: T::AccountId = account("closer", 0, 0);
+		Pallet::<T>::close_motion(RawOrigin::Signed(closer).into(), 0u32).unwrap();
+
+		let expiry = T::PendingApprovalExpiryBlocks::get();
+		frame_system::Pallet::<T>::set_block_number(
+			end_block + expiry.into() + 1u32.into(),
+		);
+
+		#[extrinsic_call]
+		clear_stale_approval(RawOrigin::Signed(clearer));
+
+		assert!(PendingLegislatureApproval::<T>::get().is_none());
+	}
+
 	impl_benchmark_test_suite!(Legislature, crate::mock::new_test_ext(), crate::mock::Test);
 }

@@ -36,6 +36,7 @@ pub fn unset_minister(who: u64) {
 pub const MAX_MEMBERS: u32 = 5;
 pub const MOTION_DURATION: u32 = 10;
 pub const PASSAGE_THRESHOLD: u8 = 50;
+pub const APPROVAL_EXPIRY: u32 = 20;
 
 #[frame_support::runtime]
 mod runtime {
@@ -73,6 +74,7 @@ impl pallet_legislature::Config for Test {
     type MaxMembers = frame_support::traits::ConstU32<MAX_MEMBERS>;
     type MotionDurationBlocks = frame_support::traits::ConstU32<MOTION_DURATION>;
     type PassageThreshold = frame_support::traits::ConstU8<PASSAGE_THRESHOLD>;
+    type PendingApprovalExpiryBlocks = frame_support::traits::ConstU32<APPROVAL_EXPIRY>;
     type MinisterChecker = TestMinisterChecker;
     type WeightInfo = ();
 }

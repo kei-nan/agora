@@ -805,6 +805,9 @@ impl pallet_legislature::Config for Runtime {
 	/// more for Structural/Foundational calls via `EnsureLegislatureMotion`'s tier-aware
 	/// `([u8; 32], u8)` origin overload (see `pallet_constitution::Config::LegislatureOrigin`).
 	type PassageThreshold = ConstU8<51>;
+	/// An unconsumed approval token can be discarded by any member after 14 days, recovering
+	/// the legislature if a proposer never executes it (offline, lost key, or removed).
+	type PendingApprovalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	/// Active ministers are blocked from legislature votes (incompatibility rule).
 	type MinisterChecker = Cabinet;
 	type WeightInfo = pallet_legislature::weights::SubstrateWeight<Runtime>;

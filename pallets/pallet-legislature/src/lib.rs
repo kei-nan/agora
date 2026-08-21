@@ -80,11 +80,17 @@ pub mod pallet {
     /// it is dispatching the exact call the motion approved.
     ///
     /// `close_motion` writes a `PendingLegislatureApproval` token (the passed `call_hash`,
-    /// the motion's proposer, and the frozen `ayes`/`total_members` tally) to storage.
-    /// `EnsureLegislatureMotion::try_origin` consumes that token exactly once, and only if
-    /// the caller-supplied hash argument matches it, so a motion that passed to authorize
-    /// one call can never be replayed to execute a different one — including a different
-    /// call in a different legislature-gated pallet. This is enforced with
+    /// the motion's proposer, the frozen `ayes`/`total_members` tally, and the block it was
+    /// planted at) to storage. `EnsureLegislatureMotion::try_origin` consumes that token
+    /// exactly once, and only if the caller-supplied hash argument matches it, so a motion
+    /// that passed to authorize one call can never be replayed to execute a different one —
+    /// including a different call in a different legislature-gated pallet. Any current
+    /// legislature member may consume the token, not only the original proposer: the vote
+    /// that passed the motion is what legitimizes the action, not the proposer's continued
+    /// availability, and requiring the exact proposer created a permanent-deadlock risk if
+    /// they went offline or were removed before executing it. If no member consumes it
+    /// before `PendingApprovalExpiryBlocks` elapses, `clear_stale_approval` lets any member
+    /// discard it so a new motion can pass. This is enforced with
     /// `EnsureOriginWithArg` (rather than plain `EnsureOrigin`) so the check lives inside
     /// the origin gate itself: a consuming call site cannot forget to verify the token,
     /// because there is no path to a successful origin without supplying a matching hash.
@@ -116,18 +122,18 @@ pub mod pallet {
             use frame_system::RawOrigin;
             match o.clone().into() {
                 Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
-                    // Consume the pending approval token only if this member is the
-                    // motion's proposer *and* the caller's hash matches the hash the
-                    // motion actually passed for. Any other member, or a mismatched
-                    // hash, is rejected — preventing both a hostile member from
-                    // hijacking the queued action and a passed motion for call A from
-                    // being replayed against unrelated call B. The frozen tally is not
-                    // re-checked here — a planted token already cleared the floor
-                    // threshold at close time.
-                    if let Some((approved_hash, authorized, _ayes, _total)) =
+                    // Consume the pending approval token if the caller's hash matches
+                    // the hash the motion actually passed for. Any current member may
+                    // consume it — not only the original proposer, since `who` is
+                    // already verified to be a current member above and it's the vote
+                    // that legitimizes the action. A mismatched hash is rejected,
+                    // preventing a passed motion for call A from being replayed against
+                    // unrelated call B. The frozen tally is not re-checked here — a
+                    // planted token already cleared the floor threshold at close time.
+                    if let Some((approved_hash, _proposer, _ayes, _total, _planted_at)) =
                         PendingLegislatureApproval::<T>::get()
                     {
-                        if authorized == who && approved_hash == *call_hash {
+                        if approved_hash == *call_hash {
                             PendingLegislatureApproval::<T>::kill();
                             return Ok(());
                         }
@@ -142,7 +148,13 @@ pub mod pallet {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
             // Plant a token so the benchmark-generated origin validates (100% tally, so
             // both overloads accept it regardless of required percentage).
-            PendingLegislatureApproval::<T>::put((*call_hash, member.clone(), 1u32, 1u32));
+            PendingLegislatureApproval::<T>::put((
+                *call_hash,
+                member.clone(),
+                1u32,
+                1u32,
+                frame_system::Pallet::<T>::block_number(),
+            ));
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -160,12 +172,12 @@ pub mod pallet {
             let (call_hash, required_pct) = *arg;
             match o.clone().into() {
                 Ok(RawOrigin::Signed(who)) if Members::<T>::get().contains(&who) => {
-                    if let Some((approved_hash, authorized, ayes, total)) =
+                    if let Some((approved_hash, _proposer, ayes, total, _planted_at)) =
                         PendingLegislatureApproval::<T>::get()
                     {
                         let meets_required = (ayes as u64).saturating_mul(100)
                             >= (required_pct as u64).saturating_mul(total as u64);
-                        if authorized == who && approved_hash == call_hash && meets_required {
+                        if approved_hash == call_hash && meets_required {
                             PendingLegislatureApproval::<T>::kill();
                             return Ok(());
                         }
@@ -180,7 +192,13 @@ pub mod pallet {
             let (call_hash, _required_pct) = *arg;
             let member = Members::<T>::get().first().cloned().ok_or(())?;
             // 100/100 satisfies any required percentage up to 100.
-            PendingLegislatureApproval::<T>::put((call_hash, member.clone(), 100u32, 100u32));
+            PendingLegislatureApproval::<T>::put((
+                call_hash,
+                member.clone(),
+                100u32,
+                100u32,
+                frame_system::Pallet::<T>::block_number(),
+            ));
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -212,6 +230,11 @@ pub mod pallet {
         /// higher bar the specific call being authorized actually requires.
         #[pallet::constant]
         type PassageThreshold: Get<u8>;
+        /// How many blocks an unconsumed `PendingLegislatureApproval` token may sit before any
+        /// member can discard it via `clear_stale_approval`, unblocking the legislature from a
+        /// proposer who never executes it (offline, lost key, or removed via `remove_member`).
+        #[pallet::constant]
+        type PendingApprovalExpiryBlocks: Get<u32>;
         /// Checks whether a member is an active executive minister.
         /// Ministers are blocked from voting on motions (incompatibility rule).
         type MinisterChecker: MinisterChecker<Self::AccountId>;
@@ -240,16 +263,22 @@ pub mod pallet {
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool>;
 
     /// Set by `close_motion` when a motion passes; consumed by `EnsureLegislatureMotion`.
-    /// Stores `(call_hash, proposer, ayes, total_members)` — only the motion's proposer can
-    /// consume the token, preventing any other member from hijacking a passed motion's
-    /// approval. `ayes`/`total_members` are the tally frozen at close time, so a consuming
-    /// pallet's tier-aware `EnsureOriginWithArg<_, ([u8; 32], u8)>` check (see
-    /// `EnsureLegislatureMotion`'s doc comment) can verify the *real* support a motion
-    /// received meets whatever higher threshold the call being authorized actually requires.
-    /// Cleared after it is consumed — each passed motion authorizes exactly one action.
+    /// Stores `(call_hash, proposer, ayes, total_members, planted_at)` — any current
+    /// legislature member may consume the token (see `EnsureLegislatureMotion`'s doc comment
+    /// for why it's no longer restricted to the original proposer). `ayes`/`total_members` are
+    /// the tally frozen at close time, so a consuming pallet's tier-aware
+    /// `EnsureOriginWithArg<_, ([u8; 32], u8)>` check (see `EnsureLegislatureMotion`'s doc
+    /// comment) can verify the *real* support a motion received meets whatever higher
+    /// threshold the call being authorized actually requires. `planted_at` is the block the
+    /// token was written, used by `clear_stale_approval` to discard a token nobody ever
+    /// consumed. Cleared after it is consumed — each passed motion authorizes exactly one
+    /// action.
     #[pallet::storage]
-    pub type PendingLegislatureApproval<T: Config> =
-        StorageValue<_, ([u8; 32], T::AccountId, u32, u32), OptionQuery>;
+    pub type PendingLegislatureApproval<T: Config> = StorageValue<
+        _,
+        ([u8; 32], T::AccountId, u32, u32, BlockNumberFor<T>),
+        OptionQuery,
+    >;
 
     // ── Events ───────────────────────────────────────────────────────────────────
 
@@ -268,6 +297,9 @@ pub mod pallet {
         MotionPassed { motion_id: u32, call_hash: [u8; 32] },
         /// A motion was closed but did not reach the passage threshold — it failed.
         MotionFailed { motion_id: u32 },
+        /// A `PendingLegislatureApproval` token expired unconsumed and was discarded via
+        /// `clear_stale_approval`, freeing the legislature to pass a new motion.
+        PendingApprovalExpired { call_hash: [u8; 32] },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────────
@@ -297,6 +329,10 @@ pub mod pallet {
         /// A previously passed motion's approval token is still pending consumption.
         /// The queued action must be executed before another passed motion can plant a new token.
         ApprovalPending,
+        /// There is no pending approval token to clear.
+        NoPendingApproval,
+        /// The pending approval token has not yet reached `PendingApprovalExpiryBlocks`.
+        ApprovalNotYetStale,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -448,12 +484,38 @@ pub mod pallet {
                     motion.proposer.clone(),
                     motion.ayes,
                     total_members as u32,
+                    now,
                 ));
                 Self::deposit_event(Event::MotionPassed { motion_id, call_hash: motion.call_hash });
             } else {
                 Self::deposit_event(Event::MotionFailed { motion_id });
             }
 
+            Ok(())
+        }
+
+        /// Discard an unconsumed `PendingLegislatureApproval` token once
+        /// `PendingApprovalExpiryBlocks` have passed since it was planted. Open to any current
+        /// legislature member — recovers the legislature from a proposer (or every consuming
+        /// member) never executing the queued action, which would otherwise block every future
+        /// motion from passing (`close_motion` refuses to overwrite a pending token).
+        #[pallet::call_index(5)]
+        #[pallet::weight(T::WeightInfo::clear_stale_approval())]
+        pub fn clear_stale_approval(origin: OriginFor<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Members::<T>::get().contains(&who), Error::<T>::NotAMember);
+
+            let (call_hash, _proposer, _ayes, _total, planted_at) =
+                PendingLegislatureApproval::<T>::get().ok_or(Error::<T>::NoPendingApproval)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            let expiry = BlockNumberFor::<T>::from(T::PendingApprovalExpiryBlocks::get());
+            ensure!(
+                now >= planted_at.saturating_add(expiry),
+                Error::<T>::ApprovalNotYetStale
+            );
+
+            PendingLegislatureApproval::<T>::kill();
+            Self::deposit_event(Event::PendingApprovalExpired { call_hash });
             Ok(())
         }
     }
