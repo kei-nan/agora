@@ -256,6 +256,10 @@ export async function fetchDepartmentBudgets(): Promise<DepartmentBudget[]> {
 export interface Ruling {
   id: string;
   caseTitle: string;
+  // The raw `Courts::Cases`/`Courts::Rulings` map key this ruling was decoded from, exposed so
+  // the UI can correlate a displayed ruling with other per-case chain state (e.g. a pending
+  // oracle-approval lookup) without re-deriving it from `id`.
+  caseId: number;
   level: number;
   outcome: string;
   summary: string;
@@ -299,6 +303,7 @@ export async function fetchRulings(): Promise<Ruling[]> {
     rulings.push({
       id: `ruling-${caseId}`,
       caseTitle: `Case #${caseId}`,
+      caseId,
       level: 0,
       outcome,
       summary: `Verdict: ${outcome}. Fetch full ruling text from IPFS.`,
@@ -308,6 +313,22 @@ export async function fetchRulings(): Promise<Ruling[]> {
   });
   return rulings;
 }
+
+// ── Oracle Council transparency (project-review #092, Citizen/UX finding: "Oracle council
+// composition/approval count is invisible to citizens viewing a ruling") ───────────────────────
+//
+// Unlike the reads above, `fetchOracleCouncilInfo`/case-pending-approval lookups are NOT
+// mirrored here: `fetch_oracle_council_info` and `fetch_oracle_pending_approvals` are new
+// Tauri/reqwest-only commands (see `desktop/src-tauri/src/commands/chain.rs`) — they're absent
+// from `LIGHT_CLIENT_COMMANDS` in `desktop/src/lib/invoke.ts`, so `invoke(...)` calls them
+// through the real Tauri IPC path instead, the same way `fetch_ipfs_content` and
+// `chain_submit_extrinsic` already do. That means these two reads are *not* independently
+// verified against finalized GRANDPA consensus by smoldot the way every other query on this page
+// is — they trust the local node's plain JSON-RPC response, same trust level `fetch_rulings` had
+// before the smoldot migration (changelog #089). Acceptable for now given how low-stakes the
+// data is (council size/threshold and a live approval counter, not a value anything is gated
+// on) — flagged here so it isn't silently assumed to carry the same guarantee as the rest of
+// this file's reads.
 
 // ── fetch_legislature_data ────────────────────────────────────────────────────────────────
 

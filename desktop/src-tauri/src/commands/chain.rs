@@ -17,6 +17,15 @@
 // (and `rpc.rs`) may become fully dead code — check `invoke.ts`'s `LIGHT_CLIENT_COMMANDS` map
 // before assuming that, since it's the actual source of truth for what the frontend still calls
 // here.
+//
+// `fetch_oracle_council_info`/`fetch_oracle_pending_approvals` (added for project-review #092's
+// oracle-council-transparency finding) are new commands that join `fetch_ipfs_content`/
+// `chain_submit_extrinsic` in this second category — Tauri/reqwest-only, not in
+// `LIGHT_CLIENT_COMMANDS`, so not smoldot-verified. See their own doc comments and the note atop
+// `desktop/src/chain/queries.ts`'s Oracle Council section for why that's an acceptable trade-off
+// here. `fetch_rulings`'s `Ruling` struct here gained a `case_id` field in the same change —
+// that one *is* mirrored in `queries.ts` since `fetch_rulings` is one of the nine migrated
+// commands above and this file's copy of it is otherwise dead code for the live app.
 use serde::{Deserialize, Serialize};
 use crate::rpc::{RpcClient, storage_prefix};
 use std::collections::HashMap;
@@ -88,6 +97,11 @@ pub struct Ruling {
     pub id: String,
     #[serde(rename = "caseTitle")]
     pub case_title: String,
+    /// The raw `Courts::Cases`/`Courts::Rulings` map key this ruling was decoded from, exposed
+    /// so the frontend can correlate a displayed ruling with other per-case chain state (e.g.
+    /// `fetch_oracle_pending_approvals`) without having to re-derive it from `id`.
+    #[serde(rename = "caseId")]
+    pub case_id: u32,
     pub level: u8,
     pub outcome: String,
     pub summary: String,
@@ -595,6 +609,7 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
             rulings.push(Ruling {
                 id: format!("ruling-{case_id}"),
                 case_title: format!("Case #{case_id}"),
+                case_id,
                 level: 0,
                 outcome: outcome.to_string(),
                 summary: format!("Verdict: {outcome}. Fetch full ruling text from IPFS."),
@@ -604,6 +619,105 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
         }
     }
     Ok(rulings)
+}
+
+// ── Oracle Council transparency (project-review #092, Citizen/UX finding: "Oracle council
+// composition/approval count is invisible to citizens viewing a ruling") ───────────────────────
+
+#[derive(Serialize, Deserialize)]
+pub struct OracleCouncilInfo {
+    /// Live length of `Courts::OracleMembers` — the current council roster size.
+    #[serde(rename = "councilSize")]
+    pub council_size: u32,
+    #[serde(rename = "approvalNumerator")]
+    pub approval_numerator: u32,
+    #[serde(rename = "approvalDenominator")]
+    pub approval_denominator: u32,
+}
+
+/// Mirrors `pallet_courts::Config::OracleApprovalNumerator`/`OracleApprovalDenominator` as wired
+/// in `runtime/src/configs/mod.rs` (`ConstU32<1>` / `ConstU32<2>` at time of writing — i.e. an
+/// oracle action needs *strictly more than* half the council to approve, not "at least half";
+/// see that pallet's `oracle_approval_reached` doc comment). These are compile-time `Get<u32>`
+/// runtime constants, not on-chain storage, so there is no RPC read for them — only
+/// `council_size` below is a live chain read. If the runtime config ever changes these values,
+/// update the constants here to match.
+const ORACLE_APPROVAL_NUMERATOR: u32 = 1;
+const ORACLE_APPROVAL_DENOMINATOR: u32 = 2;
+
+/// Fetches the Oracle Council's current size (`Courts::OracleMembers`, a
+/// `BoundedVec<AccountId, MaxOracleMembers>` — only its compact-encoded length is decoded, not
+/// the member accounts themselves) plus the approval threshold fraction it takes for a proposed
+/// AI ruling or finalization to apply. Council-wide, not per-case — see
+/// `fetch_oracle_pending_approvals` for a specific case's live approval count.
+#[tauri::command]
+pub async fn fetch_oracle_council_info() -> Result<OracleCouncilInfo, String> {
+    let client = RpcClient::new(NODE_URL);
+    let key = storage_prefix("Courts", "OracleMembers");
+    let bytes = client
+        .get_storage(&key)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let council_size = bytes.map(|b| decode_compact(&b).0).unwrap_or(0);
+    Ok(OracleCouncilInfo {
+        council_size,
+        approval_numerator: ORACLE_APPROVAL_NUMERATOR,
+        approval_denominator: ORACLE_APPROVAL_DENOMINATOR,
+    })
+}
+
+/// For `case_id`, returns `Some(approval_count)` if an oracle ruling/finalization proposal is
+/// currently pending for it (`Courts::PendingOracleProposal[case_id]` exists), or `None` if it
+/// isn't — either never proposed, or already resolved (`PendingOracleProposal`/`OracleApprovals`
+/// are cleared together the instant an action resolves, see pallet_courts's
+/// `try_resolve_oracle_action`). A case that already has a finalized `Courts::Rulings` entry
+/// (the only kind `fetch_rulings` returns) is by definition no longer pending, so this will
+/// normally return `None` for any case_id taken from `fetch_rulings`'s output — it's exposed so
+/// a citizen looking at a case still awaiting oracle sign-off can see live approval progress
+/// while it's happening, not just after the fact.
+///
+/// No `Blake2_128Concat` map-key construction here (no hasher for it is available in this
+/// module) — instead this follows the same list-then-match pattern the rest of this file already
+/// uses for other maps (`Cases`, `Rulings`, `Motions`, `Delegates`): page all keys, decode each
+/// one's trailing `case_id` via `extract_u32_key_suffix`, and match. Both maps stay small (at
+/// most `MaxOracleMembers`-bounded activity at a time), so this is cheap in practice.
+#[tauri::command]
+pub async fn fetch_oracle_pending_approvals(case_id: u32) -> Result<Option<u32>, String> {
+    let client = RpcClient::new(NODE_URL);
+
+    let pending_prefix = storage_prefix("Courts", "PendingOracleProposal");
+    let pending_keys = client
+        .get_keys_paged(&pending_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let is_pending = pending_keys.iter().any(|key_hex| {
+        let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+        extract_u32_key_suffix(&kbytes) == case_id
+    });
+    if !is_pending {
+        return Ok(None);
+    }
+
+    let approvals_prefix = storage_prefix("Courts", "OracleApprovals");
+    let approval_keys = client
+        .get_keys_paged(&approvals_prefix)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let approval_key = approval_keys.into_iter().find(|key_hex| {
+        let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
+        extract_u32_key_suffix(&kbytes) == case_id
+    });
+    let Some(key) = approval_key else {
+        // PendingOracleProposal exists but OracleApprovals doesn't (shouldn't happen — both
+        // pallet call paths insert them together — but decode defensively rather than error).
+        return Ok(Some(0));
+    };
+    let value = client
+        .get_storage(&key)
+        .await
+        .map_err(|e| format!("chain unreachable: {e}"))?;
+    let count = value.map(|b| decode_compact(&b).0).unwrap_or(0);
+    Ok(Some(count))
 }
 
 /// Public IPFS gateway used to resolve law/proposal/ruling content by CID.

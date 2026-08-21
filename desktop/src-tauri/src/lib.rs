@@ -42,6 +42,8 @@ pub fn run() {
             chain::fetch_treasury,
             chain::fetch_department_budgets,
             chain::fetch_rulings,
+            chain::fetch_oracle_council_info,
+            chain::fetch_oracle_pending_approvals,
             chain::fetch_ipfs_content,
             chain::auth_verify_nullifier,
             chain::fetch_legislature_data,

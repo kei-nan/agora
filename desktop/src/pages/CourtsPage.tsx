@@ -7,6 +7,7 @@ import "./Page.css";
 interface Ruling {
   id: string;
   caseTitle: string;
+  caseId: number;
   level: 0 | 1 | 2;
   outcome: "upheld" | "overturned" | "pending";
   summary: string;
@@ -14,8 +15,26 @@ interface Ruling {
   timestamp: number;
 }
 
+// Oracle Council transparency (project-review #092, Citizen/UX finding: "Oracle council
+// composition/approval count is invisible to citizens viewing a ruling"). Council size/threshold
+// is council-wide (fetched once); the pending-approval count is per-case and only meaningful
+// while a case is still awaiting oracle sign-off — see `fetch_oracle_pending_approvals`'s doc
+// comment in `desktop/src-tauri/src/commands/chain.rs` for why an already-listed ruling will
+// normally come back `null` here (it's already finalized by the time it can appear in this
+// page's list at all).
+interface OracleCouncilInfo {
+  councilSize: number;
+  approvalNumerator: number;
+  approvalDenominator: number;
+}
+
 const LEVEL_LABELS = ["AI Judge", "Jury (7)", "Constitutional Jury (21)"];
 const ZERO_HASH = "0x" + "0".repeat(64);
+
+/** Smallest approval count that satisfies the pallet's strict `approvals/council > numerator/denominator` check. */
+function minApprovalsNeeded(info: OracleCouncilInfo): number {
+  return Math.floor((info.councilSize * info.approvalNumerator) / info.approvalDenominator) + 1;
+}
 
 export default function CourtsPage() {
   const [rulings, setRulings] = useState<Ruling[]>([]);
@@ -23,6 +42,8 @@ export default function CourtsPage() {
   const [loading, setLoading] = useState(true);
   const [ipfsContent, setIpfsContent] = useState<string | null>(null);
   const [ipfsLoading, setIpfsLoading] = useState(false);
+  const [councilInfo, setCouncilInfo] = useState<OracleCouncilInfo | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<number | null>(null);
   const { setActiveItem } = useAgent();
 
   useEffect(() => {
@@ -30,15 +51,22 @@ export default function CourtsPage() {
       .then(setRulings)
       .catch(() => setRulings([]))
       .finally(() => setLoading(false));
+    invoke<OracleCouncilInfo>("fetch_oracle_council_info")
+      .then(setCouncilInfo)
+      .catch(() => setCouncilInfo(null));
   }, []);
 
   function selectRuling(r: Ruling) {
     setSelected(r);
     setIpfsContent(null);
+    setPendingApprovals(null);
     setActiveItem(
       r.id,
       `Court ruling: ${r.caseTitle}\nLevel: ${LEVEL_LABELS[r.level]}\nOutcome: ${r.outcome}\nSummary: ${r.summary}\nIPFS: ${r.ipfsHash}`
     );
+    invoke<number | null>("fetch_oracle_pending_approvals", { caseId: r.caseId })
+      .then(setPendingApprovals)
+      .catch(() => setPendingApprovals(null));
     if (r.ipfsHash && r.ipfsHash !== ZERO_HASH) {
       setIpfsLoading(true);
       invoke<string>("fetch_ipfs_content", { hashHex: r.ipfsHash })
@@ -81,6 +109,16 @@ export default function CourtsPage() {
           <p className="detail-meta">
             {LEVEL_LABELS[selected.level]} · {selected.outcome}
           </p>
+          {councilInfo && (
+            <p className="detail-meta">
+              Oracle Council: {councilInfo.councilSize} member{councilInfo.councilSize === 1 ? "" : "s"} · needs more
+              than {councilInfo.approvalNumerator}/{councilInfo.approvalDenominator} to approve (at least{" "}
+              {minApprovalsNeeded(councilInfo)})
+              {pendingApprovals !== null && (
+                <> · {pendingApprovals} of {councilInfo.councilSize} approved so far</>
+              )}
+            </p>
+          )}
           {ipfsLoading && <p className="loading">Fetching ruling from IPFS…</p>}
           {ipfsContent ? (
             <pre className="ipfs-content">{ipfsContent}</pre>

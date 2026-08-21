@@ -79,6 +79,7 @@ export const MOCKS: Record<string, (...args: unknown[]) => unknown> = {
     {
       id: "ruling-1",
       caseTitle: "Re: Surveillance Amendment Act — constitutionality challenge",
+      caseId: 1,
       level: 0,
       outcome: "overturned",
       summary:
@@ -87,6 +88,17 @@ export const MOCKS: Record<string, (...args: unknown[]) => unknown> = {
       timestamp: Math.floor(Date.now() / 1000) - 86400,
     },
   ],
+
+  // Oracle Council transparency (project-review #092 Citizen/UX finding). A finalized ruling
+  // (like the stub above) is by definition no longer pending — see the doc comment on
+  // `fetch_oracle_pending_approvals` in `desktop/src-tauri/src/commands/chain.rs` for why —
+  // so the pending-approvals mock returns `null` for it, same as the real chain would.
+  fetch_oracle_council_info: () => ({
+    councilSize: 5,
+    approvalNumerator: 1,
+    approvalDenominator: 2,
+  }),
+  fetch_oracle_pending_approvals: () => null,
 
   fetch_anticorruption_data: () => ({
     assetDisclosures: [
