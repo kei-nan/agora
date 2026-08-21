@@ -46,9 +46,31 @@ import {
   isRuledAgainstParty,
 } from '../chain/courts';
 import { useAppModal } from '../components/AppModal';
+import IpfsContentBox from '../components/IpfsContentBox';
 import { colors } from '../theme';
 
 type Nav = NativeStackNavigationProp<RootStackParamList>;
+
+/**
+ * Human-readable "time left" for the appeal window, mirroring the blocks-to-time
+ * conversion `RegistrationStatusScreen.tsx`'s `estimateTimeRemaining` already uses
+ * (`minimumPeriod * 2` for block time — same pattern desktop's `AuthPage.tsx` uses
+ * for QR expiry, just block-denominated instead of a wall-clock timestamp).
+ */
+function formatBlocksRemaining(blocksRemaining: number, blockTimeMs: number): string {
+  const msRemaining = blocksRemaining * blockTimeMs;
+  const hoursRemaining = msRemaining / (1000 * 60 * 60);
+  if (hoursRemaining < 1) {
+    const minutes = Math.max(1, Math.round(msRemaining / (1000 * 60)));
+    return `~${minutes} minute${minutes === 1 ? '' : 's'} left to appeal`;
+  }
+  if (hoursRemaining < 24) {
+    const hours = Math.max(1, Math.round(hoursRemaining));
+    return `~${hours} hour${hours === 1 ? '' : 's'} left to appeal`;
+  }
+  const days = Math.max(1, Math.round(hoursRemaining / 24));
+  return `~${days} day${days === 1 ? '' : 's'} left to appeal`;
+}
 
 /**
  * `identity.ts` exposes `isCitizen(address)` (a boolean) but nothing that
@@ -107,6 +129,7 @@ export default function CasesScreen() {
   const [oracleMembers, setOracleMembers] = useState<string[]>([]);
   const [myNullifier, setMyNullifier] = useState<Uint8Array | null>(null);
   const [currentBlock, setCurrentBlock] = useState<number | null>(null);
+  const [blockTimeMs, setBlockTimeMs] = useState<number | null>(null);
   const [votedByMe, setVotedByMe] = useState<Record<number, boolean>>({});
   const [pending, setPending] = useState<Record<number, PendingAction>>({});
   const { showError } = useAppModal();
@@ -114,16 +137,18 @@ export default function CasesScreen() {
   const load = useCallback(
     async (opts: { manual: boolean } = { manual: false }) => {
       try {
+        const api = await getApi();
         const [{ keypair }, summaries, oracle, header] = await Promise.all([
           getSigningKeypair(),
           fetchAllCases(),
           getOracleMembers(),
-          getApi().then((api) => api.rpc.chain.getHeader()),
+          api.rpc.chain.getHeader(),
         ]);
         const address = keypair.address;
         setMyAddress(address);
         setOracleMembers(oracle);
         setCurrentBlock(header.number.toNumber());
+        setBlockTimeMs((api.consts.timestamp.minimumPeriod as any).toNumber() * 2);
 
         const [nullifier, detailList] = await Promise.all([
           fetchMyCitizenNullifier(address),
@@ -260,9 +285,26 @@ export default function CasesScreen() {
 
             <Text style={s.subject}>{subjectDescription(item.subject)}</Text>
 
+            {item.rulingIpfsHash && (
+              <View style={s.reasoningBox}>
+                <Text style={s.reasoningLabel}>AI judge's reasoning</Text>
+                <IpfsContentBox hashHex={item.rulingIpfsHash} />
+              </View>
+            )}
+
             {item.ruling && (
               <Text style={[s.ruling, item.ruling === 'Upheld' ? s.rulingUpheld : s.rulingOverturned]}>
                 Ruling: {item.ruling}
+              </Text>
+            )}
+
+            {item.status === 'AIRulingIssued' && item.appealDeadlineBlock !== null && currentBlock !== null && (
+              <Text style={s.deadline}>
+                {currentBlock <= item.appealDeadlineBlock
+                  ? blockTimeMs !== null
+                    ? formatBlocksRemaining(item.appealDeadlineBlock - currentBlock, blockTimeMs)
+                    : 'Appeal window still open'
+                  : 'Appeal window has closed'}
               </Text>
             )}
 
@@ -346,9 +388,12 @@ const s = StyleSheet.create({
   badgeSuccessBg: { backgroundColor: colors.successBg },
   badgeSuccessText: { color: colors.success },
   subject: { fontSize: 15, fontWeight: '600', color: colors.textPrimary, marginBottom: 8 },
+  reasoningBox: { marginBottom: 8 },
+  reasoningLabel: { fontSize: 11, fontWeight: '600', color: colors.textDim, marginBottom: 4 },
   ruling: { fontSize: 13, fontWeight: '600', marginBottom: 8 },
   rulingUpheld: { color: colors.success },
   rulingOverturned: { color: colors.danger },
+  deadline: { fontSize: 12, color: colors.textMuted, marginBottom: 8 },
   actionBtn: {
     backgroundColor: colors.accent,
     paddingVertical: 11,
