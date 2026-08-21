@@ -11,6 +11,7 @@ import {
 import { Proposal, fetchProposals, hasVotedOnReferendum, voteOnReferendum } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { useAppModal } from '../components/AppModal';
+import IpfsContentBox from '../components/IpfsContentBox';
 import { colors } from '../theme';
 
 /**
@@ -149,7 +150,9 @@ export default function ProposalsScreen() {
               <Text style={s.id}>#{item.id}</Text>
             </View>
 
-            <Text style={s.hash} numberOfLines={1}>{item.topicHash}</Text>
+            <View style={s.contentBox}>
+              <IpfsContentBox hashHex={item.topicHash} />
+            </View>
 
             <View
               style={s.tally}
@@ -218,7 +221,7 @@ const s = StyleSheet.create({
   chipDone: { backgroundColor: colors.border, color: colors.textSecondary },
   chipConst: { backgroundColor: '#1e1040', color: '#a78bfa' },
   id: { fontSize: 12, color: colors.textMuted },
-  hash: { fontSize: 11, color: colors.textDim, fontFamily: 'monospace', marginBottom: 10 },
+  contentBox: { marginBottom: 10 },
   tally: { flexDirection: 'row', gap: 16, marginBottom: 14 },
   forVotes: { color: colors.success, fontSize: 14, fontWeight: '600' },
   againstVotes: { color: colors.danger, fontSize: 14, fontWeight: '600' },

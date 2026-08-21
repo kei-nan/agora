@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import { Law, fetchLaws } from '../chain/governance';
 import { useAppModal } from '../components/AppModal';
+import IpfsContentBox from '../components/IpfsContentBox';
 import { colors } from '../theme';
 
 export default function LawsScreen() {
@@ -79,7 +80,7 @@ export default function LawsScreen() {
             <Text style={s.meta}>Law #{item.id} · v{item.version}</Text>
           </View>
           <Text style={s.title}>{item.title}</Text>
-          <Text style={s.hash} numberOfLines={1}>{item.contentHash}</Text>
+          <IpfsContentBox hashHex={item.contentHash} />
         </View>
       )}
     />
@@ -111,5 +112,4 @@ const s = StyleSheet.create({
   chipTextConstitutional: { color: '#a78bfa' },
   meta: { fontSize: 11, color: colors.textDim, marginLeft: 'auto' },
   title: { fontSize: 15, fontWeight: '600', color: colors.textPrimary, marginBottom: 8, lineHeight: 21 },
-  hash: { fontSize: 11, color: colors.textFaint, fontFamily: 'monospace' },
 });
