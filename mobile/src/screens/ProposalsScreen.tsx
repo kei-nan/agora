@@ -53,6 +53,11 @@ export default function ProposalsScreen() {
   // Seeded from chain state in load() (see hasVotedOnReferendum) so it
   // reflects votes cast in earlier sessions too, not just this one.
   const [voted, setVoted] = useState<Set<number>>(new Set());
+  // A citizen must expand/load a proposal's actual IPFS content at least once
+  // before its vote buttons enable — casting an irreversible on-chain vote
+  // having read nothing but a status chip and a tally is the bug this guards.
+  const [readIds, setReadIds] = useState<Set<number>>(new Set());
+  const [proposalText, setProposalText] = useState<Record<number, string>>({});
   const { showInfo, showError, showConfirm } = useAppModal();
 
   const load = useCallback(async () => {
@@ -91,9 +96,11 @@ export default function ProposalsScreen() {
   useEffect(() => { load(); }, [load]);
 
   function vote(id: number, inFavor: boolean) {
+    const text = proposalText[id];
+    const snippet = text ? `\n\n"${text.slice(0, 200)}${text.length > 200 ? '…' : ''}"` : '';
     showConfirm({
       title: inFavor ? 'Vote for this proposal?' : 'Vote against this proposal?',
-      message: `You're about to cast an on-chain vote ${inFavor ? 'for' : 'against'} proposal #${id}. Votes cannot be changed once submitted.`,
+      message: `You're about to cast an on-chain vote ${inFavor ? 'for' : 'against'} proposal #${id}. Votes cannot be changed once submitted.${snippet}`,
       confirmLabel: inFavor ? 'Vote For' : 'Vote Against',
       destructive: !inFavor,
       onConfirm: () => castVote(id, inFavor),
@@ -132,6 +139,7 @@ export default function ProposalsScreen() {
       ListEmptyComponent={<Text style={s.empty}>No proposals on-chain yet.</Text>}
       renderItem={({ item }) => {
         const hasVoted = voted.has(item.id);
+        const hasRead = readIds.has(item.id);
         return (
           <View style={s.card}>
             <View
@@ -151,7 +159,13 @@ export default function ProposalsScreen() {
             </View>
 
             <View style={s.contentBox}>
-              <IpfsContentBox hashHex={item.topicHash} />
+              <IpfsContentBox
+                hashHex={item.topicHash}
+                onLoaded={(text) => {
+                  setReadIds((prev) => new Set(prev).add(item.id));
+                  setProposalText((prev) => ({ ...prev, [item.id]: text }));
+                }}
+              />
             </View>
 
             <View
@@ -169,29 +183,34 @@ export default function ProposalsScreen() {
                   <Text style={s.votedText}>✓ You voted on this proposal</Text>
                 </View>
               ) : (
-                <View style={s.voteRow}>
-                  <TouchableOpacity
-                    style={[s.voteBtn, s.voteBtnFor]}
-                    onPress={() => vote(item.id, true)}
-                    disabled={voting === item.id}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Vote for proposal ${item.id}`}
-                    accessibilityState={{ disabled: voting === item.id }}
-                  >
-                    {voting === item.id
-                      ? <ActivityIndicator color={colors.textPrimary} size="small" />
-                      : <Text style={s.voteBtnText}>Vote For</Text>}
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[s.voteBtn, s.voteBtnAgainst]}
-                    onPress={() => vote(item.id, false)}
-                    disabled={voting === item.id}
-                    accessibilityRole="button"
-                    accessibilityLabel={`Vote against proposal ${item.id}`}
-                    accessibilityState={{ disabled: voting === item.id }}
-                  >
-                    <Text style={s.voteBtnText}>Vote Against</Text>
-                  </TouchableOpacity>
+                <View>
+                  <View style={s.voteRow}>
+                    <TouchableOpacity
+                      style={[s.voteBtn, s.voteBtnFor, !hasRead && s.voteBtnDisabled]}
+                      onPress={() => vote(item.id, true)}
+                      disabled={voting === item.id || !hasRead}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Vote for proposal ${item.id}`}
+                      accessibilityState={{ disabled: voting === item.id || !hasRead }}
+                    >
+                      {voting === item.id
+                        ? <ActivityIndicator color={colors.textPrimary} size="small" />
+                        : <Text style={s.voteBtnText}>Vote For</Text>}
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[s.voteBtn, s.voteBtnAgainst, !hasRead && s.voteBtnDisabled]}
+                      onPress={() => vote(item.id, false)}
+                      disabled={voting === item.id || !hasRead}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Vote against proposal ${item.id}`}
+                      accessibilityState={{ disabled: voting === item.id || !hasRead }}
+                    >
+                      <Text style={s.voteBtnText}>Vote Against</Text>
+                    </TouchableOpacity>
+                  </View>
+                  {!hasRead && (
+                    <Text style={s.readHint}>Read the proposal above to vote</Text>
+                  )}
                 </View>
               )
             )}
@@ -229,7 +248,9 @@ const s = StyleSheet.create({
   voteBtn: { flex: 1, paddingVertical: 10, borderRadius: 10, alignItems: 'center' },
   voteBtnFor: { backgroundColor: colors.successSolid },
   voteBtnAgainst: { backgroundColor: colors.dangerSolid },
+  voteBtnDisabled: { opacity: 0.4 },
   voteBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
+  readHint: { color: colors.textMuted, fontSize: 12, textAlign: 'center', marginTop: 6 },
   votedRow: { paddingVertical: 10, alignItems: 'center', backgroundColor: colors.border, borderRadius: 10 },
   votedText: { color: colors.success, fontWeight: '600', fontSize: 14 },
 });

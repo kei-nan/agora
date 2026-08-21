@@ -29,9 +29,11 @@ type LoadState =
 interface Props {
   /** On-chain content hash, hex-encoded (with or without `0x`) — e.g. `item.topicHash` / `item.contentHash`. */
   hashHex: string;
+  /** Fired once the content has successfully loaded, with the full fetched text. */
+  onLoaded?: (text: string) => void;
 }
 
-export default function IpfsContentBox({ hashHex }: Props) {
+export default function IpfsContentBox({ hashHex, onLoaded }: Props) {
   const [state, setState] = useState<LoadState>({ status: 'collapsed' });
 
   async function load() {
@@ -39,6 +41,7 @@ export default function IpfsContentBox({ hashHex }: Props) {
     try {
       const text = await fetchIpfsContent(hashHex);
       setState({ status: 'loaded', text });
+      onLoaded?.(text);
     } catch (e: any) {
       setState({ status: 'error', message: e?.message ?? String(e) });
     }
