@@ -2,7 +2,7 @@ use crate::{
 	mock::*,
 	pallet::{CaseBonds, CaseStatus, CaseSubject, Error, Event, JuryPool, JuryRequestBlock, Verdict},
 };
-use frame_support::{assert_noop, assert_ok, traits::Hooks};
+use frame_support::{assert_noop, assert_ok, traits::{EnsureOriginWithArg, Hooks}};
 use sp_core::H256;
 use sp_runtime::DispatchError;
 
@@ -1131,5 +1131,114 @@ fn remove_oracle_member_purges_stale_approval_from_in_flight_proposal() {
 		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
 		assert_eq!(status, CaseStatus::AIRulingIssued);
 		assert_eq!(ruling_hash, Some([7u8; 32]));
+	});
+}
+
+// ── Admin actions (EnsureOracleCouncilApproved) ────────────────────────────────
+//
+// These cover the fix for the gap where pallet-constitution::invalidate_law and
+// pallet-identity::suspend_citizen/restore_citizen_rights were gated only by the bare
+// single-member `EnsureOracle` check: any one Oracle Council member could pause any law or
+// suspend any citizen unilaterally, with none of the M-of-N approval submit_ai_ruling/
+// approve_ai_ruling/finalize_ruling require. `propose_admin_action`/`approve_admin_action`
+// plus `EnsureOracleCouncilApproved` close that gap for any manual-override extrinsic gated
+// on this origin, regardless of which other pallet actually wires it in.
+
+#[test]
+fn admin_action_single_member_call_is_rejected() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [42u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+
+		// Only 1 of 3 approvals -- not yet resolved, so the proposer cannot consume it.
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(m1),
+				&call_hash,
+			)
+			.is_err()
+		);
+	});
+}
+
+#[test]
+fn admin_action_majority_approved_call_succeeds_and_only_the_proposer_may_consume_it() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let call_hash = [43u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		// Second approval reaches the 1/2 strict-majority threshold (2 of 3).
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+
+		assert_eq!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash), Some(m1));
+		assert!(crate::pallet::PendingAdminAction::<Test>::get(call_hash).is_none());
+
+		// A different council member -- even one who approved -- cannot hijack the proposer's
+		// resolved approval.
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(m3),
+				&call_hash,
+			)
+			.is_err()
+		);
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+
+		// The proposer consumes it exactly once.
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(m1),
+				&call_hash,
+			)
+			.is_ok()
+		);
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+		// A second attempt to consume the same (now-cleared) action fails.
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(m1),
+				&call_hash,
+			)
+			.is_err()
+		);
+	});
+}
+
+#[test]
+fn admin_action_rejects_double_approval_and_non_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [44u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_noop!(
+			Courts::approve_admin_action(RuntimeOrigin::signed(m1), call_hash),
+			Error::<Test>::AlreadyApprovedOracleAction
+		);
+		assert_noop!(
+			Courts::approve_admin_action(RuntimeOrigin::signed(999), call_hash),
+			DispatchError::BadOrigin
+		);
+	});
+}
+
+#[test]
+fn admin_action_rejects_re_proposing_a_call_hash_already_pending_or_approved() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [45u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_noop!(
+			Courts::propose_admin_action(RuntimeOrigin::signed(m2), call_hash),
+			Error::<Test>::OracleActionAlreadyProposed
+		);
+
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+		assert_noop!(
+			Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash),
+			Error::<Test>::OracleActionAlreadyProposed
+		);
 	});
 }

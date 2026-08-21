@@ -54,8 +54,8 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
     `AnchorVerifier`) as the Sybil-resistance gate, rejecting if `anchor` already exists under
     the current `OprfSchemeVersion` in `IdentityAnchorRegistry`
 - `revoke_citizen()` — swap-and-pop, clears suspension (both `SuspendedNullifiers` and `SuspendedByJuryReview`)
-- `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (EnsureRoot placeholder); always writes `SuspendedByJuryReview = false` — this extrinsic-driven path is oracle-only, never jury-reviewed
-- `restore_citizen_rights(nullifier)` — `SuspensionOrigin`; clears both `SuspendedNullifiers` and `SuspendedByJuryReview`
+- `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (wired to `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's M-of-N approval of this exact call, not a single member — fixed after a project review found the prior `EnsureOracle` wiring let any one member suspend any citizen unilaterally); always writes `SuspendedByJuryReview = false` — this extrinsic-driven path is oracle-only, never jury-reviewed
+- `restore_citizen_rights(nullifier)` — `SuspensionOrigin` (same M-of-N gating as above); clears both `SuspendedNullifiers` and `SuspendedByJuryReview`
 - `add_allowed_merkle_root(root)` / `remove_allowed_merkle_root(root)` — `AdminOrigin`
 - `reverify_citizen(proof)` — any registered citizen; extends `ReverificationDeadline` via `AnchorVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep)
 - `migrate_oprf_scheme(zk_proof, public_inputs, new_anchor, old_oprf_pk_hashes,

@@ -265,8 +265,12 @@ impl pallet_identity_zk::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type ZkVerifier = PassthroughZkVerifier;
 	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
-	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
-	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// CitizenSuspender trait; this extrinsic is an explicit administrative override). Wired to
+	/// `EnsureOracleCouncilApproved`, not the bare `EnsureOracle` membership check: this
+	/// extrinsic only succeeds once the Oracle Council's M-of-N threshold has approved this
+	/// exact call via `propose_admin_action`/`approve_admin_action`, closing the gap where a
+	/// single member could suspend any citizen unilaterally.
+	type SuspensionOrigin = pallet_courts::EnsureOracleCouncilApproved<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet.
@@ -327,8 +331,12 @@ impl pallet_identity_zk::Config for Runtime {
 	/// not a missing pairing check. See `crate::verifier`'s module docs for the full detail.
 	type ZkVerifier = crate::verifier::ZkPassportUltraHonkVerifier;
 	/// Court oracle may manually suspend citizens (auto-path uses suspend_citizen_internal via
-	/// CitizenSuspender trait; this extrinsic is an explicit administrative override).
-	type SuspensionOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// CitizenSuspender trait; this extrinsic is an explicit administrative override). Wired to
+	/// `EnsureOracleCouncilApproved`, not the bare `EnsureOracle` membership check: this
+	/// extrinsic only succeeds once the Oracle Council's M-of-N threshold has approved this
+	/// exact call via `propose_admin_action`/`approve_admin_action`, closing the gap where a
+	/// single member could suspend any citizen unilaterally.
+	type SuspensionOrigin = pallet_courts::EnsureOracleCouncilApproved<Runtime>;
 	/// Merkle root allowlist updates require a legislature vote.
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// Real for all three methods (Poseidon2 `param_commitment` recomputation against the
@@ -752,8 +760,12 @@ impl pallet_constitution::Config for Runtime {
 	/// Structural/Foundational laws auto-open a court case on enactment for AI review.
 	type AutoChallengeHook = Runtime;
 	/// Courts origin for invalidate_law (manual override). The auto-enforcement path
-	/// uses invalidate_law_internal via the LawEnforcer trait.
-	type CourtOrigin = pallet_courts::EnsureOracle<Runtime>;
+	/// uses invalidate_law_internal via the LawEnforcer trait. Wired to
+	/// `EnsureOracleCouncilApproved`, not the bare `EnsureOracle` membership check: this
+	/// extrinsic only succeeds once the Oracle Council's M-of-N threshold has approved this
+	/// exact call via `propose_admin_action`/`approve_admin_action`, closing the gap where a
+	/// single member could pause any law unilaterally.
+	type CourtOrigin = pallet_courts::EnsureOracleCouncilApproved<Runtime>;
 	type WeightInfo = pallet_constitution::weights::SubstrateWeight<Runtime>;
 	/// `submit_petition`/`sign_petition`/`reaffirm_amendment` benchmarks need a way to mark an
 	/// account as an active citizen and to fast-forward `FreshLegislatureChecker` — this runtime

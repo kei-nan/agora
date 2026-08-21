@@ -46,7 +46,7 @@ Config constants: `ProvisioningPeriodBlocks = 2 * 365 * DAYS`, `ConfirmationPeri
 
 Calls:
 - `enact_law(tier, content_hash)` — `LegislatureOrigin`; Structural/Foundational auto-opens a court case via `AutoChallengeHook`
-- `invalidate_law(law_id)` — `CourtOrigin` (wired to `pallet_courts::EnsureOracle`)
+- `invalidate_law(law_id)` — `CourtOrigin` (wired to `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's M-of-N approval of this exact call, not a single member — fixed after a project review found the prior `EnsureOracle` wiring let any one member pause any law unilaterally)
 - `repeal_law(law_id)` — `LegislatureOrigin`; terminal (cannot be re-enacted under the same id);
   cleans up any pending Ordinary/Constitutional amendment records for the law
 - `propose_amendment(law_id, hash)` — `LegislatureOrigin`; Ordinary tier only

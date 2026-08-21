@@ -58,7 +58,8 @@ mod benchmarks {
 	#[benchmark]
 	fn invalidate_law() {
 		Laws::<T>::insert(0u32, (LawTier::Ordinary, LawStatus::Active, 1u32, [2u8; 32]));
-		let origin = T::CourtOrigin::try_successful_origin().unwrap();
+		let hash = legislature_call_hash(b"pallet-constitution::invalidate_law", 0u32);
+		let origin = T::CourtOrigin::try_successful_origin(&hash).unwrap();
 
 		#[extrinsic_call]
 		invalidate_law(origin, 0u32);

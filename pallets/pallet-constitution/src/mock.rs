@@ -158,7 +158,10 @@ impl pallet_constitution::Config for Test {
 	// `EnsureLegislatureMotion` origin wired in the runtime enforces it for real).
 	type LegislatureOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
 	type RevocationOrigin = EnsureRoot<u64>;
-	type CourtOrigin = EnsureRoot<u64>;
+	// Same `AsEnsureOriginWithArg` adaptation as `LegislatureOrigin` above, now that
+	// `CourtOrigin` requires `EnsureOriginWithArg<_, [u8; 32]>` too (the call-hash binding
+	// itself is exercised by pallet-courts' own `EnsureOracleCouncilApproved` test suite).
+	type CourtOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
 
 	// Tier-aware legislature passage thresholds (see `required_threshold` in lib.rs). Values
 	// mirror the runtime's real wiring (51/67/75) even though this mock's `LegislatureOrigin`

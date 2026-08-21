@@ -117,6 +117,11 @@ impl frame_system::Config for Test {
 impl pallet_emergency_council::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     type MaxEmergencyBlocks = frame_support::traits::ConstU32<100>;
+    // Pre-existing gap fixed incidentally here: this mock didn't implement
+    // `EmergencyCooldownBlocks` after it was added to `pallet_emergency_council::Config`
+    // (see that pallet's own mock for the equivalent value), which left this crate's `--tests`
+    // build broken regardless of this file's other contents.
+    type EmergencyCooldownBlocks = frame_support::traits::ConstU32<50>;
     type MaxCouncilSize = frame_support::traits::ConstU32<10>;
     type SupermajorityNumerator = frame_support::traits::ConstU32<2>;
     type SupermajorityDenominator = frame_support::traits::ConstU32<3>;
@@ -128,10 +133,10 @@ impl pallet_identity_zk::Config for Test {
     type ZkVerifier = TestZkVerifier;
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for suspend/restore and the admin calls.
-    type SuspensionOrigin = frame_system::EnsureRoot<u64>;
-    // `AsEnsureOriginWithArg` ignores the call-hash argument `AdminOrigin` now requires --
-    // this pallet's own tests exercise this pallet's logic, not the call-hash binding
-    // invariant (covered by pallet-legislature's own test suite).
+    // `AsEnsureOriginWithArg` ignores the call-hash argument `SuspensionOrigin`/`AdminOrigin`
+    // now require -- this pallet's own tests exercise this pallet's logic, not the call-hash
+    // binding invariant (covered by pallet-courts'/pallet-legislature's own test suites).
+    type SuspensionOrigin = frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type AdminOrigin = frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type AnchorVerifier = TestAnchorVerifier;
     // Short period so tests can cross a reverification deadline without huge block numbers.

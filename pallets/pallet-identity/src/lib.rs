@@ -158,10 +158,19 @@ pub mod pallet {
         /// Pluggable ZK proof verifier. Implement with the real Rarimo Groth16 verifier.
         /// Use a no-op impl for testing.
         type ZkVerifier: ZkProofVerifier;
-        /// The origin permitted to suspend and restore citizen voting rights.
-        /// Wired to `pallet_courts::EnsureOracle` in the runtime — only a court ruling
-        /// (AI judge or jury) can suspend or restore a citizen.
-        type SuspensionOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// The origin permitted to suspend and restore citizen voting rights via the manual
+        /// override extrinsics below (the auto-enforcement path from an actual court case
+        /// instead calls `suspend_citizen_internal` directly via the `CitizenSuspender` trait,
+        /// bypassing this origin entirely). `EnsureOriginWithArg` so each call site must pass
+        /// the domain-separated hash of its own parameters (see `legislature_call_hash`, same
+        /// binding `AdminOrigin` below uses) — a resolved approval for one call can never be
+        /// replayed to authorize a different one. Wired to
+        /// `pallet_courts::EnsureOracleCouncilApproved` in the runtime: it only succeeds once
+        /// the Oracle Council's M-of-N threshold has approved this exact call, not merely a
+        /// single member's say-so (a bare `pallet_courts::EnsureOracle` here would let any one
+        /// Oracle Council member suspend any citizen unilaterally — the gap a project review
+        /// flagged, since `EnsureOracle` alone only checks membership).
+        type SuspensionOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
         /// The origin permitted to manage the trusted issuer Merkle root allowlist
         /// (add/remove country CA certificate roots). Keeping this separate from
         /// SuspensionOrigin lets governance rotate the allowlist without touching
@@ -827,7 +836,9 @@ pub mod pallet {
         /// `until`: None = indefinite suspension; Some(block) = suspension lifts at that block.
         /// If the citizen is already suspended, the existing record is replaced (allows courts
         /// to extend or modify an active suspension).
-        /// Origin: `SuspensionOrigin` (court ruling — see `Config::SuspensionOrigin`).
+        /// Origin: `SuspensionOrigin` — a manual Oracle Council override requiring the
+        /// council's M-of-N approval of this exact call, not a single member (see
+        /// `Config::SuspensionOrigin`).
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn suspend_citizen(
@@ -835,14 +846,17 @@ pub mod pallet {
             nullifier: [u8; 32],
             until: Option<BlockNumberFor<T>>,
         ) -> DispatchResult {
-            T::SuspensionOrigin::ensure_origin(origin)?;
+            T::SuspensionOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::suspend_citizen", (nullifier, until)),
+            )?;
             ensure!(NullifierRegistry::<T>::contains_key(nullifier), Error::<T>::NotRegistered);
             // Upsert: courts may extend or modify an existing suspension.
             SuspendedNullifiers::<T>::insert(nullifier, until);
-            // This extrinsic is `SuspensionOrigin`-gated (the same oracle account as an
-            // unappealed AI ruling, see `Config::SuspensionOrigin`'s doc comment) — no jury is
-            // ever involved on this path, so it's never eligible to trigger a higher-bar
-            // consequence like automatic office removal.
+            // This extrinsic is `SuspensionOrigin`-gated (the Oracle Council's M-of-N approval,
+            // see `Config::SuspensionOrigin`'s doc comment) — no jury is ever involved on this
+            // path, so it's never eligible to trigger a higher-bar consequence like automatic
+            // office removal.
             SuspendedByJuryReview::<T>::insert(nullifier, false);
             Self::deposit_event(Event::CitizenSuspended { nullifier, until });
             Ok(())
@@ -851,14 +865,19 @@ pub mod pallet {
         /// Restore suspended voting rights.
         /// Called when a sentence is served, the waiting period passes, or a conviction is
         /// overturned on appeal. Works on both active and expired-but-not-yet-cleaned-up records.
-        /// Origin: `SuspensionOrigin` (court ruling — see `Config::SuspensionOrigin`).
+        /// Origin: `SuspensionOrigin` — a manual Oracle Council override requiring the
+        /// council's M-of-N approval of this exact call, not a single member (see
+        /// `Config::SuspensionOrigin`).
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn restore_citizen_rights(
             origin: OriginFor<T>,
             nullifier: [u8; 32],
         ) -> DispatchResult {
-            T::SuspensionOrigin::ensure_origin(origin)?;
+            T::SuspensionOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-identity::restore_citizen_rights", nullifier),
+            )?;
             ensure!(
                 SuspendedNullifiers::<T>::contains_key(nullifier),
                 Error::<T>::NotSuspended

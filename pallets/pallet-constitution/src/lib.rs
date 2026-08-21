@@ -44,7 +44,8 @@
 //!      The required revocation threshold (30 / 35 / 40 %) grows by stage and is
 //!      enforced externally by the RevocationOrigin collective configuration.
 //!
-//! Courts may pause any Active law via CourtOrigin.
+//! Courts may pause any Active law via CourtOrigin (M-of-N Oracle Council approval, not a
+//! single member — see `Config::CourtOrigin`'s doc comment).
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;
@@ -254,8 +255,18 @@ pub mod pallet {
         type AutoChallengeHook: AutoChallengeHook;
 
         // ── Courts ───────────────────────────────────────────────────────────────
-        /// Origin permitted to pause a law via court ruling.
-        type CourtOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// Origin permitted to pause a law via court ruling (manual Oracle Council override,
+        /// not the auto-enforcement path — see `invalidate_law`'s doc comment). `EnsureOriginWithArg`
+        /// so the call site must pass the domain-separated hash of its own parameters (see
+        /// `legislature_call_hash`), the same binding `LegislatureOrigin` uses below — a
+        /// resolved Oracle Council approval for one call can never be replayed to authorize a
+        /// different one. Wire to `pallet_courts::EnsureOracleCouncilApproved<Runtime>` in
+        /// production: it only succeeds once the Oracle Council's M-of-N threshold
+        /// (`OracleApprovalNumerator`/`Denominator`) has approved this exact call, not merely
+        /// on a single member's say-so (a bare `pallet_courts::EnsureOracle<Runtime>` here
+        /// would let any one Oracle Council member pause any law unilaterally — the gap a
+        /// project review flagged, since `EnsureOracle` alone only checks membership).
+        type CourtOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
 
         /// Weight functions needed for this pallet's extrinsics.
         type WeightInfo: crate::weights::WeightInfo;
@@ -397,11 +408,19 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Pause a law on court invalidation ruling.
+        /// Pause a law on court invalidation ruling (manual Oracle Council override — the
+        /// auto-enforcement path from an actual court case instead calls
+        /// `invalidate_law_internal` directly, bypassing this extrinsic and its origin entirely).
+        /// `CourtOrigin` only succeeds once the Oracle Council's M-of-N threshold has approved
+        /// this exact `law_id` (see `Config::CourtOrigin`'s doc comment) — a single member can
+        /// no longer pause a law unilaterally.
         #[pallet::call_index(1)]
         #[pallet::weight(T::WeightInfo::invalidate_law())]
         pub fn invalidate_law(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            T::CourtOrigin::ensure_origin(origin)?;
+            T::CourtOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-constitution::invalidate_law", law_id),
+            )?;
             Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
                 ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);

@@ -585,9 +585,10 @@ fn suspend_citizen_upserts_existing_suspension() {
 
 #[test]
 fn suspend_citizen_extrinsic_is_never_jury_reviewed() {
-    // The manual admin-override extrinsic is SuspensionOrigin-gated (EnsureOracle in the real
-    // runtime) — no jury is ever involved on this path, so it must never be enough on its own
-    // to trigger a higher-bar consequence like pallet-executive's office-vacancy sweep.
+    // The manual admin-override extrinsic is SuspensionOrigin-gated (EnsureOracleCouncilApproved
+    // in the real runtime, requiring the Oracle Council's M-of-N approval) — no jury is ever
+    // involved on this path, so it must never be enough on its own to trigger a higher-bar
+    // consequence like pallet-executive's office-vacancy sweep.
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         allow_root();

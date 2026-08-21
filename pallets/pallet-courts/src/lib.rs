@@ -121,6 +121,55 @@ pub mod pallet {
         }
     }
 
+    /// `EnsureOriginWithArg<RuntimeOrigin, [u8; 32]>` that succeeds only when
+    /// `propose_admin_action`/`approve_admin_action` have already driven the given call hash's
+    /// approvals past the Oracle Council's M-of-N threshold, *and* the caller is the proposer
+    /// who is entitled to consume it (see `ApprovedAdminAction`). This is the fix for the gap
+    /// where `pallet_constitution::invalidate_law` and `pallet_identity_zk::suspend_citizen`/
+    /// `restore_citizen_rights` were gated only by the bare `EnsureOracle` membership check —
+    /// any single Oracle Council member could call those "manual override" extrinsics directly
+    /// and take effect immediately, with none of the M-of-N approval `submit_ai_ruling`/
+    /// `approve_ai_ruling`/`finalize_ruling` require. Wire this as `CourtOrigin`/
+    /// `SuspensionOrigin` in the runtime instead of `EnsureOracle<Runtime>` directly.
+    ///
+    /// Mirrors `pallet_legislature::EnsureLegislatureMotion`'s `call_hash`-binding design: the
+    /// consuming pallet computes a domain-separated hash of its own call's parameters (so
+    /// byte-identical parameters passed to a different call can never collide) and only that
+    /// exact hash's approved token authorizes the origin — a token approved for one call can
+    /// never be replayed against a different one.
+    pub struct EnsureOracleCouncilApproved<T>(core::marker::PhantomData<T>);
+
+    impl<T: Config> frame_support::traits::EnsureOriginWithArg<T::RuntimeOrigin, [u8; 32]>
+        for EnsureOracleCouncilApproved<T>
+    {
+        type Success = ();
+
+        fn try_origin(
+            o: T::RuntimeOrigin,
+            call_hash: &[u8; 32],
+        ) -> Result<Self::Success, T::RuntimeOrigin> {
+            use frame_system::RawOrigin;
+            match o.clone().into() {
+                Ok(RawOrigin::Signed(who)) => {
+                    if ApprovedAdminAction::<T>::get(call_hash) == Some(who) {
+                        ApprovedAdminAction::<T>::remove(call_hash);
+                        Ok(())
+                    } else {
+                        Err(o)
+                    }
+                }
+                _ => Err(o),
+            }
+        }
+
+        #[cfg(feature = "runtime-benchmarks")]
+        fn try_successful_origin(call_hash: &[u8; 32]) -> Result<T::RuntimeOrigin, ()> {
+            let member = OracleMembers::<T>::get().first().cloned().ok_or(())?;
+            ApprovedAdminAction::<T>::insert(*call_hash, member.clone());
+            Ok(frame_system::RawOrigin::Signed(member).into())
+        }
+    }
+
     // ── Enums ───────────────────────────────────────────────────────────────────
 
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
@@ -384,6 +433,33 @@ pub mod pallet {
     pub type OracleApprovals<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, BoundedVec<T::AccountId, T::MaxOracleMembers>>;
 
+    /// call_hash -> (proposer, Oracle Council members who have approved) for an in-flight
+    /// "administrative action" proposal — the case-less counterpart of `PendingOracleProposal`/
+    /// `OracleApprovals`, used to gate manual-override extrinsics in other pallets (currently
+    /// `pallet_constitution::invalidate_law` and `pallet_identity_zk::suspend_citizen`/
+    /// `restore_citizen_rights`) behind the same M-of-N threshold instead of the bare
+    /// single-member `EnsureOracle` check those extrinsics used before. `call_hash` is the
+    /// domain-separated hash of the exact call being authorized (mirrors
+    /// `pallet_legislature::EnsureLegislatureMotion`'s `call_hash`-binding design), computed by
+    /// the consuming pallet the same way it computes a `LegislatureOrigin` call hash. See
+    /// `propose_admin_action`/`approve_admin_action` and `EnsureOracleCouncilApproved`.
+    #[pallet::storage]
+    pub type PendingAdminAction<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        [u8; 32],
+        (T::AccountId, BoundedVec<T::AccountId, T::MaxOracleMembers>),
+    >;
+
+    /// call_hash -> the proposer, once `PendingAdminAction`'s approvals reached the M-of-N
+    /// threshold. Only that proposer may consume it (via `EnsureOracleCouncilApproved`) to
+    /// actually execute the authorized call — mirrors `pallet_legislature`'s
+    /// `PendingLegislatureApproval` restricting consumption to the motion's own proposer, so a
+    /// different Oracle Council member can't hijack a resolved action. Removed the moment it is
+    /// consumed; each resolved proposal authorizes exactly one call.
+    #[pallet::storage]
+    pub type ApprovedAdminAction<T: Config> = StorageMap<_, Blake2_128Concat, [u8; 32], T::AccountId>;
+
     /// case_id -> bond reserved from the filer by `file_case`. Only ever populated for
     /// citizen-filed cases — `auto_file_case` (system-initiated) never inserts an entry here,
     /// since there's no spam risk to price against for a filing the runtime itself triggers.
@@ -523,6 +599,15 @@ pub mod pallet {
         /// proposal whose case was appealed by someone else before the last approval landed).
         /// The stale proposal was dropped rather than applied or left dangling forever.
         OracleActionExpired { case_id: u32 },
+        /// An Oracle Council member proposed a case-less administrative action (e.g. a manual
+        /// `invalidate_law`/`suspend_citizen`/`restore_citizen_rights` override) identified by
+        /// the domain-separated hash of the call it authorizes.
+        AdminActionProposed { call_hash: [u8; 32], proposer: T::AccountId },
+        /// An Oracle Council member cast an approval on a pending administrative action.
+        AdminActionApprovalCast { call_hash: [u8; 32], member: T::AccountId },
+        /// A pending administrative action reached its approval threshold; its proposer may
+        /// now consume it once via `EnsureOracleCouncilApproved`.
+        AdminActionApproved { call_hash: [u8; 32] },
         /// A new member was added to the AI Model Governance Council.
         AIGovernanceMemberAdded { who: T::AccountId },
         /// A member was removed from the AI Model Governance Council.
@@ -574,15 +659,16 @@ pub mod pallet {
         /// Too many cases have their jury-seed capture scheduled for the same block; this
         /// `appeal_ruling` call would exceed `MaxCasesPerBlock` for its capture block.
         TooManyCasesInBlock,
-        /// This case already has a pending oracle action (submission or finalization) awaiting
-        /// approval; it must resolve before another can be proposed.
+        /// This case (or, for `propose_admin_action`, this `call_hash`) already has a pending
+        /// oracle action awaiting approval; it must resolve before another can be proposed.
         OracleActionAlreadyProposed,
-        /// `approve_ai_ruling` was called for a case with no pending oracle action.
+        /// `approve_ai_ruling`/`approve_admin_action` was called for a case/call_hash with no
+        /// pending oracle action.
         NoPendingOracleAction,
-        /// This Oracle Council member has already approved the case's current pending action.
+        /// This Oracle Council member has already approved the current pending action.
         AlreadyApprovedOracleAction,
-        /// Cannot add member/approval: Oracle Council (or its per-case approval list) is at
-        /// maximum capacity.
+        /// Cannot add member/approval: Oracle Council (or its per-case/per-call_hash approval
+        /// list) is at maximum capacity.
         OracleCouncilAtCapacity,
         /// The account is already an Oracle Council member.
         AlreadyOracleMember,
@@ -1062,6 +1148,46 @@ pub mod pallet {
             }
             Ok(())
         }
+
+        /// Propose a case-less Oracle Council administrative action, identified by the
+        /// domain-separated hash of the exact call it will authorize (e.g. a manual
+        /// `invalidate_law`/`suspend_citizen`/`restore_citizen_rights` override in another
+        /// pallet — see `EnsureOracleCouncilApproved`). Any Oracle Council member may call; this
+        /// both proposes the action and casts the proposer's own approval, exactly like
+        /// `submit_ai_ruling`. Resolves immediately for a 1-member council, or once enough
+        /// `approve_admin_action` calls land otherwise.
+        #[pallet::call_index(12)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn propose_admin_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
+            let who = T::OracleOrigin::ensure_origin(origin)?;
+            ensure!(
+                PendingAdminAction::<T>::get(call_hash).is_none()
+                    && ApprovedAdminAction::<T>::get(call_hash).is_none(),
+                Error::<T>::OracleActionAlreadyProposed
+            );
+            let mut approvals: BoundedVec<T::AccountId, T::MaxOracleMembers> = BoundedVec::default();
+            approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)?;
+            PendingAdminAction::<T>::insert(call_hash, (who.clone(), approvals));
+            Self::deposit_event(Event::AdminActionProposed { call_hash, proposer: who });
+            Self::try_resolve_admin_action(call_hash);
+            Ok(())
+        }
+
+        /// Cast an Oracle Council approval on `call_hash`'s pending administrative action. See
+        /// `propose_admin_action`.
+        #[pallet::call_index(13)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn approve_admin_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
+            let who = T::OracleOrigin::ensure_origin(origin)?;
+            PendingAdminAction::<T>::try_mutate(call_hash, |maybe| {
+                let (_, approvals) = maybe.as_mut().ok_or(Error::<T>::NoPendingOracleAction)?;
+                ensure!(!approvals.contains(&who), Error::<T>::AlreadyApprovedOracleAction);
+                approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)
+            })?;
+            Self::deposit_event(Event::AdminActionApprovalCast { call_hash, member: who });
+            Self::try_resolve_admin_action(call_hash);
+            Ok(())
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1334,6 +1460,25 @@ pub mod pallet {
             PendingOracleProposal::<T>::remove(case_id);
             OracleApprovals::<T>::remove(case_id);
             Ok(())
+        }
+
+        /// If `call_hash`'s pending administrative action has reached its approval threshold,
+        /// move it from `PendingAdminAction` to `ApprovedAdminAction` so its proposer can consume
+        /// it via `EnsureOracleCouncilApproved`. Otherwise a no-op (stays pending for more
+        /// approvals). Called at the end of both `propose_admin_action` (the proposer's own
+        /// approval may already be enough for a small/1-member council) and
+        /// `approve_admin_action`. Mirrors `try_resolve_oracle_action`'s shape for the case-based
+        /// flow.
+        fn try_resolve_admin_action(call_hash: [u8; 32]) {
+            let Some((proposer, approvals)) = PendingAdminAction::<T>::get(call_hash) else {
+                return;
+            };
+            let council_size = OracleMembers::<T>::get().len() as u32;
+            if Self::oracle_approval_reached(approvals.len() as u32, council_size) {
+                PendingAdminAction::<T>::remove(call_hash);
+                ApprovedAdminAction::<T>::insert(call_hash, proposer);
+                Self::deposit_event(Event::AdminActionApproved { call_hash });
+            }
         }
     }
 }
