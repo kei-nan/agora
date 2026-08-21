@@ -40,7 +40,7 @@ import {
   castJuryVote,
   fetchAllCases,
   fetchCaseDetail,
-  getOracleAccount,
+  getOracleMembers,
   hasJurorVoted,
   isFilerOrOracle,
   isRuledAgainstParty,
@@ -104,7 +104,7 @@ export default function CasesScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [details, setDetails] = useState<Record<number, CaseDetail>>({});
   const [myAddress, setMyAddress] = useState<string | null>(null);
-  const [oracleAddress, setOracleAddress] = useState<string | null>(null);
+  const [oracleMembers, setOracleMembers] = useState<string[]>([]);
   const [myNullifier, setMyNullifier] = useState<Uint8Array | null>(null);
   const [currentBlock, setCurrentBlock] = useState<number | null>(null);
   const [votedByMe, setVotedByMe] = useState<Record<number, boolean>>({});
@@ -117,12 +117,12 @@ export default function CasesScreen() {
         const [{ keypair }, summaries, oracle, header] = await Promise.all([
           getSigningKeypair(),
           fetchAllCases(),
-          getOracleAccount(),
+          getOracleMembers(),
           getApi().then((api) => api.rpc.chain.getHeader()),
         ]);
         const address = keypair.address;
         setMyAddress(address);
-        setOracleAddress(oracle);
+        setOracleMembers(oracle);
         setCurrentBlock(header.number.toNumber());
 
         const [nullifier, detailList] = await Promise.all([
@@ -240,7 +240,7 @@ export default function CasesScreen() {
         const isPending = pending[item.caseId];
 
         const eligibleParty =
-          isFilerOrOracle(item, myAddress ?? '', oracleAddress) || isRuledAgainstParty(item, myNullifier);
+          isFilerOrOracle(item, myAddress ?? '', oracleMembers) || isRuledAgainstParty(item, myNullifier);
         const appealWindowOpen =
           item.appealDeadlineBlock !== null && currentBlock !== null && currentBlock <= item.appealDeadlineBlock;
         const canAppeal = item.status === 'AIRulingIssued' && eligibleParty && appealWindowOpen;

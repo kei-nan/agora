@@ -157,17 +157,24 @@ export async function hasJurorVoted(caseId: number, jurorAddress: string): Promi
   return (vote as any).isSome;
 }
 
-/** Reads `OracleAccount` — the designated AI oracle, or null if governance hasn't set one yet. */
-export async function getOracleAccount(): Promise<string | null> {
+/**
+ * Reads `OracleMembers` — the Oracle Council roster (`BoundedVec<AccountId, MaxOracleMembers>`,
+ * `ValueQuery`, so always present, possibly empty — never an `Option`). Replaces the earlier
+ * single `OracleAccount` storage item removed by the Oracle Council migration
+ * (`pallets/pallet-courts/src/lib.rs`).
+ */
+export async function getOracleMembers(): Promise<string[]> {
   const api = await getApi();
-  const account = await api.query.courts.oracleAccount();
-  return (account as any).isSome ? (account as any).unwrap().toString() : null;
+  const members = await api.query.courts.oracleMembers();
+  return Array.from(members as unknown as Iterable<{ toString(): string }>).map((member) =>
+    member.toString(),
+  );
 }
 
 /**
  * Pure client-side port of `pallet_courts::Pallet::is_filer_or_oracle`
  * (`pallets/pallet-courts/src/lib.rs`) — true if `callerAddress` is the case's own filer or
- * the designated oracle account.
+ * a current member of the Oracle Council (`OracleMembers`).
  *
  * Deliberately omits the Rust helper's third branch — `system_case && CitizenChecker::
  * is_active_citizen(who)`, which additionally allows ANY active citizen to act on a
@@ -184,9 +191,9 @@ export async function getOracleAccount(): Promise<string | null> {
 export function isFilerOrOracle(
   caseDetail: CaseDetail,
   callerAddress: string,
-  oracleAddress: string | null,
+  oracleMembers: string[],
 ): boolean {
-  return callerAddress === caseDetail.filer || (oracleAddress !== null && callerAddress === oracleAddress);
+  return callerAddress === caseDetail.filer || oracleMembers.includes(callerAddress);
 }
 
 /**

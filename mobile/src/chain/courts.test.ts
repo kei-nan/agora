@@ -22,7 +22,7 @@ import {
   fetchAllCases,
   fetchCaseDetail,
   hasJurorVoted,
-  getOracleAccount,
+  getOracleMembers,
   isFilerOrOracle,
   isRuledAgainstParty,
   CaseSubject,
@@ -377,19 +377,19 @@ describe('hasJurorVoted', () => {
   });
 });
 
-describe('getOracleAccount', () => {
-  it('returns the address when OracleAccount is Some', async () => {
-    const oracleAccount = jest.fn(async () => some(accountId('Oracle1')));
-    mockedGetApi.mockResolvedValue({ query: { courts: { oracleAccount } } } as any);
+describe('getOracleMembers', () => {
+  it('returns the member addresses from OracleMembers', async () => {
+    const oracleMembers = jest.fn(async () => [accountId('Oracle1'), accountId('Oracle2')]);
+    mockedGetApi.mockResolvedValue({ query: { courts: { oracleMembers } } } as any);
 
-    expect(await getOracleAccount()).toBe('Oracle1');
+    expect(await getOracleMembers()).toEqual(['Oracle1', 'Oracle2']);
   });
 
-  it('returns null when OracleAccount is None', async () => {
-    const oracleAccount = jest.fn(async () => none());
-    mockedGetApi.mockResolvedValue({ query: { courts: { oracleAccount } } } as any);
+  it('returns an empty array when OracleMembers is empty', async () => {
+    const oracleMembers = jest.fn(async () => []);
+    mockedGetApi.mockResolvedValue({ query: { courts: { oracleMembers } } } as any);
 
-    expect(await getOracleAccount()).toBeNull();
+    expect(await getOracleMembers()).toEqual([]);
   });
 });
 
@@ -408,19 +408,19 @@ describe('isFilerOrOracle', () => {
   };
 
   it('is true when the caller is the filer', () => {
-    expect(isFilerOrOracle(baseDetail, 'Alice', 'Oracle1')).toBe(true);
+    expect(isFilerOrOracle(baseDetail, 'Alice', ['Oracle1'])).toBe(true);
   });
 
-  it('is true when the caller is the oracle', () => {
-    expect(isFilerOrOracle(baseDetail, 'Oracle1', 'Oracle1')).toBe(true);
+  it('is true when the caller is a member of the oracle council', () => {
+    expect(isFilerOrOracle(baseDetail, 'Oracle1', ['Oracle1', 'Oracle2'])).toBe(true);
   });
 
-  it('is false when the caller is neither the filer nor the oracle', () => {
-    expect(isFilerOrOracle(baseDetail, 'Random', 'Oracle1')).toBe(false);
+  it('is false when the caller is neither the filer nor an oracle member', () => {
+    expect(isFilerOrOracle(baseDetail, 'Random', ['Oracle1'])).toBe(false);
   });
 
-  it('is false when there is no oracle set and the caller is not the filer', () => {
-    expect(isFilerOrOracle(baseDetail, 'Random', null)).toBe(false);
+  it('is false when there are no oracle members and the caller is not the filer', () => {
+    expect(isFilerOrOracle(baseDetail, 'Random', [])).toBe(false);
   });
 });
 
