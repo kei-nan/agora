@@ -111,10 +111,20 @@ fn reset_department_spent_fails_for_non_legislature_origin() {
 
 // ---------------------------------------------------------------------
 // register_department_spender / remove_department_spender
+//
+// Previously gated by bare `ensure_root` (no configurable origin type). Now gated by
+// `T::LegislatureOrigin` — the same origin `allocate_budget`/`reset_department_spent` use —
+// since department-spender designation is an operational/Executive-branch-like power that
+// should require a passed legislature motion, not a single Root/sudo key. As with those two
+// calls, the mock's `LegislatureOrigin` is `AsEnsureOriginWithArg<EnsureRoot<AccountId>>`
+// (see mock.rs doc comment), so `root()` here stands in for a passed legislature motion and
+// any bare signed origin models a non-legislature caller. Deliberately NOT routed through
+// pallet-accountability-council (that Council governs independent oversight appointments —
+// auditors, investigators — not this operational power).
 // ---------------------------------------------------------------------
 
 #[test]
-fn register_department_spender_works_for_root() {
+fn register_department_spender_works_via_legislature_origin() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
 		assert_eq!(DepartmentSpenders::<Test>::get(DEPT), Some(SPENDER));
@@ -125,7 +135,7 @@ fn register_department_spender_works_for_root() {
 }
 
 #[test]
-fn register_department_spender_fails_for_non_root() {
+fn register_department_spender_fails_for_non_legislature_origin() {
 	new_test_ext().execute_with(|| {
 		assert_noop!(
 			TreasuryLedger::register_department_spender(signed(SPENDER), DEPT, SPENDER),
@@ -145,7 +155,7 @@ fn register_department_spender_replaces_existing_spender() {
 }
 
 #[test]
-fn remove_department_spender_works_for_root() {
+fn remove_department_spender_works_via_legislature_origin() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
 		assert_ok!(TreasuryLedger::remove_department_spender(root(), DEPT));
@@ -155,7 +165,7 @@ fn remove_department_spender_works_for_root() {
 }
 
 #[test]
-fn remove_department_spender_fails_for_non_root() {
+fn remove_department_spender_fails_for_non_legislature_origin() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
 		assert_noop!(
@@ -699,7 +709,7 @@ fn unfreeze_department_dispatchable_clears_both_axes() {
 // See the equivalent block in pallet-constitution's tests for the full rationale. The
 // binding invariant itself (a token approved for call A is rejected against call B's
 // hash) is proven against the real `EnsureLegislatureMotion` origin in
-// pallet-legislature's own suite; here we just confirm this pallet's two
+// pallet-legislature's own suite; here we just confirm this pallet's four
 // `LegislatureOrigin`-gated calls never hash to the same value for overlapping raw
 // parameters, which is the property that invariant depends on.
 #[test]
@@ -732,6 +742,39 @@ fn legislature_call_hash_differs_for_different_department_ids() {
 	let hash_b =
 		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", 2u32);
 	assert_ne!(hash_a, hash_b);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_remove_department_spender_vs_same_shaped_calls() {
+	// `remove_department_spender` takes a single `u32 department_id` — the same raw shape as
+	// `reset_department_spent` and `unfreeze_department` — so this specifically proves the
+	// call-tag domain separation prevents a motion approved for one of those from being
+	// replayed against `remove_department_spender`.
+	let remove_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::remove_department_spender", DEPT);
+	let reset_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", DEPT);
+	let unfreeze_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::unfreeze_department", DEPT);
+	assert_ne!(remove_hash, reset_hash);
+	assert_ne!(remove_hash, unfreeze_hash);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_register_department_spender_vs_allocate_budget() {
+	// `register_department_spender(department_id, spender)` and `allocate_budget(department_id,
+	// amount)` both take a `(u32, _)` pair — confirm the call tag keeps them from colliding even
+	// when the second field happens to encode the same bytes (an AccountId and a Balance can
+	// share an encoded representation).
+	let register_hash = crate::pallet::legislature_call_hash(
+		b"pallet-treasury-ledger::register_department_spender",
+		(DEPT, SPENDER),
+	);
+	let allocate_hash = crate::pallet::legislature_call_hash(
+		b"pallet-treasury-ledger::allocate_budget",
+		(DEPT, SPENDER as u128),
+	);
+	assert_ne!(register_hash, allocate_hash);
 }
 
 // ---------------------------------------------------------------------

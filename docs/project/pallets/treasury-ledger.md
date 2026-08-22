@@ -18,13 +18,25 @@ one authority's unfreeze silently clear the other's still-open freeze.
 Calls:
 - `allocate_budget(department_id, amount)` — `LegislatureOrigin` (a passed legislature motion, not root — enforces the executive/legislature separation: the legislature approves the budget, the executive spends it)
 - `reset_department_spent(department_id)` — `LegislatureOrigin`; zeroes `DepartmentSpent` for a new fiscal period after re-allocating
+- `register_department_spender(department_id, spender)` — `LegislatureOrigin`; registers or replaces the authorized spender for a department
+- `remove_department_spender(department_id)` — `LegislatureOrigin`
 
-`LegislatureOrigin` is `EnsureOriginWithArg<_, [u8; 32]>` — both calls above pass a hash of
+`LegislatureOrigin` is `EnsureOriginWithArg<_, [u8; 32]>` — all four calls above pass a hash of
 their own parameters, checked against the specific motion that authorized them, so a motion
-passed to allocate one department's budget can't be replayed to reset another's spend counter.
+passed to allocate one department's budget can't be replayed to reset another's spend counter
+(or to register a different department's spender, etc.).
+
+`register_department_spender`/`remove_department_spender` were previously bare `ensure_root`
+with no configurable origin type — fixed by wiring them to the pallet's existing
+`LegislatureOrigin`, the same origin `allocate_budget`/`reset_department_spent` already use, so
+designating who may spend a department's budget requires a passed legislature motion rather than
+a single Root/sudo key. This is deliberately *not* routed through
+`pallet-accountability-council` (wired 735d876 for auditor/investigator appointment): department-
+spender designation is an operational/Executive-branch-like power, distinct from the independent
+oversight appointments that Council governs — routing it there would dilute that Council's
+independence. See `pallet_accountability_council`'s module doc comment for the same rationale
+from that pallet's side.
 - `record_expenditure(department_id, amount, metadata_hash)` — must be the account registered in `DepartmentSpenders` for that department; enforces the budget cap and rejects if frozen
-- `register_department_spender(department_id, spender)` — root; registers or replaces the authorized spender
-- `remove_department_spender(department_id)` — root
 - `unfreeze_department(department_id)` — `CourtOrigin` (wired to
   `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's
   M-of-N approval of this exact call, not bare root — fixed after a project review found the

@@ -251,7 +251,17 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Register (or replace) the authorized spender for a department.
+        /// Register (or replace) the authorized spender for a department. Gated by
+        /// `T::LegislatureOrigin` — the same origin `allocate_budget`/`reset_department_spent`
+        /// use — rather than bare `ensure_root`: department-spender designation is an
+        /// operational/Executive-branch-like power, so it requires a passed legislature motion
+        /// like this pallet's other privileged calls, not a single Root/sudo key. Deliberately
+        /// NOT routed through `pallet-accountability-council`: that Council governs independent
+        /// oversight appointments (auditors, investigators), and routing an operational power
+        /// like this through it would dilute that independence. `EnsureOriginWithArg` so the
+        /// call binds to the domain-separated hash of its own parameters (see
+        /// `legislature_call_hash`) — a motion approved for one call/department/spender can
+        /// never be replayed to authorize another.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn register_department_spender(
@@ -259,20 +269,31 @@ pub mod pallet {
             department_id: u32,
             spender: T::AccountId,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(
+                    b"pallet-treasury-ledger::register_department_spender",
+                    (department_id, spender.clone()),
+                ),
+            )?;
             DepartmentSpenders::<T>::insert(department_id, &spender);
             Self::deposit_event(Event::SpenderRegistered { department_id, spender });
             Ok(())
         }
 
-        /// Remove the authorized spender for a department.
+        /// Remove the authorized spender for a department. Gated by `T::LegislatureOrigin` —
+        /// see `register_department_spender`'s doc comment for the rationale (same origin, same
+        /// reason it's not routed through the Accountability Council).
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn remove_department_spender(
             origin: OriginFor<T>,
             department_id: u32,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::LegislatureOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-treasury-ledger::remove_department_spender", department_id),
+            )?;
             ensure!(
                 DepartmentSpenders::<T>::contains_key(department_id),
                 Error::<T>::DepartmentHasNoSpender
