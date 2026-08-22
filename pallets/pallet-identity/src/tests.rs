@@ -1,10 +1,14 @@
 use crate::{
-    committee_slot_for, mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex,
-    CitizenNullifier, CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry,
-    LastRecoveryBlock, NextQueryId, NullifierRegistry, OprfCommitteeKeys,
+    backing_tree_empty_leaf, backing_tree_node_hash, backing_tree_tombstone_leaf,
+    backing_tree_zero_hash, committee_slot_for, mock::*, AllowedMerkleRoots, BackingCommitment,
+    BackingCommitmentTreeNodes, BackingCommitmentTreeRoot, BackingLeafIndexOf,
+    BackingRootHistoryEntries, BackingRootHistoryHead, BackingRootHistoryTail,
+    BackingRootValidUntil, CitizenAnchor, CitizenIndex, CitizenNullifier, CitizenPosition,
+    CommitteeMembers, Error, Event, IdentityAnchorRegistry, LastRecoveryBlock,
+    NextBackingLeafIndex, NextQueryId, NullifierRegistry, OprfCommitteeKeys,
     PendingOprfQueryCountBySubmitter, OprfRound1Commitments, OprfRound2Responses,
     OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
-    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens,
+    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens, BACKING_TREE_DEPTH,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -2587,5 +2591,277 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
 
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(3));
         assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(10));
+    });
+}
+
+// ─── backing-commitment Merkle tree ─────────────────────────────────────────
+
+/// Fixed test `backing_commitment` fixtures distinct from `BACKING_COMMITMENT` (the shared
+/// value the `register`/`public_inputs` helpers pass, ignored by `TestAnchorVerifier` — see
+/// its own doc comment) so tree tests can register multiple citizens with genuinely distinct
+/// leaf values.
+const BACKING_COMMITMENT_X: [u8; 32] = [211u8; 32];
+const BACKING_COMMITMENT_Y: [u8; 32] = [212u8; 32];
+
+/// Registers `who` with a caller-chosen `backing_commitment`, bypassing the shared `register`
+/// helper (which always uses the fixed `BACKING_COMMITMENT` constant) so tree tests can give
+/// distinct citizens distinct leaf values.
+fn register_with_backing(who: u64, nullifier: [u8; 32], anchor: [u8; 32], backing_commitment: [u8; 32]) {
+    approve_committee_keys(OprfSchemeVersion::<Test>::get());
+    assert_ok!(Identity::register_citizen(
+        RuntimeOrigin::signed(who),
+        valid_proof(),
+        public_inputs(nullifier, ROOT, anchor),
+        anchor,
+        OPRF_PK_HASHES,
+        backing_commitment,
+    ));
+}
+
+/// Independent reference computation of the backing-commitment tree root for a sparse set of
+/// `(leaf_index, value)` overrides (every other position is `backing_tree_empty_leaf()`).
+/// Built directly from the `pub` `backing_tree_node_hash`/`backing_tree_zero_hash`/
+/// `backing_tree_empty_leaf` primitives via straightforward recursion — deliberately *not*
+/// structured the same way `recompute_backing_tree_path`'s iterative bottom-up walk is, so a
+/// test asserting equality against this can't pass merely by mirroring a bug in that
+/// function's own index/sibling-selection arithmetic.
+fn reference_backing_root(leaves: &[(u32, [u8; 32])]) -> [u8; 32] {
+    fn node(level: u8, index: u32, leaves: &[(u32, [u8; 32])]) -> [u8; 32] {
+        if level == 0 {
+            return leaves
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, v)| *v)
+                .unwrap_or_else(backing_tree_empty_leaf);
+        }
+        let span = 1u64 << level;
+        let start = (index as u64) * span;
+        let end = start + span;
+        let touched = leaves.iter().any(|(i, _)| (*i as u64) >= start && (*i as u64) < end);
+        if !touched {
+            return backing_tree_zero_hash(level);
+        }
+        let left = node(level - 1, index * 2, leaves);
+        let right = node(level - 1, index * 2 + 1, leaves);
+        backing_tree_node_hash(left, right)
+    }
+    node(BACKING_TREE_DEPTH, 0, leaves)
+}
+
+#[test]
+fn register_citizen_inserts_first_leaf_and_computes_correct_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+
+        assert_eq!(NextBackingLeafIndex::<Test>::get(), 1);
+        assert_eq!(BackingLeafIndexOf::<Test>::get(NULLIFIER_A), Some(0));
+        assert_eq!(BackingCommitmentTreeNodes::<Test>::get(0, 0), Some(BACKING_COMMITMENT_X));
+
+        let expected_root = reference_backing_root(&[(0, BACKING_COMMITMENT_X)]);
+        assert_eq!(BackingCommitmentTreeRoot::<Test>::get(), Some(expected_root));
+        assert_eq!(Identity::current_backing_commitment_root(), expected_root);
+        assert!(Identity::is_valid_backing_commitment_root(expected_root));
+
+        // Emitted before `CitizenRegistered` (the actual last event), not last itself — check
+        // containment rather than `assert_last_event`.
+        assert!(System::events().iter().any(|r| r.event
+            == Event::BackingCommitmentLeafInserted {
+                nullifier: NULLIFIER_A,
+                leaf_index: 0,
+                root: expected_root,
+            }
+            .into()));
+    });
+}
+
+#[test]
+fn current_backing_commitment_root_before_any_registration_is_the_empty_tree_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_eq!(BackingCommitmentTreeRoot::<Test>::get(), None);
+        assert_eq!(
+            Identity::current_backing_commitment_root(),
+            backing_tree_zero_hash(BACKING_TREE_DEPTH)
+        );
+    });
+}
+
+#[test]
+fn second_registration_gets_the_next_leaf_index_and_a_correctly_updated_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        register_with_backing(2, NULLIFIER_B, ANCHOR_B, BACKING_COMMITMENT_Y);
+
+        assert_eq!(NextBackingLeafIndex::<Test>::get(), 2);
+        assert_eq!(BackingLeafIndexOf::<Test>::get(NULLIFIER_A), Some(0));
+        assert_eq!(BackingLeafIndexOf::<Test>::get(NULLIFIER_B), Some(1));
+
+        let expected_root =
+            reference_backing_root(&[(0, BACKING_COMMITMENT_X), (1, BACKING_COMMITMENT_Y)]);
+        assert_eq!(BackingCommitmentTreeRoot::<Test>::get(), Some(expected_root));
+    });
+}
+
+#[test]
+fn revoke_citizen_tombstones_leaf_in_place_and_updates_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        register_with_backing(2, NULLIFIER_B, ANCHOR_B, BACKING_COMMITMENT_Y);
+
+        assert_ok!(Identity::revoke_citizen(RuntimeOrigin::signed(1)));
+
+        // The leaf is overwritten in place with the tombstone placeholder, not removed — the
+        // second citizen's leaf index (1) is completely unaffected by the first citizen's
+        // revocation, unlike CitizenIndex/CitizenPosition's swap-and-pop.
+        let tombstone = backing_tree_tombstone_leaf();
+        assert_eq!(BackingCommitmentTreeNodes::<Test>::get(0, 0), Some(tombstone));
+        assert_eq!(BackingCommitmentTreeNodes::<Test>::get(0, 1), Some(BACKING_COMMITMENT_Y));
+        // The index assignment itself is retained as a permanent audit record.
+        assert_eq!(BackingLeafIndexOf::<Test>::get(NULLIFIER_A), Some(0));
+        // BackingCommitment itself is fully removed (pre-existing behavior, unchanged).
+        assert!(BackingCommitment::<Test>::get(1).is_none());
+
+        let expected_root =
+            reference_backing_root(&[(0, tombstone), (1, BACKING_COMMITMENT_Y)]);
+        assert_eq!(BackingCommitmentTreeRoot::<Test>::get(), Some(expected_root));
+        // Emitted before `CitizenRevoked` (the actual last event), not last itself — check
+        // containment rather than `assert_last_event`.
+        assert!(System::events().iter().any(|r| r.event
+            == Event::BackingCommitmentLeafTombstoned {
+                nullifier: NULLIFIER_A,
+                leaf_index: 0,
+                root: expected_root,
+            }
+            .into()));
+    });
+}
+
+#[test]
+fn revoked_leaf_index_is_never_reused_by_a_later_registration() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        assert_ok!(Identity::revoke_citizen(RuntimeOrigin::signed(1)));
+
+        // A brand new citizen (fresh nullifier/anchor) registers next — swap-and-pop means
+        // they land at CitizenIndex slot 0 (the vacated dense-index slot), but the
+        // Merkle-tree leaf index must still be the next never-used one (1), not the
+        // reclaimed 0 — reusing it would silently invalidate a stale-but-still-in-window
+        // Merkle path someone else might be holding for a *different* leaf 0 entry that no
+        // longer applies once tombstoned differently than expected.
+        register_with_backing(3, [3u8; 32], ANCHOR_C, BACKING_COMMITMENT_Y);
+
+        assert_eq!(CitizenIndex::<Test>::get(0), Some(3)); // swap-and-pop reused index 0
+        assert_eq!(BackingLeafIndexOf::<Test>::get([3u8; 32]), Some(1)); // tree leaf did not
+    });
+}
+
+#[test]
+fn suspending_a_citizen_does_not_touch_the_backing_commitment_tree() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        let root_before = BackingCommitmentTreeRoot::<Test>::get();
+
+        assert_ok!(Identity::suspend_citizen(RuntimeOrigin::root(), NULLIFIER_A, None));
+
+        assert_eq!(BackingCommitmentTreeRoot::<Test>::get(), root_before);
+        assert_eq!(BackingCommitmentTreeNodes::<Test>::get(0, 0), Some(BACKING_COMMITMENT_X));
+        assert_eq!(BackingCommitment::<Test>::get(1), Some(BACKING_COMMITMENT_X));
+    });
+}
+
+#[test]
+fn backing_root_history_keeps_a_recent_old_root_valid_within_the_window() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        let root_1 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+
+        // BackingRootHistoryWindowBlocks = 10 in the mock; still well inside it.
+        System::set_block_number(5);
+        register_with_backing(2, NULLIFIER_B, ANCHOR_B, BACKING_COMMITMENT_Y);
+        let root_2 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+        assert_ne!(root_1, root_2);
+
+        // The now-stale root_1 (as if a citizen had cached a path against it before the
+        // second registration landed) must still verify — this is the whole point of
+        // keeping root history at all.
+        assert!(Identity::is_valid_backing_commitment_root(root_1));
+        assert!(Identity::is_valid_backing_commitment_root(root_2));
+    });
+}
+
+#[test]
+fn backing_root_history_rejects_a_root_past_the_retention_window() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        let root_1 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+        assert!(Identity::is_valid_backing_commitment_root(root_1));
+
+        // BackingRootHistoryWindowBlocks = 10 in the mock. root_1 was pushed at block 1, so it
+        // is valid through block 11 and expired from block 12 onward.
+        System::set_block_number(12);
+        assert!(!Identity::is_valid_backing_commitment_root(root_1));
+
+        // A later mutation actually prunes the expired entry out of storage (not just logical
+        // staleness via the block comparison above) — confirm the ring's head genuinely
+        // advances past it.
+        let head_before = BackingRootHistoryHead::<Test>::get();
+        register_with_backing(2, NULLIFIER_B, ANCHOR_B, BACKING_COMMITMENT_Y);
+        assert!(BackingRootHistoryHead::<Test>::get() > head_before);
+        assert!(BackingRootHistoryEntries::<Test>::get(head_before).is_none());
+        assert!(BackingRootValidUntil::<Test>::get(root_1).is_none());
+    });
+}
+
+#[test]
+fn backing_root_history_evicts_oldest_root_once_the_count_cap_is_exceeded() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        // MaxBackingRootHistoryEntries = 3 in the mock. Register 4 citizens back-to-back, all
+        // well inside BackingRootHistoryWindowBlocks (=10), so only the count cap (not the
+        // time window) can be responsible for any eviction here.
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        let root_1 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+        register_with_backing(2, NULLIFIER_B, ANCHOR_B, BACKING_COMMITMENT_Y);
+        let root_2 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+        register_with_backing(3, [3u8; 32], ANCHOR_C, [213u8; 32]);
+        let root_3 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+        assert!(Identity::is_valid_backing_commitment_root(root_1));
+        assert_eq!(BackingRootHistoryTail::<Test>::get() - BackingRootHistoryHead::<Test>::get(), 3);
+
+        register_with_backing(4, [4u8; 32], [14u8; 32], [214u8; 32]);
+        let root_4 = BackingCommitmentTreeRoot::<Test>::get().unwrap();
+
+        // Still only 3 entries live — root_1 was evicted to make room, well before it would
+        // have expired on time alone.
+        assert_eq!(BackingRootHistoryTail::<Test>::get() - BackingRootHistoryHead::<Test>::get(), 3);
+        assert!(!Identity::is_valid_backing_commitment_root(root_1));
+        assert!(Identity::is_valid_backing_commitment_root(root_2));
+        assert!(Identity::is_valid_backing_commitment_root(root_3));
+        assert!(Identity::is_valid_backing_commitment_root(root_4));
+    });
+}
+
+#[test]
+fn unknown_root_is_never_valid() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register_with_backing(1, NULLIFIER_A, ANCHOR_A, BACKING_COMMITMENT_X);
+        assert!(!Identity::is_valid_backing_commitment_root([99u8; 32]));
     });
 }

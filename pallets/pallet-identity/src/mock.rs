@@ -176,6 +176,12 @@ impl pallet_identity_zk::Config for Test {
     // tests can cross it without huge block numbers, while still being nonzero so a
     // back-to-back double-recovery test has something real to assert against.
     type MinBlocksBetweenRecoveries = frame_support::traits::ConstU32<5>;
+    // Short window (mirrors ReverificationPeriod's convention above) so tests can cross the
+    // backing-root-history expiry without huge block numbers.
+    type BackingRootHistoryWindowBlocks = frame_support::traits::ConstU32<10>;
+    // Small on purpose: big enough for tests to push a handful of roots and exercise the
+    // count-cap eviction path without a large fixture.
+    type MaxBackingRootHistoryEntries = frame_support::traits::ConstU32<3>;
 }
 
 // Build genesis storage according to the mock runtime.

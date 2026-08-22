@@ -87,6 +87,89 @@ pub mod pallet {
         acc as u8
     }
 
+    // ── Backing-commitment incremental Merkle tree ──────────────────────────────
+    //
+    // Builds and maintains an on-chain incremental Merkle tree over every citizen's
+    // `BackingCommitment` value (see that storage item's doc comment for what a leaf value
+    // is and why it's safe to expose as one). This is purely the tree/root-history
+    // *infrastructure*: no extrinsic here yet consumes it for a real backing-privacy proof
+    // (that consumer is future work, likely in `pallet-voting`/`pallet-elections` — see
+    // `BackingCommitment`'s doc comment) — this pallet only maintains it correctly and
+    // exposes `current_backing_commitment_root`/`is_valid_backing_commitment_root` for that
+    // future consumer to call.
+
+    /// Depth of the on-chain incremental Merkle tree over `BackingCommitment` values. Chosen
+    /// to exactly match this pallet's own citizen-count ceiling: `TotalCitizens`/`CitizenIndex`
+    /// are already `u32` (`TotalCitizensOverflow` caps registration at `u32::MAX`), so a depth
+    /// of 32 gives the tree exactly `2^32` (~4.29 billion) leaf slots — enough that
+    /// `NextBackingLeafIndex` (also `u32`, see its own doc comment) never needs a wider index
+    /// type, and comfortably above any real national citizenry (the largest, China, is ~1.4
+    /// billion — more than 3x headroom) even after accounting for the fact that a revoked
+    /// citizen's tombstoned leaf (see `tombstone_backing_leaf`) permanently consumes a slot
+    /// that is never reclaimed. Mirrors `certificateTree.ts`'s depth-16 Poseidon2 tree in
+    /// spirit (both are Poseidon2 incremental Merkle trees over a per-citizen/per-cert-issuer
+    /// value), but sized for a citizenry rather than a much smaller set of trusted CA
+    /// certificates — depth 16 (65,536 leaves) would be wildly undersized here.
+    pub const BACKING_TREE_DEPTH: u8 = 32;
+
+    /// Domain-separation tags for this tree's own Poseidon2 hashing, kept in a numeric range
+    /// (210-212) disjoint from `runtime/src/anchor_verifier.rs`'s proof-type tags (200-202) so
+    /// the two tag namespaces can never collide even though both ultimately feed the same
+    /// Poseidon2 permutation via the same `poseidon2-bn254` crate.
+    const DS_BACKING_TREE_NODE: u8 = 210;
+    const DS_BACKING_TREE_EMPTY_LEAF: u8 = 211;
+    const DS_BACKING_TREE_TOMBSTONE_LEAF: u8 = 212;
+
+    fn backing_tree_tag_field(tag: u8) -> [u8; 32] {
+        let mut field = [0u8; 32];
+        field[31] = tag;
+        field
+    }
+
+    /// 2-to-1 internal-node hash for the backing-commitment tree. Domain-separated
+    /// (`DS_BACKING_TREE_NODE`) from this tree's own leaf-placeholder values below, and from
+    /// every other Poseidon2 domain in this codebase — necessary so an internal node can never
+    /// be reinterpreted as, or collide with, a value from a different domain under Poseidon2's
+    /// random-oracle assumption. This is the standard second-preimage defense a Merkle tree's
+    /// own hash function needs (the same principle as RFC 6962's leaf/node prefix separation):
+    /// without it, an attacker who can choose two leaf values could in principle craft a pair
+    /// that hashes to the same value as some existing internal node, forging a shorter fake
+    /// path. Domain-separating leaves and internal nodes from each other closes that.
+    pub fn backing_tree_node_hash(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+        poseidon2_bn254::hash_bytes(&[backing_tree_tag_field(DS_BACKING_TREE_NODE), left, right])
+    }
+
+    /// The fixed placeholder leaf value for a never-yet-registered position. Deliberately not
+    /// a bare `[0u8; 32]` (a value a genuine `backing_commitment` could, however
+    /// astronomically unlikely, equal) — a domain-separated hash instead, so "empty" can never
+    /// be confused with a real commitment.
+    pub fn backing_tree_empty_leaf() -> [u8; 32] {
+        poseidon2_bn254::hash_bytes(&[backing_tree_tag_field(DS_BACKING_TREE_EMPTY_LEAF)])
+    }
+
+    /// The fixed placeholder a revoked citizen's leaf is overwritten with (see
+    /// `tombstone_backing_leaf`). Distinct from `backing_tree_empty_leaf` so "never
+    /// registered" and "registered, then revoked" remain distinguishable on-chain; distinct
+    /// from any real `backing_commitment` for the same reason as that function.
+    pub fn backing_tree_tombstone_leaf() -> [u8; 32] {
+        poseidon2_bn254::hash_bytes(&[backing_tree_tag_field(DS_BACKING_TREE_TOMBSTONE_LEAF)])
+    }
+
+    /// The all-`backing_tree_empty_leaf` subtree root at `level` (0 = a single empty leaf).
+    /// Recomputed on demand rather than cached in a `const`/genesis-seeded table — this
+    /// pallet is `no_std` (no `LazyLock`), and this is only ever needed for the sibling of a
+    /// not-yet-touched position, so it costs at most `BACKING_TREE_DEPTH` extra Poseidon2
+    /// calls in the worst case (a nearly-empty tree), negligible next to the real ZK proof
+    /// verification `register_citizen`/`revoke_citizen`'s callers already do earlier in the
+    /// same extrinsic.
+    pub fn backing_tree_zero_hash(level: u8) -> [u8; 32] {
+        let mut current = backing_tree_empty_leaf();
+        for _ in 0..level {
+            current = backing_tree_node_hash(current, current);
+        }
+        current
+    }
+
     // ── OPRF committee mailbox data types (changelog entry 82) ──────────────────
 
     /// A citizen's pending blinded OPRF query, posted to the on-chain mailbox in place of a
@@ -287,6 +370,25 @@ pub mod pallet {
         /// from losing a first one.
         #[pallet::constant]
         type MinBlocksBetweenRecoveries: Get<u32>;
+        /// How long (in blocks) a `BackingCommitmentRootHistory` entry remains valid/queryable
+        /// after it stops being the current backing-commitment tree root, before
+        /// `push_backing_root_history` prunes it. See that storage item's doc comment for the
+        /// full retention-window rationale: sized to be `>=` the longest permitted voting
+        /// epoch (`pallet_voting::Config::MaxEpochDurationBlocks`) so a Merkle authentication
+        /// path fetched at the very start of the longest epoch still verifies against *some*
+        /// valid root by the time it's used later in that same epoch, even though other
+        /// citizens' registrations/revocations have moved the live root in the meantime.
+        #[pallet::constant]
+        type BackingRootHistoryWindowBlocks: Get<u32>;
+        /// Hard cap on how many entries `BackingRootHistoryEntries` may hold at once — a
+        /// worst-case storage ceiling independent of `BackingRootHistoryWindowBlocks`, so an
+        /// extreme, sustained burst of registrations/revocations degrades the *effective*
+        /// window (oldest entries evicted early) rather than growing chain state without
+        /// bound. See `BackingRootHistoryEntries`'s doc comment for why this is a `StorageMap`
+        /// ring rather than a single bounded vector, which is what makes a generously large
+        /// cap here cheap (each push/prune touches O(1) storage keys, not the whole history).
+        #[pallet::constant]
+        type MaxBackingRootHistoryEntries: Get<u32>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -506,6 +608,91 @@ pub mod pallet {
     pub type BackingCommitment<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, [u8; 32]>;
 
+    // ── Backing-commitment incremental Merkle tree storage ──────────────────────
+
+    /// Sparse on-chain storage of the backing-commitment tree's touched nodes, keyed by
+    /// `(level, index at that level)`. Level 0 is leaves, level `BACKING_TREE_DEPTH` is the
+    /// (single, index-0) root. Untouched nodes are implicitly `backing_tree_zero_hash(level)`
+    /// and are never written — inserting or tombstoning one leaf only ever writes the
+    /// `BACKING_TREE_DEPTH + 1` nodes on that leaf's own authentication path, not the whole
+    /// tree, keeping this genuinely cheap despite the tree's large nominal depth.
+    #[pallet::storage]
+    pub type BackingCommitmentTreeNodes<T: Config> =
+        StorageDoubleMap<_, Blake2_128Concat, u8, Blake2_128Concat, u32, [u8; 32]>;
+
+    /// Next free leaf index in `BackingCommitmentTreeNodes`. Assigned once, permanently, at
+    /// `register_citizen` (`insert_backing_leaf`) and **never reused** — not even after
+    /// `revoke_citizen` tombstones that leaf (see `tombstone_backing_leaf`). This is what
+    /// keeps every *other* citizen's previously-fetched Merkle authentication path stable
+    /// regardless of unrelated registrations/revocations elsewhere in the tree. Contrast with
+    /// `CitizenIndex`/`CitizenPosition`'s swap-and-pop reuse: that's fine for their O(1)-
+    /// random-pick use case (jury selection), where index stability across calls is never
+    /// relied on, but would be actively unsafe reused here, since it would silently invalidate
+    /// an unrelated citizen's cached Merkle path every time someone else revoked.
+    #[pallet::storage]
+    pub type NextBackingLeafIndex<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    /// A citizen's permanent leaf index in the backing-commitment tree, keyed by **nullifier**
+    /// (not `AccountId`) so it survives `recover_account`'s account rebind exactly the way
+    /// `SuspendedNullifiers` does — `recover_account` never touches `backing_commitment`'s
+    /// *value* (it's checked to match the old account's on-file value, not replaced), so the
+    /// underlying leaf never needs to move when only the owning `AccountId` changes. Set once
+    /// at `register_citizen` and never reassigned; consulted by `revoke_citizen` to know which
+    /// leaf to tombstone. Deliberately left on file after revocation (not removed) — a
+    /// harmless, small, permanent audit record of which leaf a given nullifier ever occupied.
+    #[pallet::storage]
+    pub type BackingLeafIndexOf<T: Config> = StorageMap<_, Blake2_128Concat, [u8; 32], u32>;
+
+    /// Current root of the backing-commitment tree (the node at `(BACKING_TREE_DEPTH, 0)`).
+    /// `None` before any citizen has ever registered (equivalent to
+    /// `backing_tree_zero_hash(BACKING_TREE_DEPTH)` — see `current_backing_commitment_root`,
+    /// which is what callers should actually use). Kept in sync by
+    /// `recompute_backing_tree_path`, the only function that ever mutates
+    /// `BackingCommitmentTreeNodes`.
+    #[pallet::storage]
+    pub type BackingCommitmentTreeRoot<T: Config> = StorageValue<_, [u8; 32]>;
+
+    /// FIFO history of backing-commitment tree roots, implemented as a ring over a
+    /// `StorageMap` (`head`/`tail` cursors into `BackingRootHistoryEntries`) rather than a
+    /// single `StorageValue<BoundedVec<..>>` — pushing a new root or pruning an old one then
+    /// touches O(1) storage keys instead of re-encoding/re-decoding the entire history on
+    /// every `register_citizen`/`revoke_citizen` call, which matters because
+    /// `MaxBackingRootHistoryEntries` needs real headroom (see its own doc comment) and a
+    /// multi-thousand-entry bounded vector would make every insert/tombstone pay to
+    /// SCALE-(de)serialize the whole thing.
+    ///
+    /// Root history exists because a citizen's locally-cached Merkle authentication path can
+    /// lag real-time insertion by other citizens: a future backing-nullifier proof (see
+    /// `BackingCommitment`'s doc comment — not built yet) needs to verify membership against
+    /// *some* root that was genuinely current at a recent point, not necessarily the very
+    /// latest one. See `Config::BackingRootHistoryWindowBlocks` for the retention-window
+    /// rationale.
+    #[pallet::storage]
+    pub type BackingRootHistoryEntries<T: Config> =
+        StorageMap<_, Blake2_128Concat, u64, (BlockNumberFor<T>, [u8; 32])>;
+
+    /// Index of the oldest entry still live in `BackingRootHistoryEntries`. The queue is empty
+    /// when this equals `BackingRootHistoryTail`.
+    #[pallet::storage]
+    pub type BackingRootHistoryHead<T: Config> = StorageValue<_, u64, ValueQuery>;
+
+    /// Index the *next* pushed entry will occupy in `BackingRootHistoryEntries`.
+    #[pallet::storage]
+    pub type BackingRootHistoryTail<T: Config> = StorageValue<_, u64, ValueQuery>;
+
+    /// O(1) membership index mirroring `BackingRootHistoryEntries`'s live contents: a root
+    /// value maps to the block number after which it is no longer considered valid (i.e. the
+    /// block it was pushed at, plus `BackingRootHistoryWindowBlocks`).
+    /// `is_valid_backing_commitment_root` checks this map *and* re-compares against the
+    /// current block, rather than trusting bare presence alone — presence here is only
+    /// removed when `push_backing_root_history` next runs and happens to prune this exact
+    /// entry, so a root can otherwise sit past its nominal expiry, still present, between
+    /// prune passes; the current-block comparison is what makes validity correct regardless of
+    /// exactly when the next prune happens to run.
+    #[pallet::storage]
+    pub type BackingRootValidUntil<T: Config> =
+        StorageMap<_, Blake2_128Concat, [u8; 32], BlockNumberFor<T>>;
+
     /// Block at which a citizen's registration lapses for voting purposes unless renewed.
     /// Pushed forward by `reverify_citizen`. Checked lazily inside `is_active_citizen`, the
     /// same point-of-use pattern already used for suspension — no separate background sweep.
@@ -669,6 +856,14 @@ pub mod pallet {
         /// `PendingOprfQueries`/`OprfRound1Commitments`/`OprfRound2Responses` state for
         /// `query_id`.
         OprfQueryPruned { query_id: u64, submitter: T::AccountId },
+        /// A citizen's `backing_commitment` was inserted as a fresh leaf in the
+        /// backing-commitment Merkle tree at `register_citizen` time. `nullifier` carries no
+        /// additional vote-correlation risk beyond what's already public via
+        /// `CitizenRegistered` (see that event's own doc comment on this point).
+        BackingCommitmentLeafInserted { nullifier: [u8; 32], leaf_index: u32, root: [u8; 32] },
+        /// A citizen's backing-commitment leaf was overwritten with the tombstone placeholder
+        /// at `revoke_citizen` time.
+        BackingCommitmentLeafTombstoned { nullifier: [u8; 32], leaf_index: u32, root: [u8; 32] },
     }
 
     #[pallet::error]
@@ -705,6 +900,11 @@ pub mod pallet {
         InvalidMigrationProof,
         /// OPRF scheme version counter would overflow u32::MAX.
         OprfSchemeVersionOverflow,
+        /// `NextBackingLeafIndex` would overflow u32::MAX — the backing-commitment tree
+        /// (`BACKING_TREE_DEPTH` = 32) has no more free leaf slots. Would require ~4.29
+        /// billion never-reused leaf assignments (registrations plus tombstoned revocations
+        /// combined) over the chain's whole lifetime to ever actually trigger.
+        BackingLeafIndexOverflow,
         /// A committee slot outside `0..NUM_COMMITTEES` was given to
         /// `set_oprf_committee_key`/`remove_oprf_committee_key`.
         InvalidCommitteeSlot,
@@ -871,6 +1071,12 @@ pub mod pallet {
             IdentityAnchorRegistry::<T>::insert((scheme_version, anchor), &who);
             CitizenAnchor::<T>::insert(&who, (scheme_version, anchor));
             BackingCommitment::<T>::insert(&who, backing_commitment);
+            // Insert this citizen's backing_commitment as a fresh leaf in the on-chain
+            // incremental Merkle tree (see the "Backing-commitment incremental Merkle tree"
+            // storage section above). Must run after every other uniqueness/anchor check
+            // above has already succeeded — a rejected registration must not consume a leaf
+            // index.
+            Self::insert_backing_leaf(nullifier, backing_commitment)?;
             let deadline = frame_system::Pallet::<T>::block_number()
                 .saturating_add(BlockNumberFor::<T>::from(T::ReverificationPeriod::get()));
             ReverificationDeadline::<T>::insert(&who, deadline);
@@ -908,6 +1114,14 @@ pub mod pallet {
                 IdentityAnchorRegistry::<T>::remove((version, anchor));
             }
             BackingCommitment::<T>::remove(&who);
+            // Overwrite this citizen's Merkle-tree leaf with the tombstone placeholder — a
+            // revoked citizen must no longer be provable as a member of the backing-commitment
+            // tree. Suspension (`suspend_citizen`/`restore_citizen_rights`) deliberately does
+            // NOT do this: it's reversible and keyed by nullifier independent of
+            // `BackingCommitment`, and a merely-suspended citizen is still a registered
+            // citizen. Only outright revocation removes `BackingCommitment` (above), so only
+            // revocation tombstones the tree leaf.
+            Self::tombstone_backing_leaf(nullifier);
             // Swap-and-pop: fill the vacated slot with the last citizen to keep the index dense.
             let pos = CitizenPosition::<T>::take(&who).ok_or(Error::<T>::NotRegistered)?;
             let last = TotalCitizens::<T>::get().saturating_sub(1);
@@ -1851,6 +2065,135 @@ pub mod pallet {
                 ensure!(approved == Some(*pk_hash), Error::<T>::CommitteeKeyMismatch);
             }
             Ok(())
+        }
+
+        // ── Backing-commitment incremental Merkle tree ──────────────────────────
+
+        /// Reads a tree node, falling back to the deterministic all-empty-subtree value for
+        /// any position never yet written.
+        fn backing_tree_node(level: u8, index: u32) -> [u8; 32] {
+            BackingCommitmentTreeNodes::<T>::get(level, index)
+                .unwrap_or_else(|| backing_tree_zero_hash(level))
+        }
+
+        /// Writes `leaf_value` at `leaf_index` and recomputes every ancestor up to the root,
+        /// storing the new root and returning it. Shared by both a fresh registration
+        /// (`leaf_value` = the real `backing_commitment`) and a revocation tombstone
+        /// (`leaf_value` = `backing_tree_tombstone_leaf()`) — the update algorithm is
+        /// identical either way, only the leaf value differs.
+        fn recompute_backing_tree_path(leaf_index: u32, leaf_value: [u8; 32]) -> [u8; 32] {
+            BackingCommitmentTreeNodes::<T>::insert(0u8, leaf_index, leaf_value);
+            let mut index = leaf_index;
+            let mut current = leaf_value;
+            for level in 0..BACKING_TREE_DEPTH {
+                let sibling = Self::backing_tree_node(level, index ^ 1);
+                current = if index % 2 == 0 {
+                    backing_tree_node_hash(current, sibling)
+                } else {
+                    backing_tree_node_hash(sibling, current)
+                };
+                index /= 2;
+                BackingCommitmentTreeNodes::<T>::insert(level + 1, index, current);
+            }
+            BackingCommitmentTreeRoot::<T>::put(current);
+            current
+        }
+
+        /// Pushes `root` onto `BackingRootHistoryEntries`'s FIFO ring, first pruning from the
+        /// head any entry that is either older than `BackingRootHistoryWindowBlocks` or, if
+        /// none have aged out yet, as many oldest entries as needed to respect the hard
+        /// `MaxBackingRootHistoryEntries` count cap. See those two storage/config items' doc
+        /// comments for the full retention-window rationale and its documented degrade-under-
+        /// burst trade-off.
+        fn push_backing_root_history(root: [u8; 32]) {
+            let now = frame_system::Pallet::<T>::block_number();
+            let window = BlockNumberFor::<T>::from(T::BackingRootHistoryWindowBlocks::get());
+            let max_entries = T::MaxBackingRootHistoryEntries::get() as u64;
+
+            let mut head = BackingRootHistoryHead::<T>::get();
+            let tail = BackingRootHistoryTail::<T>::get();
+            while head < tail {
+                let len = tail.saturating_sub(head);
+                let Some((entry_block, entry_root)) = BackingRootHistoryEntries::<T>::get(head)
+                else {
+                    // head < tail implies an entry was written here and not yet removed; if
+                    // it's somehow missing, don't loop forever on the inconsistency.
+                    break;
+                };
+                let expired = now.saturating_sub(entry_block) > window;
+                if !expired && len < max_entries {
+                    break;
+                }
+                BackingRootHistoryEntries::<T>::remove(head);
+                BackingRootValidUntil::<T>::remove(entry_root);
+                head = head.saturating_add(1);
+            }
+            BackingRootHistoryHead::<T>::put(head);
+
+            BackingRootHistoryEntries::<T>::insert(tail, (now, root));
+            BackingRootValidUntil::<T>::insert(root, now.saturating_add(window));
+            BackingRootHistoryTail::<T>::put(tail.saturating_add(1));
+        }
+
+        /// Assigns `nullifier` a fresh, permanent leaf index (see `NextBackingLeafIndex`'s doc
+        /// comment for why it's never reused) and inserts `backing_commitment` there — called
+        /// once, from `register_citizen`, after every other registration check has already
+        /// succeeded.
+        fn insert_backing_leaf(nullifier: [u8; 32], backing_commitment: [u8; 32]) -> DispatchResult {
+            let leaf_index = NextBackingLeafIndex::<T>::get();
+            let next_index =
+                leaf_index.checked_add(1).ok_or(Error::<T>::BackingLeafIndexOverflow)?;
+            NextBackingLeafIndex::<T>::put(next_index);
+            BackingLeafIndexOf::<T>::insert(nullifier, leaf_index);
+            let root = Self::recompute_backing_tree_path(leaf_index, backing_commitment);
+            Self::push_backing_root_history(root);
+            Self::deposit_event(Event::BackingCommitmentLeafInserted {
+                nullifier,
+                leaf_index,
+                root,
+            });
+            Ok(())
+        }
+
+        /// Overwrites `nullifier`'s leaf (if it has one) with the tombstone placeholder —
+        /// called from `revoke_citizen`. A no-op if `nullifier` has no `BackingLeafIndexOf`
+        /// entry; defensive only, since every caller of this function has already confirmed
+        /// the nullifier was registered.
+        fn tombstone_backing_leaf(nullifier: [u8; 32]) {
+            if let Some(leaf_index) = BackingLeafIndexOf::<T>::get(nullifier) {
+                let root =
+                    Self::recompute_backing_tree_path(leaf_index, backing_tree_tombstone_leaf());
+                Self::push_backing_root_history(root);
+                Self::deposit_event(Event::BackingCommitmentLeafTombstoned {
+                    nullifier,
+                    leaf_index,
+                    root,
+                });
+            }
+        }
+
+        /// The backing-commitment tree's current root — `backing_tree_zero_hash
+        /// (BACKING_TREE_DEPTH)` (the all-empty-tree root) before any citizen has ever
+        /// registered, otherwise `BackingCommitmentTreeRoot`'s on-file value. The function a
+        /// future backing-nullifier proof's submitter-facing tooling should call to fetch the
+        /// live root to build a fresh authentication path against.
+        pub fn current_backing_commitment_root() -> [u8; 32] {
+            BackingCommitmentTreeRoot::<T>::get()
+                .unwrap_or_else(|| backing_tree_zero_hash(BACKING_TREE_DEPTH))
+        }
+
+        /// True if `root` is a backing-commitment tree root that was current at some block
+        /// within the last `BackingRootHistoryWindowBlocks` (inclusive of the current root
+        /// itself). The function a future backing-nullifier proof's on-chain verification
+        /// should call instead of comparing only against `current_backing_commitment_root`,
+        /// so a proof built against a slightly-stale-but-still-in-window root is still
+        /// accepted. See `BackingRootValidUntil`'s doc comment for why this re-compares
+        /// against the current block rather than trusting bare map presence.
+        pub fn is_valid_backing_commitment_root(root: [u8; 32]) -> bool {
+            match BackingRootValidUntil::<T>::get(root) {
+                Some(valid_until) => frame_system::Pallet::<T>::block_number() <= valid_until,
+                None => false,
+            }
         }
     }
 }

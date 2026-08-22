@@ -325,6 +325,15 @@ impl pallet_identity_zk::Config for Runtime {
 	/// well clear of a genuine back-to-back device-loss scenario. Placeholder pending real
 	/// pilot telemetry, same spirit as this pallet's other governance-tunable cadences above.
 	type MinBlocksBetweenRecoveries = ConstU32<{ 7 * DAYS }>;
+	/// Matches `pallet_voting::Config::MaxEpochDurationBlocks` (30 days, see below) — the
+	/// longest a voting epoch can run, and therefore the longest a Merkle authentication path
+	/// fetched at epoch-open might need to stay verifiable for (see
+	/// `pallet_identity_zk::Config::BackingRootHistoryWindowBlocks`'s doc comment).
+	type BackingRootHistoryWindowBlocks = ConstU32<{ 30 * DAYS }>;
+	/// Generous headroom above any realistic registration/revocation volume within a 30-day
+	/// window; see `pallet_identity_zk::Config::MaxBackingRootHistoryEntries`'s doc comment for
+	/// why a large cap here stays cheap (a `StorageMap` ring, not a bounded vector).
+	type MaxBackingRootHistoryEntries = ConstU32<100_000>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -370,6 +379,10 @@ impl pallet_identity_zk::Config for Runtime {
 	type MaxPendingOprfQueriesPerCitizen = ConstU32<20>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MinBlocksBetweenRecoveries = ConstU32<{ 7 * DAYS }>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type BackingRootHistoryWindowBlocks = ConstU32<{ 30 * DAYS }>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MaxBackingRootHistoryEntries = ConstU32<100_000>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as
