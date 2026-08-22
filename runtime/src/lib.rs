@@ -261,4 +261,7 @@ mod runtime {
 
 	#[runtime::pallet_index(18)]
 	pub type Cabinet = pallet_executive;
+
+	#[runtime::pallet_index(19)]
+	pub type AccountabilityCouncil = pallet_accountability_council;
 }

@@ -7,7 +7,7 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 ## Current State
 - Ubuntu 24.04 (WSL2), Rust 1.96 stable
 - Chain builds and runs in dev mode
-- **All 11 pallets are wired into the runtime**, index 8–18 (see `docs/project/README.md` for
+- **All 12 pallets are wired into the runtime**, index 8–19 (see `docs/project/README.md` for
   detail — `HANDOFF.md` is now just a thin pointer there, split out 2026-08-01).
   `pallet-emergency-council` is in `runtime/Cargo.toml`, configured in
   `runtime/src/configs/mod.rs`, and present at `pallet_index(15)` in the
@@ -316,8 +316,10 @@ democracy-chain/
 │   ├── pallet-emergency-council/ ← time-locked emergency powers, auto-sunset   (index 15)
 │   ├── pallet-audit/             ← treasury audit trail, flag/clear/dispute     (index 16)
 │   ├── pallet-anticorruption/    ← asset disclosure, conflict registry, ZK whistleblower (index 17)
-│   └── pallet-executive/         ← parliamentary executive/Cabinet, PM ranked-choice
-│                                    investiture, minister confirmation            (index 18)
+│   ├── pallet-executive/         ← parliamentary executive/Cabinet, PM ranked-choice
+│   │                                investiture, minister confirmation            (index 18)
+│   └── pallet-accountability-council/ ← independent auditor/investigator appointment oversight,
+│                                    barred from legislature/executive overlap    (index 19)
 ├── circuits/          ← Noir ZK circuits (oprf-identity-anchor: built, proven against a dev
 │                         simulator, not a real committee — see docs/project/next-steps.md #8)
 ├── mobile/            ← React Native app; android/ real + committed (JS tests pass, no

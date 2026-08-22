@@ -38,6 +38,7 @@ pallet-emergency-council.workspace = true
 pallet-audit.workspace = true
 pallet-anticorruption.workspace = true
 pallet-executive.workspace = true
+pallet-accountability-council.workspace = true
 pallet-timestamp.workspace = true
 poseidon2-bn254.workspace = true
 pallet-transaction-payment-rpc-runtime-api.workspace = true
@@ -101,6 +102,7 @@ std = [
 	"pallet-audit/std",
 	"pallet-anticorruption/std",
 	"pallet-executive/std",
+	"pallet-accountability-council/std",
 	"pallet-timestamp/std",
 	"poseidon2-bn254/std",
 	"pallet-transaction-payment-rpc-runtime-api/std",
@@ -164,6 +166,7 @@ try-runtime = [
 	"pallet-emergency-council/try-runtime",
 	"pallet-audit/try-runtime",
 	"pallet-anticorruption/try-runtime",
+	"pallet-accountability-council/try-runtime",
 	"pallet-timestamp/try-runtime",
 	"pallet-transaction-payment/try-runtime",
 	"sp-runtime/try-runtime",

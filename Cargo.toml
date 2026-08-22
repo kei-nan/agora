@@ -20,6 +20,7 @@ members = [
     "pallets/pallet-audit",
     "pallets/pallet-anticorruption",
     "pallets/pallet-executive",
+    "pallets/pallet-accountability-council",
     "pallets/poseidon2-bn254",
     "runtime",
 ]
@@ -39,6 +40,7 @@ pallet-emergency-council = { path = "./pallets/pallet-emergency-council", defaul
 pallet-audit = { path = "./pallets/pallet-audit", default-features = false }
 pallet-anticorruption = { path = "./pallets/pallet-anticorruption", default-features = false }
 pallet-executive = { path = "./pallets/pallet-executive", default-features = false }
+pallet-accountability-council = { path = "./pallets/pallet-accountability-council", default-features = false }
 poseidon2-bn254 = { path = "./pallets/poseidon2-bn254", default-features = false }
 clap = { version = "4.5.13" }
 frame-benchmarking-cli = { version = "47.0.0", default-features = false }

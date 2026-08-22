@@ -1056,3 +1056,54 @@ impl pallet_anticorruption::Config for Runtime {
 	/// See the `dev-mode` impl above for the block-time rationale.
 	type AssetDisclosureRenewalBlocks = ConstU32<{ 365 * DAYS }>;
 }
+
+// ── Accountability Council ───────────────────────────────────────────────────
+//
+// Independent oversight body governing pallet-audit auditor and pallet-anticorruption
+// investigator appointment — see docs/project/pallets/accountability-council.md and
+// `pallet_accountability_council`'s module doc comment for why this is a dedicated council
+// rather than routed through pallet-legislature (self-oversight risk) or pallet-executive.
+//
+// NOT yet wired as `pallet_audit::Config::AuditorOrigin` / `pallet_anticorruption::Config::
+// InvestigatorOrigin` in this pass — those pallets' `add_auditor`/`add_investigator` etc. are
+// still bare `ensure_root` with no configurable `EnsureOrigin` at all, so there is nothing yet
+// for `EnsureAccountabilityCouncilApproved` to be wired into; that origin-plumbing change to
+// pallet-audit/pallet-anticorruption is deliberately left for a follow-up pass.
+
+/// Runtime implements `pallet_accountability_council::LegislatureChecker` by reading
+/// pallet-legislature's `Members` directly — same approach as the identical check
+/// `pallet_executive::LegislatureMembership` already performs for the runtime.
+impl pallet_accountability_council::LegislatureChecker<AccountId> for Runtime {
+	fn is_legislature_member(who: &AccountId) -> bool {
+		pallet_legislature::Members::<Runtime>::get().contains(who)
+	}
+}
+
+/// Runtime implements `pallet_accountability_council::ExecutiveChecker` by reading
+/// pallet-executive's minister/Prime-Minister storage directly — the same two storage items
+/// `pallet_legislature::pallet::MinisterChecker for pallet_executive::Pallet<T>` checks
+/// (`is_active_minister`), just read from `Runtime` instead of delegated to a pallet-local impl,
+/// consistent with how every other cross-pallet "Checker" trait in this file is wired.
+impl pallet_accountability_council::ExecutiveChecker<AccountId> for Runtime {
+	fn is_active_minister(who: &AccountId) -> bool {
+		pallet_executive::MinisterPortfolio::<Runtime>::contains_key(who)
+			|| pallet_executive::PrimeMinister::<Runtime>::get().as_ref() == Some(who)
+	}
+}
+
+impl pallet_accountability_council::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	/// 7-9 members, matching the Oracle Council's size range (see
+	/// `pallet_courts::Config::MaxOracleMembers`).
+	type MaxCouncilSize = ConstU32<9>;
+	/// Genuine 2/3 supermajority — not the Oracle Council's simple >1/2 majority — for both
+	/// membership changes (post-bootstrap) and any external action this Council approves.
+	type SupermajorityNumerator = ConstU32<2>;
+	type SupermajorityDenominator = ConstU32<3>;
+	/// An unconsumed approved action can be discarded by any member after 14 days, mirroring
+	/// pallet-legislature's `PendingApprovalExpiryBlocks` / pallet-courts'
+	/// `AdminActionExpiryBlocks`.
+	type ApprovalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
+	type LegislatureChecker = Runtime;
+	type ExecutiveChecker = Runtime;
+}

@@ -58,14 +58,14 @@ democracy-chain/
 └── HANDOFF.md                     # thin pointer into docs/project/
 ```
 
-Build is clean. Next available pallet index: **19**.
+Build is clean. Next available pallet index: **20**.
 
 ## Where to look
 
 | Topic | File |
 |---|---|
 | Runtime features, cross-pallet trait wiring, full citizen→law pipeline | [architecture.md](architecture.md) |
-| Per-pallet storage/calls/TODOs (11 pallets, index 8–18) | [pallets/](pallets/) — one file per pallet, see below |
+| Per-pallet storage/calls/TODOs (12 pallets, index 8–19) | [pallets/](pallets/) — one file per pallet, see below |
 | ZK proof verifier status | [zk-verifier.md](zk-verifier.md) |
 | Desktop app (Tauri 2) | [apps/desktop.md](apps/desktop.md) |
 | Mobile app (React Native) | [apps/mobile.md](apps/mobile.md) |
@@ -88,6 +88,7 @@ Build is clean. Next available pallet index: **19**.
 | pallet-audit | 16 | [audit.md](pallets/audit.md) |
 | pallet-anticorruption | 17 | [anticorruption.md](pallets/anticorruption.md) |
 | pallet-executive (alias `Cabinet`) | 18 | [executive.md](pallets/executive.md) |
+| pallet-accountability-council | 19 | [accountability-council.md](pallets/accountability-council.md) |
 
 ### Changelog (`changelog/`)
 
