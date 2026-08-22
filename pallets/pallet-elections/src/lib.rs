@@ -14,10 +14,17 @@
 //! chosen by the legislature itself via pallet-executive's ranked-choice investiture. See
 //! docs/project/changelog/ for the full removal rationale.
 //!
-//! ### Delegate identity
-//! Separate from citizen identity: uses `Poseidon2(national_id || country_code || "delegate")`
-//! as nullifier, so the citizen and delegate on-chain identities are cryptographically unlinked.
-//! The delegate voluntarily publishes their real name; citizens remain anonymous.
+//! ### Delegate identity — NOT cryptographically separated (current limitation)
+//! `register_as_delegate` uses the caller's own ordinary citizen `AccountId` directly
+//! (`ensure_signed`) — there is no separate derivation, nullifier, or persona for the delegate
+//! role. This means becoming a delegate permanently and publicly links that account's entire
+//! on-chain history (votes, delegations, whistleblower reports, case filings, everything) to
+//! whatever name/profile the delegate chooses to publish. Backing is not anonymous either:
+//! `BackingOf` is a plain public `StorageDoubleMap`, so anyone can query exactly which citizen
+//! accounts back which delegate. A genuinely unlinkable design (a derived delegate persona via
+//! a Poseidon2-based nullifier, plus Merkle-tree/nullifier-circuit infrastructure for backing
+//! anonymity) has been scoped as future work but is not built — no timeline is committed. Until
+//! then, treat delegate registration and backing as fully public actions.
 //!
 //! ### Backing threshold
 //! A delegate becomes Active only when they have ≥ `BackingThreshold` citizen backers.

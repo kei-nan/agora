@@ -40,13 +40,14 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
     <ScrollView style={s.container} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>Become a Delegate</Text>
       <Text style={s.subtitle}>
-        As a delegate your real name is publicly visible on-chain. Your delegate identity is
-        cryptographically separate from your citizen identity — you remain anonymous as a voter.
+        As a delegate your real name is publicly visible on-chain. Delegate registration uses
+        this same account you already vote with — there is no separate delegate identity, so
+        your full on-chain activity is publicly linkable to your public name once you register.
       </Text>
 
       <View style={s.infoBox}>
         <InfoRow icon="👤" text="Your display name is permanently public" />
-        <InfoRow icon="🔑" text="Uses a separate ZK identity from your citizen account" />
+        <InfoRow icon="🔗" text="Links your public name to this account's full on-chain activity" />
         <InfoRow icon="📊" text="You need 50 citizen backers to become active" />
         <InfoRow icon="⏱" text="Max 3 consecutive terms, then a mandatory break" />
       </View>

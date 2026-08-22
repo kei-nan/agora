@@ -25,7 +25,7 @@ const HELP = {
   termLimit:
     'To prevent permanent concentration of power, delegates serve a maximum number of consecutive terms before a mandatory break. The progress bar shows how far through their current term they are.',
   becomeDelegate:
-    'Registering as a delegate makes your verified name publicly visible. You start as Pending and need 50 backers to become Active. You can still vote privately as a citizen — your delegate identity is cryptographically separate.',
+    'Registering as a delegate makes your verified name publicly visible and links it to this account permanently — there is no separate delegate identity, so this account\'s full on-chain activity becomes publicly attributable to your name. You start as Pending and need 50 backers to become Active.',
 };
 
 function HelpIcon({ title, message }: { title: string; message: string }) {

@@ -19,12 +19,18 @@ replaces the removed subsystem — it's deleted, not rebuilt; `call_index` 0–6
 left unused rather than reassigned. See `docs/project/changelog/` for the full removal
 rationale.
 
-### Delegate identity
+### Delegate identity — NOT cryptographically separated (current limitation)
 
-Separate from citizen identity: a delegate's nullifier is `Poseidon2(national_id ||
-country_code || "delegate")`, cryptographically unlinked from the citizen's own nullifier. The
-delegate voluntarily publishes their real name and profile; the citizens backing them remain
-anonymous.
+`register_as_delegate` uses the caller's own ordinary citizen `AccountId` directly
+(`ensure_signed`) — there is no separate derivation, nullifier, or persona for the delegate
+role today. Becoming a delegate therefore permanently and publicly links that account's entire
+on-chain history (votes, delegations, whistleblower reports, case filings, everything else) to
+whatever name/profile the delegate publishes. Backing is not anonymous either: `BackingOf` is a
+plain public `StorageDoubleMap`, so anyone can query exactly which citizen accounts back which
+delegate. A genuinely unlinkable design — a derived delegate persona via a Poseidon2-based
+nullifier, plus Merkle-tree/nullifier-circuit infrastructure for backing anonymity — has been
+scoped as future work but is not built, and no timeline is committed. Until then, treat
+delegate registration and backing as fully public, permanently attributable actions.
 
 ### Backing threshold
 
