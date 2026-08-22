@@ -52,6 +52,23 @@ import { colors } from '../theme';
 type Nav = NativeStackNavigationProp<RootStackParamList>;
 
 /**
+ * Mirrors `pallet_courts::Config::OracleApprovalNumerator`/`OracleApprovalDenominator` as wired
+ * in `runtime/src/configs/mod.rs` (`ConstU32<1>` / `ConstU32<2>` at time of writing — i.e. an
+ * oracle action needs *strictly more than* half the council to approve). These are compile-time
+ * `Get<u32>` runtime constants, not on-chain storage, so there is no chain read for them — same
+ * hardcoded approach and same caveat as desktop's `fetch_oracle_council_info`
+ * (`desktop/src-tauri/src/commands/chain.rs`): if the runtime config ever changes these values,
+ * update the constants here (and there) to match.
+ */
+const ORACLE_APPROVAL_NUMERATOR = 1;
+const ORACLE_APPROVAL_DENOMINATOR = 2;
+
+/** Smallest approval count that satisfies the pallet's strict `approvals/council > numerator/denominator` check. */
+function minOracleApprovalsNeeded(councilSize: number): number {
+  return Math.floor((councilSize * ORACLE_APPROVAL_NUMERATOR) / ORACLE_APPROVAL_DENOMINATOR) + 1;
+}
+
+/**
  * Human-readable "time left" for the appeal window, mirroring the blocks-to-time
  * conversion `RegistrationStatusScreen.tsx`'s `estimateTimeRemaining` already uses
  * (`minimumPeriod * 2` for block time — same pattern desktop's `AuthPage.tsx` uses
@@ -248,7 +265,15 @@ export default function CasesScreen() {
       }
       ListHeaderComponent={
         <View style={s.header}>
-          <Text style={s.title}>Courts</Text>
+          <View>
+            <Text style={s.title}>Courts</Text>
+            {oracleMembers.length > 0 && (
+              <Text style={s.oracleInfo}>
+                Oracle Council: {oracleMembers.length} member{oracleMembers.length === 1 ? '' : 's'}, needs{' '}
+                {minOracleApprovalsNeeded(oracleMembers.length)} to approve a ruling
+              </Text>
+            )}
+          </View>
           <TouchableOpacity
             style={s.fileBtn}
             onPress={() => navigation.navigate('FileCase')}
@@ -366,6 +391,7 @@ const s = StyleSheet.create({
   center: { flex: 1, backgroundColor: colors.bg, alignItems: 'center', justifyContent: 'center' },
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
   title: { fontSize: 24, fontWeight: '700', color: colors.textPrimary },
+  oracleInfo: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
   fileBtn: { backgroundColor: colors.accent, paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10 },
   fileBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 13 },
   empty: { color: colors.textMuted, textAlign: 'center', marginTop: 40 },

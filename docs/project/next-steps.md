@@ -249,11 +249,47 @@
     purpose of surviving exactly that incident-response path; 45/45 `pallet-courts` tests
     passing including a new regression test. **Left open, not fixed this session**: a
     court-oracle prompt-injection delimiter that doesn't escape its own closing tag
-    (`court-oracle/src/context.rs`, Medium severity), a narrow delegation-cap staleness gap in
-    `pallet-voting` (Low/informational), and a long list of citizen-UX gaps (mobile shows raw
-    hex instead of proposal/law content since it never fetches IPFS, `SeatingSkippedNoDisclosure`
-    invisible in either app, oracle-council composition invisible to citizens) and PM-level
-    gaps (OPRF committee *formation logistics* — not just the crypto — has no owner or timeline;
-    no pilot-onboarding/compliance/incident-response docs exist anywhere). See
-    `docs/project/changelog/092.md` for the full findings list and fix details.
+    (`court-oracle/src/context.rs`, Medium severity — **fixed 2026-08-21, commit `7da2105`**: a
+    new `neutralize_tag_markers` HTML-entity-escapes literal open/close delimiter markers before
+    wrapping untrusted IPFS text, so a law author can no longer forge a fake closing tag followed
+    by fake trusted-looking directives; the same mitigation was ported into desktop's `agent_ask`
+    in commit `bbacd04`), a narrow delegation-cap staleness gap in `pallet-voting`
+    (Low/informational, still open), and a long list of citizen-UX gaps (mobile shows raw hex
+    instead of proposal/law content since it never fetches IPFS — **fixed 2026-08-21, commit
+    `c4aa1a9`**: `mobile/src/chain/ipfs.ts` fetches and SHA-256-verifies IPFS content the same way
+    desktop does, wired into `IpfsContentBox.tsx`/`ProposalsScreen.tsx`/`LawsScreen.tsx`;
+    `SeatingSkippedNoDisclosure` invisible in either app, still open; oracle-council composition
+    invisible to citizens — **partially fixed**: desktop's `CourtsPage.tsx` now shows council
+    size/threshold and a live per-case approval count (commit `bcc3c34`), but mobile remains
+    unfixed — `CasesScreen.tsx` calls `getOracleMembers()` and already holds the full roster in
+    state, but only uses it for the `isFilerOrOracle` eligibility check, never renders it to the
+    citizen) and PM-level gaps (OPRF committee *formation logistics* — not just the crypto — has
+    no owner or timeline; no pilot-onboarding/compliance/incident-response docs exist anywhere).
+    See `docs/project/changelog/092.md` for the full findings list and fix details.
+    **Update, 2026-08-22**: two further items from this pass's own follow-on work. (1) **The
+    Oracle Council M-of-N gate is now extended to the three manual-override extrinsics that had
+    bypassed it** — `pallet_constitution::invalidate_law` and
+    `pallet_identity_zk::suspend_citizen`/`restore_citizen_rights` were gated only by bare
+    `EnsureOracle` membership (any single council member could act unilaterally), unlike
+    `submit_ai_ruling`/`approve_ai_ruling`/`finalize_ruling`, which already required M-of-N
+    approval. Commit `ae31e71` adds `pallet_courts::EnsureOracleCouncilApproved` (an
+    `EnsureOriginWithArg` gated by a new `propose_admin_action`/`approve_admin_action` flow,
+    call-hash-bound the same way `EnsureLegislatureMotion` is) and rewires `CourtOrigin`/
+    `SuspensionOrigin` in the runtime to it. (2) **Account recovery is now implemented on-chain**
+    — CLAUDE.md's "Recovery = re-scan valid passport" claim was previously unimplemented
+    (`register_citizen` unconditionally rejected any already-registered nullifier, and no call
+    let a citizen rebind their identity to a new `AccountId`). Commit `ea12789` adds
+    `recover_account`: same proof shape/verification path as `register_citizen` (real
+    `ZkVerifier`/`AnchorVerifier`, no dev-mode shortcut); on a nullifier+anchor match it rebinds
+    all the per-citizen storage items (`NullifierRegistry`, `CitizenNullifier`, `CitizenAnchor`,
+    `IdentityAnchorRegistry`, `CitizenIndex`/`CitizenPosition`, `ReverificationDeadline`,
+    `SelfDeclaredSingleDocument`) from the old `AccountId` to the new signer, invalidating the old
+    account; rate-limited via a new `MinBlocksBetweenRecoveries` cooldown; an active suspension
+    carries over automatically since `SuspendedNullifiers`/`SuspendedByJuryReview` are keyed by
+    nullifier, not `AccountId`. 10 new pallet tests; `pallet-identity-zk` suite: 131/131 passing.
+    **The chain-side mechanism is done and tested; there is no mobile UI wrapper for it yet**
+    (no screen/flow calls `recover_account`), and — like every other real proof-submitting call in
+    this codebase — it is still gated on the standing OPRF committee blocker (item 1): no genuine
+    ZKPassport proof can be produced on-device until a real committee exists, so `recover_account`
+    cannot actually be exercised end-to-end yet either.
 
