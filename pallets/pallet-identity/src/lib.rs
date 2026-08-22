@@ -324,11 +324,20 @@ pub mod pallet {
         /// governance-approved key (`OprfCommitteeKeys`) — see
         /// `runtime/src/anchor_verifier.rs`'s module docs for why the split is there and not
         /// inside this trait.
+        ///
+        /// `backing_commitment` is a second, independent public value folded into the same
+        /// `disclosure`-circuit `param_commitment` preimage as `anchor`/`scheme_version`/
+        /// `oprf_pk_hashes` (widened from 8 to 9 fields, no new proof-type tag — see
+        /// `runtime/src/anchor_verifier.rs`'s module docs and
+        /// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s
+        /// `derive_backing_root_term`/`derive_backing_commitment`). Unlike `anchor`, it binds
+        /// to no specific target/delegate, so no front-running protection is needed for it.
         fn verify_registration_anchor(
             outer_public_inputs: &[[u8; 32]],
             anchor: [u8; 32],
             scheme_version: u32,
             oprf_pk_hashes: [[u8; 32]; 5],
+            backing_commitment: [u8; 32],
         ) -> bool;
         /// Verifies a reverification/liveness proof: the citizen currently holds a
         /// still-valid, unexpired passport that recomputes to the same anchor already on
@@ -337,12 +346,14 @@ pub mod pallet {
         /// rationale as `verify_registration_anchor`'s parameter of the same name (a
         /// standalone anchor proof's `comm_in` is an unauthenticated private witness; riding
         /// inside a fresh outer proof is what proves the passport is *currently* valid, not
-        /// just was at original registration).
+        /// just was at original registration). `backing_commitment` is checked the same way —
+        /// see `verify_registration_anchor`'s doc comment.
         fn verify_reverification(
             outer_public_inputs: &[[u8; 32]],
             anchor: [u8; 32],
             scheme_version: u32,
             oprf_pk_hashes: [[u8; 32]; 5],
+            backing_commitment: [u8; 32],
         ) -> bool;
         /// Verifies a migration consistency ("dual evaluation") proof: `old_anchor` and
         /// `new_anchor` were both derived from the same underlying personal-number value,
@@ -463,6 +474,37 @@ pub mod pallet {
     #[pallet::storage]
     pub type CitizenAnchor<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, (u32, [u8; 32])>;
+
+    /// A citizen's `backing_commitment` — the public Merkle-tree-leaf-safe value derived (via
+    /// `T::AnchorVerifier::verify_registration_anchor`/`verify_reverification`'s Poseidon2
+    /// recomputation) from the same 5-committee OPRF evaluation as `anchor`, but through a
+    /// distinct domain separator (`DS_BACKING_ROOT`/`DS_BACKING_COMMITMENT`, see
+    /// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`). Set at
+    /// `register_citizen`, kept in sync at `reverify_citizen` (which requires the caller's
+    /// submitted value to match — see `Error::BackingCommitmentMismatch` — exactly mirroring
+    /// how `CitizenAnchor`'s `anchor` half is already checked for consistency across
+    /// reverifications).
+    ///
+    /// Deliberately a plain per-citizen map, not an exclusion registry keyed by the commitment
+    /// value the way `IdentityAnchorRegistry` is for `anchor`: `backing_commitment` is a
+    /// deterministic function of the same secret material `anchor` already is, so `anchor`'s
+    /// own `AnchorAlreadyUsed` uniqueness check already transitively guarantees
+    /// `backing_commitment` uniqueness — a second exclusion registry here would be redundant.
+    /// A future Merkle-tree phase that needs to enumerate every citizen's `backing_commitment`
+    /// to build/insert tree leaves can iterate this map directly.
+    ///
+    /// **Known gap, out of this phase's scope**: `migrate_oprf_scheme` does not currently
+    /// touch this map. Since `backing_commitment` (like `anchor`) is derived under a specific
+    /// `scheme_version`'s committee keys, a citizen who migrates to a new OPRF scheme version
+    /// will have a `BackingCommitment` entry that is stale relative to their new `CitizenAnchor`
+    /// scheme version, until `migrate`/`migrate-disclosure` are themselves extended to compute
+    /// and widen their own `param_commitment` the same way `anchor`/`disclosure` were widened
+    /// here. Not fixed in this pass — doing so was out of the scope given (see this pallet's
+    /// module docs / the commit that introduced this storage item) and would need real circuit
+    /// changes to `migrate`/`migrate-disclosure`, not just Rust plumbing.
+    #[pallet::storage]
+    pub type BackingCommitment<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, [u8; 32]>;
 
     /// Block at which a citizen's registration lapses for voting purposes unless renewed.
     /// Pushed forward by `reverify_citizen`. Checked lazily inside `is_active_citizen`, the
@@ -654,6 +696,9 @@ pub mod pallet {
         /// The anchor submitted with a reverification proof does not match the citizen's
         /// on-file anchor for their current OPRF scheme version.
         AnchorMismatch,
+        /// The backing_commitment submitted with a reverification proof does not match the
+        /// citizen's on-file backing_commitment.
+        BackingCommitmentMismatch,
         /// The proposed new anchor is already registered under the target scheme version.
         NewAnchorAlreadyUsed,
         /// The migration consistency ("dual evaluation") proof failed verification.
@@ -762,6 +807,10 @@ pub mod pallet {
             public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
             anchor: [u8; 32],
             oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+            // See `BackingCommitment`'s storage doc comment: a second, independent public
+            // value folded into the same `disclosure`-circuit `param_commitment` preimage as
+            // `anchor`, checked and stored the same way.
+            backing_commitment: [u8; 32],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
@@ -803,6 +852,7 @@ pub mod pallet {
                     anchor,
                     scheme_version,
                     oprf_pk_hashes,
+                    backing_commitment,
                 ),
                 Error::<T>::InvalidAnchorProof
             );
@@ -820,6 +870,7 @@ pub mod pallet {
             NullifierRegistry::<T>::insert(nullifier, &who);
             IdentityAnchorRegistry::<T>::insert((scheme_version, anchor), &who);
             CitizenAnchor::<T>::insert(&who, (scheme_version, anchor));
+            BackingCommitment::<T>::insert(&who, backing_commitment);
             let deadline = frame_system::Pallet::<T>::block_number()
                 .saturating_add(BlockNumberFor::<T>::from(T::ReverificationPeriod::get()));
             ReverificationDeadline::<T>::insert(&who, deadline);
@@ -856,6 +907,7 @@ pub mod pallet {
             if let Some((version, anchor)) = CitizenAnchor::<T>::take(&who) {
                 IdentityAnchorRegistry::<T>::remove((version, anchor));
             }
+            BackingCommitment::<T>::remove(&who);
             // Swap-and-pop: fill the vacated slot with the last citizen to keep the index dense.
             let pos = CitizenPosition::<T>::take(&who).ok_or(Error::<T>::NotRegistered)?;
             let last = TotalCitizens::<T>::get().saturating_sub(1);
@@ -983,11 +1035,23 @@ pub mod pallet {
             public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
             anchor: [u8; 32],
             oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+            // Must match `BackingCommitment`'s on-file value — see
+            // `Error::BackingCommitmentMismatch` and that storage item's doc comment. Both
+            // `anchor` and `backing_commitment` are deterministic functions of the same
+            // committee evaluation, so a genuine reverification proof always recomputes to the
+            // exact same values already on file.
+            backing_commitment: [u8; 32],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let (scheme_version, on_file_anchor) =
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
             ensure!(anchor == on_file_anchor, Error::<T>::AnchorMismatch);
+            let on_file_backing_commitment =
+                BackingCommitment::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
+            ensure!(
+                backing_commitment == on_file_backing_commitment,
+                Error::<T>::BackingCommitmentMismatch
+            );
 
             Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
             Self::check_outer_proof_freshness(public_inputs.as_slice())?;
@@ -999,6 +1063,7 @@ pub mod pallet {
                     anchor,
                     scheme_version,
                     oprf_pk_hashes,
+                    backing_commitment,
                 ),
                 Error::<T>::InvalidReverificationProof
             );
@@ -1476,6 +1541,7 @@ pub mod pallet {
         /// outer proof doesn't actually recompute to it), rebinds every piece of that citizen's
         /// per-account identity storage from the old `AccountId` to the caller's new one:
         /// `NullifierRegistry`, `CitizenNullifier`, `CitizenAnchor`, `IdentityAnchorRegistry`,
+        /// `BackingCommitment` (checked the same way, via `BackingCommitmentMismatch`),
         /// `CitizenIndex`/`CitizenPosition` (repointed in place, not swap-and-popped — the
         /// citizen isn't leaving the registry, just changing address), `ReverificationDeadline`
         /// (pushed forward exactly like a successful `reverify_citizen`, since this proof
@@ -1510,6 +1576,9 @@ pub mod pallet {
             public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
             anchor: [u8; 32],
             oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+            // Must match the old account's on-file `BackingCommitment` — see
+            // `reverify_citizen`'s `backing_commitment` parameter doc comment for why.
+            backing_commitment: [u8; 32],
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
@@ -1525,6 +1594,12 @@ pub mod pallet {
             let (scheme_version, on_file_anchor) = CitizenAnchor::<T>::get(&old_account)
                 .ok_or(Error::<T>::NoExistingRegistrationForNullifier)?;
             ensure!(anchor == on_file_anchor, Error::<T>::AnchorMismatch);
+            let on_file_backing_commitment = BackingCommitment::<T>::get(&old_account)
+                .ok_or(Error::<T>::NoExistingRegistrationForNullifier)?;
+            ensure!(
+                backing_commitment == on_file_backing_commitment,
+                Error::<T>::BackingCommitmentMismatch
+            );
 
             Self::check_outer_proof_freshness(public_inputs.as_slice())?;
             Self::check_committee_keys(scheme_version, &oprf_pk_hashes)?;
@@ -1534,6 +1609,7 @@ pub mod pallet {
                     anchor,
                     scheme_version,
                     oprf_pk_hashes,
+                    backing_commitment,
                 ),
                 Error::<T>::InvalidReverificationProof
             );
@@ -1554,6 +1630,8 @@ pub mod pallet {
             IdentityAnchorRegistry::<T>::insert((scheme_version, anchor), &who);
             CitizenAnchor::<T>::remove(&old_account);
             CitizenAnchor::<T>::insert(&who, (scheme_version, anchor));
+            BackingCommitment::<T>::remove(&old_account);
+            BackingCommitment::<T>::insert(&who, backing_commitment);
 
             if let Some(pos) = CitizenPosition::<T>::take(&old_account) {
                 CitizenPosition::<T>::insert(&who, pos);

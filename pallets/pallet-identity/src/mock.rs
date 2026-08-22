@@ -36,6 +36,7 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         anchor: [u8; 32],
         _scheme_version: u32,
         _oprf_pk_hashes: [[u8; 32]; 5],
+        _backing_commitment: [u8; 32],
     ) -> bool {
         outer_public_inputs.contains(&anchor)
     }
@@ -45,6 +46,7 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         anchor: [u8; 32],
         _scheme_version: u32,
         _oprf_pk_hashes: [[u8; 32]; 5],
+        _backing_commitment: [u8; 32],
     ) -> bool {
         outer_public_inputs.contains(&anchor)
     }

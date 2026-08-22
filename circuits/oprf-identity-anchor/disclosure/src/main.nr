@@ -33,8 +33,9 @@
 use common::hash_salt_dg1_dg2_hash_private_nullifier;
 use data_check_expiry::check_expiry_from_date;
 use identity_anchor::{
-    assert_dg1_clear_value, combine_committee_anchors, derive_committee_anchor_term,
-    derive_identity_input, DS_ANCHOR_OUT, DS_DLOG, NUM_COMMITTEES,
+    assert_dg1_clear_value, combine_committee_anchors, derive_backing_commitment,
+    derive_backing_root_term, derive_committee_anchor_term, derive_identity_input, DS_ANCHOR_OUT,
+    DS_DLOG, NUM_COMMITTEES,
 };
 use oprf::oprf_output::verified_oprf;
 use poseidon::poseidon2::Poseidon2;
@@ -48,16 +49,20 @@ use utils::types::{DG1Data, MRZExpiryDate, OPRFProof, SaltedValue};
 global PROOF_TYPE_AGORA_IDENTITY_ANCHOR: Field = 200;
 
 /// `param_commitment = Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR, anchor, scheme_version,
-/// oprf_pk_hashes[0], ..., oprf_pk_hashes[4])`
+/// oprf_pk_hashes[0], ..., oprf_pk_hashes[4], backing_commitment)`
 ///
 /// Follows the same shape as `bind::calculate_param_commitment` and
 /// `compare_age::calculate_param_commitment`: a proof-type tag followed by the disclosed
 /// parameters. The on-chain verifier recomputes this from the (anchor, scheme_version,
-/// 5×oprf_pk_hash) tuple submitted alongside the extrinsic and checks it against the outer
-/// proof's `param_commitments[i]`. There is no room to carry the 5 committee-key hashes as
-/// separate disclosure-subproof outputs (the fixed 8-field outer layout only has one
-/// `oprf_pk_hash` slot, and that slot belongs to a different OPRF entirely — see below), so
-/// all 5 are folded into this single field instead.
+/// 5×oprf_pk_hash, backing_commitment) tuple submitted alongside the extrinsic and checks it
+/// against the outer proof's `param_commitments[i]`. There is no room to carry the 5
+/// committee-key hashes (or `backing_commitment`) as separate disclosure-subproof outputs (the
+/// fixed 8-field outer layout only has one `oprf_pk_hash` slot, and that slot belongs to a
+/// different OPRF entirely — see below), so all of them are folded into this single field
+/// instead. `backing_commitment` rides the *same* proof-type tag as the original 8-element
+/// hash (no new tag needed) — unlike the delegate-persona circuit, this widening carries no
+/// front-running risk: `backing_commitment` does not bind to any specific target/delegate the
+/// way `persona_account` does.
 ///
 /// The anchor committees' `oprf_pk_hashes` are carried *here* rather than in the subproof's
 /// dedicated `oprf_pk_hash` output because that output belongs to ZKPassport's own
@@ -68,6 +73,7 @@ fn calculate_param_commitment(
     anchor: Field,
     scheme_version: Field,
     oprf_pk_hashes: [Field; NUM_COMMITTEES],
+    backing_commitment: Field,
 ) -> Field {
     Poseidon2::hash(
         [
@@ -79,8 +85,9 @@ fn calculate_param_commitment(
             oprf_pk_hashes[2],
             oprf_pk_hashes[3],
             oprf_pk_hashes[4],
+            backing_commitment,
         ],
-        8,
+        9,
     )
 }
 
@@ -127,6 +134,7 @@ fn main(
     let identity_input = derive_identity_input(salted_dg1.value);
 
     let mut terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    let mut backing_terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
     let mut oprf_pk_hashes: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
     for i in 0..NUM_COMMITTEES {
         let oprf_proof = oprf_proofs[i];
@@ -142,11 +150,18 @@ fn main(
             DS_ANCHOR_OUT,
         );
         terms[i] = derive_committee_anchor_term(i, oprf_output, scheme_version);
+        // Same `oprf_output` witness as `terms[i]` above, a different domain-separated term —
+        // see `derive_backing_root_term`'s doc comment for why this reuse is safe here (unlike
+        // the delegate-persona circuits' deliberate fresh-query scoping).
+        backing_terms[i] = derive_backing_root_term(i, oprf_output, scheme_version);
         oprf_pk_hashes[i] = Poseidon2::hash([oprf_proof.pk.x, oprf_proof.pk.y], 2);
     }
 
     let anchor = combine_committee_anchors(terms);
-    let param_commitment = calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes);
+    let backing_root_secret = combine_committee_anchors(backing_terms);
+    let backing_commitment = derive_backing_commitment(backing_root_secret);
+    let param_commitment =
+        calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes, backing_commitment);
 
     // Silence unused-parameter warnings without changing the constrained system: these two
     // exist purely to occupy their slots in the outer circuit's fixed public-input layout.

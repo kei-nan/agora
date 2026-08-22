@@ -8,10 +8,11 @@
 
 use super::{
     ASCII_CODE_FOR_LESS_THAN, assert_dg1_clear_value, assert_personal_number_populated,
-    combine_committee_anchors, derive_committee_anchor_term, derive_delegate_identity_input,
-    derive_delegate_persona_term, derive_identity_input, DS_DELEGATE, DS_DELEGATE_IDENTITY_INPUT,
-    DS_DELEGATE_OUT, DS_IDENTITY_INPUT, get_personal_number_from_dg1, NUM_COMMITTEES,
-    PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
+    combine_committee_anchors, derive_backing_commitment, derive_backing_root_term,
+    derive_committee_anchor_term, derive_delegate_identity_input, derive_delegate_persona_term,
+    derive_identity_input, DS_ANCHOR, DS_BACKING_COMMITMENT, DS_BACKING_ROOT, DS_DELEGATE,
+    DS_DELEGATE_IDENTITY_INPUT, DS_DELEGATE_OUT, DS_IDENTITY_INPUT, get_personal_number_from_dg1,
+    NUM_COMMITTEES, PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
 };
 use utils::constants::{DG1_LENGTH, ID_CARD_SAMPLE_DG1, SAMPLE_DG1};
 use utils::types::{DG1Data, SaltedValue};
@@ -281,5 +282,82 @@ fn delegate_term_and_anchor_term_differ_under_identical_inputs() {
         derive_delegate_persona_term(0, oprf_output, scheme_version)
             != derive_committee_anchor_term(0, oprf_output, scheme_version),
         "Delegate and anchor combiners must be separated even under a hypothetically shared input",
+    );
+}
+
+// --- backing_root_secret / backing_commitment derivation ---
+
+/// The two new domain separators actually differ from each other and from every existing one —
+/// or the separation `derive_backing_root_term`/`derive_backing_commitment` rely on would be
+/// vacuous.
+#[test]
+fn backing_domain_separators_are_distinct_from_each_other_and_from_anchor() {
+    assert(DS_BACKING_ROOT != DS_BACKING_COMMITMENT, "root/commitment separators must differ");
+    assert(DS_BACKING_ROOT != DS_ANCHOR, "backing root separator must differ from DS_ANCHOR");
+    assert(
+        DS_BACKING_COMMITMENT != DS_ANCHOR,
+        "backing commitment separator must differ from DS_ANCHOR",
+    );
+}
+
+/// Mirrors `committee_term_is_separated_by_scheme_version` for the backing-root combiner.
+#[test]
+fn backing_root_term_is_separated_by_scheme_version() {
+    let oprf_output = 424242;
+    assert(
+        derive_backing_root_term(0, oprf_output, 1) != derive_backing_root_term(0, oprf_output, 2),
+        "Backing-root terms under different scheme versions must differ",
+    );
+}
+
+/// Mirrors `committee_term_is_separated_by_committee_index` for the backing-root combiner.
+#[test]
+fn backing_root_term_is_separated_by_committee_index() {
+    let oprf_output = 424242;
+    let scheme_version = 1;
+    assert(
+        derive_backing_root_term(0, oprf_output, scheme_version)
+            != derive_backing_root_term(1, oprf_output, scheme_version),
+        "Backing-root terms must differ by committee index alone",
+    );
+}
+
+/// The whole point of `derive_backing_root_term`'s doc comment: even reusing the exact same
+/// `oprf_output`/`scheme_version`/`committee_index` an anchor term and a backing-root term
+/// would ever see (which the real protocol does — see the doc comment for why that's safe
+/// here), the two terms must still differ.
+#[test]
+fn backing_root_term_differs_from_anchor_term_under_the_same_reused_oprf_output() {
+    let oprf_output = 424242;
+    let scheme_version = 1;
+    assert(
+        derive_backing_root_term(0, oprf_output, scheme_version)
+            != derive_committee_anchor_term(0, oprf_output, scheme_version),
+        "Backing-root and anchor terms must be separated even when built from the same oprf_output",
+    );
+}
+
+/// `combine_committee_anchors` is reused unchanged for the backing-root combination (same
+/// "depends on every committee" property `combined_anchor_depends_on_every_committee_term`
+/// already checks for the anchor case) — this checks `derive_backing_commitment` on top of it:
+/// the published commitment must change whenever the private root secret does.
+#[test]
+fn backing_commitment_changes_with_backing_root_secret() {
+    assert(
+        derive_backing_commitment(111) != derive_backing_commitment(222),
+        "Backing commitment must depend on backing_root_secret",
+    );
+}
+
+/// A citizen's `backing_commitment` must never collide with their own `anchor` even if (by
+/// some coincidence, which the protocol never actually produces since the two are built from
+/// differently-tagged terms) the combined secrets happened to match — defense in depth beyond
+/// the per-term separation above.
+#[test]
+fn backing_commitment_differs_from_a_same_valued_anchor() {
+    let shared_combined_secret = 999;
+    assert(
+        derive_backing_commitment(shared_combined_secret) != shared_combined_secret,
+        "Backing commitment must not be the identity function",
     );
 }

@@ -61,6 +61,18 @@ pub global DS_DLOG: Field = 1523098184080632582082867317389990410064981862;
 /// Domain separator for the published anchor itself, ASCII "AGORA_ANCHOR_V1".
 pub global DS_ANCHOR: Field = 338945631368262504456167009336383025;
 
+/// Domain separator for the private per-committee "backing root" term, ASCII
+/// "AGORA_BACKING_ROOT_V1". See [`derive_backing_root_term`] for what this backs and why it is
+/// safe to reuse the *same* `oprf_output_i` values the anchor itself is built from — unlike
+/// `DS_DELEGATE_IDENTITY_INPUT` above, this is deliberately **not** a fresh OPRF-query-level
+/// scope.
+pub global DS_BACKING_ROOT: Field = 95404713695560287137769915241250939547227302876721;
+
+/// Domain separator for the published backing commitment, ASCII "AGORA_BACKING_COMMITMENT_V1".
+/// See [`derive_backing_commitment`].
+pub global DS_BACKING_COMMITMENT: Field =
+    26854039565544635344688987002232158116294794610509940030217082417;
+
 /// Domain separator for the delegate-persona OPRF *client input*, ASCII
 /// "AGORA_DELEGATE_INPUT_V1" read as a big-endian integer. See
 /// `derive_delegate_identity_input` for why delegate-persona creation uses a **distinctly
@@ -274,6 +286,63 @@ pub fn derive_delegate_persona_term(
     scheme_version: Field,
 ) -> Field {
     Poseidon2::hash([DS_DELEGATE, committee_index as Field, oprf_output, scheme_version], 4)
+}
+
+/// Derives one committee's contribution to a citizen's private `backing_root_secret` —
+/// `Poseidon2(DS_BACKING_ROOT, committee_index, oprf_output, scheme_version)`. Structurally
+/// identical to [`derive_committee_anchor_term`], and — deliberately, unlike
+/// [`derive_delegate_persona_term`] — fed the *same* `oprf_output` the anchor's own term is
+/// built from in the same circuit invocation, not a value from a separately-scoped OPRF query.
+///
+/// # Why reuse is safe here, unlike the delegate-persona case
+///
+/// [`derive_delegate_identity_input`]'s doc comment lays out why delegate-persona creation
+/// scopes its OPRF *query* itself rather than reusing the registration anchor's `oprf_output_i`
+/// under a new outer separator: that reuse design would rest solely on Poseidon2 providing
+/// real domain separation between two hashes of a shared secret, and delegate-persona
+/// creation's whole point is a persona genuinely unlinkable from the citizen's registration
+/// identity to an outside observer.
+///
+/// `backing_root_secret`/`backing_commitment` do not have that requirement. Per
+/// `pallets/pallet-identity/src/lib.rs`'s `BackingCommitment` storage, the resulting public
+/// commitment is stored keyed by the *same* `AccountId` `CitizenAnchor`'s `anchor` already is —
+/// deliberately, explicitly linked to the citizen's registered identity from the moment it is
+/// written, exactly like `anchor` itself. There is no unlinkability property for this reuse to
+/// undermine: an observer can already correlate a citizen's `anchor` and `backing_commitment`
+/// trivially via two public storage reads keyed by the same account, with no cryptanalysis
+/// required. A later Merkle-tree-membership phase that wants unlinkable *use* of
+/// `backing_commitment` (proving "some leaf in this tree", not which one) gets that property
+/// from the membership-proof construction itself — which only requires `backing_root_secret`
+/// and `oprf_output_i` to never be revealed, true regardless of how `backing_root_secret` was
+/// derived — not from `backing_root_secret` being independent of `anchor`'s own derivation.
+///
+/// Reusing `oprf_output_i` also avoids doubling the OPRF committee's workload on *every*
+/// `register_citizen`/`reverify_citizen` call (not just a rare, dedicated event like
+/// delegate-persona creation) — a fresh, distinctly-scoped query here would mean 10 committee
+/// round-trips per registration and per periodic reverification, permanently, rather than 5.
+/// Given no security property is bought by paying that cost, this module does not pay it.
+pub fn derive_backing_root_term(
+    committee_index: u32,
+    oprf_output: Field,
+    scheme_version: Field,
+) -> Field {
+    Poseidon2::hash([DS_BACKING_ROOT, committee_index as Field, oprf_output, scheme_version], 4)
+}
+
+/// Derives the public `backing_commitment` from the private `backing_root_secret`:
+/// `Poseidon2(DS_BACKING_COMMITMENT, backing_root_secret)`.
+///
+/// This is the only value that may ever leave the circuit as a public output/witness —
+/// `backing_root_secret` itself must stay a private witness the citizen's wallet can
+/// reproduce (by re-running the same OPRF query flow used for the anchor, or caching the
+/// already-verified `oprf_output_i` values from that flow) and never publishes or stores
+/// on-chain. Safe to publish as a Merkle-tree leaf specifically because its input
+/// (`backing_root_secret`) already carries committee-derived PRF entropy, rather than being a
+/// bare function of the low-entropy `identity_input`/personal-number field — the same
+/// invertibility concern [`derive_committee_anchor_term`]'s hash-then-sum combiner exists to
+/// avoid for `anchor` itself.
+pub fn derive_backing_commitment(backing_root_secret: Field) -> Field {
+    Poseidon2::hash([DS_BACKING_COMMITMENT, backing_root_secret], 2)
 }
 
 /// Combines all 5 committees' hashed terms into the final published anchor by field addition.

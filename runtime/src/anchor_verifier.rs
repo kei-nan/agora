@@ -57,6 +57,21 @@
 //! that to `T::ZkVerifier`), using the `OprfCommitteeKeys` storage. Keeping these functions
 //! pure (no storage reads) is also what makes them cleanly unit-testable below with plain
 //! fixtures.
+//!
+//! # `backing_commitment`
+//!
+//! [`calculate_param_commitment`]/[`check_registration_anchor`] additionally recompute and
+//! check a `backing_commitment` value, folded into the same 8-field `param_commitment` preimage
+//! (widened to 9 fields) `anchor`/`scheme_version`/`oprf_pk_hashes` already occupy — no new
+//! proof-type tag, since (unlike the delegate-persona commitment) `backing_commitment` binds to
+//! no specific target and carries no front-running risk. It is the Poseidon2 hash of a private
+//! `backing_root_secret` the citizen's wallet derives via the same committee-OPRF-blinding
+//! construction as `anchor` itself (see
+//! `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s `derive_backing_root_term`/
+//! `derive_backing_commitment`) — safe to store on-chain per citizen
+//! (`pallet_identity_zk::BackingCommitment`) as a future Merkle-tree leaf, because unlike a
+//! bare hash of `identity_input` it does not admit the personal-number brute-force attack a
+//! low-entropy preimage would.
 
 #![cfg(not(feature = "dev-mode"))]
 
@@ -106,21 +121,31 @@ fn u32_to_field_bytes(value: u32) -> [u8; 32] {
 }
 
 /// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR, anchor, scheme_version, oprf_pk_hashes[0],
-/// .., oprf_pk_hashes[4])` — an 8-element hash, matching
+/// .., oprf_pk_hashes[4], backing_commitment)` — a 9-element hash, matching
 /// `disclosure::calculate_param_commitment` field-for-field and argument-for-argument.
+///
+/// `backing_commitment` was folded into this preimage (widening it from 8 to 9 elements) rather
+/// than given its own proof-type tag, because — unlike the delegate-persona commitment — it
+/// binds to no specific target/delegate at proof time, so there is no front-running risk a
+/// dedicated tag would need to close. See
+/// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s `derive_backing_root_term`
+/// doc comment for the full derivation and why reusing the anchor's own per-committee
+/// `oprf_output_i` values for it is safe.
 pub fn calculate_param_commitment(
     anchor: [u8; 32],
     scheme_version: u32,
     oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    backing_commitment: [u8; 32],
 ) -> [u8; 32] {
     let mut tag = [0u8; 32];
     tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR;
 
-    let mut input: Vec<[u8; 32]> = Vec::with_capacity(3 + NUM_COMMITTEES);
+    let mut input: Vec<[u8; 32]> = Vec::with_capacity(4 + NUM_COMMITTEES);
     input.push(tag);
     input.push(anchor);
     input.push(u32_to_field_bytes(scheme_version));
     input.extend_from_slice(&oprf_pk_hashes);
+    input.push(backing_commitment);
 
     poseidon2_bn254::hash_bytes(&input)
 }
@@ -133,6 +158,7 @@ pub fn check_registration_anchor(
     anchor: [u8; 32],
     scheme_version: u32,
     oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    backing_commitment: [u8; 32],
 ) -> bool {
     // A `count_N` outer proof always exposes at least one param_commitment (register_citizen
     // already enforces public_inputs.len() >= 9, but this function is also unit-tested
@@ -149,12 +175,16 @@ pub fn check_registration_anchor(
             return false;
         }
     }
+    if !is_canonical_fr(&backing_commitment) {
+        return false;
+    }
 
     // param_commitments occupy indices 5..len-3 — see crate::verifier's module docs for the
     // full outer-circuit public-input table this mirrors.
     let param_commitments = &outer_public_inputs[5..outer_public_inputs.len() - 3];
 
-    let recomputed = calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes);
+    let recomputed =
+        calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes, backing_commitment);
     param_commitments.iter().any(|commitment| *commitment == recomputed)
 }
 
@@ -334,8 +364,15 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         anchor: [u8; 32],
         scheme_version: u32,
         oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+        backing_commitment: [u8; 32],
     ) -> bool {
-        check_registration_anchor(outer_public_inputs, anchor, scheme_version, oprf_pk_hashes)
+        check_registration_anchor(
+            outer_public_inputs,
+            anchor,
+            scheme_version,
+            oprf_pk_hashes,
+            backing_commitment,
+        )
     }
 
     fn verify_reverification(
@@ -343,8 +380,15 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         anchor: [u8; 32],
         scheme_version: u32,
         oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+        backing_commitment: [u8; 32],
     ) -> bool {
-        check_registration_anchor(outer_public_inputs, anchor, scheme_version, oprf_pk_hashes)
+        check_registration_anchor(
+            outer_public_inputs,
+            anchor,
+            scheme_version,
+            oprf_pk_hashes,
+            backing_commitment,
+        )
     }
 
     fn verify_migration(
@@ -398,16 +442,23 @@ mod tests {
         hashes[4][31] = 5;
         hashes
     };
+    const BACKING_COMMITMENT: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 77;
+        b
+    };
 
     #[test]
     fn accepts_a_correctly_recomputed_commitment() {
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(check_registration_anchor(
             &public_inputs,
             ANCHOR,
             SCHEME_VERSION,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
         ));
     }
 
@@ -416,7 +467,8 @@ mod tests {
         // Two disclosure subproofs (D = 2): param_commitments at indices 5 and 6. The
         // anchor's commitment is the *second* one — check_registration_anchor must not
         // assume it's always index 5.
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let mut public_inputs = alloc::vec![[0u8; 32]; 10];
         public_inputs[5] = [9u8; 32]; // an unrelated disclosure subproof's commitment
         public_inputs[6] = commitment;
@@ -424,13 +476,15 @@ mod tests {
             &public_inputs,
             ANCHOR,
             SCHEME_VERSION,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
         ));
     }
 
     #[test]
     fn rejects_wrong_anchor() {
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         let mut wrong_anchor = ANCHOR;
         wrong_anchor[0] ^= 1;
@@ -438,34 +492,63 @@ mod tests {
             &public_inputs,
             wrong_anchor,
             SCHEME_VERSION,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
         ));
     }
 
     #[test]
     fn rejects_wrong_scheme_version() {
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(!check_registration_anchor(
             &public_inputs,
             ANCHOR,
             SCHEME_VERSION + 1,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
         ));
     }
 
     #[test]
     fn rejects_a_single_mutated_pk_hash() {
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         for i in 0..NUM_COMMITTEES {
             let mut mutated = PK_HASHES;
             mutated[i][0] ^= 1;
             assert!(
-                !check_registration_anchor(&public_inputs, ANCHOR, SCHEME_VERSION, mutated),
+                !check_registration_anchor(
+                    &public_inputs,
+                    ANCHOR,
+                    SCHEME_VERSION,
+                    mutated,
+                    BACKING_COMMITMENT
+                ),
                 "mutating pk_hash slot {i} must be rejected",
             );
         }
+    }
+
+    #[test]
+    fn rejects_wrong_backing_commitment() {
+        // The whole point of folding backing_commitment into param_commitment: a caller cannot
+        // resubmit a valid proof/public_inputs paired with a different claimed
+        // backing_commitment and have it silently accepted.
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        let mut wrong = BACKING_COMMITMENT;
+        wrong[0] ^= 1;
+        assert!(!check_registration_anchor(
+            &public_inputs,
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            wrong,
+        ));
     }
 
     #[test]
@@ -475,52 +558,97 @@ mod tests {
             &public_inputs,
             ANCHOR,
             SCHEME_VERSION,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
         ));
     }
 
     #[test]
     fn rejects_non_canonical_anchor() {
-        let commitment = calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES);
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(!check_registration_anchor(
             &public_inputs,
             BN254_FR_MODULUS_BE,
             SCHEME_VERSION,
-            PK_HASHES
+            PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+    }
+
+    #[test]
+    fn rejects_non_canonical_backing_commitment() {
+        let commitment =
+            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(!check_registration_anchor(
+            &public_inputs,
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BN254_FR_MODULUS_BE,
         ));
     }
 
     #[test]
     fn rejects_too_few_public_inputs() {
-        assert!(!check_registration_anchor(&[[0u8; 32]; 8], ANCHOR, SCHEME_VERSION, PK_HASHES));
+        assert!(!check_registration_anchor(
+            &[[0u8; 32]; 8],
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT
+        ));
     }
 
     #[test]
-    fn calculate_param_commitment_matches_the_real_nargo_vector() {
-        // Same vector as poseidon2_bn254's own test, restated at this layer to confirm the
-        // tag/field assembly (not just the underlying hash) matches
-        // disclosure::calculate_param_commitment's exact call shape: tag=200, anchor=111,
-        // scheme_version=1, pk_hashes=[222,333,444,555,666].
-        let mut anchor = [0u8; 32];
-        anchor[31] = 111;
-        let mut pk_hashes = [[0u8; 32]; NUM_COMMITTEES];
-        // 333/444/555/666 don't fit in a single byte, so these are big-endian u16s in the
-        // low two bytes of each 32-byte field.
-        for (i, v) in [222u16, 333, 444, 555, 666].iter().enumerate() {
-            pk_hashes[i][30..32].copy_from_slice(&v.to_be_bytes());
-        }
-        let got = calculate_param_commitment(anchor, 1, pk_hashes);
-        let expected_hex = "2bbdcc5187d2d2f63d3b906c678f5ef5af7e0e86984d60b7db38ee2c4731dc2f";
-        let expected = {
-            let mut out = [0u8; 32];
-            let bytes = (0..32)
-                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
-                .collect::<Vec<u8>>();
-            out.copy_from_slice(&bytes);
-            out
-        };
+    fn calculate_param_commitment_matches_the_real_nargo_and_bb_vector() {
+        // Real end-to-end vector: `nargo execute --package oprf_identity_anchor_disclosure`
+        // against `disclosure/Prover.toml` (a DEV-ONLY committee-simulator-backed fixture —
+        // reuses the same 5-committee proofs as `anchor/Prover.toml`, confirmed byte-identical
+        // by diffing the two files), followed by a real `bb write_vk`/`bb prove`/`bb verify`
+        // round-trip that accepted the resulting proof.
+        //
+        // `anchor` and `backing_commitment` here are `anchor`/`disclosure`'s own real circuit
+        // outputs (read off `target/bb-anchor/public_inputs` indices 2/8, and cross-checked
+        // identical to what `disclosure`'s witness solves internally, since both Prover.tomls
+        // drive the same identity_input/oprf_proofs) — not fabricated small integers, unlike
+        // the fixtures above. `oprf_pk_hashes` and `param_commitment` are `oprf_identity_anchor`
+        // /`oprf_identity_anchor_disclosure`'s own real public outputs
+        // (`target/bb-anchor/public_inputs` indices 3-7, `target/bb-disclosure/public_inputs`
+        // index 4) — the same simulated committee key set `delegate_oprf_pk_hashes` below (and
+        // the delegate-persona phase's own vector) already uses, confirmed byte-for-byte.
+        let anchor =
+            hex32("0beff326e082ed177b5ad64c97336db7af826a90a072cdb18f65de2ac6d5326f");
+        let oprf_pk_hashes = delegate_oprf_pk_hashes();
+        let backing_commitment =
+            hex32("221383d2793ff2aece98eeb39646dc8350d535ff862ffbb17ffa7eb137990571");
+        let got = calculate_param_commitment(anchor, 1, oprf_pk_hashes, backing_commitment);
+        let expected =
+            hex32("242b02c97c624472577d4e4af2a2b3b09b0182f586558f465091472ec2b8ae0c");
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn accepts_the_real_nargo_and_bb_vector_via_check_registration_anchor() {
+        // Same real vector as above, exercised through the full `check_registration_anchor`
+        // path (canonicality checks + param_commitments scan), not just the raw hash.
+        let anchor =
+            hex32("0beff326e082ed177b5ad64c97336db7af826a90a072cdb18f65de2ac6d5326f");
+        let oprf_pk_hashes = delegate_oprf_pk_hashes();
+        let backing_commitment =
+            hex32("221383d2793ff2aece98eeb39646dc8350d535ff862ffbb17ffa7eb137990571");
+        let param_commitment =
+            hex32("242b02c97c624472577d4e4af2a2b3b09b0182f586558f465091472ec2b8ae0c");
+        let public_inputs = outer_public_inputs_with_commitment(param_commitment);
+        assert!(check_registration_anchor(
+            &public_inputs,
+            anchor,
+            1,
+            oprf_pk_hashes,
+            backing_commitment,
+        ));
     }
 
     // --- verify_migration / check_migration_anchor ---
@@ -971,6 +1099,7 @@ mod tests {
             delegate_persona_id(),
             1,
             delegate_oprf_pk_hashes(),
+            delegate_persona_account(), // any similarly-shaped [u8; 32] stand-in
         );
         assert_ne!(registration_style, delegate_param_commitment());
     }

@@ -23,21 +23,30 @@
 
 use common::hash_salt_dg1_dg2_hash_private_nullifier;
 use identity_anchor::{
-    assert_dg1_clear_value, combine_committee_anchors, derive_committee_anchor_term,
-    derive_identity_input, DS_ANCHOR_OUT, DS_DLOG, NUM_COMMITTEES,
+    assert_dg1_clear_value, combine_committee_anchors, derive_backing_commitment,
+    derive_backing_root_term, derive_committee_anchor_term, derive_identity_input, DS_ANCHOR_OUT,
+    DS_DLOG, NUM_COMMITTEES,
 };
 use oprf::oprf_output::verified_oprf;
 use poseidon::poseidon2::Poseidon2;
 use utils::types::{DG1Data, MRZExpiryDate, OPRFProof, SaltedValue};
 
 /// Public inputs:  `comm_in`, `scheme_version`
-/// Public outputs: `(anchor, oprf_pk_hashes)` — `oprf_pk_hashes[i] = Poseidon2(pk_i.x, pk_i.y)`
+/// Public outputs: `(anchor, oprf_pk_hashes, backing_commitment)` —
+/// `oprf_pk_hashes[i] = Poseidon2(pk_i.x, pk_i.y)`
 ///
 /// Each `oprf_pk_hashes[i]` is emitted rather than taken as an input so the verifier learns
 /// *which* committee key produced committee `i`'s evaluation. The circuit cannot itself decide
 /// whether that key is the legitimate one for `scheme_version`'s committee slot `i` — that
 /// binding lives on-chain and must be enforced by the Rust verifier, once per committee. See
 /// the README.
+///
+/// `backing_commitment` is a second, independent public value derived from the *same* 5
+/// committee evaluations as `anchor` (see `identity_anchor::derive_backing_root_term`'s doc
+/// comment for why reusing them here is safe, unlike the delegate-persona circuits' deliberate
+/// fresh-query scoping) — safe to publish as a future Merkle-tree leaf because its private
+/// preimage (`backing_root_secret`) carries committee-derived PRF entropy rather than being a
+/// bare function of the low-entropy personal-number field.
 fn main(
     comm_in: pub Field,
     scheme_version: pub Field,
@@ -47,7 +56,7 @@ fn main(
     salted_dg2_hash_type: SaltedValue<u32>,
     salted_private_nullifier: SaltedValue<Field>,
     oprf_proofs: [OPRFProof; NUM_COMMITTEES],
-) -> pub (Field, [Field; NUM_COMMITTEES]) {
+) -> pub (Field, [Field; NUM_COMMITTEES], Field) {
     assert(
         comm_in
             == hash_salt_dg1_dg2_hash_private_nullifier(
@@ -68,6 +77,7 @@ fn main(
     let identity_input = derive_identity_input(salted_dg1.value);
 
     let mut terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
+    let mut backing_terms: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
     let mut oprf_pk_hashes: [Field; NUM_COMMITTEES] = [0; NUM_COMMITTEES];
     for i in 0..NUM_COMMITTEES {
         let oprf_proof = oprf_proofs[i];
@@ -89,10 +99,15 @@ fn main(
         );
 
         terms[i] = derive_committee_anchor_term(i, oprf_output, scheme_version);
+        // Same `oprf_output` witness, a different domain-separated term — see
+        // `derive_backing_root_term`'s doc comment for why this reuse is safe here.
+        backing_terms[i] = derive_backing_root_term(i, oprf_output, scheme_version);
         oprf_pk_hashes[i] = Poseidon2::hash([oprf_proof.pk.x, oprf_proof.pk.y], 2);
     }
 
     let anchor = combine_committee_anchors(terms);
+    let backing_root_secret = combine_committee_anchors(backing_terms);
+    let backing_commitment = derive_backing_commitment(backing_root_secret);
 
-    (anchor, oprf_pk_hashes)
+    (anchor, oprf_pk_hashes, backing_commitment)
 }
