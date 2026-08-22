@@ -17,9 +17,25 @@
 //!    citizen who filed it. See `submit_whistleblower_report`'s doc comment below for the
 //!    full writeup — this has the same structural gap as `pallet-voting::commit_vote`.
 //!
-//! Investigators (appointed by root) move reports through a workflow:
+//! Investigators (appointed via `Config::AppointmentOrigin`) move reports through a workflow:
 //! Pending → Flagged → UnderInvestigation → Cleared | ReferredToCourts
 //! When a report is referred to courts, the investigator then files a case in pallet-courts.
+//!
+//! ## Recusal: a structural 2-of-N safeguard on `clear_report`/`refer_report_to_courts`
+//! Report *content* is off-chain and encrypted to the investigator's key precisely so the chain
+//! cannot see who or what a report concerns — which also means the chain can never check "is
+//! this investigator recusing from a report about themselves" without breaking that privacy
+//! model. Any such on-chain check would be a fabricated no-op. Instead, closing a report
+//! (`clear_report` or `refer_report_to_courts`) is structural: one investigator's call only
+//! *proposes* the transition (recorded in `PendingReportAction`, keyed by `report_id`); the
+//! report's `status` does not change until a **different** investigator calls
+//! `approve_report_action` to co-sign it — mirrors the propose/approve pattern used for the
+//! Oracle Council (`pallet-courts`) and the Accountability Council
+//! (`pallet-accountability-council`), scoped down to a 2-of-N (any two distinct investigators)
+//! rather than a supermajority, since this is a peer-recusal safeguard, not a governance vote.
+//! A lone investigator — including one clearing/referring a report that happens to be about
+//! themselves — can never unilaterally close a report. See `clear_report`/
+//! `refer_report_to_courts`/`approve_report_action`'s doc comments below.
 #![cfg_attr(not(feature = "std"), no_std)]
 pub use pallet::*;
 
@@ -155,6 +171,16 @@ pub mod pallet {
         ReferredToCourts,
     }
 
+    /// Which terminal transition a `PendingReportAction` entry is awaiting a second, different
+    /// investigator's approval for. See the module doc comment's "Recusal" section.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum ReportAction {
+        /// Awaiting approval to move the report to `ReportStatus::Cleared`.
+        Clear,
+        /// Awaiting approval to move the report to `ReportStatus::ReferredToCourts`.
+        ReferToCourts,
+    }
+
     /// On-chain record of an official's asset disclosure.
     #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
     pub struct AssetDeclaration<BlockNumber> {
@@ -251,6 +277,15 @@ pub mod pallet {
     pub type Investigators<T: Config> =
         StorageValue<_, BoundedVec<T::AccountId, T::MaxInvestigators>, ValueQuery>;
 
+    /// `report_id -> (action, proposer)` for a `clear_report`/`refer_report_to_courts` call
+    /// awaiting a second, different investigator's `approve_report_action` sign-off — see the
+    /// module doc comment's "Recusal" section. At most one pending action per report at a time:
+    /// a new proposal for the same report is rejected while one is outstanding, so a report can
+    /// never have conflicting Clear/ReferToCourts proposals in flight simultaneously.
+    #[pallet::storage]
+    pub type PendingReportAction<T: Config> =
+        StorageMap<_, Blake2_128Concat, u32, (ReportAction, T::AccountId)>;
+
     // ── Events ───────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -276,10 +311,16 @@ pub mod pallet {
         ReportFlagged { report_id: u32, investigator: T::AccountId },
         /// An investigator opened a formal investigation on a report.
         InvestigationOpened { report_id: u32, investigator: T::AccountId },
-        /// An investigator cleared a report — no violation found.
-        ReportCleared { report_id: u32, investigator: T::AccountId },
-        /// An investigator referred a report to pallet-courts for formal proceedings.
-        ReportReferredToCourts { report_id: u32, investigator: T::AccountId },
+        /// An investigator proposed closing a report (`Clear` or `ReferToCourts`) — awaiting a
+        /// second, different investigator's `approve_report_action` before it takes effect. See
+        /// the module doc comment's "Recusal" section.
+        ReportActionProposed { report_id: u32, action: ReportAction, proposer: T::AccountId },
+        /// A second, different investigator approved a pending `Clear` action — the report is
+        /// now `Cleared`. No violation found.
+        ReportCleared { report_id: u32, proposer: T::AccountId, approver: T::AccountId },
+        /// A second, different investigator approved a pending `ReferToCourts` action — the
+        /// report is now `ReferredToCourts`.
+        ReportReferredToCourts { report_id: u32, proposer: T::AccountId, approver: T::AccountId },
         /// A new investigator was appointed.
         InvestigatorAdded { who: T::AccountId },
         /// An investigator was removed.
@@ -314,6 +355,15 @@ pub mod pallet {
         TooManyInvestigators,
         /// Account is already a registered investigator.
         AlreadyInvestigator,
+        /// This report already has a `Clear`/`ReferToCourts` proposal pending a second
+        /// investigator's approval — a new proposal cannot be raised until it resolves.
+        ReportActionAlreadyPending,
+        /// `approve_report_action` was called for a report with no pending action.
+        NoPendingReportAction,
+        /// The caller is the same investigator who proposed this pending action — a second,
+        /// *different* investigator is required. See the module doc comment's "Recusal"
+        /// section.
+        SameInvestigator,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────
@@ -512,44 +562,31 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Clear a report under investigation — no violation found. Investigator only.
+        /// Propose clearing a report under investigation — no violation found. Investigator
+        /// only. **Does not clear the report by itself**: this records the caller as the
+        /// report's pending-`Clear` proposer and leaves `status` at `UnderInvestigation` until
+        /// a second, *different* investigator calls `approve_report_action` — see the module
+        /// doc comment's "Recusal" section for why a single investigator can never unilaterally
+        /// close a report, including one about themselves.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn clear_report(origin: OriginFor<T>, report_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_investigator(&who), Error::<T>::NotInvestigator);
-            WhistleblowerReports::<T>::try_mutate(report_id, |maybe| {
-                let entry = maybe.as_mut().ok_or(Error::<T>::ReportNotFound)?;
-                ensure!(
-                    entry.status == ReportStatus::UnderInvestigation,
-                    Error::<T>::InvalidReportState
-                );
-                entry.status = ReportStatus::Cleared;
-                Ok::<_, DispatchError>(())
-            })?;
-            Self::deposit_event(Event::ReportCleared { report_id, investigator: who });
-            Ok(())
+            Self::propose_report_action(report_id, ReportAction::Clear, who)
         }
 
-        /// Refer an investigated report to pallet-courts for formal proceedings.
-        /// Emits ReportReferredToCourts; the investigator then files a case in pallet-courts.
-        /// Investigator only.
+        /// Propose referring an investigated report to pallet-courts for formal proceedings.
+        /// Investigator only. Same propose/approve safeguard as `clear_report`: does not
+        /// transition the report by itself — a second, different investigator must call
+        /// `approve_report_action`. Once approved, the (first) investigator to have proposed or
+        /// approved the referral is expected to file the actual case in pallet-courts.
         #[pallet::call_index(7)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn refer_report_to_courts(origin: OriginFor<T>, report_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Self::is_investigator(&who), Error::<T>::NotInvestigator);
-            WhistleblowerReports::<T>::try_mutate(report_id, |maybe| {
-                let entry = maybe.as_mut().ok_or(Error::<T>::ReportNotFound)?;
-                ensure!(
-                    entry.status == ReportStatus::UnderInvestigation,
-                    Error::<T>::InvalidReportState
-                );
-                entry.status = ReportStatus::ReferredToCourts;
-                Ok::<_, DispatchError>(())
-            })?;
-            Self::deposit_event(Event::ReportReferredToCourts { report_id, investigator: who });
-            Ok(())
+            Self::propose_report_action(report_id, ReportAction::ReferToCourts, who)
         }
 
         /// Appoint a new investigator. Requires `AppointmentOrigin` — in production, the
@@ -588,6 +625,47 @@ pub mod pallet {
             Self::deposit_event(Event::InvestigatorRemoved { who });
             Ok(())
         }
+
+        /// Approve `report_id`'s pending `clear_report`/`refer_report_to_courts` proposal,
+        /// applying whichever transition it recorded (`Clear` → `ReportStatus::Cleared`,
+        /// `ReferToCourts` → `ReportStatus::ReferredToCourts`). Must be a current investigator
+        /// **different** from the one who proposed it — see the module doc comment's "Recusal"
+        /// section. Consumes the `PendingReportAction` entry so it cannot be approved twice.
+        #[pallet::call_index(10)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn approve_report_action(origin: OriginFor<T>, report_id: u32) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Self::is_investigator(&who), Error::<T>::NotInvestigator);
+            let (action, proposer) = PendingReportAction::<T>::get(report_id)
+                .ok_or(Error::<T>::NoPendingReportAction)?;
+            ensure!(who != proposer, Error::<T>::SameInvestigator);
+            WhistleblowerReports::<T>::try_mutate(report_id, |maybe| {
+                let entry = maybe.as_mut().ok_or(Error::<T>::ReportNotFound)?;
+                ensure!(
+                    entry.status == ReportStatus::UnderInvestigation,
+                    Error::<T>::InvalidReportState
+                );
+                entry.status = match action {
+                    ReportAction::Clear => ReportStatus::Cleared,
+                    ReportAction::ReferToCourts => ReportStatus::ReferredToCourts,
+                };
+                Ok::<_, DispatchError>(())
+            })?;
+            PendingReportAction::<T>::remove(report_id);
+            match action {
+                ReportAction::Clear => Self::deposit_event(Event::ReportCleared {
+                    report_id,
+                    proposer,
+                    approver: who,
+                }),
+                ReportAction::ReferToCourts => Self::deposit_event(Event::ReportReferredToCourts {
+                    report_id,
+                    proposer,
+                    approver: who,
+                }),
+            }
+            Ok(())
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -595,6 +673,25 @@ pub mod pallet {
     impl<T: Config> Pallet<T> {
         fn is_investigator(who: &T::AccountId) -> bool {
             Investigators::<T>::get().contains(who)
+        }
+
+        /// Shared body for `clear_report`/`refer_report_to_courts`: records `who` as
+        /// `report_id`'s pending-action proposer without transitioning `status` — see
+        /// `approve_report_action` for the second-investigator step that actually applies it.
+        fn propose_report_action(
+            report_id: u32,
+            action: ReportAction,
+            who: T::AccountId,
+        ) -> DispatchResult {
+            let entry = WhistleblowerReports::<T>::get(report_id).ok_or(Error::<T>::ReportNotFound)?;
+            ensure!(entry.status == ReportStatus::UnderInvestigation, Error::<T>::InvalidReportState);
+            ensure!(
+                PendingReportAction::<T>::get(report_id).is_none(),
+                Error::<T>::ReportActionAlreadyPending
+            );
+            PendingReportAction::<T>::insert(report_id, (action.clone(), who.clone()));
+            Self::deposit_event(Event::ReportActionProposed { report_id, action, proposer: who });
+            Ok(())
         }
 
         /// True if `who` has an asset declaration on file whose `update_due_at` has not yet

@@ -1,7 +1,7 @@
 use crate::{
     mock::*, AssetDisclosures, ConflictRegistry, ConflictType, Error, Event, Investigators,
-    NextReportId, ReportNullifiers, ReportStatus, WhistleblowerReports,
-    WHISTLEBLOWER_REPORT_SERVICE_SCOPE, WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
+    NextReportId, PendingReportAction, ReportAction, ReportNullifiers, ReportStatus,
+    WhistleblowerReports, WHISTLEBLOWER_REPORT_SERVICE_SCOPE, WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -626,21 +626,162 @@ fn open_investigation_fails_when_not_flagged() {
     });
 }
 
-// ─── report workflow: clear_report ──────────────────────────────────────────
+// ─── report workflow: clear_report / approve_report_action (2-of-N recusal) ─
+//
+// clear_report/refer_report_to_courts only *propose* a transition now — see the module doc
+// comment's "Recusal" section. A structural 2-of-N safeguard against a single investigator
+// (including one clearing/referring a report that happens to be about themselves — the chain
+// cannot check that, since report content is encrypted to the investigator's key) unilaterally
+// closing any report.
+
+fn open_investigation_on(report_id: u32, investigator: u64) {
+    assert_ok!(AntiCorruption::flag_report(RuntimeOrigin::signed(investigator), report_id));
+    assert_ok!(AntiCorruption::open_investigation(RuntimeOrigin::signed(investigator), report_id));
+}
 
 #[test]
-fn clear_report_works() {
+fn clear_report_by_single_investigator_does_not_clear_the_report() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         add_investigator(9);
         submit_report(1, NULLIFIER_A, CONTENT_A);
-        assert_ok!(AntiCorruption::flag_report(RuntimeOrigin::signed(9), 0));
-        assert_ok!(AntiCorruption::open_investigation(RuntimeOrigin::signed(9), 0));
+        open_investigation_on(0, 9);
 
+        // Propose only — a lone investigator's clear_report call must not itself clear the
+        // report; it only records a pending action awaiting a second, different investigator.
         assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
 
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::UnderInvestigation
+        );
+        assert_eq!(PendingReportAction::<Test>::get(0), Some((ReportAction::Clear, 9)));
+        System::assert_last_event(
+            Event::ReportActionProposed { report_id: 0, action: ReportAction::Clear, proposer: 9 }
+                .into(),
+        );
+    });
+}
+
+#[test]
+fn refer_report_to_courts_by_single_investigator_does_not_refer_the_report() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        assert_ok!(AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(9), 0));
+
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::UnderInvestigation
+        );
+        assert_eq!(PendingReportAction::<Test>::get(0), Some((ReportAction::ReferToCourts, 9)));
+    });
+}
+
+#[test]
+fn clear_report_two_different_investigators_succeeds() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+        assert_ok!(AntiCorruption::approve_report_action(RuntimeOrigin::signed(10), 0));
+
         assert_eq!(WhistleblowerReports::<Test>::get(0).unwrap().status, ReportStatus::Cleared);
-        System::assert_last_event(Event::ReportCleared { report_id: 0, investigator: 9 }.into());
+        assert!(PendingReportAction::<Test>::get(0).is_none());
+        System::assert_last_event(
+            Event::ReportCleared { report_id: 0, proposer: 9, approver: 10 }.into(),
+        );
+    });
+}
+
+#[test]
+fn refer_report_to_courts_two_different_investigators_succeeds() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        assert_ok!(AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(9), 0));
+        assert_ok!(AntiCorruption::approve_report_action(RuntimeOrigin::signed(10), 0));
+
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::ReferredToCourts
+        );
+        assert!(PendingReportAction::<Test>::get(0).is_none());
+        System::assert_last_event(
+            Event::ReportReferredToCourts { report_id: 0, proposer: 9, approver: 10 }.into(),
+        );
+    });
+}
+
+#[test]
+fn approve_report_action_fails_for_same_investigator_who_proposed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+
+        // Same investigator (9) who proposed cannot also approve — even though 9 is a valid
+        // investigator, this must not be treated as sufficient sign-off.
+        assert_noop!(
+            AntiCorruption::approve_report_action(RuntimeOrigin::signed(9), 0),
+            Error::<Test>::SameInvestigator
+        );
+
+        // Still pending — the report was not cleared.
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::UnderInvestigation
+        );
+        assert!(PendingReportAction::<Test>::get(0).is_some());
+
+        // A genuinely different investigator can still approve afterward.
+        assert_ok!(AntiCorruption::approve_report_action(RuntimeOrigin::signed(10), 0));
+        assert_eq!(WhistleblowerReports::<Test>::get(0).unwrap().status, ReportStatus::Cleared);
+    });
+}
+
+#[test]
+fn approve_report_action_fails_for_non_investigator() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+
+        assert_noop!(
+            AntiCorruption::approve_report_action(RuntimeOrigin::signed(1), 0),
+            Error::<Test>::NotInvestigator
+        );
+    });
+}
+
+#[test]
+fn approve_report_action_fails_when_no_pending_action() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        assert_noop!(
+            AntiCorruption::approve_report_action(RuntimeOrigin::signed(9), 0),
+            Error::<Test>::NoPendingReportAction
+        );
     });
 }
 
@@ -650,8 +791,7 @@ fn clear_report_fails_for_non_investigator() {
         System::set_block_number(1);
         add_investigator(9);
         submit_report(1, NULLIFIER_A, CONTENT_A);
-        assert_ok!(AntiCorruption::flag_report(RuntimeOrigin::signed(9), 0));
-        assert_ok!(AntiCorruption::open_investigation(RuntimeOrigin::signed(9), 0));
+        open_investigation_on(0, 9);
 
         assert_noop!(
             AntiCorruption::clear_report(RuntimeOrigin::signed(1), 0),
@@ -689,28 +829,30 @@ fn clear_report_fails_when_not_under_investigation() {
     });
 }
 
-// ─── report workflow: refer_report_to_courts ────────────────────────────────
-
 #[test]
-fn refer_report_to_courts_works() {
+fn clear_report_fails_when_action_already_pending() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         add_investigator(9);
+        add_investigator(10);
         submit_report(1, NULLIFIER_A, CONTENT_A);
-        assert_ok!(AntiCorruption::flag_report(RuntimeOrigin::signed(9), 0));
-        assert_ok!(AntiCorruption::open_investigation(RuntimeOrigin::signed(9), 0));
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
 
-        assert_ok!(AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(9), 0));
-
-        assert_eq!(
-            WhistleblowerReports::<Test>::get(0).unwrap().status,
-            ReportStatus::ReferredToCourts
+        // A second proposal (even from a different investigator, and even for the other kind
+        // of action) is rejected while one is already pending on this report.
+        assert_noop!(
+            AntiCorruption::clear_report(RuntimeOrigin::signed(10), 0),
+            Error::<Test>::ReportActionAlreadyPending
         );
-        System::assert_last_event(
-            Event::ReportReferredToCourts { report_id: 0, investigator: 9 }.into(),
+        assert_noop!(
+            AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(10), 0),
+            Error::<Test>::ReportActionAlreadyPending
         );
     });
 }
+
+// ─── report workflow: refer_report_to_courts ────────────────────────────────
 
 #[test]
 fn refer_report_to_courts_fails_for_non_investigator() {
@@ -718,8 +860,7 @@ fn refer_report_to_courts_fails_for_non_investigator() {
         System::set_block_number(1);
         add_investigator(9);
         submit_report(1, NULLIFIER_A, CONTENT_A);
-        assert_ok!(AntiCorruption::flag_report(RuntimeOrigin::signed(9), 0));
-        assert_ok!(AntiCorruption::open_investigation(RuntimeOrigin::signed(9), 0));
+        open_investigation_on(0, 9);
 
         assert_noop!(
             AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(1), 0),

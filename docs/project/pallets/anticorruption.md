@@ -11,10 +11,41 @@ Storage:
 - `ReportNullifiers`: `(nullifier [u8;32], content_hash [u8;32])` → `bool` (dedup guard)
 - `NextReportId`: `u32`
 - `Investigators`: `BoundedVec<AccountId, 20>`
+- `PendingReportAction`: `report_id: u32` → `(ReportAction, proposer: AccountId)` — an in-flight
+  `clear_report`/`refer_report_to_courts` proposal awaiting a second, *different* investigator's
+  `approve_report_action` sign-off. See "Recusal: 2-of-N on clear/refer" below.
 
 `ConflictType` enum: `FinancialInterest` | `FamilyRelation` | `FormerEmployer` | `BusinessPartner`
 
 `ReportStatus` enum: `Pending` → `Flagged` → `UnderInvestigation` → `Cleared` | `ReferredToCourts`
+
+`ReportAction` enum: `Clear` | `ReferToCourts` — which terminal transition a `PendingReportAction`
+entry is awaiting approval for.
+
+### Recusal: a structural 2-of-N safeguard on clear_report/refer_report_to_courts
+
+Report *content* is off-chain and encrypted to the investigator's key precisely so the chain
+cannot see who or what a report concerns — so an on-chain "is this investigator recusing from a
+report about themselves" check is impossible without breaking that privacy model; any such check
+would be a fabricated no-op. Fixed instead with a structural safeguard, not a content check:
+closing a report now requires **two different investigators**, mirroring the propose/approve
+pattern already used for the Oracle Council (`pallet-courts`) and the Accountability Council
+(`pallet-accountability-council`), scoped down to 2-of-N rather than a supermajority since this
+is peer recusal, not a governance vote.
+
+- `clear_report(report_id)` / `refer_report_to_courts(report_id)` now only **propose** — they
+  record the caller as `PendingReportAction[report_id]`'s proposer and leave `status` at
+  `UnderInvestigation`. A lone investigator's call, including a self-interested one, never moves
+  the report to `Cleared`/`ReferredToCourts` by itself. Fails with `ReportActionAlreadyPending`
+  if the report already has a pending proposal (of either kind).
+- `approve_report_action(report_id)` — any current investigator **other than** the proposer
+  applies the pending transition (`Clear` → `Cleared`, `ReferToCourts` → `ReferredToCourts`),
+  consuming the `PendingReportAction` entry. The same investigator who proposed cannot also
+  approve (`Error::SameInvestigator`) — even self-appointing a second identity doesn't help,
+  since `Investigators` is a flat account list and the check is a strict `who != proposer`
+  account-identity comparison, not anything content-derived.
+- With only one investigator appointed, a report can never be cleared or referred — an inherent
+  consequence of requiring two *different* investigators, not a bug.
 
 Enforcement: `Pallet::has_current_disclosure(who)` returns `true` only if `who` has an
 `AssetDisclosures` entry whose `update_due_at` has not yet passed. **Now wired with teeth**
@@ -73,9 +104,18 @@ Calls:
   repo yet.
 - `flag_report(report_id)` — investigator: Pending → Flagged
 - `open_investigation(report_id)` — investigator: Flagged → UnderInvestigation
-- `clear_report(report_id)` — investigator: UnderInvestigation → Cleared
-- `refer_report_to_courts(report_id)` — investigator: UnderInvestigation → ReferredToCourts;
-  emits `ReportReferredToCourts`; investigator then files a case in pallet-courts
+- `clear_report(report_id)` — investigator: **proposes** clearing (UnderInvestigation stays
+  UnderInvestigation); emits `ReportActionProposed { action: Clear, proposer }`. Requires a
+  second, different investigator's `approve_report_action` to actually reach `Cleared` — see
+  "Recusal" above.
+- `refer_report_to_courts(report_id)` — investigator: **proposes** referral (UnderInvestigation
+  stays UnderInvestigation); emits `ReportActionProposed { action: ReferToCourts, proposer }`.
+  Same second-investigator requirement as `clear_report`.
+- `approve_report_action(report_id)` — a **different** investigator than the proposer approves
+  the pending action: UnderInvestigation → Cleared (emits `ReportCleared { proposer, approver }`)
+  or UnderInvestigation → ReferredToCourts (emits `ReportReferredToCourts { proposer, approver
+  }`). After a referral takes effect, an investigator then files the actual case in
+  pallet-courts.
 - `add_investigator(account)` / `remove_investigator(account)` — `T::AppointmentOrigin`, wired to
   `pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>` in the runtime,
   **not** bare root — same self-oversight fix, same `EnsureOriginWithArg<Self::RuntimeOrigin,
