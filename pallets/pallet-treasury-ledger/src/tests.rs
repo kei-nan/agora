@@ -11,6 +11,7 @@ const SPENDER: u64 = 10;
 const NOT_SPENDER: u64 = 11;
 const HASH_A: [u8; 32] = [0xAA; 32];
 const HASH_B: [u8; 32] = [0xBB; 32];
+const COUNCIL_MEMBER: u64 = 20;
 
 fn root() -> RuntimeOrigin {
 	RuntimeOrigin::root()
@@ -18,6 +19,17 @@ fn root() -> RuntimeOrigin {
 
 fn signed(who: u64) -> RuntimeOrigin {
 	RuntimeOrigin::signed(who)
+}
+
+/// Simulate the Oracle Council having approved `unfreeze_department(department_id)` for
+/// `COUNCIL_MEMBER` to consume (standing in for `propose_admin_action`/`approve_admin_action`
+/// reaching M-of-N in the real runtime — see `mock::MockCourtOrigin`).
+fn approve_unfreeze(department_id: u32) {
+	let call_hash = crate::pallet::legislature_call_hash(
+		b"pallet-treasury-ledger::unfreeze_department",
+		department_id,
+	);
+	approve_court_action(call_hash, COUNCIL_MEMBER);
 }
 
 // ---------------------------------------------------------------------
@@ -503,17 +515,41 @@ fn freeze_department_internal_sets_frozen_and_emits_event() {
 }
 
 #[test]
-fn unfreeze_department_works_for_root() {
+fn unfreeze_department_succeeds_with_court_origin_approval() {
+	// The fix for the finding below: `unfreeze_department` requires Oracle Council M-of-N
+	// approval (`T::CourtOrigin`), not bare root.
 	new_test_ext().execute_with(|| {
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
-		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+		approve_unfreeze(DEPT);
+		assert_ok!(TreasuryLedger::unfreeze_department(signed(COUNCIL_MEMBER), DEPT));
 		assert!(!CourtFrozenDepartments::<Test>::get(DEPT));
 		System::assert_last_event(Event::DepartmentUnfrozen { department_id: DEPT }.into());
 	});
 }
 
+// ── CVE-class regression: court-ordered freeze reversible by a lone Root key ──────────────
+//
+// `freeze_department` (via `TreasuryEnforcer`, triggered only by a court ruling that has
+// itself cleared pallet-courts' M-of-7 `EnsureOracleCouncilApproved` flow) used to be
+// pairable with an `unfreeze_department` gated by bare `ensure_root` — letting a single
+// Root/sudo key silently undo an already-adjudicated court ruling with no council or jury
+// involvement. `unfreeze_department` is now gated the same way `freeze_department` effectively
+// is: Oracle Council M-of-N approval via `T::CourtOrigin`.
+
 #[test]
-fn unfreeze_department_fails_for_non_root() {
+fn unfreeze_department_fails_for_lone_root() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
+		assert_noop!(
+			TreasuryLedger::unfreeze_department(root(), DEPT),
+			sp_runtime::DispatchError::BadOrigin
+		);
+		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
+	});
+}
+
+#[test]
+fn unfreeze_department_fails_for_unapproved_signed_origin() {
 	new_test_ext().execute_with(|| {
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
 		assert_noop!(
@@ -527,8 +563,9 @@ fn unfreeze_department_fails_for_non_root() {
 #[test]
 fn unfreeze_department_fails_when_not_frozen() {
 	new_test_ext().execute_with(|| {
+		approve_unfreeze(DEPT);
 		assert_noop!(
-			TreasuryLedger::unfreeze_department(root(), DEPT),
+			TreasuryLedger::unfreeze_department(signed(COUNCIL_MEMBER), DEPT),
 			Error::<Test>::DepartmentNotFrozen
 		);
 	});
@@ -540,7 +577,8 @@ fn record_expenditure_succeeds_again_after_unfreeze() {
 		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
-		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+		approve_unfreeze(DEPT);
+		assert_ok!(TreasuryLedger::unfreeze_department(signed(COUNCIL_MEMBER), DEPT));
 
 		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 100);
@@ -581,8 +619,9 @@ fn audit_unfreeze_does_not_lift_a_still_open_court_freeze() {
 			Error::<Test>::DepartmentFrozen
 		);
 
-		// Only the root override clears the remaining (court) axis.
-		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+		// Only the Oracle-Council-approved manual override clears the remaining (court) axis.
+		approve_unfreeze(DEPT);
+		assert_ok!(TreasuryLedger::unfreeze_department(signed(COUNCIL_MEMBER), DEPT));
 		assert!(!crate::Pallet::<Test>::is_frozen(DEPT));
 		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));
 	});
@@ -638,7 +677,7 @@ fn audit_freeze_alone_blocks_expenditure_and_audit_unfreeze_alone_clears_it() {
 
 #[test]
 fn unfreeze_department_dispatchable_clears_both_axes() {
-	// Root's manual override is an explicit full clear (documented design choice on
+	// The manual override is an explicit full clear (documented design choice on
 	// `unfreeze_department`), not a per-axis clear.
 	new_test_ext().execute_with(|| {
 		assert_ok!(crate::Pallet::<Test>::freeze_department_internal(DEPT));
@@ -646,7 +685,8 @@ fn unfreeze_department_dispatchable_clears_both_axes() {
 		assert!(CourtFrozenDepartments::<Test>::get(DEPT));
 		assert!(AuditFrozenDepartments::<Test>::get(DEPT));
 
-		assert_ok!(TreasuryLedger::unfreeze_department(root(), DEPT));
+		approve_unfreeze(DEPT);
+		assert_ok!(TreasuryLedger::unfreeze_department(signed(COUNCIL_MEMBER), DEPT));
 
 		assert!(!CourtFrozenDepartments::<Test>::get(DEPT));
 		assert!(!AuditFrozenDepartments::<Test>::get(DEPT));
@@ -671,6 +711,18 @@ fn legislature_call_hash_differs_across_allocate_budget_and_reset_department_spe
 	let reset_hash =
 		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", DEPT);
 	assert_ne!(allocate_hash, reset_hash);
+}
+
+#[test]
+fn legislature_call_hash_differs_for_reset_department_spent_and_unfreeze_department() {
+	// Same reasoning as above, now covering `T::CourtOrigin`-gated `unfreeze_department`
+	// (both take a single `u32` department_id — close enough in shape to collide without
+	// domain separation by call tag).
+	let reset_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::reset_department_spent", DEPT);
+	let unfreeze_hash =
+		crate::pallet::legislature_call_hash(b"pallet-treasury-ledger::unfreeze_department", DEPT);
+	assert_ne!(reset_hash, unfreeze_hash);
 }
 
 #[test]
@@ -743,7 +795,7 @@ fn record_expenditure_succeeds_again_after_audit_unfreeze_department_internal() 
 		);
 
 		// This is the path pallet-audit's TreasuryFreezer wiring uses (as opposed to the
-		// root-only `unfreeze_department` dispatchable).
+		// Oracle-Council-gated `unfreeze_department` dispatchable).
 		assert_ok!(crate::Pallet::<Test>::audit_unfreeze_department_internal(DEPT));
 
 		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 100, HASH_A));

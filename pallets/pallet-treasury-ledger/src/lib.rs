@@ -71,6 +71,21 @@ pub mod pallet {
         /// hash against the motion's approved `call_hash`, so a motion passed to authorize
         /// one call can never be replayed to execute another.
         type LegislatureOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
+        /// Origin permitted to manually clear a freeze via `unfreeze_department`. Must be
+        /// wired to `pallet_courts::EnsureOracleCouncilApproved` in the runtime, exactly like
+        /// `pallet_constitution::Config::CourtOrigin` / `pallet_identity_zk::Config::
+        /// SuspensionOrigin` — succeeds only once the Oracle Council's M-of-N threshold has
+        /// approved this exact call via `propose_admin_action`/`approve_admin_action`. This
+        /// closes the gap where bare `ensure_root` let a single Root/sudo key silently reverse
+        /// an already-adjudicated court-ordered freeze (`CourtFrozenDepartments`, set only via
+        /// the M-of-N-gated `TreasuryEnforcer`/`freeze_department_internal` path) with no
+        /// council or jury involvement — the same class of bug `EnsureOracleCouncilApproved`
+        /// was introduced to fix for `invalidate_law`/`suspend_citizen`/`restore_citizen_rights`.
+        /// `EnsureOriginWithArg` so the call binds to the domain-separated hash of its own
+        /// parameters (see `legislature_call_hash`), the same binding every other privileged
+        /// call in this pallet uses — a token approved for one call can never be replayed
+        /// against another.
+        type CourtOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
     }
 
     /// Department id -> allocated budget (in base units).
@@ -118,8 +133,10 @@ pub mod pallet {
     /// combined check `record_expenditure` actually uses.
     ///
     /// pallet-courts' `TreasuryEnforcer` trait exposes only `freeze_department` — no unfreeze —
-    /// so a court-ordered freeze is terminal until root's `unfreeze_department` dispatchable
-    /// clears it (see that call's doc comment for why root clears both axes at once).
+    /// so a court-ordered freeze stays in place until `unfreeze_department` clears it.
+    /// `unfreeze_department` is gated by `T::CourtOrigin` (Oracle Council M-of-N approval, not
+    /// bare root — see that call's doc comment), so lifting a court-ordered freeze always
+    /// requires the same collective authorization that court rulings themselves do.
     #[pallet::storage]
     pub type CourtFrozenDepartments<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, bool, ValueQuery>;
@@ -265,30 +282,41 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Unfreeze a previously frozen department. Root only.
+        /// Unfreeze a previously frozen department. Gated by `T::CourtOrigin` — in production
+        /// `pallet_courts::EnsureOracleCouncilApproved`, i.e. this only succeeds once the
+        /// Oracle Council's M-of-N threshold has approved this exact call via
+        /// `propose_admin_action`/`approve_admin_action`. Deliberately NOT bare `ensure_root`:
+        /// a court-ordered freeze (`CourtFrozenDepartments`) is only ever set via the M-of-N-
+        /// gated `TreasuryEnforcer` path (a court ruling), so a single Root/sudo key must not
+        /// be able to unilaterally reverse it either — that would let one compromised or
+        /// rogue key silently undo an already-adjudicated ruling with no council or jury
+        /// involvement.
         ///
         /// Clears BOTH freeze axes (`CourtFrozenDepartments` and `AuditFrozenDepartments`)
         /// unconditionally, rather than picking one. This is a deliberate design choice, not
-        /// an oversight: root already holds full trusted-override authority elsewhere in this
-        /// codebase (e.g. the emergency council's sunset-gated powers), and a partial clear
-        /// here would recreate exactly the silent-desync failure mode the two-axis split
-        /// exists to prevent — an operator calling this dispatchable expecting "the department
-        /// can spend again" but leaving a leftover flag on the axis they didn't know about,
-        /// with `record_expenditure` still failing for no visible reason. A root operator
-        /// invoking this call is presumed to have already confirmed remediation on whichever
-        /// side(s) actually needed it (e.g. via governance record or off-chain process) before
-        /// reaching for the one manual override that exists. It is not meant to replace either
-        /// authority's own everyday path: pallet-courts has no unfreeze path at all (a
-        /// court-ordered freeze is terminal by design — see `CourtFrozenDepartments`), and
-        /// pallet-audit clears its own axis automatically via `audit_unfreeze_department_internal`
-        /// as `resolve_entry` brings `OpenFlags` back to zero.
+        /// an oversight: a partial clear here would recreate exactly the silent-desync failure
+        /// mode the two-axis split exists to prevent — a caller expecting "the department can
+        /// spend again" but leaving a leftover flag on the axis they didn't know about, with
+        /// `record_expenditure` still failing for no visible reason. A caller invoking this is
+        /// presumed to have already confirmed remediation on whichever side(s) actually needed
+        /// it (e.g. via governance record or off-chain process) before reaching for the one
+        /// manual override that exists. It is not meant to replace either authority's own
+        /// everyday path: pallet-courts has no separate unfreeze path of its own (this
+        /// dispatchable, M-of-N-gated, *is* its unfreeze path), and pallet-audit clears its own
+        /// axis automatically via `audit_unfreeze_department_internal` as `resolve_entry`
+        /// brings `OpenFlags` back to zero — this dispatchable is only the manual escape hatch
+        /// for cases that path doesn't cover, now raised from single-key root to the same
+        /// M-of-N collective every other manual court-adjacent override in this codebase uses.
         #[pallet::call_index(5)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn unfreeze_department(
             origin: OriginFor<T>,
             department_id: u32,
         ) -> DispatchResult {
-            ensure_root(origin)?;
+            T::CourtOrigin::ensure_origin(
+                origin,
+                &legislature_call_hash(b"pallet-treasury-ledger::unfreeze_department", department_id),
+            )?;
             ensure!(Self::is_frozen(department_id), Error::<T>::DepartmentNotFrozen);
             CourtFrozenDepartments::<T>::remove(department_id);
             AuditFrozenDepartments::<T>::remove(department_id);

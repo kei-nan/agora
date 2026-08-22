@@ -42,6 +42,51 @@ impl frame_system::Config for Test {
 thread_local! {
 	/// Every call recorded by `RecordingAuditHook::on_expenditure`, in call order.
 	pub static AUDIT_CALLS: RefCell<Vec<(u64, u32, u128, [u8; 32])>> = RefCell::new(Vec::new());
+	/// The single `(call_hash, account)` pair `MockCourtOrigin` currently accepts, standing in
+	/// for an Oracle Council M-of-N approval already recorded for that exact call in the real
+	/// `pallet_courts::EnsureOracleCouncilApproved`. Consumed (cleared) on use, single-shot
+	/// just like the real thing.
+	static APPROVED_COURT_ACTION: RefCell<Option<([u8; 32], AccountId)>> = const { RefCell::new(None) };
+}
+
+/// Test helper: simulate the Oracle Council having approved `call_hash` for `who` to consume —
+/// stands in for `pallet_courts::propose_admin_action` + `approve_admin_action` reaching M-of-N
+/// in the real runtime.
+pub fn approve_court_action(call_hash: [u8; 32], who: AccountId) {
+	APPROVED_COURT_ACTION.with(|c| *c.borrow_mut() = Some((call_hash, who)));
+}
+
+/// Test-only stand-in for `pallet_courts::EnsureOracleCouncilApproved`. Unlike this mock's
+/// `LegislatureOrigin` below (which adapts bare `EnsureRoot`, deferring the call-hash binding
+/// invariant itself to pallet-legislature's own suite), the security property under test for
+/// `CourtOrigin` is specifically that bare Root must NOT be sufficient — so this mock models
+/// the real origin's actual shape (a call-hash-gated *signed* account, never `Root`) instead of
+/// trivially accepting Root, letting this pallet's own tests prove that property directly.
+pub struct MockCourtOrigin;
+impl frame_support::traits::EnsureOriginWithArg<RuntimeOrigin, [u8; 32]> for MockCourtOrigin {
+	type Success = ();
+
+	fn try_origin(o: RuntimeOrigin, call_hash: &[u8; 32]) -> Result<Self::Success, RuntimeOrigin> {
+		use frame_system::RawOrigin;
+		match o.clone().into() {
+			Ok(RawOrigin::Signed(who)) => {
+				let matches =
+					APPROVED_COURT_ACTION.with(|c| *c.borrow() == Some((*call_hash, who)));
+				if matches {
+					APPROVED_COURT_ACTION.with(|c| *c.borrow_mut() = None);
+					Ok(())
+				} else {
+					Err(o)
+				}
+			}
+			_ => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin(_call_hash: &[u8; 32]) -> Result<RuntimeOrigin, ()> {
+		Err(())
+	}
 }
 
 /// Test-only `AuditHook` implementation that records every call so tests can assert
@@ -71,6 +116,7 @@ impl pallet_treasury_ledger::Config for Test {
 	// requires -- this pallet's own tests exercise this pallet's logic, not the call-hash
 	// binding invariant (covered by pallet-legislature's own test suite).
 	type LegislatureOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<AccountId>>;
+	type CourtOrigin = MockCourtOrigin;
 }
 
 // Build genesis storage according to the mock runtime.
@@ -79,6 +125,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 		frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into();
 	ext.execute_with(|| {
 		reset_audit_calls();
+		APPROVED_COURT_ACTION.with(|c| *c.borrow_mut() = None);
 		System::set_block_number(1);
 	});
 	ext

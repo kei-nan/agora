@@ -36,8 +36,10 @@ and pallet-courts' freezes (via its own `TreasuryEnforcer` trait) in two separat
 blocked from spending while *either* is set. This means: if pallet-courts has also frozen a
 department for an unresolved ruling, `resolve_entry` clearing pallet-audit's last open flag does
 **not** lift the department's freeze overall — the court-ordered freeze remains until cleared by
-pallet-treasury-ledger's root-only `unfreeze_department` dispatchable (which clears both axes at
-once). This was previously a single shared boolean, which let either authority silently clear
+pallet-treasury-ledger's Oracle-Council-gated `unfreeze_department` dispatchable — `CourtOrigin`,
+wired to `pallet_courts::EnsureOracleCouncilApproved` rather than bare root, since a court-ordered
+freeze must not be reversible by a single Root/sudo key. That call clears both axes at once. This
+storage split was previously a single shared boolean, which let either authority silently clear
 the other's freeze; see pallet-treasury-ledger's `CourtFrozenDepartments`/`AuditFrozenDepartments`
 doc comments for the full rationale.
 

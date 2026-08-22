@@ -25,18 +25,24 @@ passed to allocate one department's budget can't be replayed to reset another's 
 - `record_expenditure(department_id, amount, metadata_hash)` — must be the account registered in `DepartmentSpenders` for that department; enforces the budget cap and rejects if frozen
 - `register_department_spender(department_id, spender)` — root; registers or replaces the authorized spender
 - `remove_department_spender(department_id)` — root
-- `unfreeze_department(department_id)` — root; clears BOTH `CourtFrozenDepartments` and
-  `AuditFrozenDepartments` unconditionally (a deliberate full override, not a per-axis clear —
-  see the doc comment on this call for why). Used after an appeal overturns a treasury ruling,
-  after remediation, or to clear a stuck freeze on either axis.
+- `unfreeze_department(department_id)` — `CourtOrigin` (wired to
+  `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's
+  M-of-N approval of this exact call, not bare root — fixed after a project review found the
+  prior `EnsureRoot` wiring let a single Root/sudo key silently reverse an already-adjudicated
+  court-ordered freeze with no council or jury involvement, mirroring the same fix already
+  applied to `pallet_constitution::invalidate_law` and `pallet_identity_zk::suspend_citizen`/
+  `restore_citizen_rights`). Clears BOTH `CourtFrozenDepartments` and `AuditFrozenDepartments`
+  unconditionally (a deliberate full override, not a per-axis clear — see the doc comment on this
+  call for why). Used after an appeal overturns a treasury ruling, after remediation, or to clear
+  a stuck freeze on either axis.
 
 After every `record_expenditure`, calls `T::AuditHook::on_expenditure(...)` → pallet-audit inserts a `Pending` audit entry.
 
 Internal (no origin check; not dispatchable, only reachable via runtime-wired traits):
 - `freeze_department_internal(department_id)` — called by pallet-courts (`TreasuryEnforcer`) on
   an illegal-treasury-activity ruling; sets `CourtFrozenDepartments` only. pallet-courts has no
-  corresponding unfreeze call — a court-ordered freeze is terminal until the root
-  `unfreeze_department` dispatchable clears it.
+  corresponding unfreeze call — a court-ordered freeze stays in place until the
+  Oracle-Council-gated `unfreeze_department` dispatchable clears it.
 - `audit_freeze_department_internal(department_id)` / `audit_unfreeze_department_internal(department_id)`
   — called by pallet-audit (`TreasuryFreezer`) when its `OpenFlags` counter for a department goes
   to/from zero; set/clear `AuditFrozenDepartments` only, independent of the court axis. Idempotent.

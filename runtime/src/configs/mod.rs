@@ -581,6 +581,14 @@ impl pallet_treasury_ledger::Config for Runtime {
 	type AuditHook = PalletAuditImpl;
 	/// Budget allocation requires a passed legislature motion, not just sudo.
 	type LegislatureOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
+	/// Manually clearing a freeze (`unfreeze_department`) requires the Oracle Council's
+	/// M-of-N approval, not bare root — mirrors exactly how `SuspensionOrigin`/`CourtOrigin`
+	/// are wired for `pallet_identity_zk`/`pallet_constitution` above. A court-ordered freeze
+	/// (`CourtFrozenDepartments`) is only ever set via the M-of-N-gated `TreasuryEnforcer`
+	/// path (an actual court ruling); before this, `unfreeze_department` was gated only by
+	/// `EnsureRoot`, letting a single Root/sudo key silently reverse an already-adjudicated
+	/// ruling with no council or jury involvement.
+	type CourtOrigin = pallet_courts::EnsureOracleCouncilApproved<Runtime>;
 }
 
 /// Runtime implements CitizenSelector by reading pallet-identity's indexed storage.
