@@ -37,6 +37,7 @@ mod tests;
 pub mod pallet {
     use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use scale_info::TypeInfo;
 
@@ -92,6 +93,21 @@ pub mod pallet {
         /// Freezes/unfreezes a department in pallet-treasury-ledger when this pallet opens
         /// or fully resolves flags/disputes against it.
         type TreasuryFreezer: TreasuryFreezer;
+        /// Origin required to add/remove auditors. `add_auditor`/`remove_auditor` used to be
+        /// bare `ensure_root`, which routed appointment through whoever holds `Root` with no
+        /// dedicated oversight body at all — see
+        /// `pallet_accountability_council`'s module doc comment for why that's a problem
+        /// (self-oversight: the branch that controls the treasury must not also pick its own
+        /// auditors) and why a separate, independent Accountability Council exists to fix it.
+        /// Wire this to `pallet_accountability_council::EnsureAccountabilityCouncilApproved`
+        /// in production (requires that Council's genuine 2/3 supermajority for the exact
+        /// call — see `add_auditor`/`remove_auditor`'s use of
+        /// `pallet_accountability_council::accountability_call_hash` below); kept generic
+        /// over `EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>` rather than depending on
+        /// that concrete type, the same way `pallet_constitution::Config::CourtOrigin` is
+        /// generic over `pallet_courts::EnsureOracleCouncilApproved` — call-hash binding is
+        /// what's required here, not the specific pallet.
+        type AppointmentOrigin: EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
     }
 
     // ── Storage ────────────────────────────────────────────────────────────────
@@ -173,11 +189,19 @@ pub mod pallet {
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Add an auditor to the registry. Root only.
+        /// Add an auditor to the registry. Requires `AppointmentOrigin` — in production, the
+        /// Accountability Council's own 2/3 supermajority approval for this exact call (see
+        /// `Config::AppointmentOrigin`'s doc comment), not bare `Root`.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn add_auditor(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AppointmentOrigin::ensure_origin(
+                origin,
+                &pallet_accountability_council::accountability_call_hash(
+                    b"pallet-audit::add_auditor",
+                    &account,
+                ),
+            )?;
             Auditors::<T>::try_mutate(|auditors| {
                 ensure!(!auditors.contains(&account), Error::<T>::AlreadyAuditor);
                 auditors.try_push(account.clone()).map_err(|_| Error::<T>::TooManyAuditors)
@@ -186,11 +210,17 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Remove an auditor from the registry. Root only.
+        /// Remove an auditor from the registry. Same `AppointmentOrigin` gate as `add_auditor`.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn remove_auditor(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AppointmentOrigin::ensure_origin(
+                origin,
+                &pallet_accountability_council::accountability_call_hash(
+                    b"pallet-audit::remove_auditor",
+                    &account,
+                ),
+            )?;
             Auditors::<T>::try_mutate(|auditors| {
                 let pos = auditors
                     .iter()

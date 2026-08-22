@@ -164,6 +164,22 @@ fn add_auditor_fails_for_non_root_origin() {
 }
 
 #[test]
+fn add_auditor_requires_appointment_origin() {
+    // `Config::AppointmentOrigin` (in production,
+    // `pallet_accountability_council::EnsureAccountabilityCouncilApproved` — a genuine 2/3
+    // Council supermajority for this exact call) rejects a lone signed account outright, even
+    // one signed by the very account being appointed (no self-appointment). This mock's
+    // permissive `AsEnsureOriginWithArg<EnsureRoot<u64>>` (see mock.rs) stands in for a
+    // successful Council approval with bare `Root` — the real call-hash-binding/supermajority
+    // invariant is covered by `pallet-accountability-council`'s own test suite.
+    new_test_ext().execute_with(|| {
+        assert_noop!(Audit::add_auditor(RuntimeOrigin::signed(9), 9), DispatchError::BadOrigin);
+        assert_ok!(Audit::add_auditor(RuntimeOrigin::root(), 9));
+        assert!(Auditors::<Test>::get().contains(&9));
+    });
+}
+
+#[test]
 fn add_auditor_fails_on_duplicate() {
     new_test_ext().execute_with(|| {
         add_auditor(1);
@@ -214,6 +230,17 @@ fn remove_auditor_fails_for_non_root_origin() {
             Audit::remove_auditor(RuntimeOrigin::signed(1), 1),
             DispatchError::BadOrigin
         );
+    });
+}
+
+#[test]
+fn remove_auditor_requires_appointment_origin() {
+    // Same property as `add_auditor_requires_appointment_origin` above, for `remove_auditor`.
+    new_test_ext().execute_with(|| {
+        add_auditor(9);
+        assert_noop!(Audit::remove_auditor(RuntimeOrigin::signed(9), 9), DispatchError::BadOrigin);
+        assert_ok!(Audit::remove_auditor(RuntimeOrigin::root(), 9));
+        assert!(!Auditors::<Test>::get().contains(&9));
     });
 }
 

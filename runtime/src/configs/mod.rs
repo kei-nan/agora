@@ -572,6 +572,11 @@ impl pallet_audit::Config for Runtime {
 	/// At most 10 registered auditors.
 	type MaxAuditors = ConstU32<10>;
 	type TreasuryFreezer = Runtime;
+	/// Auditor appointment now requires the independent Accountability Council's own 2/3
+	/// supermajority approval for the exact call, not bare `Root` — see
+	/// `pallet_accountability_council`'s module doc comment and the "Accountability Council"
+	/// section below for the self-oversight rationale.
+	type AppointmentOrigin = pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>;
 }
 
 impl pallet_treasury_ledger::Config for Runtime {
@@ -1029,6 +1034,11 @@ impl pallet_anticorruption::Config for Runtime {
 	/// 6s/block", but this runtime's actual block time is 12s, making that literal ~2 years,
 	/// contradicting docs/project/pallets/anticorruption.md's "mandatory annual renewal" claim.
 	type AssetDisclosureRenewalBlocks = ConstU32<{ 365 * DAYS }>;
+	/// Investigator appointment now requires the independent Accountability Council's own 2/3
+	/// supermajority approval for the exact call, not bare `Root` — see
+	/// `pallet_accountability_council`'s module doc comment and the "Accountability Council"
+	/// section below for the self-oversight rationale.
+	type AppointmentOrigin = pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -1055,6 +1065,8 @@ impl pallet_anticorruption::Config for Runtime {
 	type MaxInvestigators = ConstU32<20>;
 	/// See the `dev-mode` impl above for the block-time rationale.
 	type AssetDisclosureRenewalBlocks = ConstU32<{ 365 * DAYS }>;
+	/// See the `dev-mode` impl above.
+	type AppointmentOrigin = pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>;
 }
 
 // ── Accountability Council ───────────────────────────────────────────────────
@@ -1064,11 +1076,18 @@ impl pallet_anticorruption::Config for Runtime {
 // `pallet_accountability_council`'s module doc comment for why this is a dedicated council
 // rather than routed through pallet-legislature (self-oversight risk) or pallet-executive.
 //
-// NOT yet wired as `pallet_audit::Config::AuditorOrigin` / `pallet_anticorruption::Config::
-// InvestigatorOrigin` in this pass — those pallets' `add_auditor`/`add_investigator` etc. are
-// still bare `ensure_root` with no configurable `EnsureOrigin` at all, so there is nothing yet
-// for `EnsureAccountabilityCouncilApproved` to be wired into; that origin-plumbing change to
-// pallet-audit/pallet-anticorruption is deliberately left for a follow-up pass.
+// Now wired as `pallet_audit::Config::AppointmentOrigin` / `pallet_anticorruption::Config::
+// AppointmentOrigin` (both `= pallet_accountability_council::EnsureAccountabilityCouncilApproved
+// <Runtime>`, see the two `impl ... ::Config for Runtime` blocks above): those pallets'
+// `add_auditor`/`remove_auditor`/`add_investigator`/`remove_investigator` gained a genuine
+// `EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>` associated type (previously bare
+// `ensure_root` with no configurable `EnsureOrigin` at all), bound to the call-hash-domain-
+// separated tags `pallet-audit::add_auditor`/`::remove_auditor` and
+// `pallet-anticorruption::add_investigator`/`::remove_investigator` via
+// `pallet_accountability_council::accountability_call_hash` (imported directly — pallet-audit
+// and pallet-anticorruption both now depend on the pallet-accountability-council crate for
+// this one shared hash function, so the two sides can never silently drift apart the way two
+// independently-reimplemented hash functions could).
 
 /// Runtime implements `pallet_accountability_council::LegislatureChecker` by reading
 /// pallet-legislature's `Members` directly — same approach as the identical check

@@ -1,5 +1,6 @@
 use crate as pallet_anticorruption;
 use frame_support::derive_impl;
+use frame_system::EnsureRoot;
 use sp_runtime::BuildStorage;
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -65,6 +66,16 @@ impl pallet_anticorruption::Config for Test {
     type ZkVerifier = TestZkVerifier;
     type MaxInvestigators = MaxInvestigators;
     type AssetDisclosureRenewalBlocks = AssetDisclosureRenewalBlocks;
+    // `AsEnsureOriginWithArg` adapts the plain `EnsureRoot` origin (which only cares about
+    // Root-ness) to the `EnsureOriginWithArg<_, [u8; 32]>` bound `AppointmentOrigin` now
+    // requires — ignoring the call-hash argument entirely. Mirrors
+    // `pallet_treasury_ledger`'s mock `LegislatureOrigin` wiring: this pallet's own tests
+    // exercise this pallet's investigator-registry logic, not the call-hash-binding/
+    // supermajority invariant of the real
+    // `pallet_accountability_council::EnsureAccountabilityCouncilApproved` origin, which is
+    // covered by that pallet's own test suite. Keeping this permissive (Root still succeeds)
+    // lets the pre-existing `RuntimeOrigin::root()`-based tests keep working unchanged.
+    type AppointmentOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
 }
 
 // Build genesis storage according to the mock runtime.

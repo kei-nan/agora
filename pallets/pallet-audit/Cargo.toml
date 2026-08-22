@@ -19,6 +19,7 @@ frame-system.workspace = true
 scale-info = { features = ["derive"], workspace = true }
 sp-runtime.workspace = true
 pallet-treasury-ledger = { path = "../pallet-treasury-ledger", default-features = false }
+pallet-accountability-council = { path = "../pallet-accountability-council", default-features = false }
 
 [dev-dependencies]
 sp-core = { default-features = true, workspace = true }
@@ -34,10 +35,12 @@ std = [
     "scale-info/std",
     "sp-runtime/std",
     "pallet-treasury-ledger/std",
+    "pallet-accountability-council/std",
 ]
 try-runtime = [
     "frame-support/try-runtime",
     "frame-system/try-runtime",
     "sp-runtime/try-runtime",
     "pallet-treasury-ledger/try-runtime",
+    "pallet-accountability-council/try-runtime",
 ]

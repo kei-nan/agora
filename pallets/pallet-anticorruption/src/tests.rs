@@ -783,6 +783,26 @@ fn add_investigator_fails_for_non_root() {
 }
 
 #[test]
+fn add_investigator_requires_appointment_origin() {
+    // `Config::AppointmentOrigin` (in production,
+    // `pallet_accountability_council::EnsureAccountabilityCouncilApproved` — a genuine 2/3
+    // Council supermajority for this exact call) rejects a lone signed account outright, even
+    // one signed by the very account being appointed (no self-appointment). This mock's
+    // permissive `AsEnsureOriginWithArg<EnsureRoot<u64>>` (see mock.rs) stands in for a
+    // successful Council approval with bare `Root` — the real call-hash-binding/supermajority
+    // invariant is covered by `pallet-accountability-council`'s own test suite.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            AntiCorruption::add_investigator(RuntimeOrigin::signed(9), 9),
+            DispatchError::BadOrigin
+        );
+        assert_ok!(AntiCorruption::add_investigator(RuntimeOrigin::root(), 9));
+        assert!(Investigators::<Test>::get().contains(&9));
+    });
+}
+
+#[test]
 fn add_investigator_fails_when_already_investigator() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -833,6 +853,22 @@ fn remove_investigator_fails_for_non_root() {
             AntiCorruption::remove_investigator(RuntimeOrigin::signed(1), 9),
             DispatchError::BadOrigin
         );
+    });
+}
+
+#[test]
+fn remove_investigator_requires_appointment_origin() {
+    // Same property as `add_investigator_requires_appointment_origin` above, for
+    // `remove_investigator`.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        assert_noop!(
+            AntiCorruption::remove_investigator(RuntimeOrigin::signed(9), 9),
+            DispatchError::BadOrigin
+        );
+        assert_ok!(AntiCorruption::remove_investigator(RuntimeOrigin::root(), 9));
+        assert!(!Investigators::<Test>::get().contains(&9));
     });
 }
 

@@ -13,7 +13,27 @@ Storage:
 Every `record_expenditure` in pallet-treasury-ledger automatically inserts a `Pending` entry here.
 
 Calls:
-- `add_auditor(account)` / `remove_auditor(account)` — root
+- `add_auditor(account)` / `remove_auditor(account)` — `T::AppointmentOrigin`, wired to
+  `pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>` in the runtime,
+  **not** bare root (fixed after a self-oversight gap: pallet-legislature already controls the
+  treasury budget via `LegislatureOrigin`, so if it also appointed the auditors overseeing that
+  same spending, the auditors would answer to the branch they audit — see
+  `docs/project/pallets/accountability-council.md` for the full rationale, including the
+  Indonesia KPK precedent this is meant to avoid). `Config::AppointmentOrigin` is generic over
+  `EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>` (not hardcoded to the Accountability
+  Council's concrete type), the same way `pallet_constitution::Config::CourtOrigin` is generic
+  over `pallet_courts::EnsureOracleCouncilApproved`. `add_auditor`/`remove_auditor` compute the
+  call hash via `pallet_accountability_council::accountability_call_hash(b"pallet-
+  audit::add_auditor"|"::remove_auditor", &account)` — pallet-audit depends on the
+  pallet-accountability-council crate for this one shared hash function rather than
+  reimplementing the domain-separation algorithm locally, so the two sides can't drift apart.
+  The mock test runtime wires `AppointmentOrigin = AsEnsureOriginWithArg<EnsureRoot<u64>>` (a
+  permissive stand-in, ignoring the call hash — mirrors `pallet_treasury_ledger`'s mock
+  `LegislatureOrigin`), so this pallet's own tests exercise the auditor-registry logic, not the
+  Accountability Council's call-hash-binding/supermajority invariant (covered by that pallet's
+  own test suite); `add_auditor_requires_appointment_origin`/
+  `remove_auditor_requires_appointment_origin` do assert that a lone signed account (including
+  the very account being appointed) is rejected with `BadOrigin`.
 - `clear_entry(expenditure_index)` — auditor only; → `Cleared` (Pending entries only)
 - `flag_entry(expenditure_index, reason_hash)` — auditor only; → `Flagged` with IPFS reason doc
 - `dispute_entry(expenditure_index)` — auditor only; → `Disputed`

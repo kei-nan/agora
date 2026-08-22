@@ -2,11 +2,8 @@
 
 ### pallet-accountability-council (crate: pallet-accountability-council) — runtime index 19
 
-An independent oversight body that will govern appointment of `pallet-audit` auditors and
-`pallet-anticorruption` investigators. Both of those pallets' `add_auditor`/`remove_auditor` and
-`add_investigator`/`remove_investigator` calls are currently bare `ensure_root` with no
-configurable `EnsureOrigin` at all — this pallet exists so that governance has an origin to wire
-them to that isn't `pallet-legislature`. Routing appointment through the legislature would
+An independent oversight body that governs appointment of `pallet-audit` auditors and
+`pallet-anticorruption` investigators. Routing appointment through the legislature would
 reproduce the exact self-oversight failure real Supreme Audit Institutions are designed to
 prevent: the legislature already controls the treasury budget via `LegislatureOrigin` (see
 `pallet_treasury_ledger::Config::LegislatureOrigin`), so letting it also pick who audits/
@@ -14,10 +11,21 @@ investigates that same spending puts the auditors under the thumb of the body th
 (Concrete cautionary precedent cited in the design discussion: Indonesia's KPK was weakened when
 its legislature inserted itself into the anti-corruption commission's appointment structure.)
 
-**Not yet wired as `AuditorOrigin`/`InvestigatorOrigin`.** This pass built and runtime-wired the
-Council pallet itself only; `pallet-audit` and `pallet-anticorruption` still have no configurable
-origin for those calls to point `EnsureAccountabilityCouncilApproved` at. That plumbing change to
-the two consuming pallets is a deliberate follow-up, not attempted here.
+**Wired as `AppointmentOrigin` on both consuming pallets.** `pallet-audit` and
+`pallet-anticorruption` each gained a new `AppointmentOrigin: EnsureOriginWithArg<Self::
+RuntimeOrigin, [u8; 32]>` associated type (replacing their previous bare `ensure_root` calls with
+no configurable `EnsureOrigin` at all), wired in `runtime/src/configs/mod.rs` to
+`pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>`. `add_auditor`/
+`remove_auditor`/`add_investigator`/`remove_investigator` compute their call hash via this
+pallet's own `accountability_call_hash(tag, params)` (imported directly — both consuming crates
+now depend on pallet-accountability-council for this one function, rather than each
+reimplementing the domain-separation algorithm locally the way `pallet_constitution::
+legislature_call_hash` mirrors `pallet-courts`' hashing) with tags `pallet-audit::add_auditor` /
+`::remove_auditor` and `pallet-anticorruption::add_investigator` / `::remove_investigator`. See
+`docs/project/pallets/audit.md` and `docs/project/pallets/anticorruption.md` for the per-pallet
+detail, including each pallet's permissive `AsEnsureOriginWithArg<EnsureRoot<u64>>` mock
+convention (mirroring `pallet_treasury_ledger`'s mock `LegislatureOrigin`) and the
+lone-signature-rejected tests it added.
 
 Department-spender designation (`pallet_treasury_ledger::register_department_spender`) is
 deliberately **not** routed through this Council — it's an operational, Executive-branch-like
@@ -105,10 +113,6 @@ Calls:
   token nobody consumed once `ApprovalExpiryBlocks` have passed
 
 TODOs:
-- Wire `pallet_audit::Config::AuditorOrigin` and `pallet_anticorruption::Config::
-  InvestigatorOrigin` (new configurable `EnsureOrigin` type params — neither pallet has one yet)
-  to `pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>`, replacing
-  their current bare `ensure_root` calls.
-- `pallet-anticorruption` also needs a per-report recusal/multi-sign-off mechanism independent of
-  the appointment-origin fix above: today any current investigator can unilaterally clear or
+- `pallet-anticorruption` still needs a per-report recusal/multi-sign-off mechanism independent
+  of the appointment-origin fix above: today any current investigator can unilaterally clear or
   refer *any* report, including one filed about themselves.

@@ -76,7 +76,14 @@ Calls:
 - `clear_report(report_id)` — investigator: UnderInvestigation → Cleared
 - `refer_report_to_courts(report_id)` — investigator: UnderInvestigation → ReferredToCourts;
   emits `ReportReferredToCourts`; investigator then files a case in pallet-courts
-- `add_investigator(account)` / `remove_investigator(account)` — root
+- `add_investigator(account)` / `remove_investigator(account)` — `T::AppointmentOrigin`, wired to
+  `pallet_accountability_council::EnsureAccountabilityCouncilApproved<Runtime>` in the runtime,
+  **not** bare root — same self-oversight fix, same `EnsureOriginWithArg<Self::RuntimeOrigin,
+  [u8; 32]>`-generic `Config` field, same shared `accountability_call_hash` dependency, and same
+  permissive `AsEnsureOriginWithArg<EnsureRoot<u64>>` mock convention as `pallet-audit`'s
+  `add_auditor`/`remove_auditor` above — see that pallet's doc entry and
+  `docs/project/pallets/accountability-council.md` for the full rationale. Call-hash tags:
+  `pallet-anticorruption::add_investigator` / `::remove_investigator`.
 
 ZK verifier: `PassthroughAntiCorruptionZkVerifier` (dev-mode) / `ZkPassportAntiCorruptionZkVerifier` (prod).
 Production impl reuses the same ZKPassport UltraHonk outer circuit as pallet-identity

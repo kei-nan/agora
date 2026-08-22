@@ -19,6 +19,7 @@ frame-system.workspace = true
 scale-info = { features = ["derive"], workspace = true }
 sp-runtime.workspace = true
 pallet-elections = { path = "../pallet-elections", default-features = false }
+pallet-accountability-council = { path = "../pallet-accountability-council", default-features = false }
 
 [dev-dependencies]
 sp-core = { default-features = true, workspace = true }
@@ -34,10 +35,12 @@ std = [
     "scale-info/std",
     "sp-runtime/std",
     "pallet-elections/std",
+    "pallet-accountability-council/std",
 ]
 try-runtime = [
     "frame-support/try-runtime",
     "frame-system/try-runtime",
     "sp-runtime/try-runtime",
     "pallet-elections/try-runtime",
+    "pallet-accountability-council/try-runtime",
 ]

@@ -33,6 +33,7 @@ pub mod pallet {
 
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
+    use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
 
     #[pallet::pallet]
@@ -200,6 +201,22 @@ pub mod pallet {
         /// How many blocks between mandatory asset disclosure renewals (e.g., 1 year).
         #[pallet::constant]
         type AssetDisclosureRenewalBlocks: Get<u32>;
+        /// Origin required to add/remove investigators. `add_investigator`/
+        /// `remove_investigator` used to be bare `ensure_root`, which routed appointment
+        /// through whoever holds `Root` with no dedicated oversight body at all — see
+        /// `pallet_accountability_council`'s module doc comment for why that's a problem
+        /// (self-oversight: the branch that controls the treasury must not also pick its own
+        /// investigators) and why a separate, independent Accountability Council exists to
+        /// fix it. Wire this to
+        /// `pallet_accountability_council::EnsureAccountabilityCouncilApproved` in production
+        /// (requires that Council's genuine 2/3 supermajority for the exact call — see
+        /// `add_investigator`/`remove_investigator`'s use of
+        /// `pallet_accountability_council::accountability_call_hash` below); kept generic
+        /// over `EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>` rather than depending on
+        /// that concrete type, the same way `pallet_constitution::Config::CourtOrigin` is
+        /// generic over `pallet_courts::EnsureOracleCouncilApproved` — call-hash binding is
+        /// what's required here, not the specific pallet.
+        type AppointmentOrigin: EnsureOriginWithArg<Self::RuntimeOrigin, [u8; 32]>;
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────
@@ -535,11 +552,19 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Appoint a new investigator. Root only.
+        /// Appoint a new investigator. Requires `AppointmentOrigin` — in production, the
+        /// Accountability Council's own 2/3 supermajority approval for this exact call (see
+        /// `Config::AppointmentOrigin`'s doc comment), not bare `Root`.
         #[pallet::call_index(8)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
         pub fn add_investigator(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AppointmentOrigin::ensure_origin(
+                origin,
+                &pallet_accountability_council::accountability_call_hash(
+                    b"pallet-anticorruption::add_investigator",
+                    &who,
+                ),
+            )?;
             Investigators::<T>::try_mutate(|list| {
                 ensure!(!list.contains(&who), Error::<T>::AlreadyInvestigator);
                 list.try_push(who.clone()).map_err(|_| Error::<T>::TooManyInvestigators)
@@ -548,11 +573,17 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Remove an investigator. Root only.
+        /// Remove an investigator. Same `AppointmentOrigin` gate as `add_investigator`.
         #[pallet::call_index(9)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
         pub fn remove_investigator(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
-            ensure_root(origin)?;
+            T::AppointmentOrigin::ensure_origin(
+                origin,
+                &pallet_accountability_council::accountability_call_hash(
+                    b"pallet-anticorruption::remove_investigator",
+                    &who,
+                ),
+            )?;
             Investigators::<T>::mutate(|list| list.retain(|x| x != &who));
             Self::deposit_event(Event::InvestigatorRemoved { who });
             Ok(())

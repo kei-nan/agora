@@ -6029,6 +6029,7 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-accountability-council",
  "pallet-elections",
  "parity-scale-codec",
  "scale-info",
@@ -6043,6 +6044,7 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "pallet-accountability-council",
  "pallet-treasury-ledger",
  "parity-scale-codec",
  "scale-info",
