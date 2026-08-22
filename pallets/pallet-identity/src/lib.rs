@@ -276,6 +276,17 @@ pub mod pallet {
         /// and grow chain state at ordinary transaction-fee cost with no ceiling.
         #[pallet::constant]
         type MaxPendingOprfQueriesPerCitizen: Get<u32>;
+        /// Minimum number of blocks that must pass between two successful `recover_account`
+        /// calls for the same nullifier (tracked in `LastRecoveryBlock`). `recover_account`
+        /// deliberately has no dispute/challenge window (see its doc comment for why: a delay
+        /// only helps if the old key is still reachable to contest it, which contradicts the
+        /// lost-device scenario recovery exists for), so this cooldown is the only friction
+        /// standing between a valid recovery proof and an immediate, unchallengeable account
+        /// swap. Set high enough to blunt rapid-fire abuse/griefing without meaningfully
+        /// hindering a citizen who has genuinely lost a second device shortly after recovering
+        /// from losing a first one.
+        #[pallet::constant]
+        type MinBlocksBetweenRecoveries: Get<u32>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -542,6 +553,15 @@ pub mod pallet {
     pub type PendingOprfQueryCountBySubmitter<T: Config> =
         StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
 
+    /// Last block at which a `recover_account` succeeded for this nullifier. The cooldown
+    /// guard (`Config::MinBlocksBetweenRecoveries`) checks against this so a single citizen's
+    /// identity can't be bounced between accounts in rapid succession. Abuse/griefing
+    /// mitigation only, not a security boundary — see `recover_account`'s doc comment for why
+    /// no dispute window backs it up instead.
+    #[pallet::storage]
+    pub type LastRecoveryBlock<T: Config> =
+        StorageMap<_, Blake2_128Concat, [u8; 32], BlockNumberFor<T>>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -555,6 +575,18 @@ pub mod pallet {
         MerkleRootRemoved { merkle_root: [u8; 32] },
         /// A citizen's registration/reverification deadline was pushed forward.
         CitizenReverified { who: T::AccountId, deadline: BlockNumberFor<T> },
+        /// A citizen's identity was recovered onto a new `AccountId` after losing access to
+        /// the original one (`recover_account`). `old_account` is fully invalidated as of this
+        /// event — it no longer has any `CitizenNullifier`/`CitizenAnchor` entry and can no
+        /// longer act as this citizen. `nullifier_hash` is included for auditability; unlike
+        /// `IdentityAnchorRegistry`'s anchor value, the nullifier is already public elsewhere
+        /// (`CitizenRegistered`), so including it here carries no additional
+        /// vote-correlation risk.
+        CitizenAccountRecovered {
+            old_account: T::AccountId,
+            new_account: T::AccountId,
+            nullifier_hash: [u8; 32],
+        },
         /// A citizen migrated their identity anchor to a new OPRF scheme version. Anchor
         /// values themselves are never included in events (see `IdentityAnchorRegistry`'s
         /// doc comment) — only the resulting scheme version is public.
@@ -685,6 +717,13 @@ pub mod pallet {
         /// nor fully answered (every committee slot at `T::OprfThreshold` round-2 responses),
         /// so it is still potentially live and must not be pruned yet.
         QueryNotPrunable,
+        /// `recover_account`: no existing citizen is registered under this proof's nullifier —
+        /// there is nothing to recover. Use `register_citizen` for a genuinely new identity
+        /// instead.
+        NoExistingRegistrationForNullifier,
+        /// `recover_account`: `Config::MinBlocksBetweenRecoveries` has not yet passed since the
+        /// last successful recovery for this nullifier.
+        RecoveryCooldownActive,
     }
 
     #[pallet::call]
@@ -1415,6 +1454,128 @@ pub mod pallet {
             });
 
             Self::deposit_event(Event::OprfQueryPruned { query_id, submitter: query.submitter });
+            Ok(())
+        }
+
+        /// Recover a citizen's identity onto a brand-new `AccountId` after losing access to the
+        /// one they originally registered with (e.g. a reinstalled/reset device — see
+        /// `mobile/src/chain/keystoreWallet.ts`'s own doc comment on why a lost wallet file
+        /// otherwise strands the identity with no way back in). Takes the exact same proof
+        /// shape as `register_citizen` (a fresh outer ZKPassport proof plus the OPRF identity
+        /// anchor it recomputes to) and verifies it through the same real `T::ZkVerifier`/
+        /// `T::AnchorVerifier` path used at original registration — no weakened check and no
+        /// dev-mode/passthrough shortcut here. Possessing the passport and passing the same
+        /// liveness/face-match bar as original registration is treated as sufficient proof of
+        /// identity, exactly as it is for `register_citizen` itself.
+        ///
+        /// Unlike `register_citizen` (which rejects outright when the proof's nullifier is
+        /// already in `NullifierRegistry`), this call treats that as the expected case: it
+        /// looks up which existing citizen the nullifier belongs to and, once the fresh proof
+        /// re-derives that citizen's on-file anchor (checked the same way `reverify_citizen`
+        /// checks it — `AnchorMismatch` on a mismatch, `InvalidReverificationProof` if the
+        /// outer proof doesn't actually recompute to it), rebinds every piece of that citizen's
+        /// per-account identity storage from the old `AccountId` to the caller's new one:
+        /// `NullifierRegistry`, `CitizenNullifier`, `CitizenAnchor`, `IdentityAnchorRegistry`,
+        /// `CitizenIndex`/`CitizenPosition` (repointed in place, not swap-and-popped — the
+        /// citizen isn't leaving the registry, just changing address), `ReverificationDeadline`
+        /// (pushed forward exactly like a successful `reverify_citizen`, since this proof
+        /// establishes the same currently-valid-passport fact), and
+        /// `SelfDeclaredSingleDocument` (carried over if set — it's a claim about the citizen,
+        /// not the device).
+        ///
+        /// `SuspendedNullifiers`/`SuspendedByJuryReview` are deliberately **not** touched here:
+        /// they're keyed by `nullifier`, not `AccountId`, so a suspended citizen's suspension
+        /// automatically carries over onto the new account at zero extra code — recovery cannot
+        /// be used to silently launder away an active court-ordered suspension.
+        ///
+        /// The old `AccountId` is fully invalidated as this citizen's identity: after this call
+        /// it has no `CitizenNullifier`/`CitizenAnchor` entry, so it can no longer act as this
+        /// citizen (vote, reverify, migrate, self-declare) even if it's still reachable —
+        /// closing the gap where a merely-misplaced-but-still-accessible old key could act in
+        /// parallel with the new one. Recovering onto an already-registered `who` (including
+        /// `who == old_account`) is rejected up front (`AlreadyRegistered`), same check
+        /// `register_citizen` makes.
+        ///
+        /// No time-delayed dispute window guards the rebind — deliberate, not an oversight: a
+        /// delay only helps if the old key is still reachable to contest it, which contradicts
+        /// the lost-device scenario this call exists for, and would add friction with no real
+        /// benefit here. The only guard against abuse/griefing is
+        /// `Config::MinBlocksBetweenRecoveries`, a per-nullifier cooldown tracked in
+        /// `LastRecoveryBlock`.
+        #[pallet::call_index(20)]
+        #[pallet::weight(Weight::from_parts(50_000, 0))]
+        pub fn recover_account(
+            origin: OriginFor<T>,
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<18>>,
+            anchor: [u8; 32],
+            oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
+
+            // Verify the real proof before touching any registry state keyed on its claimed
+            // nullifier — same ordering rationale used throughout this pallet: an
+            // unauthenticated caller must never learn anything about registry contents.
+            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            let nullifier = public_inputs[public_inputs.len() - 2];
+
+            let old_account = NullifierRegistry::<T>::get(nullifier)
+                .ok_or(Error::<T>::NoExistingRegistrationForNullifier)?;
+            let (scheme_version, on_file_anchor) = CitizenAnchor::<T>::get(&old_account)
+                .ok_or(Error::<T>::NoExistingRegistrationForNullifier)?;
+            ensure!(anchor == on_file_anchor, Error::<T>::AnchorMismatch);
+
+            Self::check_outer_proof_freshness(public_inputs.as_slice())?;
+            Self::check_committee_keys(scheme_version, &oprf_pk_hashes)?;
+            ensure!(
+                T::AnchorVerifier::verify_reverification(
+                    public_inputs.as_slice(),
+                    anchor,
+                    scheme_version,
+                    oprf_pk_hashes,
+                ),
+                Error::<T>::InvalidReverificationProof
+            );
+
+            let now = frame_system::Pallet::<T>::block_number();
+            if let Some(last) = LastRecoveryBlock::<T>::get(nullifier) {
+                let earliest_next = last.saturating_add(BlockNumberFor::<T>::from(
+                    T::MinBlocksBetweenRecoveries::get(),
+                ));
+                ensure!(now >= earliest_next, Error::<T>::RecoveryCooldownActive);
+            }
+
+            // ---- Rebind every per-account identity storage from old_account to who. ----
+            NullifierRegistry::<T>::insert(nullifier, &who);
+            CitizenNullifier::<T>::remove(&old_account);
+            CitizenNullifier::<T>::insert(&who, nullifier);
+
+            IdentityAnchorRegistry::<T>::insert((scheme_version, anchor), &who);
+            CitizenAnchor::<T>::remove(&old_account);
+            CitizenAnchor::<T>::insert(&who, (scheme_version, anchor));
+
+            if let Some(pos) = CitizenPosition::<T>::take(&old_account) {
+                CitizenPosition::<T>::insert(&who, pos);
+                CitizenIndex::<T>::insert(pos, &who);
+            }
+
+            ReverificationDeadline::<T>::remove(&old_account);
+            let deadline =
+                now.saturating_add(BlockNumberFor::<T>::from(T::ReverificationPeriod::get()));
+            ReverificationDeadline::<T>::insert(&who, deadline);
+
+            if SelfDeclaredSingleDocument::<T>::take(&old_account) {
+                SelfDeclaredSingleDocument::<T>::insert(&who, true);
+            }
+
+            LastRecoveryBlock::<T>::insert(nullifier, now);
+
+            Self::deposit_event(Event::CitizenAccountRecovered {
+                old_account,
+                new_account: who,
+                nullifier_hash: nullifier,
+            });
             Ok(())
         }
     }

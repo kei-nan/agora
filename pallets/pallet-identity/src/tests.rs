@@ -1,10 +1,10 @@
 use crate::{
     committee_slot_for, mock::*, AllowedMerkleRoots, CitizenAnchor, CitizenIndex,
     CitizenNullifier, CitizenPosition, CommitteeMembers, Error, Event, IdentityAnchorRegistry,
-    NextQueryId, NullifierRegistry, OprfCommitteeKeys, PendingOprfQueryCountBySubmitter,
-    OprfRound1Commitments, OprfRound2Responses, OprfSchemeVersion, PendingOprfQueries,
-    ReverificationDeadline, SelfDeclaredSingleDocument, SuspendedByJuryReview,
-    SuspendedNullifiers, TotalCitizens,
+    LastRecoveryBlock, NextQueryId, NullifierRegistry, OprfCommitteeKeys,
+    PendingOprfQueryCountBySubmitter, OprfRound1Commitments, OprfRound2Responses,
+    OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
+    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens,
 };
 use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -2296,4 +2296,253 @@ fn legislature_call_hash_differs_for_different_committee_slots() {
         (1u32, 1u8, NULLIFIER_A),
     );
     assert_ne!(a, b);
+}
+
+// ─── recover_account ────────────────────────────────────────────────────────
+
+#[test]
+fn recover_account_rebinds_identity_storage_and_invalidates_old_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_eq!(ReverificationDeadline::<Test>::get(1), Some(11));
+
+        System::set_block_number(5);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+
+        // New account holds everything the old one used to.
+        assert_eq!(CitizenNullifier::<Test>::get(2), Some(NULLIFIER_A));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+        assert_eq!(CitizenAnchor::<Test>::get(2), Some((0, ANCHOR_A)));
+        assert_eq!(IdentityAnchorRegistry::<Test>::get((0, ANCHOR_A)), Some(2));
+        assert_eq!(CitizenIndex::<Test>::get(0), Some(2));
+        assert_eq!(CitizenPosition::<Test>::get(2), Some(0));
+        // Deadline pushed forward from "now" (5), same as a successful reverify_citizen.
+        assert_eq!(ReverificationDeadline::<Test>::get(2), Some(15));
+
+        // Old account is fully invalidated — no leftover identity storage.
+        assert_eq!(CitizenNullifier::<Test>::get(1), None);
+        assert_eq!(CitizenAnchor::<Test>::get(1), None);
+        assert_eq!(CitizenPosition::<Test>::get(1), None);
+        assert_eq!(ReverificationDeadline::<Test>::get(1), None);
+        assert!(!Identity::is_citizen(&1));
+
+        // Registry-wide invariants unaffected — this is a rebind, not a leave-and-rejoin.
+        assert_eq!(TotalCitizens::<Test>::get(), 1);
+
+        assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(5));
+        System::assert_last_event(
+            Event::CitizenAccountRecovered {
+                old_account: 1,
+                new_account: 2,
+                nullifier_hash: NULLIFIER_A,
+            }
+            .into(),
+        );
+    });
+}
+
+#[test]
+fn recover_account_carries_over_self_declaration() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_ok!(Identity::declare_no_other_passport(RuntimeOrigin::signed(1)));
+        assert!(SelfDeclaredSingleDocument::<Test>::get(1));
+
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+
+        assert!(SelfDeclaredSingleDocument::<Test>::get(2));
+        assert!(!SelfDeclaredSingleDocument::<Test>::get(1));
+    });
+}
+
+#[test]
+fn recover_account_preserves_suspension_across_the_rebind() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_ok!(Identity::suspend_citizen(RuntimeOrigin::root(), NULLIFIER_A, None));
+        assert!(!Identity::is_active_citizen(&1));
+
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+
+        // SuspendedNullifiers is keyed by nullifier, not AccountId — the suspension follows
+        // the citizen onto the new account automatically, with no special-case code needed.
+        assert_eq!(SuspendedNullifiers::<Test>::get(NULLIFIER_A), Some(None));
+        assert!(Identity::is_citizen(&2));
+        assert!(!Identity::is_active_citizen(&2));
+    });
+}
+
+#[test]
+fn recover_account_fails_for_a_nullifier_that_was_never_registered() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::NoExistingRegistrationForNullifier
+        );
+    });
+}
+
+#[test]
+fn recover_account_fails_when_anchor_does_not_match_on_file() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        // ANCHOR_B was never registered for this citizen's nullifier.
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AnchorMismatch
+        );
+    });
+}
+
+#[test]
+fn recover_account_fails_when_target_account_is_already_registered() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        register(2, NULLIFIER_B, ANCHOR_B);
+
+        // Recovering onto an already-registered account (whether it's a different citizen, as
+        // here, or the same old_account) is rejected up front — mirrors register_citizen's own
+        // AlreadyRegistered check.
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::AlreadyRegistered
+        );
+    });
+}
+
+#[test]
+fn recover_account_fails_with_invalid_zk_proof() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                invalid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::InvalidZKProof
+        );
+    });
+}
+
+#[test]
+fn recover_account_fails_twice_within_the_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        System::set_block_number(5);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+        assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(5));
+
+        // MinBlocksBetweenRecoveries is 5 in the mock, so the earliest a second recovery for
+        // this nullifier may succeed is block 10. Block 9 must still fail.
+        System::set_block_number(9);
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(3),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+            ),
+            Error::<Test>::RecoveryCooldownActive
+        );
+        // The failed attempt must not have touched anything — still bound to account 2.
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        System::set_block_number(5);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+
+        // Exactly at the boundary (last + MinBlocksBetweenRecoveries) recovery is allowed again.
+        System::set_block_number(10);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(3),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+        ));
+
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(3));
+        assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(10));
+    });
 }

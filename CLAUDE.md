@@ -98,7 +98,16 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   resistance, is `Poseidon2(DS_IDENTITY_INPUT, personal_number, issuing_country)` (see
   `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`) — do not conflate the two
 - Passport must be valid at registration AND at vote time
-- Recovery = re-scan valid passport
+- Recovery = re-scan valid passport. Chain-side mechanism now real (2026-08-22):
+  `pallet-identity`'s `recover_account` extrinsic takes the same real-verified proof shape as
+  `register_citizen`, and when its nullifier matches an existing citizen, rebinds that
+  citizen's on-file identity storage from their old (lost) `AccountId` to a new one, fully
+  invalidating the old account and rate-limited by a `MinBlocksBetweenRecoveries` cooldown —
+  see `docs/project/pallets/identity.md`. Still gated on the same OPRF-committee blocker as
+  every other identity call (no real committee exists yet, so no proof can be produced or
+  submitted end-to-end), and no mobile-side UI/call wrapper exists yet to drive it (see
+  `mobile/src/chain/keystoreWallet.ts`'s doc comment) — the mechanism is real, the flow isn't
+  wired up end-to-end.
 - Passport-only for v1 (country allowlist — some countries lack stable national ID in NFC chip)
 
 ## Voting System

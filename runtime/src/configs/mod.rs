@@ -318,6 +318,11 @@ impl pallet_identity_zk::Config for Runtime {
 	/// (retries included), while still bounding per-citizen mailbox growth — see
 	/// `pallet_identity_zk::Config::MaxPendingOprfQueriesPerCitizen`'s doc comment.
 	type MaxPendingOprfQueriesPerCitizen = ConstU32<20>;
+	/// ~7 days — blunts rapid-fire recovery abuse/griefing (see
+	/// `pallet_identity_zk::Config::MinBlocksBetweenRecoveries`'s doc comment) while staying
+	/// well clear of a genuine back-to-back device-loss scenario. Placeholder pending real
+	/// pilot telemetry, same spirit as this pallet's other governance-tunable cadences above.
+	type MinBlocksBetweenRecoveries = ConstU32<{ 7 * DAYS }>;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -361,6 +366,8 @@ impl pallet_identity_zk::Config for Runtime {
 	type OprfThreshold = ConstU32<12>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxPendingOprfQueriesPerCitizen = ConstU32<20>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type MinBlocksBetweenRecoveries = ConstU32<{ 7 * DAYS }>;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as

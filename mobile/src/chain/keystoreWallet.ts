@@ -23,15 +23,25 @@
  * encrypted at rest instead of a public, hardcoded, identical-on-every-
  * install value.
  *
- * Not a migration/recovery story: if this file is lost (app data cleared,
- * uninstall/reinstall, device reset) the seed is unrecoverable and a fresh
- * one is generated, meaning a *new* on-chain address — this module doesn't
- * attempt account recovery. CLAUDE.md's Identity System section says
- * "Recovery = re-scan valid passport", which implies recovery should key off
- * the passport-derived OPRF identity anchor (`getSigningKeypair`'s
- * `nullifierHash`/pallet-identity's `CitizenAnchor`), not this file — wiring
- * that up is separate, unstarted work; this module only provides *a*
- * hardware-backed key, not identity continuity across reinstalls.
+ * Not a migration/recovery story on its own: if this file is lost (app data
+ * cleared, uninstall/reinstall, device reset), the seed is unrecoverable and
+ * a fresh one is generated on next use, meaning a *new* on-chain address —
+ * this module itself doesn't attempt account recovery, it only provides *a*
+ * hardware-backed key. Chain-side recovery now exists to make that new
+ * address usable again: `pallet-identity`'s `recover_account` extrinsic
+ * (same passport re-scan / ZK proof flow as original registration) rebinds
+ * the citizen's on-file identity (nullifier, OPRF anchor, reverification
+ * deadline, jury-selection index, etc.) from the old, now-unreachable
+ * `AccountId` onto whatever fresh one this module generates next — see
+ * `pallets/pallet-identity/src/lib.rs`'s `recover_account` doc comment and
+ * `docs/project/pallets/identity.md`. As of this writing no mobile-side code
+ * calls it yet (this file, and the rest of `mobile/src/chain/`, has no
+ * `recoverAccount` wrapper analogous to `identity.ts`'s `registerCitizen`) —
+ * wiring the re-scan UI flow to that call is separate, unstarted work; only
+ * the chain-side mechanism is done. It also inherits `register_citizen`'s
+ * own standing limitation: it depends on a real OPRF committee existing
+ * (`OprfCommitteeKeys`/`CommitteeMembers` are still empty — see CLAUDE.md's
+ * "Remaining Work" #1), so it can't be exercised end-to-end yet either.
  */
 import RNFS from 'react-native-fs';
 import { Keyring } from '@polkadot/keyring';

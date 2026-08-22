@@ -170,6 +170,10 @@ impl pallet_identity_zk::Config for Test {
     // Small on purpose (mirrors MaxCommitteeSize's convention above): big enough for tests to
     // submit a handful of queries and exercise the over-cap rejection without a large fixture.
     type MaxPendingOprfQueriesPerCitizen = frame_support::traits::ConstU32<3>;
+    // Short cooldown (mirrors ReverificationPeriod/OprfQuerySlaBlocks' convention above) so
+    // tests can cross it without huge block numbers, while still being nonzero so a
+    // back-to-back double-recovery test has something real to assert against.
+    type MinBlocksBetweenRecoveries = frame_support::traits::ConstU32<5>;
 }
 
 // Build genesis storage according to the mock runtime.
