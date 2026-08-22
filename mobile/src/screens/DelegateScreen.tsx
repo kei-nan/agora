@@ -21,7 +21,7 @@ const HELP = {
   registry:
     'Delegates are citizens who have publicly registered with their verified passport name. They represent other citizens on specific topics. You choose which topics — and for how long — you trust each delegate.',
   backing:
-    'Backing endorses a delegate as trustworthy. A delegate needs at least 50 backers to become Active and eligible to receive vote delegations. Backing is separate from delegation — you can back without delegating.',
+    'Backing endorses a delegate as trustworthy. A delegate needs at least 50 backers to become Active and eligible to receive vote delegations. Backing is separate from delegation — you can back without delegating. Backing is public and permanent: it links your own account to the delegate\'s, and anyone can query exactly which citizens back which delegate — it is not an anonymous endorsement.',
   termLimit:
     'To prevent permanent concentration of power, delegates serve a maximum number of consecutive terms before a mandatory break. The progress bar shows how far through their current term they are.',
   becomeDelegate:

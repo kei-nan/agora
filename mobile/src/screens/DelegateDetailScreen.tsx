@@ -90,6 +90,26 @@ export default function DelegateDetailScreen({ route }: Props) {
     load();
   }, [address]));
 
+  function confirmToggleBacking() {
+    if (isBacking) {
+      showConfirm({
+        title: 'Remove backing?',
+        message: 'Your account will no longer publicly back this delegate.',
+        confirmLabel: 'Remove',
+        destructive: true,
+        onConfirm: toggleBacking,
+      });
+      return;
+    }
+    showConfirm({
+      title: 'Back this delegate?',
+      message: 'Backing is public and permanent: it links your account to this delegate, and '
+        + 'anyone can query on-chain that you back them. This is not an anonymous endorsement.',
+      confirmLabel: 'Back',
+      onConfirm: toggleBacking,
+    });
+  }
+
   async function toggleBacking() {
     setActionLoading('back');
     try {
@@ -238,13 +258,13 @@ export default function DelegateDetailScreen({ route }: Props) {
             </Text>
             <Text style={s.backingRowSub}>
               {isBacking
-                ? 'You are endorsing this delegate — counts towards their 50-backer threshold'
-                : 'Endorse them to help reach the 50-backer activation threshold'}
+                ? 'You are endorsing this delegate — counts towards their 50-backer threshold. This is public and permanent, linked to your account.'
+                : 'Endorse them to help reach the 50-backer activation threshold. Backing is public and permanent — anyone can query that your account backs this delegate.'}
             </Text>
           </View>
           <TouchableOpacity
             style={[s.backingBtn, isBacking ? s.backingBtnActive : s.backingBtnInactive]}
-            onPress={toggleBacking}
+            onPress={confirmToggleBacking}
             disabled={actionLoading === 'back' || profile.status === 'OnBreak'}
             accessibilityRole="button"
             accessibilityLabel={isBacking ? 'Remove backing' : 'Back this delegate'}
