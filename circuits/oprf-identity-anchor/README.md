@@ -65,9 +65,10 @@ Consequences:
 
 ## The circuits
 
-Five binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
-committee evaluates → unblind), so a single circuit cannot cover it; `query` is round one and
-`anchor`/`disclosure`/`migrate`/`migrate-disclosure` are round two.
+Seven binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
+committee evaluates → unblind), so a single circuit cannot cover it; `query`/`delegate-query`
+are round one and `anchor`/`disclosure`/`migrate`/`migrate-disclosure`/`delegate-persona` are
+round two.
 
 | Package | ACIR opcodes | bb circuit size | Role |
 |---|---:|---:|---|
@@ -76,6 +77,12 @@ committee evaluates → unblind), so a single circuit cannot cover it; `query` i
 | `disclosure` | 219,440 | 283,679 | Round 2, **pipeline-integrated**. Same, shaped as an outer-circuit disclosure subproof. Adds an expiry check. Backs `verify_registration_anchor` and `verify_reverification`. |
 | `migrate` | 433,740 | 555,380 | Dual evaluation under two committee generations (**10** total OPRF checks), for OPRF scheme rotation. Standalone — kept for testing, same unauthenticated-`comm_in` caveat as `anchor`. |
 | `migrate-disclosure` | 435,707 | 558,896 | Round 2, **pipeline-integrated** form of `migrate` (changelog entry 76) — same dual evaluation, shaped as a disclosure subproof, with an expiry check. Backs `verify_migration`. |
+| `delegate-query` | 6,733 | 12,113 | Round 1 for **delegate-persona creation** — a separate on-demand flow, not folded into registration. Structurally identical to `query`, blinds a *distinctly-scoped* delegate identity input instead. |
+| `delegate-persona` | 219,603 | 283,900 | Round 2, **pipeline-integrated**, for delegate-persona creation. Verifies 5 committees' responses to the delegate-scoped query, emits `delegate_persona_id`, and binds the citizen's chosen `persona_account` into `param_commitment` (anti-front-running). See "Delegate-persona derivation" below. |
+
+`delegate-query`/`delegate-persona` are new in changelog entry 093 and are a genuinely separate
+feature from citizen registration: they run once, on demand, whenever a registered citizen
+chooses to become a delegate, never as part of `register_citizen`/`reverify_citizen`.
 
 For reference, unmodified upstream `oprf-auth` measures **6,644** ACIR opcodes with the same
 toolchain. `query`'s fork costs **+89 opcodes** — the personal-number slice, the populated
@@ -129,6 +136,72 @@ integer:
 | `DS_ANCHOR` | `AGORA_ANCHOR_V1` | Agora circuits + on-chain verifier |
 | `DS_ANCHOR_OUT` | `AGORA_ANCHOR_OPRF_OUT` | Agora circuits only (client-side; the committee never sees it) |
 | `DS_DLOG` | `DLOG Equality Proof` | **the deployed OPRF committee service** — this is the domain separator of the Chaum-Pedersen proof the service produces. Kept byte-identical to ZKPassport's `DS_DLOG`, which is the value TACEO's `oprf-service` is known to be driven with. |
+| `DS_DELEGATE_IDENTITY_INPUT` | `AGORA_DELEGATE_INPUT_V1` | Agora circuits only — see "Delegate-persona derivation" below |
+| `DS_DELEGATE_OUT` | `AGORA_DELEGATE_OPRF_OUT` | Agora circuits only (client-side; the committee never sees it) |
+| `DS_DELEGATE` | `AGORA_DELEGATE_V1` | Agora circuits + on-chain verifier |
+
+### Delegate-persona derivation
+
+`delegate-query`/`delegate-persona` (changelog entry 093) derive a second, independent
+per-citizen identifier — `delegate_persona_id` — for citizens who choose to become delegates.
+This is a genuinely separate on-demand flow, not part of registration:
+
+```
+delegate_identity_input = Poseidon2(DS_DELEGATE_IDENTITY_INPUT,
+                                     pack_be(personal_number[14]),
+                                     pack_be(issuing_country[3]))
+
+// A SEPARATE query from the registration one above — same 5 committees, distinct client
+// input, hence a genuinely independent PRF evaluation per committee, not a reuse of the
+// registration query's oprf_output_i values. See identity_anchor::derive_delegate_identity_
+// input's doc comment for the full reasoning this design choice was based on.
+for i in 0..5:
+    oprf_output_i = verified_oprf(committee_i_proof, ..., delegate_identity_input, DS_DLOG, DS_DELEGATE_OUT)
+    term_i        = Poseidon2(DS_DELEGATE, i, oprf_output_i, scheme_version)
+
+delegate_persona_id = term_0 + term_1 + term_2 + term_3 + term_4   // combine_committee_anchors, reused unchanged
+
+// persona_account (the AccountId the citizen is registering as their delegate persona) is
+// bound into the SAME proof, folded into param_commitment — see delegate-persona/src/main.nr.
+param_commitment = Poseidon2(202, delegate_persona_id, persona_account_lo, persona_account_hi,
+                              scheme_version, oprf_pk_hashes[0..5])
+```
+
+**Why a separate OPRF query, not a cheaper reuse of the citizen's existing anchor evaluation.**
+An earlier design considered reusing the citizen's cached `oprf_output_i` values from
+registration and changing only the outer combiner's domain separator (`DS_DELEGATE` in place
+of `DS_ANCHOR`) — no extra committee round-trip. That is plausibly safe under a bare
+random-oracle argument (the committee never sees the outer separator; it's applied
+client-side, after unblinding), but it relies on exactly one thing: Poseidon2 providing real
+domain separation between two hashes that share a secret preimage. This design instead scopes
+the *client input* itself, so the unlinkability between a citizen's anchor and their delegate
+persona rests on the OPRF's own PRF security — the same class of guarantee `DS_IDENTITY_INPUT`
+itself already relies on — rather than adding a new reliance on hash-domain-separation-under-
+a-shared-preimage. It also avoids a new operational hazard: reusing cached `oprf_output_i`
+would require the client to persist raw per-committee `OPRFProof` material indefinitely after
+registration, which nothing else in this pipeline requires (`disclosure`/`migrate-disclosure`
+both run fresh committee round-trips on every invocation). Since delegate-persona creation is
+already "a fresh, dedicated full proof event" requiring its own passport scan, the extra
+committee round-trip is not incremental friction on top of that event — it is that event's
+natural cost. See `identity_anchor::derive_delegate_identity_input`'s doc comment for the full
+argument, and `runtime/src/anchor_verifier.rs`'s `check_delegate_persona` for the Rust-side
+commitment recomputation this backs.
+
+**Why `persona_account` rides inside `param_commitment` rather than as its own public slot.**
+The outer circuit's disclosure-subproof interface is a fixed 8 fields (see "Why `disclosure`/
+`migrate-disclosure` exist" below) — there is no room to add a 9th. `persona_account` is a raw
+32-byte value, not guaranteed to be a canonical BN254 field element on its own, so it is split
+into two safe limbs via `utils::pack_be_bytes_into_fields::<32, 2, 31>` (the same helper
+ZKPassport's own `SaltedValue<[u8; N]>::get_hash` already uses to pack arbitrary byte arrays)
+and folded into `param_commitment` alongside `delegate_persona_id`/`scheme_version`/
+`oprf_pk_hashes` — the same technique `migrate-disclosure` uses to fit a wider payload than
+`disclosure` into the same single slot. Because `param_commitment` is one of the outer proof's
+cryptographically-verified public inputs, an observer cannot take a valid proof and resubmit it
+paired with a *different* `persona_account`: the recomputed commitment would no longer match,
+so `check_delegate_persona` rejects it even though the underlying SNARK pairing check still
+passes. `202` is a third Agora-specific proof-type tag (`delegate-persona/src/main.nr`'s
+`PROOF_TYPE_AGORA_DELEGATE_PERSONA`), deliberately distinct from registration's `200` and
+migration's `201`.
 
 ### Deliberate constraints
 
@@ -277,6 +350,46 @@ param_commitment, 0, 0, 0]`, and `bb verify` accepted the proof. This closes the
 flagged — that entry only confirmed this layout via a stubbed scratch copy, never a real
 committee-backed witness.
 
+### `oprf_delegate_persona_query` — 3 fields
+
+Same layout as `oprf_identity_anchor_query` above (`comm_in`, `blinded_query_x`,
+`blinded_query_y`) — structurally identical circuit, blinding
+`derive_delegate_identity_input` instead of `derive_identity_input`. Verified by the OPRF
+committee nodes, not on-chain. Confirmed against a real `nargo execute` + `bb prove`/
+`bb verify` round-trip (changelog entry 093) — the same fixture (`SAMPLE_DG1`, salt `1111`,
+`comm_in = 0x09b01eae21f4d04f3e2e513020415e549e5322003a7dd77e17e465dca7949699`) `query`'s own
+`Prover.toml` uses, since `comm_in` does not depend on which client input is being blinded. Its
+`blinded_query` output was checked empirically to differ from `query`'s own output over the
+identical `beta`/passport (a real `nargo execute --package oprf_identity_anchor_query` run
+alongside it), confirming the two queries are genuinely distinct, not accidentally identical.
+
+### `oprf_delegate_persona` — 8 fields
+
+| # | Name | Value |
+|---|---|---|
+| 0 | `comm_in` | |
+| 1 | `current_date` | unix timestamp; drives the expiry check |
+| 2 | `service_scope` | unused; present to hold its slot |
+| 3 | `service_subscope` | unused; present to hold its slot |
+| 4 | `param_commitment` | `Poseidon2(202, delegate_persona_id, persona_account_lo, persona_account_hi, scheme_version, oprf_pk_hashes[0..5])` — 10-element hash |
+| 5 | `nullifier_type` | always 0 |
+| 6 | `scoped_nullifier` | always 0 |
+| 7 | `oprf_pk_hash` | always 0 |
+
+Same fixed 8-field outer-circuit-facing shape as `disclosure`/`migrate-disclosure` — see
+"Delegate-persona derivation" above for why `persona_account` rides inside `param_commitment`
+rather than occupying its own slot, and why `202` is a third, distinct proof-type tag.
+
+Confirmed against a real `bb prove`/`bb verify` round-trip (changelog entry 093), driven by a
+new `oprf-committee-dev` binary (`generate_delegate_persona_prover_toml`) that simulates the
+SAME 5-committee key set `anchor`/`disclosure`'s existing driver uses (same RNG seed —
+standing in for the same real committees, cross-checked by comparing committee 0's simulated
+public key across both drivers' output) evaluating the delegate-scoped query instead: `nargo
+execute` solved a genuine witness, the resulting `public_inputs` file is exactly `[comm_in,
+current_date, service_scope, service_subscope, param_commitment, 0, 0, 0]`, and `bb verify`
+accepted the proof. Like `disclosure`/`migrate-disclosure` before it, this has not been run
+inside an actual outer proof or against a live (non-simulated) OPRF committee.
+
 ### Why `disclosure`/`migrate-disclosure` exist, and why a Rust verifier must use them
 
 `anchor` (and, identically, `migrate`) alone is **not safe to verify on-chain**. Each proves its
@@ -294,6 +407,13 @@ proof and one `comm_in`, authenticated all the way back to `certificate_registry
 Keep `anchor`/`migrate` for testing and for any future flow that publishes `comm_in` some other
 way, but **a production `AnchorProofVerifier` is built on `disclosure`/`migrate-disclosure`,
 as of changelog entry 76.**
+
+The same argument applies to delegate-persona creation, which is why `delegate-persona`
+(changelog entry 093) was built directly in the disclosure-integrated shape rather than adding
+a standalone `anchor`-style twin first: a standalone delegate-persona proof's `comm_in` would
+be exactly as unauthenticated as a standalone `anchor` proof's, and the front-running concern
+`persona_account`-binding exists to close only holds if `comm_in` itself is authenticated back
+to a real passport proof in the first place.
 
 ## What the Rust verifier still has to enforce
 
@@ -317,16 +437,25 @@ The circuits cannot check these; they are on-chain obligations.
    values submitted with the extrinsic and check it equals the outer proof's
    `param_commitments[i]`. For migration, recompute `Poseidon2(201, old_anchor, new_anchor,
    old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5])`
-   (15-element hash) the same way — see changelog entry 76.
+   (15-element hash) the same way — see changelog entry 76. For delegate-persona creation,
+   recompute `Poseidon2(202, delegate_persona_id, persona_account_lo, persona_account_hi,
+   scheme_version, oprf_pk_hashes[0..5])` (10-element hash) — see changelog entry 093 and
+   `runtime/src/anchor_verifier.rs`'s `check_delegate_persona`/`calculate_delegate_param_commitment`.
+   No pallet extrinsic calls these yet (changelog entry 093 is circuit + Rust-verifier only); a
+   future caller is expected to follow `register_citizen`'s exact shape — run
+   `T::ZkVerifier::verify(zk_proof, public_inputs)` first, then this recomputation.
 4. **`current_date` freshness**, so an old proof cannot be replayed past the passport's expiry.
-   Applies to registration, reverification, and migration alike (all three now ride
-   `disclosure`/`migrate-disclosure` subproofs, both of which carry `current_date`).
-5. **The `anchor` combination itself is not re-verified on-chain** — the chain trusts the
-   circuit's `term_0 + ... + term_4` constraint and only checks the *inputs* to it (the 5 pk
-   hashes, on both sides of a migration) against governance-approved keys. This is
+   Applies to registration, reverification, migration, and delegate-persona creation alike (all
+   four now ride `disclosure`/`migrate-disclosure`/`delegate-persona` subproofs, all of which
+   carry `current_date`).
+5. **The `anchor`/`delegate_persona_id` combination itself is not re-verified on-chain** — the
+   chain trusts the circuit's `term_0 + ... + term_4` constraint and only checks the *inputs* to
+   it (the 5 pk hashes, on both sides of a migration) against governance-approved keys. This is
    intentional: recomputing the combination outside the SNARK would require the individual
    `oprf_output_i` values, which are exactly the private witnesses the proof exists to keep
-   off-chain.
+   off-chain. Delegate-persona creation reuses the SAME governance-approved committee keys as
+   registration (per scheme version, per committee slot) — it is a different *query* to the same
+   5 committees, not a different committee set requiring its own key registry.
 
 ---
 
@@ -348,10 +477,10 @@ The `--workspace` flag on each command below is load-bearing, not decoration: th
 `Nargo.toml` sets `default-member = "anchor"`, which has no `#[test]`s of its own, so a bare
 `nargo test` run from this directory silently reports "Running 0 test functions" instead of
 erroring — it's *not* telling you the tests are broken, just that it only ran the default
-member. The real 15 tests live in `lib/identity-anchor` and only run with `--workspace` (or by
+member. The real 21 tests live in `lib/identity-anchor` and only run with `--workspace` (or by
 `cd`ing into `lib/identity-anchor` directly, or `--package identity_anchor`). We keep
 `default-member = "anchor"` rather than removing it, because removing it also changes the
-default scope of `nargo compile`/`nargo info`/`nargo execute` (they'd default to all 5 bin
+default scope of `nargo compile`/`nargo info`/`nargo execute` (they'd default to all 7 bin
 packages instead of just `anchor`), which is a bigger behavior change than this note is worth
 fixing via workspace restructuring. `default-member` also only accepts a single package path in
 this nargo version (1.0.0-beta.22), not an array, so listing both `anchor` and
@@ -360,12 +489,14 @@ this nargo version (1.0.0-beta.22), not an array, so listing both `anchor` and
 ```bash
 cd circuits/oprf-identity-anchor
 
-nargo compile --workspace     # 5 ACIR artifacts into target/
-nargo test --workspace        # 18 tests (15 in identity_anchor, 3 in oprf_identity_anchor_query)
+nargo compile --workspace     # 7 ACIR artifacts into target/
+nargo test --workspace        # 28 tests (21 in identity_anchor, 3 in oprf_identity_anchor_query,
+                               #           4 in oprf_delegate_persona_query)
 nargo info --workspace        # opcode counts
 
-# End-to-end on the query circuit (the only one runnable without a committee):
+# End-to-end on the query circuits (the only ones runnable without a committee):
 nargo execute --package oprf_identity_anchor_query query_witness
+nargo execute --package oprf_delegate_persona_query delegate_query_witness
 mkdir -p target/bb
 bb write_vk --scheme ultra_honk -b target/oprf_identity_anchor_query.json -o target/bb
 bb prove    --scheme ultra_honk -b target/oprf_identity_anchor_query.json \
@@ -378,15 +509,16 @@ bb verify   --scheme ultra_honk -k target/bb/vk -p target/bb/proof -i target/bb/
 `nargo test --package oprf_identity_anchor_query --show-output`; regenerate it there if any
 salted value changes.
 
-Verification keys can be produced for all five circuits (`bb write_vk`) without needing a live
+Verification keys can be produced for all seven circuits (`bb write_vk`) without needing a live
 committee — VK generation only needs the compiled ACIR, not a satisfying witness. Their
 `vk_hash` values under bb 0.82.2 are recorded in changelog entry 69; changelog entry 74
 reconfirmed `bb write_vk` succeeds under bb 5.0.0 for the original four (now-larger,
-post-5-committee) circuits, and changelog entry 76 confirmed it again for the new
-`migrate-disclosure` circuit — but none of this byte-diffs the resulting `vk_hash`es against
-entry 69's **or against each other**: do not treat any of these as stable identifiers yet, and
-expect a fresh `vk_hash` once a genuine committee response lets `anchor`/`disclosure`/
-`migrate`/`migrate-disclosure` actually execute.
+post-5-committee) circuits, changelog entry 76 confirmed it again for the new
+`migrate-disclosure` circuit, and changelog entry 093 confirmed it for `delegate-query`/
+`delegate-persona` — but none of this byte-diffs the resulting `vk_hash`es against entry 69's
+**or against each other**: do not treat any of these as stable identifiers yet, and expect a
+fresh `vk_hash` once a genuine committee response lets `anchor`/`disclosure`/`migrate`/
+`migrate-disclosure`/`delegate-persona` actually execute against a real committee.
 
 ---
 
@@ -405,19 +537,24 @@ Honest list. Several of these are blocking.
   *one* instance (key generation, threshold split across a committee's members, node
   operation, `DS_DLOG` configuration), let alone 5 independently-keyed ones plus the founding
   DKG ceremonies changelog entry 73 specifies, is **explicitly out of scope for this work and
-  was not attempted**. Until at least 5 exist, `anchor`, `disclosure`, `migrate` and
-  `migrate-disclosure` cannot be executed at all, only compiled.
-- **`anchor`, `disclosure`, `migrate`, and `migrate-disclosure` have now all been executed —
-  but only against `oprf-committee-dev`'s DEV-ONLY simulator, not a real committee.**
-  `anchor`/`disclosure` in changelog entry 078, `migrate`/`migrate-disclosure` in entry 081.
-  All four have a real solved witness, a real bb 5.0.0 proof, and a `bb verify` accepting it.
-  This closes the "never been executed" gap specifically — it does **not** touch the actual
-  blocker above: the simulator's 5 (or, for migrate, 10) key pairs are one process's RNG
-  output, not real committees, so nothing here proves anything about a genuine citizen's
-  identity.
+  was not attempted**. Until at least 5 exist, `anchor`, `disclosure`, `migrate`,
+  `migrate-disclosure`, and `delegate-persona` cannot be executed at all, only compiled.
+  `query`/`delegate-query` are the exception — round 1 needs no committee response, only a
+  well-formed `beta`, and both have real `nargo execute`/`bb prove`/`bb verify` round-trips.
+- **`anchor`, `disclosure`, `migrate`, `migrate-disclosure`, and `delegate-persona` have now all
+  been executed — but only against `oprf-committee-dev`'s DEV-ONLY simulator, not a real
+  committee.** `anchor`/`disclosure` in changelog entry 078, `migrate`/`migrate-disclosure` in
+  entry 081, `delegate-persona` in entry 093 (via a new `generate_delegate_persona_prover_toml`
+  driver that reuses the *same* simulated 5-committee key set — same RNG seed — as the
+  registration driver, evaluating the delegate-scoped query instead). All five have a real
+  solved witness, a real bb 5.0.0 proof, and a `bb verify` accepting it. This closes the "never
+  been executed" gap specifically — it does **not** touch the actual blocker above: the
+  simulator's key pairs are one process's RNG output, not real committees, so nothing here
+  proves anything about a genuine citizen's identity.
 - **Rust verifier — real for registration, reverification, and migration as of changelog
-  entry 76 (all three of the "recompute and check `param_commitment`" family); the actual
-  committee service is still the unbuilt part.** `runtime/src/anchor_verifier.rs`'s
+  entry 76 (all three of the "recompute and check `param_commitment`" family), and for
+  delegate-persona creation as of entry 093 (same family, no pallet extrinsic wired to it yet);
+  the actual committee service is still the unbuilt part.** `runtime/src/anchor_verifier.rs`'s
   `Poseidon2AnchorVerifier` implements obligation 3 (`param_commitment` recomputation, via the
   `pallets/poseidon2-bn254` crate — a from-source port of `noir-lang/noir`'s own Poseidon2
   blackbox-solver implementation, validated against real `nargo`-produced test vectors) for
@@ -427,25 +564,37 @@ Honest list. Several of these are blocking.
   obligation 1 (the governance-approved per-committee-slot key registry, `OprfCommitteeKeys`)
   and obligation 4 (`current_date` freshness) directly in all three calls. Obligation 2
   (`certificate_registry_root`/`circuit_registry_root` allowlisting) is `AllowedMerkleRoots`,
-  unchanged since before entry 75. See changelog entry 76 for the full trail.
+  unchanged since before entry 75. See changelog entry 76 for the full trail. The same module
+  now also exposes `calculate_delegate_param_commitment`/`check_delegate_persona` (entry 093),
+  cross-validated against a real `nargo`/`bb`-produced vector the same way — but as pure,
+  storage-free functions only: no pallet extrinsic calls them yet (obligations 1/2/4 above have
+  no delegate-persona-specific call site to live in until one exists).
 - **Verifier-crate compatibility is no longer the open question it was.** Changelog entry 72
   landed the bb 5.0.0 port of `ultrahonk-no-std` for the passport (`outer`) verifier, and entry
   074 confirmed `bb write_vk --scheme ultra_honk` succeeds under bb **5.0.0** for all four
-  circuits in this workspace, including the two largest (`migrate` at 433,740 ACIR opcodes /
-  555,380 circuit size). Proof-level round-trips (not just VK generation) are now confirmed too
-  — entries 078 and 081, via the dev simulator — for all four, the same way entry 72 confirmed
-  it for the passport `outer` circuit. **Still open at the same level entry 72 closed for
-  `outer`**: no circuit here has been proven against a *real* committee response, only the
-  simulator's.
+  circuits in this workspace at the time, including the two largest (`migrate` at 433,740 ACIR
+  opcodes / 555,380 circuit size); entry 093 reconfirmed it for `delegate-query`/
+  `delegate-persona`. Proof-level round-trips (not just VK generation) are now confirmed too —
+  entries 078, 081, and 093, via the dev simulator — for every circuit in this workspace, the
+  same way entry 72 confirmed it for the passport `outer` circuit. **Still open at the same
+  level entry 72 closed for `outer`**: no circuit here has been proven against a *real*
+  committee response, only the simulator's.
 
 ### Not verified
 
-- **`disclosure`'s and `migrate-disclosure`'s outer-circuit integration have never been run
-  inside an actual outer proof.** Both 8-field layouts are now empirically confirmed against a
-  real, committee-simulator-backed `bb prove` run (entries 078/081), but "the standalone
-  subproof's layout matches" is not the same as "the outer circuit's own recursive
-  verification accepts it". Confirming that needs the full outer-proof assembly pipeline
-  (a genuine ZKPassport passport proof) plus a committee, neither of which exists yet.
+- **`disclosure`'s, `migrate-disclosure`'s, and `delegate-persona`'s outer-circuit integration
+  have never been run inside an actual outer proof.** All three 8-field layouts are now
+  empirically confirmed against a real, committee-simulator-backed `bb prove` run (entries
+  078/081/093), but "the standalone subproof's layout matches" is not the same as "the outer
+  circuit's own recursive verification accepts it". Confirming that needs the full outer-proof
+  assembly pipeline (a genuine ZKPassport passport proof) plus a committee, neither of which
+  exists yet.
+- **No pallet extrinsic calls `check_delegate_persona` yet.** Changelog entry 093 delivered the
+  circuit and the Rust-side commitment recomputation only — wiring a `pallet-elections`/
+  `pallet-identity` extrinsic that runs `T::ZkVerifier::verify` and then this check, records the
+  resulting `(scheme_version, delegate_persona_id) -> persona_account` mapping on-chain, and
+  rejects a reused `delegate_persona_id` (mirroring `IdentityAnchorRegistry`'s
+  `AnchorAlreadyUsed` check) is future work.
 - **The 8-field layout was measured on a stubbed copy** of `disclosure` (in scratch, not in
   this repo) with the `verified_oprf` call replaced, since the real circuit cannot execute.
   Only the function body differed; the signature and returns were identical, and the ABI
@@ -465,9 +614,9 @@ Honest list. Several of these are blocking.
   leaked outgoing key lets an attacker fabricate an `old_anchor` for an input they do not hold.
   This is why entry 67 routes a *suspected* break through `pallet-emergency-council`'s
   emergency rotation and its disclosed degraded mode rather than through this circuit.
-- **`disclosure`/`migrate-disclosure` compile with one warning each** — "Return variable
-  contains a constant value" for the three zero returns. They are required by the fixed
-  outer-circuit interface and cannot be dropped. Expected, benign.
+- **`disclosure`/`migrate-disclosure`/`delegate-persona` compile with one warning each** —
+  "Return variable contains a constant value" for the three zero returns. They are required by
+  the fixed outer-circuit interface and cannot be dropped. Expected, benign.
 - **No DG11 support.** Entry 67 evaluated the explicitly-labelled `5F10` "Personal number" tag
   in DG11 and recommended against it: it would need a whole new data-group parser, integrity
   check and SOD hash-list entry, for a field that is *more* optional than DG1's slot. Nothing

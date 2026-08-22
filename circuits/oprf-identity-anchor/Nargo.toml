@@ -5,6 +5,8 @@ members = [
     "disclosure",
     "migrate",
     "migrate-disclosure",
+    "delegate-query",
+    "delegate-persona",
     "lib/identity-anchor",
 ]
 default-member = "anchor"

@@ -1,10 +1,11 @@
 //! Agora identity-anchor derivation primitives.
 //!
-//! Shared by the three binaries in this workspace (`query`, `anchor`, `migrate`) so the
-//! OPRF client input can never drift between the circuit that *blinds* it and the circuits
-//! that *verify the committee's evaluation of it*. If those two derivations disagreed by a
-//! single byte the OPRF verification would simply fail, so keeping them in one place is a
-//! correctness requirement, not just tidiness.
+//! Shared by every binary in this workspace (`query`/`anchor`/`disclosure`/`migrate`/
+//! `migrate-disclosure` for citizen registration, `delegate-query`/`delegate-persona` for
+//! delegate-persona creation) so the OPRF client input can never drift between the circuit
+//! that *blinds* it and the circuits that *verify the committee's evaluation of it*. If those
+//! two derivations disagreed by a single byte the OPRF verification would simply fail, so
+//! keeping them in one place is a correctness requirement, not just tidiness.
 //!
 //! See `circuits/oprf-identity-anchor/README.md` and `docs/project/changelog/069-070.md`
 //! entry 69 for the full design rationale, and changelog entry 67 for the architecture
@@ -59,6 +60,27 @@ pub global DS_DLOG: Field = 1523098184080632582082867317389990410064981862;
 
 /// Domain separator for the published anchor itself, ASCII "AGORA_ANCHOR_V1".
 pub global DS_ANCHOR: Field = 338945631368262504456167009336383025;
+
+/// Domain separator for the delegate-persona OPRF *client input*, ASCII
+/// "AGORA_DELEGATE_INPUT_V1" read as a big-endian integer. See
+/// `derive_delegate_identity_input` for why delegate-persona creation uses a **distinctly
+/// scoped** client input rather than reusing `identity_input`/`DS_IDENTITY_INPUT` — this is
+/// the load-bearing separator that makes the two OPRF evaluations genuinely independent PRF
+/// outputs, not merely two differently-tagged hashes of the same secret.
+pub global DS_DELEGATE_IDENTITY_INPUT: Field = 6252443316752239663789143805072366868461078375420614193;
+
+/// Domain separator for the delegate-persona OPRF final output (`ds_out` argument of
+/// `verified_oprf`), ASCII "AGORA_DELEGATE_OPRF_OUT". Purely client-side — the committee
+/// never sees it — mirrors `DS_ANCHOR_OUT`'s role exactly, just for the delegate-persona
+/// evaluation.
+pub global DS_DELEGATE_OUT: Field = 6252443316752239663789143805072366868893989024383849812;
+
+/// Domain separator for the published delegate-persona ID itself, ASCII "AGORA_DELEGATE_V1".
+/// Mirrors `DS_ANCHOR`'s role in `derive_committee_anchor_term` /
+/// `combine_committee_anchors`, but see `derive_delegate_persona_term` for why this alone
+/// would not be sufficient domain separation from the anchor even without
+/// `DS_DELEGATE_IDENTITY_INPUT`/`DS_DELEGATE_OUT` above.
+pub global DS_DELEGATE: Field = 22213140897350455076481323875272149128753;
 
 /// Number of independent OPRF committees a registration/reverification/migration proof must
 /// evaluate against. Fixed at 5 per changelog entry 73's governance design: every registration
@@ -134,31 +156,78 @@ pub fn assert_dg1_clear_value(salted_dg1: SaltedValue<DG1Data>) {
     );
 }
 
-/// Derives the OPRF client input from an authenticated DG1.
-///
-/// `Poseidon2(DS_IDENTITY_INPUT, packed(personal_number[14]), packed(issuing_country[3]))`
+/// Shared body of `derive_identity_input`/`derive_delegate_identity_input`:
+/// `Poseidon2(ds, packed(personal_number[14]), packed(issuing_country[3]))`.
 ///
 /// The issuing country is folded in even though Agora deploys one chain per country (so it is
 /// effectively constant): it costs one extra Poseidon2 input, and it means the anchor space
 /// stays collision-free by construction if the country allowlist is ever widened.
 ///
-/// This is the value that replaces `calculate_private_nullifier(dg1, e_content, sod_signature)`
-/// in the upstream `oprf-auth` flow. Both inputs are byte ranges of DG1, which is already
-/// bound into `comm_in` by the caller, so switching between them requires no change anywhere
-/// upstream in the commitment chain.
-pub fn derive_identity_input(dg1: DG1Data) -> Field {
+/// Kept private: callers pick a domain separator via the two `pub` wrappers below, never a
+/// caller-chosen `Field`, so it is not possible to accidentally derive an identity input under
+/// an ad hoc separator that neither `anchor`/`disclosure`/`migrate*` nor
+/// `delegate-query`/`delegate-persona` actually use.
+fn derive_scoped_identity_input(dg1: DG1Data, ds: Field) -> Field {
     let personal_number = get_personal_number_from_dg1(dg1);
     assert_personal_number_populated(personal_number);
     let issuing_country = get_issuing_country_from_mrz(dg1);
 
     Poseidon2::hash(
         [
-            DS_IDENTITY_INPUT,
+            ds,
             pack_be_bytes_into_field::<PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH, 31>(personal_number),
             pack_be_bytes_into_field::<3, 31>(issuing_country),
         ],
         3,
     )
+}
+
+/// Derives the citizen-registration OPRF client input from an authenticated DG1:
+/// `derive_scoped_identity_input(dg1, DS_IDENTITY_INPUT)`.
+///
+/// This is the value that replaces `calculate_private_nullifier(dg1, e_content, sod_signature)`
+/// in the upstream `oprf-auth` flow. Both inputs are byte ranges of DG1, which is already
+/// bound into `comm_in` by the caller, so switching between them requires no change anywhere
+/// upstream in the commitment chain.
+pub fn derive_identity_input(dg1: DG1Data) -> Field {
+    derive_scoped_identity_input(dg1, DS_IDENTITY_INPUT)
+}
+
+/// Derives the delegate-persona OPRF client input from an authenticated DG1:
+/// `derive_scoped_identity_input(dg1, DS_DELEGATE_IDENTITY_INPUT)`.
+///
+/// # Why this is a *distinct* OPRF query, not a reuse of `identity_input`
+///
+/// An earlier design considered reusing the citizen's existing anchor `oprf_output_i` values
+/// (cached from registration) and only changing the *outer* combiner separator —
+/// `Poseidon2(DS_DELEGATE, i, oprf_output_i, scheme_version)` in place of
+/// `Poseidon2(DS_ANCHOR, i, oprf_output_i, scheme_version)`. That would have been cheaper (no
+/// extra committee round-trip) and is plausibly safe under a random-oracle argument alone: the
+/// committee never sees `ds_out`/the outer separator (both are applied client-side, after
+/// unblinding — see `TaceoLabs/oprf-nr`'s `generate_output`), so on-chain `anchor` and
+/// `delegate_persona_id` would be two independent-looking hash evaluations of the same secret
+/// `oprf_output_i`, unlinkable to an observer who never learns `oprf_output_i` itself. That
+/// argument leans on exactly one thing: that Poseidon2 provides real domain separation between
+/// `H(DS_ANCHOR, i, x, v)` and `H(DS_DELEGATE, i, x, v)` for a shared secret `x`.
+///
+/// This module deliberately does not rely on that alone. Scoping the *client input* itself —
+/// so `verified_oprf` evaluates each committee's actual PRF (not just a downstream hash) at a
+/// different point for the anchor versus the delegate persona — means unlinkability instead
+/// rests on the OPRF's own PRF security (the same assumption `identity_input` vs. any other
+/// hypothetical future per-purpose input would already need), the same class of guarantee this
+/// codebase already leans on for `DS_IDENTITY_INPUT` itself, rather than adding a new reliance
+/// on hash-domain-separation-under-a-shared-preimage holding perfectly. It also removes an
+/// operational hazard the reuse design would otherwise introduce: reusing cached `oprf_output_i`
+/// values would require the client to persist raw per-committee OPRF response material
+/// (`OPRFProof`) indefinitely after registration, which is not otherwise required anywhere in
+/// this pipeline (`disclosure`/`migrate-disclosure` both run a fresh committee round-trip on
+/// every invocation) and would widen the at-rest secrets an attacker could exfiltrate from a
+/// compromised device. Since delegate-persona creation is already specified as "a fresh,
+/// dedicated full proof event" requiring its own passport scan, the fresh-committee-round-trip
+/// cost of a genuinely distinct query is not incremental UX friction on top of that — it is the
+/// natural cost of the event, not an extra one.
+pub fn derive_delegate_identity_input(dg1: DG1Data) -> Field {
+    derive_scoped_identity_input(dg1, DS_DELEGATE_IDENTITY_INPUT)
 }
 
 /// Derives one committee's contribution to the published identity anchor.
@@ -188,6 +257,23 @@ pub fn derive_committee_anchor_term(
     scheme_version: Field,
 ) -> Field {
     Poseidon2::hash([DS_ANCHOR, committee_index as Field, oprf_output, scheme_version], 4)
+}
+
+/// Derives one committee's contribution to the published delegate-persona ID.
+///
+/// `Poseidon2(DS_DELEGATE, committee_index, oprf_output, scheme_version)` — structurally
+/// identical to [`derive_committee_anchor_term`], but `oprf_output` here comes from evaluating
+/// `derive_delegate_identity_input`'s output, not `derive_identity_input`'s, through a
+/// **separate** committee round-trip (see that function's doc comment for why: the
+/// distinctness has to live at the OPRF-query level, not only in this outer separator). Fed
+/// into the same [`combine_committee_anchors`] combiner as the anchor — that function only
+/// sums whatever 5 terms it is given, so no delegate-specific combiner is needed.
+pub fn derive_delegate_persona_term(
+    committee_index: u32,
+    oprf_output: Field,
+    scheme_version: Field,
+) -> Field {
+    Poseidon2::hash([DS_DELEGATE, committee_index as Field, oprf_output, scheme_version], 4)
 }
 
 /// Combines all 5 committees' hashed terms into the final published anchor by field addition.

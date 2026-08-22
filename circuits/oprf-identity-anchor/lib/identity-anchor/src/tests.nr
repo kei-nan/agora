@@ -8,8 +8,10 @@
 
 use super::{
     ASCII_CODE_FOR_LESS_THAN, assert_dg1_clear_value, assert_personal_number_populated,
-    combine_committee_anchors, derive_committee_anchor_term, derive_identity_input,
-    get_personal_number_from_dg1, NUM_COMMITTEES, PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
+    combine_committee_anchors, derive_committee_anchor_term, derive_delegate_identity_input,
+    derive_delegate_persona_term, derive_identity_input, DS_DELEGATE, DS_DELEGATE_IDENTITY_INPUT,
+    DS_DELEGATE_OUT, DS_IDENTITY_INPUT, get_personal_number_from_dg1, NUM_COMMITTEES,
+    PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
 };
 use utils::constants::{DG1_LENGTH, ID_CARD_SAMPLE_DG1, SAMPLE_DG1};
 use utils::types::{DG1Data, SaltedValue};
@@ -193,4 +195,91 @@ fn combined_anchor_depends_on_every_committee_term() {
 fn combined_anchor_is_the_field_sum_of_terms() {
     let terms: [Field; NUM_COMMITTEES] = [10, 20, 30, 40, 50];
     assert_eq(combine_committee_anchors(terms), 150, "Combination must be plain field addition");
+}
+
+// --- delegate-persona derivation ---
+
+/// The two domain separators actually differ, or the "distinct client input" argument in
+/// `derive_delegate_identity_input`'s doc comment would be vacuous.
+#[test]
+fn delegate_domain_separators_are_distinct_from_each_other_and_from_registration() {
+    assert(DS_DELEGATE_IDENTITY_INPUT != DS_IDENTITY_INPUT, "must differ from DS_IDENTITY_INPUT");
+    assert(DS_DELEGATE_IDENTITY_INPUT != DS_DELEGATE_OUT, "input/out separators must differ");
+    assert(DS_DELEGATE_IDENTITY_INPUT != DS_DELEGATE, "input/combiner separators must differ");
+    assert(DS_DELEGATE_OUT != DS_DELEGATE, "out/combiner separators must differ");
+}
+
+/// The whole point: a citizen's delegate-persona client input must differ from their ordinary
+/// registration client input, over the *same* passport. If these ever collided, the two OPRF
+/// evaluations would be the same PRF query and the "distinct query" design would collapse back
+/// into the reuse design this module's doc comment explains and rejects.
+#[test]
+fn delegate_identity_input_differs_from_registration_identity_input() {
+    assert(
+        derive_delegate_identity_input(SAMPLE_DG1) != derive_identity_input(SAMPLE_DG1),
+        "Delegate-persona client input must differ from the registration client input",
+    );
+}
+
+/// Same renewal-stability property `identity_input_is_stable_across_a_simulated_renewal`
+/// checks for registration must hold for the delegate-persona client input too — a delegate
+/// who renews their passport must still be able to re-derive the same delegate persona.
+#[test]
+fn delegate_identity_input_is_stable_across_a_simulated_renewal() {
+    let before = derive_delegate_identity_input(SAMPLE_DG1);
+
+    let mut renewed: DG1Data = SAMPLE_DG1;
+    let new_document_number: [u8; 9] = [80, 66, 57, 56, 55, 54, 53, 52, 51]; // "PB9876543"
+    for i in 0..9 {
+        renewed[49 + i] = new_document_number[i];
+    }
+    let new_expiry: [u8; 6] = [52, 48, 48, 49, 48, 49]; // "400101"
+    for i in 0..6 {
+        renewed[70 + i] = new_expiry[i];
+    }
+
+    assert_eq(
+        derive_delegate_identity_input(renewed),
+        before,
+        "Delegate-persona client input must be unchanged by a passport renewal",
+    );
+}
+
+/// Mirrors `committee_term_is_separated_by_scheme_version` for the delegate-persona combiner.
+#[test]
+fn delegate_term_is_separated_by_scheme_version() {
+    let oprf_output = 424242;
+    assert(
+        derive_delegate_persona_term(0, oprf_output, 1)
+            != derive_delegate_persona_term(0, oprf_output, 2),
+        "Delegate terms under different scheme versions must differ",
+    );
+}
+
+/// Mirrors `committee_term_is_separated_by_committee_index` for the delegate-persona combiner.
+#[test]
+fn delegate_term_is_separated_by_committee_index() {
+    let oprf_output = 424242;
+    let scheme_version = 1;
+    assert(
+        derive_delegate_persona_term(0, oprf_output, scheme_version)
+            != derive_delegate_persona_term(1, oprf_output, scheme_version),
+        "Delegate terms must differ by committee index alone",
+    );
+}
+
+/// Even given the *same* `oprf_output`/`scheme_version`/`committee_index` a real anchor term
+/// and delegate term would only share (which cannot happen in the real protocol, since the two
+/// come from separately-scoped OPRF queries — see `derive_delegate_identity_input`), the two
+/// combiners must still disagree: this is what `DS_ANCHOR != DS_DELEGATE` buys as
+/// defense-in-depth on top of the query-level separation.
+#[test]
+fn delegate_term_and_anchor_term_differ_under_identical_inputs() {
+    let oprf_output = 424242;
+    let scheme_version = 1;
+    assert(
+        derive_delegate_persona_term(0, oprf_output, scheme_version)
+            != derive_committee_anchor_term(0, oprf_output, scheme_version),
+        "Delegate and anchor combiners must be separated even under a hypothetically shared input",
+    );
 }
