@@ -109,6 +109,11 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   `mobile/src/chain/keystoreWallet.ts`'s doc comment) — the mechanism is real, the flow isn't
   wired up end-to-end.
 - Passport-only for v1 (country allowlist — some countries lack stable national ID in NFC chip)
+- **Submission-metadata linkability applies to every identity-bearing extrinsic, not just
+  votes.** `register_citizen`/`reverify_citizen`/`recover_account`/`migrate_oprf_scheme` are all
+  signed calls whose funding source and submission timing are ordinary public chain data — see
+  the Voting System section's fuller writeup of this gap for the general reasoning (it applies
+  identically here, and to any future delegate-persona/backing submission too).
 
 ## Voting System
 - MACI for vote-content privacy — a citizen's chosen option is hidden via MACI commitments, but
@@ -117,6 +122,28 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   same structural limitation applies to pallet-anticorruption's whistleblower reports — see that
   pallet's own doc comments for the detail). No Semaphore code exists in this codebase; "anonymous
   unlinkable votes" overstated what MACI alone delivers here — content-hidden, not sender-hidden.
+- **Submission-metadata linkability is a distinct, broader gap than the nullifier-map one above,
+  and it survives even perfect proof-level unlinkability.** The nullifier-map gap is about a
+  signer account that *is* the citizen's own registered account. But even a signer account that
+  was never registered as a citizen at all — e.g. a fresh account created specifically to submit
+  an anonymized proof — can still be deanonymized by ordinary chain analysis, not cryptanalysis:
+  if it was funded by a direct on-chain transfer from the citizen's known account, or if it
+  submits in close temporal proximity to other citizen-linked activity, that funding-source or
+  timing correlation breaks pseudonymity regardless of what the extrinsic's payload proves. This
+  applies to `commit_vote` today and would equally apply to the delegate-persona-creation and
+  backing-proof schemes discussed in `docs/project/pallets/elections.md` once built (not built as
+  of 2026-08-22 — see that file) — a mathematically unlinkable ZK derivation does not anonymize
+  the *transaction* that reveals it. Checked for a real mitigation before writing this down: no
+  relayer, mixnet, or unsigned/ZK-gated submission path exists anywhere in this repo
+  (`pallets/pallet-voting`'s and `pallets/pallet-anticorruption`'s own doc comments already
+  independently concluded the same thing for `commit_vote`/`submit_whistleblower_report`), and
+  neither `pallets/pallet-treasury-ledger` nor anywhere else has a faucet-like mechanism that
+  could fund a submission account without a traceable direct transfer. `court-oracle/` and
+  `committee-node/` are standalone-service precedent for *a* deployable component, but both
+  authenticate as a known council/committee member — neither is a pattern for relaying an
+  arbitrary citizen's transaction pseudonymously. Building real submission-layer anonymity (a
+  relayer/mixnet, or unsigned extrinsics validated by ZK group-membership instead of a signature)
+  is a genuine standalone-infrastructure project, not a local fix to any one pallet.
 - Liquid democracy: direct vote OR delegate (transitive, revocable, per-topic)
 - Delegation caps: no single delegate can hold >X% of votes
 - Petitions: citizen signatures → threshold → votable referendum

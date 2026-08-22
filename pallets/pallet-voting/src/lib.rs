@@ -534,6 +534,16 @@ pub mod pallet {
         /// infrastructure anywhere in this repo to reuse. Building one is a genuine architectural
         /// addition (new transaction-validity logic, new proof type, new client-side flow), not a
         /// local fix to this call — left as a tracked gap rather than force a partial change here.
+        ///
+        /// **Note (2026-08-22): the above is only the `CitizenNullifier`-map sub-case of a
+        /// broader gap.** Even a signer account that was never registered as a citizen at all —
+        /// so it never appears in `CitizenNullifier` — is not automatically safe: if it was
+        /// funded by a direct on-chain transfer from the citizen's real account, or submits in
+        /// close temporal proximity to other citizen-linked activity, ordinary chain analysis of
+        /// that funding source or timing still deanonymizes it, independent of anything proved
+        /// inside `commitment`. A relayer/mixnet fix needs to anonymize the funding path too, not
+        /// just decouple the `AccountId` from the vote content. See `CLAUDE.md`'s Voting System
+        /// section for the general writeup.
         #[pallet::call_index(1)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn commit_vote(

@@ -43,6 +43,10 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
         As a delegate your real name is publicly visible on-chain. Delegate registration uses
         this same account you already vote with — there is no separate delegate identity, so
         your full on-chain activity is publicly linkable to your public name once you register.
+        A future unlinkable delegate identity is planned but not built yet — and even once it
+        exists, funding that account from your known citizen account, or registering right
+        after other citizen activity, would still let outside observers connect the two by
+        ordinary chain analysis, not just by the missing cryptography.
       </Text>
 
       <View style={s.infoBox}>

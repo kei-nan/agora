@@ -397,6 +397,14 @@ pub mod pallet {
         /// submission from the signing key. No such infrastructure exists anywhere in this
         /// repo yet; building one is a genuine architectural addition, not a local fix to
         /// this call — left as a tracked gap rather than force a partial change here.
+        ///
+        /// **Note (2026-08-22): the `CitizenNullifier`-map cross-reference above is only one
+        /// sub-case of a broader submission-metadata gap.** Even a signer account never
+        /// registered as a citizen — so absent from `CitizenNullifier` — can still be
+        /// deanonymized by ordinary chain analysis of its funding source (a direct on-chain
+        /// transfer from the whistleblower's known account) or its submission timing relative
+        /// to other citizen-linked activity, regardless of `content_hash` staying hidden. See
+        /// `CLAUDE.md`'s Voting System section for the general writeup.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(60_000, 0))]
         pub fn submit_whistleblower_report(

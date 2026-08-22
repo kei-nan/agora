@@ -32,6 +32,24 @@ nullifier, plus Merkle-tree/nullifier-circuit infrastructure for backing anonymi
 scoped as future work but is not built, and no timeline is committed. Until then, treat
 delegate registration and backing as fully public, permanently attributable actions.
 
+**A further residual gap that survives even once that future work is built (2026-08-22):**
+the design sketched above (delegate persona derivation, backing-commitment, backing-nullifier
+Merkle proofs — some of this exists as unlanded circuit/verifier work outside `pallet-elections`
+itself, not yet wired to any extrinsic here) makes the *derivation* unlinkable, but the
+extrinsic that reveals a resulting proof is still an ordinary signed transaction with a signer
+`AccountId`, a fee-payment source, and a block timestamp. If that account is funded by a direct
+on-chain transfer from the citizen's real, identity-linked account, or submits in close temporal
+proximity to other citizen-linked activity, ordinary chain analysis — not cryptanalysis — can
+still deanonymize it. This is the same class of gap already documented for MACI's `commit_vote`
+in `pallets/pallet-voting/src/lib.rs`'s doc comment and in `CLAUDE.md`'s Voting System section;
+neither this repo nor `court-oracle/`/`committee-node/` (both authenticate as a known
+council/committee member, not a pattern for pseudonymous relaying) nor
+`pallets/pallet-treasury-ledger` (no faucet-like account-funding mechanism exists) currently has
+any relayer, mixnet, or unsigned/ZK-gated submission path that would close it. Closing it is a
+genuine standalone-infrastructure project, separate from finishing the persona/backing-commitment
+circuits themselves — do not treat completion of those circuits as delivering full anonymity for
+delegate registration or backing.
+
 ### Backing threshold
 
 A delegate becomes `Active` only once they have `BackingCount` ≥ `BackingThreshold` citizen

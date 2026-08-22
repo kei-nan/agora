@@ -26,6 +26,16 @@
 //! anonymity) has been scoped as future work but is not built — no timeline is committed. Until
 //! then, treat delegate registration and backing as fully public actions.
 //!
+//! **Residual gap even once that future work lands (2026-08-22):** an unlinkable derivation
+//! only anonymizes the *proof*, not the *transaction* that reveals it. That transaction is
+//! still a signed extrinsic with a signer `AccountId`, a fee-payment source, and a block
+//! timestamp — funding the account from the citizen's own known account, or submitting close
+//! in time to other citizen-linked activity, deanonymizes it via ordinary chain analysis, not
+//! cryptanalysis. Same class of gap as `pallet-voting`'s `commit_vote` (see its doc comment);
+//! no relayer/mixnet/unsigned-ZK-gated submission path or faucet-like funding mechanism exists
+//! anywhere in this repo to close it — see `docs/project/pallets/elections.md` for the full
+//! writeup. Do not treat the persona/backing-commitment circuits as delivering full anonymity.
+//!
 //! ### Backing threshold
 //! A delegate becomes Active only when they have ≥ `BackingThreshold` citizen backers.
 //! Each citizen may back at most `MaxBackingsPerCitizen` delegates (constitutional parameter,
