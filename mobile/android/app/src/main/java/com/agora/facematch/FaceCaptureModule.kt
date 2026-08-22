@@ -54,6 +54,10 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
   companion object {
     private const val CAMERA_PERMISSION_REQUEST_CODE = 5824
 
+    /** Filename pattern written by `capturePhoto` below — shared with `sweepCaptureFiles`. */
+    private const val CAPTURE_FILE_PREFIX = "facematch-"
+    private const val CAPTURE_FILE_SUFFIX = ".jpg"
+
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
       .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
       .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
@@ -68,10 +72,38 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
     fun bindImageCapture(imageCapture: ImageCapture?) {
       activeImageCapture = imageCapture
     }
+
+    /**
+     * Deletes every registration-selfie JPEG this module has ever written into
+     * [cacheDir] (the `facematch-<challenge>-<timestamp>.jpg` pattern `capturePhoto`
+     * writes below) — these are biometric capture photos, not data that should ever
+     * accumulate on disk. Called from two places: `FaceMatchModule` right after it
+     * finishes comparing a captured selfie against the passport's DG2 photo (success
+     * *or* failure — see that module), and this module's own `init` block below as a
+     * startup sweep for anything orphaned by a previous crashed/interrupted session
+     * (e.g. the app was killed mid-registration, after a shot was captured but before
+     * the match call that would otherwise trigger cleanup). Best-effort: an individual
+     * file failing to delete doesn't stop the sweep or throw.
+     */
+    @JvmStatic
+    fun sweepCaptureFiles(cacheDir: File) {
+      cacheDir.listFiles { file ->
+        file.isFile && file.name.startsWith(CAPTURE_FILE_PREFIX) && file.name.endsWith(CAPTURE_FILE_SUFFIX)
+      }?.forEach { file ->
+        runCatching { file.delete() }
+      }
+    }
   }
 
   /** Set while a `requestCameraPermission` call is waiting on the user's response; see `onRequestPermissionsResult`. */
   private var pendingPermissionPromise: Promise? = null
+
+  init {
+    // Startup cleanup sweep — see `sweepCaptureFiles` doc comment. Runs once per
+    // process, when RN's module registry instantiates this module (FaceMatchPackage
+    // constructs it eagerly alongside FaceMatchModule).
+    sweepCaptureFiles(reactContext.cacheDir)
+  }
 
   override fun getName(): String = "FaceCaptureModule"
 
@@ -121,7 +153,7 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
       promise.reject("CAMERA_NOT_READY", "No live camera preview is bound yet — is <FaceCameraView> mounted?")
       return
     }
-    val outputFile = File(reactContext.cacheDir, "facematch-$challenge-${System.currentTimeMillis()}.jpg")
+    val outputFile = File(reactContext.cacheDir, "$CAPTURE_FILE_PREFIX$challenge-${System.currentTimeMillis()}$CAPTURE_FILE_SUFFIX")
     val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
     imageCapture.takePicture(
       outputOptions,

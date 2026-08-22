@@ -97,46 +97,69 @@ class FaceMatchModule(private val reactContext: ReactApplicationContext) :
    * gap (`docs/project/changelog/087.md`), not a bug to hide behind a thrown
    * error. `RegisterScreen.tsx` still gates registration on the liveness
    * signals already captured even when this resolves `skipped: true`.
+   *
+   * This is also where the registration selfie(s) `FaceCaptureModule.capturePhoto`
+   * wrote to the app cache directory get cleaned up (`FaceCaptureModule.sweepCaptureFiles`
+   * in the outer `finally`, covering every exit path below — the unsupported-format skip,
+   * a thrown error, and a normal match result alike) — see that function's doc comment
+   * for why a directory sweep rather than deleting just `capturedUri`.
    */
   @ReactMethod
   fun matchAgainstPassport(dg2Base64: String, dg2MimeType: String, capturedUri: String, promise: Promise) {
-    if (dg2MimeType != "image/jpeg") {
-      val result = Arguments.createMap().apply {
-        putBoolean("matched", false)
-        putBoolean("skipped", true)
-        putString("reason", "unsupported DG2 image format: $dg2MimeType")
-      }
-      promise.resolve(result)
-      return
-    }
     try {
-      val dg2Bytes = Base64.decode(dg2Base64, Base64.DEFAULT)
-      val dg2Bitmap = BitmapFactory.decodeByteArray(dg2Bytes, 0, dg2Bytes.size)
-        ?: throw IllegalStateException("Could not decode DG2 photo")
-      val capturedPath = Uri.parse(capturedUri).path
-        ?: throw IllegalStateException("Invalid captured photo URI: $capturedUri")
-      val capturedBitmap = BitmapFactory.decodeFile(capturedPath)
-        ?: throw IllegalStateException("Could not decode captured photo")
-
-      val dg2Face = detectLargestFace(dg2Bitmap)
-      val capturedFace = detectLargestFace(capturedBitmap)
-      if (dg2Face == null || capturedFace == null) {
-        promise.reject("NO_FACE_DETECTED", "Could not detect a face in the passport photo or the captured selfie")
+      if (dg2MimeType != "image/jpeg") {
+        val result = Arguments.createMap().apply {
+          putBoolean("matched", false)
+          putBoolean("skipped", true)
+          putString("reason", "unsupported DG2 image format: $dg2MimeType")
+        }
+        promise.resolve(result)
         return
       }
+      var dg2Bitmap: Bitmap? = null
+      var capturedBitmap: Bitmap? = null
+      var dg2Crop: Bitmap? = null
+      var capturedCrop: Bitmap? = null
+      try {
+        val dg2Bytes = Base64.decode(dg2Base64, Base64.DEFAULT)
+        dg2Bitmap = BitmapFactory.decodeByteArray(dg2Bytes, 0, dg2Bytes.size)
+          ?: throw IllegalStateException("Could not decode DG2 photo")
+        val capturedPath = Uri.parse(capturedUri).path
+          ?: throw IllegalStateException("Invalid captured photo URI: $capturedUri")
+        capturedBitmap = BitmapFactory.decodeFile(capturedPath)
+          ?: throw IllegalStateException("Could not decode captured photo")
 
-      val dg2Embedding = embed(cropFace(dg2Bitmap, dg2Face))
-      val capturedEmbedding = embed(cropFace(capturedBitmap, capturedFace))
-      val score = cosineSimilarity(dg2Embedding, capturedEmbedding)
+        val dg2Face = detectLargestFace(dg2Bitmap)
+        val capturedFace = detectLargestFace(capturedBitmap)
+        if (dg2Face == null || capturedFace == null) {
+          promise.reject("NO_FACE_DETECTED", "Could not detect a face in the passport photo or the captured selfie")
+          return
+        }
 
-      val result = Arguments.createMap().apply {
-        putBoolean("matched", score >= MATCH_THRESHOLD)
-        putBoolean("skipped", false)
-        putDouble("score", score.toDouble())
+        dg2Crop = cropFace(dg2Bitmap, dg2Face)
+        capturedCrop = cropFace(capturedBitmap, capturedFace)
+        val dg2Embedding = embed(dg2Crop)
+        val capturedEmbedding = embed(capturedCrop)
+        val score = cosineSimilarity(dg2Embedding, capturedEmbedding)
+
+        val result = Arguments.createMap().apply {
+          putBoolean("matched", score >= MATCH_THRESHOLD)
+          putBoolean("skipped", false)
+          putDouble("score", score.toDouble())
+        }
+        promise.resolve(result)
+      } catch (e: Exception) {
+        promise.reject("FACE_MATCH_ERROR", e.message ?: "Face match failed", e)
+      } finally {
+        // Best-effort — recycling an already-recycled bitmap (e.g. if cropFace/
+        // createScaledBitmap returned the same object it was given) is a documented no-op.
+        dg2Bitmap?.recycle()
+        capturedBitmap?.recycle()
+        dg2Crop?.recycle()
+        capturedCrop?.recycle()
       }
-      promise.resolve(result)
-    } catch (e: Exception) {
-      promise.reject("FACE_MATCH_ERROR", e.message ?: "Face match failed", e)
+    } finally {
+      FaceCaptureModule.sweepCaptureFiles(reactContext.cacheDir)
     }
   }
 
@@ -155,7 +178,15 @@ class FaceMatchModule(private val reactContext: ReactApplicationContext) :
     val width = box.width().coerceAtMost(bitmap.width - left)
     val height = box.height().coerceAtMost(bitmap.height - top)
     val cropped = Bitmap.createBitmap(bitmap, left, top, width, height)
-    return Bitmap.createScaledBitmap(cropped, INPUT_SIZE, INPUT_SIZE, true)
+    val scaled = Bitmap.createScaledBitmap(cropped, INPUT_SIZE, INPUT_SIZE, true)
+    // createBitmap/createScaledBitmap can each return the same object they were given
+    // (no-op crop/scale) rather than a new one — only recycle the intermediate crop if
+    // it's genuinely a distinct bitmap from what we're returning, and never the caller's
+    // own `bitmap` (matchAgainstPassport still owns and recycles that one itself).
+    if (cropped !== scaled && cropped !== bitmap) {
+      cropped.recycle()
+    }
+    return scaled
   }
 
   /** `(pixel - 127.5) / 128.0` per MobileFaceNet_TF's own preprocessing convention — see module doc comment. */
