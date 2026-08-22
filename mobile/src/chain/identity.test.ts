@@ -30,10 +30,12 @@ import {
   MigrateOprfSchemeParams,
   NUM_OPRF_COMMITTEES,
   OprfCommitteeKeyHashes,
+  RecoverAccountParams,
   RegisterCitizenParams,
   ReverifyCitizenParams,
   getSigningKeypair,
   migrateOprfScheme,
+  recoverAccount,
   registerCitizen,
   resolveCommitteeMemberIndex,
   reverifyCitizen,
@@ -114,6 +116,7 @@ function fakeApi(outcome: { dispatchError?: unknown } = {}) {
           registerCitizen: makeCall('registerCitizen'),
           reverifyCitizen: makeCall('reverifyCitizen'),
           migrateOprfScheme: makeCall('migrateOprfScheme'),
+          recoverAccount: makeCall('recoverAccount'),
         },
       },
     },
@@ -237,6 +240,72 @@ describe('reverifyCitizen', () => {
     const params = validParams();
     (params as any).anchor = new Uint8Array(0);
     await expect(reverifyCitizen(params)).rejects.toThrow(RangeError);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+});
+
+describe('recoverAccount', () => {
+  function validParams(): RecoverAccountParams {
+    return {
+      zkProof: new Uint8Array([8, 7, 6]),
+      publicInputs: validPublicInputs(),
+      outerCount: 4,
+      anchor: bytes32(0xdd),
+      oprfPkHashes: committeeHashes(41),
+      backingCommitment: bytes32(0xee),
+    };
+  }
+
+  it('submits recover_account with the 5 arguments in the pallet\'s order', async () => {
+    const { api, calls } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+
+    const params = validParams();
+    await recoverAccount(params);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe('recoverAccount');
+    expect(calls[0].args).toEqual([
+      params.zkProof,
+      params.publicInputs,
+      params.anchor,
+      params.oprfPkHashes,
+      params.backingCommitment,
+    ]);
+  });
+
+  it('resolves when the extrinsic finalizes without a dispatch error', async () => {
+    const { api } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+    await expect(recoverAccount(validParams())).resolves.toBeUndefined();
+  });
+
+  it('rejects when the chain reports a dispatch error (e.g. RecoveryCooldownActive)', async () => {
+    const { api } = fakeApi({ dispatchError: { toString: () => 'identity.RecoveryCooldownActive' } });
+    mockedGetApi.mockResolvedValue(api as any);
+    await expect(recoverAccount(validParams())).rejects.toThrow('identity.RecoveryCooldownActive');
+  });
+
+  it('rejects a malformed anchor before ever calling getApi', async () => {
+    const params = validParams();
+    (params as any).anchor = new Uint8Array(0);
+    await expect(recoverAccount(params)).rejects.toThrow(RangeError);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed backingCommitment before ever calling getApi', async () => {
+    const params = validParams();
+    (params as any).backingCommitment = new Uint8Array(31);
+    await expect(recoverAccount(params)).rejects.toThrow(/backingCommitment.*31 bytes/);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects the wrong number of OPRF committee key hashes before ever calling getApi', async () => {
+    const params = validParams();
+    (params as any).oprfPkHashes = committeeHashes(41).slice(0, 4);
+    await expect(recoverAccount(params)).rejects.toThrow(
+      new RegExp(`expected ${NUM_OPRF_COMMITTEES} OPRF committee key hashes`),
+    );
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 });

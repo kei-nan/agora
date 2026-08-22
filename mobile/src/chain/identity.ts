@@ -319,6 +319,60 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
 }
 
 /**
+ * Parameters for `recover_account` (call index 20, `pallets/pallet-identity/src/lib.rs`):
+ * same shape as `ReverifyCitizenParams` (a fresh outer proof re-establishing the caller
+ * still holds the passport behind an existing registration) plus `backingCommitment`,
+ * which must equal the *old* account's on-file `BackingCommitment` — mirrors
+ * `reverify_citizen`'s own `backing_commitment` parameter, see that extrinsic's doc
+ * comment for why it rides alongside `anchor` rather than being re-derived on-chain.
+ *
+ * Unlike `reverify_citizen`, the caller signing this extrinsic is a *different* account
+ * than the one the registration currently lives under — that old account is looked up
+ * on-chain via the proof's own nullifier, never supplied here directly.
+ */
+export interface RecoverAccountParams extends OuterProofPayload {
+  anchor: Uint8Array;
+  oprfPkHashes: OprfCommitteeKeyHashes;
+  backingCommitment: Uint8Array;
+}
+
+/**
+ * Submits `recover_account` (call index 20): rebinds an existing citizen's
+ * pallet-identity registration from its old, presumably-lost `AccountId` onto the
+ * caller's new one, given a proof that the caller holds the same passport the old
+ * registration was built from. See `pallets/pallet-identity/src/lib.rs`'s doc comment on
+ * the extrinsic for the exact storage items rebound and the (deliberate) absence of a
+ * dispute window.
+ *
+ * IMPORTANT — known gap this wrapper does NOT close (see `docs/project/pallets/identity.md`
+ * and `docs/project/next-steps.md`): `recover_account` only rebinds pallet-identity's own
+ * per-account storage. It does not move the old account's AGR balance, pallet-voting
+ * budget/delegations, pallet-elections delegate registration/backing, a legislature seat,
+ * a cabinet role, or pallet-anticorruption disclosures — all of that silently stays on the
+ * old, now-unusable account. Any UI calling this must disclose that plainly before the
+ * citizen confirms, not just document it here — see `RecoverAccountScreen.tsx`.
+ */
+export async function recoverAccount(params: RecoverAccountParams): Promise<void> {
+  assertValidPublicInputs(params.outerCount, params.publicInputs);
+  assertValidAnchor(params.anchor, 'recoverAccount');
+  assertValidOprfCommitteeKeyHashes(params.oprfPkHashes, 'recoverAccount');
+  assertValidAnchor(params.backingCommitment, 'recoverAccount (backingCommitment)');
+
+  const api = await getApi();
+  const { keypair } = await getSigningKeypair();
+  return submitExtrinsic(
+    api.tx.identity.recoverAccount(
+      params.zkProof,
+      params.publicInputs,
+      params.anchor,
+      params.oprfPkHashes,
+      params.backingCommitment,
+    ),
+    keypair,
+  );
+}
+
+/**
  * Submits `submit_oprf_query(origin, blinded_query: [u8; 64])` (call index 15,
  * `pallets/pallet-identity/src/lib.rs`) — posts a citizen's blinded OPRF query to the
  * on-chain mailbox (changelog entry 82), which the query's target committee slot

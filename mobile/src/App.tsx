@@ -11,6 +11,7 @@ enableScreens();
 import { AppModalProvider } from './components/AppModal';
 import { colors } from './theme';
 import RegisterScreen from './screens/RegisterScreen';
+import RecoverAccountScreen from './screens/RecoverAccountScreen';
 import RegistrationStatusScreen from './screens/RegistrationStatusScreen';
 import HomeScreen from './screens/HomeScreen';
 import ProposalsScreen from './screens/ProposalsScreen';
@@ -27,6 +28,7 @@ import FileCaseScreen from './screens/FileCaseScreen';
 export type RootStackParamList = {
   Main: undefined;
   Register: undefined;
+  RecoverAccount: undefined;
   RegistrationStatus: undefined;
   Auth: { deepLink?: string };
   DelegateDetail: { address: string };
@@ -105,6 +107,11 @@ export default function App() {
           name="Register"
           component={RegisterScreen}
           options={{ title: 'Register as Citizen' }}
+        />
+        <Stack.Screen
+          name="RecoverAccount"
+          component={RecoverAccountScreen}
+          options={{ title: 'Recover Account' }}
         />
         <Stack.Screen
           name="RegistrationStatus"

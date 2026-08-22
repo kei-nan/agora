@@ -142,6 +142,13 @@ export default function HomeScreen() {
             >
               <Text style={s.registerBtnText}>Register now</Text>
             </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => navigation.navigate('RecoverAccount')}
+              accessibilityRole="button"
+              accessibilityLabel="Lost access to an old account? Recover it"
+            >
+              <Text style={s.recoverLink}>Lost access to an old account? Recover it</Text>
+            </TouchableOpacity>
           </>
         ) : (
           <>
@@ -229,6 +236,7 @@ const s = StyleSheet.create({
     borderRadius: 10,
   },
   registerBtnText: { color: colors.textPrimary, fontWeight: '600', fontSize: 14 },
+  recoverLink: { marginTop: 12, fontSize: 12, color: colors.textMuted, textDecorationLine: 'underline' },
   statsRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',

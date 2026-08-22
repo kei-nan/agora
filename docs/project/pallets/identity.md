@@ -77,30 +77,50 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
 - `submit_oprf_query(blinded_query: [u8; 64])` — any registered citizen (`is_citizen` gate); posts a query to the on-chain mailbox and assigns/emits a fresh `query_id`; committee members for the target slot (derived off-chain via `committee_slot_for`) poll `PendingOprfQueries` and answer via `submit_oprf_round1`/`submit_oprf_round2`
 - `submit_oprf_round1(query_id, committee_slot, r_i: [u8;64], d_g: [u8;64], d_q: [u8;64], e_g: [u8;64], e_q: [u8;64])` — round 1 of a genuine `t`-of-`n` threshold OPRF evaluation (Option B, `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`); caller must be on `CommitteeMembers[committee_slot]`; checks slot validity, query existence/expiry (`OprfQuerySlaBlocks`), and no duplicate submission from this caller for this pair; once the `OprfThreshold`-th commitment lands the qualifying set locks (`OprfRound1SetLocked`) and further round-1 submissions for that pair are rejected. Performs no cryptographic verification of the submitted points itself — a deliberate, documented scope boundary (see `OprfRound1Commitment`'s doc comment), not an oversight
 - `submit_oprf_round2(query_id, committee_slot, z_i: [u8; 32])` — round 2; requires round 1 already locked (exactly `OprfThreshold` commitments) and caller to be one of that locked set's members; same no-crypto-verification scope boundary as round 1. Once every member of the locked set has submitted, the citizen's own client combines the round-1/round-2 data into the final proof off-chain (`oprf-committee-dev::threshold::combine_evaluations`/`combine_responses`) — the pallet never computes or stores that combination itself
-- `recover_account(zk_proof, public_inputs, anchor, oprf_pk_hashes)` — account recovery for a
-  citizen who lost access to their original `AccountId` (e.g. a reinstalled/reset mobile
-  wallet — see `mobile/src/chain/keystoreWallet.ts`). Same proof shape and the same real
-  `ZkVerifier`/`AnchorVerifier` verification path as `register_citizen`/`reverify_citizen` —
-  no weakened check, no dev-mode shortcut. Where `register_citizen` rejects outright when the
-  proof's nullifier is already in `NullifierRegistry`, this call treats that as the expected
-  case: it looks up the existing citizen the nullifier belongs to, checks the fresh proof
-  re-derives that citizen's on-file anchor (`AnchorMismatch`/`InvalidReverificationProof` on a
-  mismatch — the same check `reverify_citizen` makes), and then rebinds
+- `recover_account(zk_proof, public_inputs, anchor, oprf_pk_hashes, backing_commitment)` —
+  account recovery for a citizen who lost access to their original `AccountId` (e.g. a
+  reinstalled/reset mobile wallet — see `mobile/src/chain/keystoreWallet.ts`). Same proof shape
+  and the same real `ZkVerifier`/`AnchorVerifier` verification path as
+  `register_citizen`/`reverify_citizen` — no weakened check, no dev-mode shortcut.
+  `backing_commitment` must match the old account's on-file `BackingCommitment`, checked the
+  same way `reverify_citizen`'s own parameter of the same name is. Where `register_citizen`
+  rejects outright when the proof's nullifier is already in `NullifierRegistry`, this call
+  treats that as the expected case: it looks up the existing citizen the nullifier belongs to,
+  checks the fresh proof re-derives that citizen's on-file anchor
+  (`AnchorMismatch`/`InvalidReverificationProof` on a mismatch — the same check
+  `reverify_citizen` makes), and then rebinds
   `NullifierRegistry`/`CitizenNullifier`/`CitizenAnchor`/`IdentityAnchorRegistry`/
-  `CitizenIndex`+`CitizenPosition`/`ReverificationDeadline`/`SelfDeclaredSingleDocument` from
-  the old `AccountId` to the caller's new one, fully clearing the old account's identity
-  storage so it can no longer act as this citizen even if it's still reachable. Rejects if the
-  new account is already registered (`AlreadyRegistered`, same check `register_citizen` makes
-  — this also blocks `who == old_account`) or if the nullifier has no existing registration at
-  all (`NoExistingRegistrationForNullifier`). Rate-limited per nullifier by
-  `Config::MinBlocksBetweenRecoveries`, checked against `LastRecoveryBlock`
+  `BackingCommitment`/`CitizenIndex`+`CitizenPosition`/`ReverificationDeadline`/
+  `SelfDeclaredSingleDocument` from the old `AccountId` to the caller's new one, fully clearing
+  the old account's identity storage so it can no longer act as this citizen even if it's still
+  reachable. Rejects if the new account is already registered (`AlreadyRegistered`, same check
+  `register_citizen` makes — this also blocks `who == old_account`) or if the nullifier has no
+  existing registration at all (`NoExistingRegistrationForNullifier`). Rate-limited per
+  nullifier by `Config::MinBlocksBetweenRecoveries`, checked against `LastRecoveryBlock`
   (`RecoveryCooldownActive`). Deliberately has **no** time-delayed dispute/challenge window —
   a delay only helps if the old key is still reachable to contest it, which contradicts the
-  lost-device scenario this call exists for. `SuspendedNullifiers`/`SuspendedByJuryReview` are
+  lost-device scenario this call exists for; this is also a real, currently-open product
+  question rather than a settled tradeoff (see `docs/project/next-steps.md`) — the same
+  instant, no-dispute-window property is what makes recovery usable as a silent forced
+  identity-transfer tool under coercion. `SuspendedNullifiers`/`SuspendedByJuryReview` are
   untouched by this call and need no special handling: they're keyed by nullifier, not
   `AccountId`, so an existing suspension carries over onto the new account automatically —
   recovery cannot be used to launder away an active court-ordered suspension. Emits
   `CitizenAccountRecovered { old_account, new_account, nullifier_hash }`.
+
+  **Known limitation — cross-pallet orphaning.** This call rebinds only the pallet-identity
+  storage listed above. It has no knowledge of, and does not touch, any other pallet's
+  per-account state. After a successful recovery, all of the following remain bound to
+  `old_account` and are silently orphaned there (not moved, not frozen, not flagged): the
+  citizen's AGR balance, pallet-voting budget/delegation state, pallet-elections delegate
+  registration/backing, a legislature seat, a cabinet role, and pallet-anticorruption asset
+  disclosures/conflict-registry entries. Closing this needs a real cross-pallet
+  `AccountMigrator` trait (mirroring the existing `CitizenSuspender` pattern) spanning
+  pallet-voting/elections/legislature/executive/anticorruption — real, separate future work,
+  tracked in `docs/project/next-steps.md`, not attempted as part of adding this call. A mobile
+  UI wrapper exists (`mobile/src/chain/identity.ts`'s `recoverAccount`,
+  `mobile/src/screens/RecoverAccountScreen.tsx`) and discloses this plainly to the citizen
+  before they can confirm — but the underlying gap is on-chain, not something any UI can fix.
 
 `AdminOrigin`, like `pallet-legislature::EnsureLegislatureMotion` elsewhere, is `EnsureOriginWithArg<_, [u8; 32]>`: each call above passes a domain-separated hash of its own parameters, checked against the specific motion that authorized it, so one passed motion can't be replayed to authorize a different call.
 

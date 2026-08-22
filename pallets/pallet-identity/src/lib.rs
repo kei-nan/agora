@@ -1567,7 +1567,29 @@ pub mod pallet {
         /// the lost-device scenario this call exists for, and would add friction with no real
         /// benefit here. The only guard against abuse/griefing is
         /// `Config::MinBlocksBetweenRecoveries`, a per-nullifier cooldown tracked in
-        /// `LastRecoveryBlock`.
+        /// `LastRecoveryBlock`. That absence is also a documented, currently-unresolved product
+        /// question, not settled by the reasoning above alone: this same "instant, no dispute
+        /// window" property is what makes recovery usable as a silent forced identity-transfer
+        /// tool under coercion (e.g. compelling someone to re-scan their own passport onto an
+        /// attacker-controlled account). See `docs/project/next-steps.md` for the open item.
+        ///
+        /// **Known, current gap — cross-pallet orphaning (not fixed by this call):** everything
+        /// rebound above is pallet-identity's own per-account storage, and *only* that. This
+        /// call does NOT touch, and has no visibility into, any other pallet's per-account
+        /// state. Concretely, after a successful recovery, all of the following stay bound to
+        /// `old_account` and are silently orphaned there — not moved, not frozen, not flagged:
+        /// the citizen's AGR balance, pallet-voting's budget/delegation state, pallet-elections'
+        /// delegate registration/backing, a legislature seat, a cabinet role, and
+        /// pallet-anticorruption's asset disclosures/conflict registry entries. A citizen who
+        /// recovers loses practical access to all of it unless they separately still hold
+        /// `old_account`'s keys (in which case they didn't need to recover in the first place).
+        /// Closing this needs a real cross-pallet `AccountMigrator` trait (mirroring the
+        /// existing `CitizenSuspender` pattern) spanning pallet-voting/elections/legislature/
+        /// executive/anticorruption — genuine, separate design/implementation work, not
+        /// attempted here. See `docs/project/pallets/identity.md`'s "Known limitation" section
+        /// and `docs/project/next-steps.md`. Any UI that calls this extrinsic must disclose this
+        /// plainly to the citizen before they confirm — see `mobile/src/screens/
+        /// RecoverAccountScreen.tsx`.
         #[pallet::call_index(20)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn recover_account(

@@ -293,3 +293,62 @@
     ZKPassport proof can be produced on-device until a real committee exists, so `recover_account`
     cannot actually be exercised end-to-end yet either.
 
+    **Update, 2026-08-22 (part 3)** — a high-severity review finding covered three gaps around
+    `recover_account`; this pass closed what's safely closeable now and left the rest as tracked
+    open work (see items 14/15 below). (1) **Mobile wrapper + screen added.**
+    `mobile/src/chain/identity.ts` gained `recoverAccount`/`RecoverAccountParams`, matching the
+    real 5-argument `recover_account` call shape (`identity.test.ts`: 5 new tests, 33/33 passing
+    in that file, 228/228 across the mobile suite). `mobile/src/screens/
+    RecoverAccountScreen.tsx` is a new screen (wired into `App.tsx`, linked from `HomeScreen.tsx`'s
+    not-registered card) that mirrors `RegisterScreen.tsx`'s re-scan flow — same MRZ form, NFC
+    scan, liveness/face-match gate — gated behind a mandatory, plainly-worded disclosure screen
+    (shown, and re-confirmed via a destructive confirm dialog, before the re-scan can even start)
+    stating that recovery is instant and irreversible, the old account stops working immediately,
+    and the old account's AGR balance/delegations/delegate backing/legislature seat/cabinet role
+    are NOT transferred and will be lost. Like `RegisterScreen.tsx`, it stops at the same
+    proving-pipeline wall (no certificate-registry inclusion proof, on-device commitment salts, or
+    proving key exist yet) — `npx tsc --noEmit` clean, but this cannot be exercised end-to-end
+    (no OPRF committee, no device). (2) **Cross-pallet orphaning is now documented as a known,
+    current gap**, not silently left implicit — see `pallets/pallet-identity/src/lib.rs`'s
+    `recover_account` doc comment and `docs/project/pallets/identity.md`'s new "Known
+    limitation" section, both spelling out exactly what does *not* move (balance, pallet-voting
+    delegations/budget, pallet-elections delegate backing, legislature seat, cabinet role,
+    anticorruption disclosures). (3) **Deliberately not attempted this pass** (per the finding's
+    own scoping): the actual cross-pallet migration, and any notification/dispute-window
+    mechanism for the coercion risk — see items 14 and 15.
+
+14. [ ] **Cross-pallet `AccountMigrator` for `recover_account`** — found 2026-08-22 (review
+    finding, see item 13 part 3). `recover_account` only rebinds pallet-identity's own storage;
+    a recovering citizen's AGR balance, pallet-voting budget/delegation state, pallet-elections
+    delegate registration/backing, a legislature seat, a cabinet role, and pallet-anticorruption
+    disclosures/conflict-registry entries all stay silently bound to the abandoned old account.
+    Real, separate design/implementation work: needs a genuine cross-pallet `AccountMigrator`
+    trait (mirroring the existing `CitizenSuspender` runtime-trait pattern) spanning
+    pallet-voting/elections/legislature/executive/anticorruption, each implementing its own
+    "move this account's state to a new AccountId" logic and being called from
+    `recover_account` in a single atomic transaction. Non-trivial questions of its own: what
+    happens to an in-flight vote/delegation/motion the old account was mid-way through, whether
+    a legislature seat or cabinet role can even be "moved" mid-term without its own governance
+    implications, and how to keep the whole rebind atomic across that many pallets. Not
+    attempted in the 2026-08-22 pass — deliberately scoped out as too large for that session.
+
+15. [ ] **Open safety/product question: `recover_account` has no notification or dispute window**
+    — found 2026-08-22 (review finding, see item 13 part 3), needs a human product decision, not
+    just engineering. `recover_account` succeeds instantly with no notice to the old account and
+    no delay before it takes effect — deliberate, per the pallet's own doc comment (a delay only
+    helps if the old key is still reachable to contest it, which is the opposite of the
+    lost-device case this call exists for). But the same instant, undisputable rebind is also a
+    ready-made silent identity-transfer tool under coercion: someone can be forced (e.g. at
+    gunpoint, or via device confiscation) to re-scan their own passport onto an attacker's
+    account, permanently and unrecoverably surrendering their citizen identity with no trace
+    distinguishing it from a legitimate lost-device recovery. Whether any mitigation is even
+    desirable is a genuine open question — a delay/notification only helps if the *old* device
+    is still reachable, which directly contradicts the lost-device scenario the call exists for
+    in the first place, so a naive "add a dispute window" fix could make the legitimate case
+    worse without meaningfully stopping the coercion case (an attacker can just wait out the
+    window while still controlling the victim). Needs product-level input (e.g. is a short
+    delay with a loud, unmissable notification to any surviving old-account session an
+    acceptable tradeoff; is there a distinct "duress" signal a citizen could pre-register; is
+    this simply an accepted residual risk of any single-factor biometric-recovery scheme) before
+    any implementation is attempted. Not attempted in the 2026-08-22 pass, deliberately.
+
