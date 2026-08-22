@@ -13,6 +13,11 @@ pub type Balance = u64;
 /// constant (see that pallet's mock.rs).
 pub const CASE_FILING_BOND: Balance = 100;
 
+/// How many blocks an `ApprovedAdminAction` token may sit unconsumed before
+/// `clear_stale_admin_action` can discard it — mirrors pallet-legislature's mock
+/// `APPROVAL_EXPIRY` constant. Small so tests don't need to advance hundreds of blocks.
+pub const ADMIN_ACTION_EXPIRY: u32 = 20;
+
 #[frame_support::runtime]
 mod runtime {
 	// The main runtime
@@ -182,6 +187,7 @@ impl pallet_courts::Config for Test {
 	// Simple majority (more than half) — see Config::OracleApprovalNumerator's doc comment.
 	type OracleApprovalNumerator = ConstU32<1>;
 	type OracleApprovalDenominator = ConstU32<2>;
+	type AdminActionExpiryBlocks = ConstU32<ADMIN_ACTION_EXPIRY>;
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;

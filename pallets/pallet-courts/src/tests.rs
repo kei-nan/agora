@@ -1164,27 +1164,19 @@ fn admin_action_single_member_call_is_rejected() {
 }
 
 #[test]
-fn admin_action_majority_approved_call_succeeds_and_only_the_proposer_may_consume_it() {
+fn admin_action_majority_approved_call_succeeds_and_any_current_member_may_consume_it() {
 	new_test_ext().execute_with(|| {
-		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
 		let call_hash = [43u8; 32];
 		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
 		// Second approval reaches the 1/2 strict-majority threshold (2 of 3).
 		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
 
-		assert_eq!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash), Some(m1));
-		assert!(crate::pallet::PendingAdminAction::<Test>::get(call_hash).is_none());
-
-		// A different council member -- even one who approved -- cannot hijack the proposer's
-		// resolved approval.
-		assert!(
-			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
-				RuntimeOrigin::signed(m3),
-				&call_hash,
-			)
-			.is_err()
+		assert_eq!(
+			crate::pallet::ApprovedAdminAction::<Test>::get(call_hash),
+			Some((m1, System::block_number()))
 		);
-		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+		assert!(crate::pallet::PendingAdminAction::<Test>::get(call_hash).is_none());
 
 		// The proposer consumes it exactly once.
 		assert!(
@@ -1203,6 +1195,174 @@ fn admin_action_majority_approved_call_succeeds_and_only_the_proposer_may_consum
 			)
 			.is_err()
 		);
+	});
+}
+
+/// The deadlock fix: any current Oracle Council member -- not only the original
+/// `propose_admin_action` caller -- can consume an approved admin action token. The vote
+/// that approved it is what legitimizes the action, so a proposer who goes offline or is
+/// later removed must not be able to permanently block invalidate_law/suspend_citizen/
+/// restore_citizen_rights. Mirrors pallet-legislature's
+/// `ensure_legislature_motion_allows_any_current_member_to_consume_token`.
+#[test]
+fn ensure_oracle_council_approved_allows_any_current_member_to_consume_token() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let call_hash = [46u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+
+		// m3, who is not the proposer, successfully consumes the token.
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(m3),
+				&call_hash,
+			)
+			.is_ok()
+		);
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+	});
+}
+
+#[test]
+fn ensure_oracle_council_approved_rejects_non_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [47u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+
+		// Account 999 was never an Oracle Council member.
+		assert!(
+			crate::pallet::EnsureOracleCouncilApproved::<Test>::try_origin(
+				RuntimeOrigin::signed(999),
+				&call_hash,
+			)
+			.is_err()
+		);
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+	});
+}
+
+// ─── clear_stale_admin_action ───────────────────────────────────────────────
+
+#[test]
+fn clear_stale_admin_action_fails_when_not_yet_expired() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [48u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+
+		System::set_block_number(System::block_number() + ADMIN_ACTION_EXPIRY as u64 - 1);
+		assert_noop!(
+			Courts::clear_stale_admin_action(RuntimeOrigin::signed(m1), call_hash),
+			Error::<Test>::ApprovalNotYetStale
+		);
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
+	});
+}
+
+#[test]
+fn clear_stale_admin_action_fails_when_none_approved() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		assert_noop!(
+			Courts::clear_stale_admin_action(RuntimeOrigin::signed(m1), [49u8; 32]),
+			Error::<Test>::NoApprovedAdminAction
+		);
+	});
+}
+
+#[test]
+fn clear_stale_admin_action_fails_for_non_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, _m3) = setup_three_member_oracle_council();
+		let call_hash = [50u8; 32];
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+		System::set_block_number(System::block_number() + ADMIN_ACTION_EXPIRY as u64);
+
+		assert_noop!(
+			Courts::clear_stale_admin_action(RuntimeOrigin::signed(999), call_hash),
+			Error::<Test>::OracleMemberNotFound
+		);
+	});
+}
+
+/// The deadlock recovery this fix adds: once an approved admin action token sits unconsumed
+/// past `AdminActionExpiryBlocks`, *any* current Oracle Council member (not necessarily the
+/// stuck proposer) can clear it, and a fresh proposal for the same call_hash is then free to
+/// be raised again -- proving the court system is no longer permanently stuck. Mirrors
+/// pallet-legislature's `clear_stale_approval_unblocks_a_new_motion_after_expiry`.
+#[test]
+fn clear_stale_admin_action_unblocks_a_new_proposal_after_expiry() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let call_hash = [51u8; 32];
+
+		// The action is approved but nobody (e.g. an offline/removed proposer) ever consumes it.
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+		let approved_at = System::block_number();
+
+		// Before expiry, the call_hash cannot be re-proposed.
+		assert_noop!(
+			Courts::propose_admin_action(RuntimeOrigin::signed(m3), call_hash),
+			Error::<Test>::OracleActionAlreadyProposed
+		);
+
+		// Move past the expiry window and clear the stale token -- called by m3, who is not
+		// the original proposer.
+		System::set_block_number(approved_at + ADMIN_ACTION_EXPIRY as u64);
+		assert_ok!(Courts::clear_stale_admin_action(RuntimeOrigin::signed(m3), call_hash));
+		System::assert_last_event(Event::AdminActionExpired { call_hash }.into());
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+
+		// The court system is unblocked: the same call_hash can be proposed again.
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert!(crate::pallet::PendingAdminAction::<Test>::get(call_hash).is_some());
+	});
+}
+
+/// The second half of the finding: a removed/compromised member's still-pending admin-action
+/// approval must no longer count toward the M-of-N threshold, exactly like the existing
+/// `remove_oracle_member_purges_stale_approval_from_in_flight_proposal` coverage for case-based
+/// oracle proposals.
+#[test]
+fn remove_oracle_member_purges_stale_approval_from_pending_admin_action() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let call_hash = [52u8; 32];
+
+		// m1 proposes and is auto-approved -- 1 of 3, below the 2-of-3 threshold.
+		assert_ok!(Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash));
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+
+		// m1's key is compromised; root removes them mid-proposal.
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), m1));
+
+		// The stale approval must be purged -- the pending entry (if it still exists) must not
+		// contain m1, and the action must not have been resolved off of m1's stale approval
+		// plus a single fresh one from a council that's now only {m2, m3}.
+		if let Some((_, approvals)) = crate::pallet::PendingAdminAction::<Test>::get(call_hash) {
+			assert!(!approvals.contains(&m1));
+		}
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none());
+
+		// Remaining council is {m2, m3}: 1/2 strict majority now needs 2 of 2. If m1's stale
+		// approval still counted, m2 approving alone would wrongly reach quorum (stale m1 +
+		// fresh m2 == 2 of a size-2 council).
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m2), call_hash));
+		assert!(
+			crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_none(),
+			"m2 alone must not reach quorum on a 2-member council"
+		);
+
+		// A genuine second approval from the remaining council is required to resolve.
+		assert_ok!(Courts::approve_admin_action(RuntimeOrigin::signed(m3), call_hash));
+		assert!(crate::pallet::ApprovedAdminAction::<Test>::get(call_hash).is_some());
 	});
 }
 

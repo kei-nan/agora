@@ -669,6 +669,9 @@ impl pallet_courts::Config for Runtime {
 	/// rather than the `>=` this pallet's own AI-model-approval supermajority below uses.
 	type OracleApprovalNumerator = ConstU32<1>;
 	type OracleApprovalDenominator = ConstU32<2>;
+	/// 14 days, matching `pallet_legislature::Config::PendingApprovalExpiryBlocks` — the same
+	/// stuck-proposer deadlock this closes (see `EnsureOracleCouncilApproved`'s doc comment).
+	type AdminActionExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	type CitizenSuspender = Runtime;
 	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`

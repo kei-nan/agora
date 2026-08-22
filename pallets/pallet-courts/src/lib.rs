@@ -4,6 +4,7 @@
 //! Rulings are auto-enforced: invalidated law -> pallet-constitution pauses it;
 //! illegal treasury tx -> pallet-treasury-ledger freezes department.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
@@ -123,20 +124,32 @@ pub mod pallet {
 
     /// `EnsureOriginWithArg<RuntimeOrigin, [u8; 32]>` that succeeds only when
     /// `propose_admin_action`/`approve_admin_action` have already driven the given call hash's
-    /// approvals past the Oracle Council's M-of-N threshold, *and* the caller is the proposer
-    /// who is entitled to consume it (see `ApprovedAdminAction`). This is the fix for the gap
-    /// where `pallet_constitution::invalidate_law` and `pallet_identity_zk::suspend_citizen`/
-    /// `restore_citizen_rights` were gated only by the bare `EnsureOracle` membership check —
-    /// any single Oracle Council member could call those "manual override" extrinsics directly
-    /// and take effect immediately, with none of the M-of-N approval `submit_ai_ruling`/
-    /// `approve_ai_ruling`/`finalize_ruling` require. Wire this as `CourtOrigin`/
-    /// `SuspensionOrigin` in the runtime instead of `EnsureOracle<Runtime>` directly.
+    /// approvals past the Oracle Council's M-of-N threshold (see `ApprovedAdminAction`). This is
+    /// the fix for the gap where `pallet_constitution::invalidate_law` and
+    /// `pallet_identity_zk::suspend_citizen`/`restore_citizen_rights` were gated only by the bare
+    /// `EnsureOracle` membership check — any single Oracle Council member could call those
+    /// "manual override" extrinsics directly and take effect immediately, with none of the M-of-N
+    /// approval `submit_ai_ruling`/`approve_ai_ruling`/`finalize_ruling` require. Wire this as
+    /// `CourtOrigin`/`SuspensionOrigin` in the runtime instead of `EnsureOracle<Runtime>` directly.
     ///
     /// Mirrors `pallet_legislature::EnsureLegislatureMotion`'s `call_hash`-binding design: the
     /// consuming pallet computes a domain-separated hash of its own call's parameters (so
     /// byte-identical parameters passed to a different call can never collide) and only that
     /// exact hash's approved token authorizes the origin — a token approved for one call can
     /// never be replayed against a different one.
+    ///
+    /// Any *current* Oracle Council member may consume an approved token, not only the original
+    /// `propose_admin_action` caller — mirrors `df8fff7`'s identical fix in
+    /// `pallet_legislature::EnsureLegislatureMotion`, ported here after the same permanent-
+    /// deadlock risk was found unfixed in this pallet: the approval vote is what legitimizes the
+    /// action, not the proposer's continued availability, and requiring the exact proposer meant
+    /// a proposer who went offline, lost their key, or was removed via `remove_oracle_member`
+    /// before consuming it would permanently block every future admin action gated on this
+    /// origin (`propose_admin_action` refuses to re-propose an already-approved `call_hash`, see
+    /// `Error::OracleActionAlreadyProposed`). `ApprovedAdminAction` now also stores the block the
+    /// token was approved at; `clear_stale_admin_action` lets any current council member discard
+    /// it once `AdminActionExpiryBlocks` have passed unconsumed, unblocking a fresh proposal for
+    /// the same `call_hash`.
     pub struct EnsureOracleCouncilApproved<T>(core::marker::PhantomData<T>);
 
     impl<T: Config> frame_support::traits::EnsureOriginWithArg<T::RuntimeOrigin, [u8; 32]>
@@ -150,8 +163,8 @@ pub mod pallet {
         ) -> Result<Self::Success, T::RuntimeOrigin> {
             use frame_system::RawOrigin;
             match o.clone().into() {
-                Ok(RawOrigin::Signed(who)) => {
-                    if ApprovedAdminAction::<T>::get(call_hash) == Some(who) {
+                Ok(RawOrigin::Signed(who)) if OracleMembers::<T>::get().contains(&who) => {
+                    if ApprovedAdminAction::<T>::get(call_hash).is_some() {
                         ApprovedAdminAction::<T>::remove(call_hash);
                         Ok(())
                     } else {
@@ -165,7 +178,10 @@ pub mod pallet {
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin(call_hash: &[u8; 32]) -> Result<T::RuntimeOrigin, ()> {
             let member = OracleMembers::<T>::get().first().cloned().ok_or(())?;
-            ApprovedAdminAction::<T>::insert(*call_hash, member.clone());
+            ApprovedAdminAction::<T>::insert(
+                *call_hash,
+                (member.clone(), frame_system::Pallet::<T>::block_number()),
+            );
             Ok(frame_system::RawOrigin::Signed(member).into())
         }
     }
@@ -286,6 +302,12 @@ pub mod pallet {
         /// Denominator of the oracle-approval fraction (see `OracleApprovalNumerator`).
         #[pallet::constant]
         type OracleApprovalDenominator: Get<u32>;
+        /// How many blocks an `ApprovedAdminAction` token may sit unconsumed before any current
+        /// Oracle Council member can discard it via `clear_stale_admin_action`. Mirrors
+        /// `pallet_legislature::Config::PendingApprovalExpiryBlocks` — see
+        /// `EnsureOracleCouncilApproved`'s doc comment for the deadlock this closes.
+        #[pallet::constant]
+        type AdminActionExpiryBlocks: Get<u32>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// Number of blocks, starting the block *after* a case enters jury appeal, whose
@@ -451,14 +473,18 @@ pub mod pallet {
         (T::AccountId, BoundedVec<T::AccountId, T::MaxOracleMembers>),
     >;
 
-    /// call_hash -> the proposer, once `PendingAdminAction`'s approvals reached the M-of-N
-    /// threshold. Only that proposer may consume it (via `EnsureOracleCouncilApproved`) to
-    /// actually execute the authorized call — mirrors `pallet_legislature`'s
-    /// `PendingLegislatureApproval` restricting consumption to the motion's own proposer, so a
-    /// different Oracle Council member can't hijack a resolved action. Removed the moment it is
-    /// consumed; each resolved proposal authorizes exactly one call.
+    /// call_hash -> (proposer, block approved) once `PendingAdminAction`'s approvals reached the
+    /// M-of-N threshold. Any *current* Oracle Council member may consume it (via
+    /// `EnsureOracleCouncilApproved`) to actually execute the authorized call — not only the
+    /// original proposer; see `EnsureOracleCouncilApproved`'s doc comment for why (ports
+    /// `pallet_legislature`'s `df8fff7` deadlock fix, which restricting consumption to the
+    /// proposer alone would otherwise reintroduce here). `proposer` is retained only as an audit
+    /// trail, not for authorization. The approval block is used by `clear_stale_admin_action` to
+    /// discard a token nobody ever consumes once `AdminActionExpiryBlocks` elapses. Removed the
+    /// moment it is consumed (or expired); each resolved proposal authorizes exactly one call.
     #[pallet::storage]
-    pub type ApprovedAdminAction<T: Config> = StorageMap<_, Blake2_128Concat, [u8; 32], T::AccountId>;
+    pub type ApprovedAdminAction<T: Config> =
+        StorageMap<_, Blake2_128Concat, [u8; 32], (T::AccountId, BlockNumberFor<T>)>;
 
     /// case_id -> bond reserved from the filer by `file_case`. Only ever populated for
     /// citizen-filed cases — `auto_file_case` (system-initiated) never inserts an entry here,
@@ -605,9 +631,12 @@ pub mod pallet {
         AdminActionProposed { call_hash: [u8; 32], proposer: T::AccountId },
         /// An Oracle Council member cast an approval on a pending administrative action.
         AdminActionApprovalCast { call_hash: [u8; 32], member: T::AccountId },
-        /// A pending administrative action reached its approval threshold; its proposer may
-        /// now consume it once via `EnsureOracleCouncilApproved`.
+        /// A pending administrative action reached its approval threshold; any current Oracle
+        /// Council member may now consume it once via `EnsureOracleCouncilApproved`.
         AdminActionApproved { call_hash: [u8; 32] },
+        /// An `ApprovedAdminAction` token expired unconsumed and was discarded via
+        /// `clear_stale_admin_action`, freeing the call_hash for a new proposal.
+        AdminActionExpired { call_hash: [u8; 32] },
         /// A new member was added to the AI Model Governance Council.
         AIGovernanceMemberAdded { who: T::AccountId },
         /// A member was removed from the AI Model Governance Council.
@@ -674,6 +703,10 @@ pub mod pallet {
         AlreadyOracleMember,
         /// The account is not in the Oracle Council member list.
         OracleMemberNotFound,
+        /// There is no `ApprovedAdminAction` token for this call_hash to clear.
+        NoApprovedAdminAction,
+        /// The `ApprovedAdminAction` token has not yet reached `AdminActionExpiryBlocks`.
+        ApprovalNotYetStale,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -1007,17 +1040,28 @@ pub mod pallet {
         /// Remove a member from the Oracle Council. Only root may call this.
         ///
         /// Also purges this member's already-cast approvals from every in-flight
-        /// `PendingOracleProposal`, unlike `pallet_legislature`'s `remove_member` (which
-        /// deliberately leaves a removed member's votes on still-open motions in place). That
-        /// tradeoff doesn't hold here: this council exists specifically to survive a compromised
-        /// member, and the expected incident-response path is "member's key is compromised, so
-        /// root removes them" — if their already-cast approval kept counting toward quorum on a
-        /// proposal they (or an attacker using their key) approved, removal wouldn't actually
-        /// shrink the set of approvals a malicious submission/finalization needs, undercutting
-        /// the whole point of the M-of-N design. `OracleApprovals` has no per-member index, so
-        /// this walks every case with an in-flight proposal — acceptable here because the call
-        /// is root-gated and root-initiated removals are rare, incident-driven events, not
-        /// routine traffic.
+        /// `PendingOracleProposal` and `PendingAdminAction`, unlike `pallet_legislature`'s
+        /// `remove_member` (which deliberately leaves a removed member's votes on still-open
+        /// motions in place). That tradeoff doesn't hold here: this council exists specifically
+        /// to survive a compromised member, and the expected incident-response path is "member's
+        /// key is compromised, so root removes them" — if their already-cast approval kept
+        /// counting toward quorum on a proposal they (or an attacker using their key) approved,
+        /// removal wouldn't actually shrink the set of approvals a malicious submission/
+        /// finalization/admin action needs, undercutting the whole point of the M-of-N design.
+        /// Neither map has a per-member index, so this walks every in-flight proposal —
+        /// acceptable here because the call is root-gated and root-initiated removals are rare,
+        /// incident-driven events, not routine traffic.
+        ///
+        /// After purging `PendingAdminAction`, `try_resolve_admin_action` is re-run for every
+        /// entry the removed member had approved: removing a member also shrinks the council
+        /// size the approval threshold is computed against, so a purge can newly cross the
+        /// threshold for an action that was previously still short (e.g. a 2-of-3 proposal with
+        /// the removed member as one of the two approvers becomes a 1-of-2 proposal, which the
+        /// remaining approval alone already satisfies). `PendingOracleProposal` has no
+        /// equivalent re-check — a case-based action's resolution has extra preconditions (case
+        /// status) checked at approval time, not just at removal time, and this pallet's
+        /// existing behavior for that map already accepts the member's own next approval call
+        /// as the trigger; not expanded here to stay within this fix's scope.
         #[pallet::call_index(10)]
         #[pallet::weight(Weight::from_parts(5_000, 0))]
         pub fn remove_oracle_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
@@ -1038,6 +1082,23 @@ pub mod pallet {
                     Some(approvers)
                 },
             );
+            let mut affected: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
+            PendingAdminAction::<T>::translate(
+                |call_hash,
+                 (proposer, mut approvers): (
+                    T::AccountId,
+                    BoundedVec<T::AccountId, T::MaxOracleMembers>,
+                )| {
+                    if let Some(pos) = approvers.iter().position(|m| m == &account) {
+                        approvers.remove(pos);
+                        affected.push(call_hash);
+                    }
+                    Some((proposer, approvers))
+                },
+            );
+            for call_hash in affected {
+                Self::try_resolve_admin_action(call_hash);
+            }
             Self::deposit_event(Event::OracleMemberRemoved { account });
             Ok(())
         }
@@ -1186,6 +1247,34 @@ pub mod pallet {
             })?;
             Self::deposit_event(Event::AdminActionApprovalCast { call_hash, member: who });
             Self::try_resolve_admin_action(call_hash);
+            Ok(())
+        }
+
+        /// Discard an unconsumed `ApprovedAdminAction` token once `AdminActionExpiryBlocks`
+        /// have passed since it was approved. Open to any *current* Oracle Council member —
+        /// recovers the court system from an approved admin action (invalidate_law/
+        /// suspend_citizen/restore_citizen_rights) that nobody ever consumes because the
+        /// proposer went offline, lost their key, or was removed. Mirrors
+        /// `pallet_legislature::clear_stale_approval` — see `EnsureOracleCouncilApproved`'s doc
+        /// comment for the deadlock this closes.
+        #[pallet::call_index(14)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn clear_stale_admin_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                OracleMembers::<T>::get().contains(&who),
+                Error::<T>::OracleMemberNotFound
+            );
+            let (_, approved_at) = ApprovedAdminAction::<T>::get(call_hash)
+                .ok_or(Error::<T>::NoApprovedAdminAction)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            let expiry = BlockNumberFor::<T>::from(T::AdminActionExpiryBlocks::get());
+            ensure!(
+                now >= approved_at.saturating_add(expiry),
+                Error::<T>::ApprovalNotYetStale
+            );
+            ApprovedAdminAction::<T>::remove(call_hash);
+            Self::deposit_event(Event::AdminActionExpired { call_hash });
             Ok(())
         }
     }
@@ -1476,7 +1565,8 @@ pub mod pallet {
             let council_size = OracleMembers::<T>::get().len() as u32;
             if Self::oracle_approval_reached(approvals.len() as u32, council_size) {
                 PendingAdminAction::<T>::remove(call_hash);
-                ApprovedAdminAction::<T>::insert(call_hash, proposer);
+                let now = frame_system::Pallet::<T>::block_number();
+                ApprovedAdminAction::<T>::insert(call_hash, (proposer, now));
                 Self::deposit_event(Event::AdminActionApproved { call_hash });
             }
         }
