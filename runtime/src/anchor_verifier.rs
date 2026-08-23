@@ -412,6 +412,31 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
     }
 }
 
+/// Real `pallet_elections::DelegatePersonaVerifier` for the non-dev-mode runtime — the same
+/// [`Poseidon2AnchorVerifier`] marker struct, extended with a fourth trait impl rather than a
+/// new type, since it is genuinely the same recompute-and-check idiom over the same module's
+/// [`check_delegate_persona`]. See `pallet_elections::register_as_delegate`'s doc comment for
+/// how this is used: `T::ZkVerifier::verify` (the outer proof's pairing check) must already
+/// have passed before this is called, exactly as `pallet_identity_zk::register_citizen` already
+/// does for [`Poseidon2AnchorVerifier`]'s other three methods.
+impl pallet_elections::DelegatePersonaVerifier for Poseidon2AnchorVerifier {
+    fn check_delegate_persona(
+        outer_public_inputs: &[[u8; 32]],
+        delegate_persona_id: [u8; 32],
+        persona_account: [u8; 32],
+        scheme_version: u32,
+        oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    ) -> bool {
+        check_delegate_persona(
+            outer_public_inputs,
+            delegate_persona_id,
+            persona_account,
+            scheme_version,
+            oprf_pk_hashes,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

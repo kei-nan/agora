@@ -186,9 +186,10 @@ fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<()> {
     ultrahonk::verify(BACKING_NULLIFIER_VK, envelope.variant, envelope.proof, public_inputs)
 }
 
-/// The real `backing-nullifier` proof verifier. Not yet wired to any pallet `Config` — see this
-/// module's top-of-file docs — so this is a plain function, not a trait impl, until a consumer
-/// exists to define the trait shape against.
+/// The real `backing-nullifier` proof verifier. Wired to `pallet_elections::Config::
+/// BackingProofVerifier` below — see this module's top-of-file docs for what a caller must
+/// additionally check afterward (root validity, `delegate_persona_id`/`max_backings_per_citizen`
+/// against live state, nullifier reuse — all performed by `pallet-elections` itself, not here).
 pub struct BackingNullifierVerifier;
 
 impl BackingNullifierVerifier {
@@ -197,6 +198,12 @@ impl BackingNullifierVerifier {
     /// docs for what a caller must additionally check afterward.
     pub fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
         verify_inner(proof_bytes, public_inputs).is_some()
+    }
+}
+
+impl pallet_elections::BackingProofVerifier for BackingNullifierVerifier {
+    fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
+        Self::verify(proof_bytes, public_inputs)
     }
 }
 

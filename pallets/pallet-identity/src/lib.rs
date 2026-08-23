@@ -2060,11 +2060,30 @@ pub mod pallet {
             scheme_version: u32,
             oprf_pk_hashes: &[[u8; 32]; NUM_COMMITTEES as usize],
         ) -> DispatchResult {
-            for (slot, pk_hash) in oprf_pk_hashes.iter().enumerate() {
-                let approved = OprfCommitteeKeys::<T>::get((scheme_version, slot as u8));
-                ensure!(approved == Some(*pk_hash), Error::<T>::CommitteeKeyMismatch);
-            }
+            ensure!(
+                Self::are_committee_keys_approved(scheme_version, oprf_pk_hashes),
+                Error::<T>::CommitteeKeyMismatch
+            );
             Ok(())
+        }
+
+        /// The bool-returning, storage-error-free half of [`Self::check_committee_keys`] --
+        /// exposed as `pub` (unlike that function) so other pallets that verify a proof riding
+        /// in the same outer-ZKPassport-proof family can enforce the identical Sybil-resistance
+        /// guarantee without duplicating `OprfCommitteeKeys` storage access or depending on this
+        /// pallet's own `Error` type. Currently consumed by `pallet-elections`'s
+        /// `register_as_delegate` (via its own `CommitteeKeyChecker` trait, implemented on this
+        /// `Pallet<T>` in `runtime/src/configs/mod.rs`) for exactly the same reason
+        /// `register_citizen` checks this itself: without it, a prover could fabricate their own
+        /// "committee" keys and self-mint an unlimited number of otherwise-valid-looking
+        /// delegate personas.
+        pub fn are_committee_keys_approved(
+            scheme_version: u32,
+            oprf_pk_hashes: &[[u8; 32]; NUM_COMMITTEES as usize],
+        ) -> bool {
+            oprf_pk_hashes.iter().enumerate().all(|(slot, pk_hash)| {
+                OprfCommitteeKeys::<T>::get((scheme_version, slot as u8)) == Some(*pk_hash)
+            })
         }
 
         // ── Backing-commitment incremental Merkle tree ──────────────────────────

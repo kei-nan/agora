@@ -19,42 +19,62 @@ replaces the removed subsystem — it's deleted, not rebuilt; `call_index` 0–6
 left unused rather than reassigned. See `docs/project/changelog/` for the full removal
 rationale.
 
-### Delegate identity — NOT cryptographically separated (current limitation)
+### Delegate identity — now cryptographically separated via ZK personas
 
-`register_as_delegate` uses the caller's own ordinary citizen `AccountId` directly
-(`ensure_signed`) — there is no separate derivation, nullifier, or persona for the delegate
-role today. Becoming a delegate therefore permanently and publicly links that account's entire
-on-chain history (votes, delegations, whistleblower reports, case filings, everything else) to
-whatever name/profile the delegate publishes. Backing is not anonymous either: `BackingOf` is a
-plain public `StorageDoubleMap`, so anyone can query exactly which citizen accounts back which
-delegate. A genuinely unlinkable design — a derived delegate persona via a Poseidon2-based
-nullifier, plus Merkle-tree/nullifier-circuit infrastructure for backing anonymity — has been
-scoped as future work but is not built, and no timeline is committed. Until then, treat
-delegate registration and backing as fully public, permanently attributable actions.
+`register_as_delegate` no longer trusts `ensure_signed`'s caller identity directly. It requires
+a real ZK proof of the `delegate-persona` circuit (`circuits/oprf-identity-anchor/
+delegate-persona`, commit 2e07f68) riding inside a fresh outer ZKPassport proof — a genuinely
+separate, on-demand proof event with its own 5-committee OPRF round-trip, not folded into
+registration. The proof derives a stable per-citizen `delegate_persona_id` and binds a chosen
+`persona_account` into `param_commitment` (anti-front-running). The runtime performs the real bb
+5.0.0 pairing check (`T::ZkVerifier`), checks the 5 committee keys against governance-approved
+keys for the given scheme version (`T::CommitteeKeyChecker` — without this, a prover could
+fabricate their own "committee" and self-mint unlimited personas), then recomputes and checks the
+`param_commitment` (`T::DelegatePersonaVerifier`, backed by
+`runtime/src/anchor_verifier.rs::check_delegate_persona`). `DelegatePersonaUsed` is an
+insert-once nullifier map on `delegate_persona_id`, so the same citizen cannot mint a second
+persona. `persona_account` (required to equal the caller) is still an ordinary `T::AccountId` —
+the same type `Delegates`/`SeatLegislature`/`DisclosureChecker` already key on — so
+pallet-legislature's seating and pallet-anticorruption's disclosure gate needed no changes.
 
-**A further residual gap that survives even once that future work is built (2026-08-22):**
-the design sketched above (delegate persona derivation, backing-commitment, backing-nullifier
-Merkle proofs — some of this exists as unlanded circuit/verifier work outside `pallet-elections`
-itself, not yet wired to any extrinsic here) makes the *derivation* unlinkable, but the
-extrinsic that reveals a resulting proof is still an ordinary signed transaction with a signer
-`AccountId`, a fee-payment source, and a block timestamp. If that account is funded by a direct
-on-chain transfer from the citizen's real, identity-linked account, or submits in close temporal
-proximity to other citizen-linked activity, ordinary chain analysis — not cryptanalysis — can
-still deanonymize it. This is the same class of gap already documented for MACI's `commit_vote`
-in `pallets/pallet-voting/src/lib.rs`'s doc comment and in `CLAUDE.md`'s Voting System section;
-neither this repo nor `court-oracle/`/`committee-node/` (both authenticate as a known
-council/committee member, not a pattern for pseudonymous relaying) nor
+Backing is unlinkable too: `back_delegate`/`remove_backing` require a real `backing-nullifier`
+circuit proof (`circuits/oprf-identity-anchor/backing-nullifier`) proving Merkle-path membership
+of the citizen's `backing_commitment` in pallet-identity's published tree, at a slot index
+range-checked *in-circuit* against the live `MaxBackingsPerCitizen` value (a checked public
+input the runtime cross-checks against live governance state — not a plaintext per-citizen
+counter this pallet maintains). `UsedBackingNullifier` (nullifier → `(submitter, delegate_persona_id)`)
+replaces the old plaintext `BackingOf`/`CitizenBackingCount` maps entirely — no on-chain record
+of *which citizen* backs *which delegate* survives, only that some nullifier currently backs a
+given `delegate_persona_id`. `remove_backing` requires the *same* submitting account to reverse
+its own action (see `UsedBackingNullifier`'s doc comment for the replay-griefing hole this
+closes, since the `backing-nullifier` circuit deliberately binds no `AccountId`); this is not a
+privacy regression since that account was already public in `back_delegate`'s own call data. One
+consequence: `back_delegate` no longer has a `CannotBackSelf` check — the tx signer is not
+cryptographically tied to the nullifier's underlying secret, so that check could not actually
+prevent a determined delegate from spending one of their own `MaxBackingsPerCitizen` slots on
+themselves via a cooperating relayer; the exposure is bounded to at most one of the
+`BackingThreshold` backers a delegate needs, the same as any single legitimate citizen's backing
+power.
+
+**A residual gap that survives this (2026-08-23):** an unlinkable proof only anonymizes the
+*derivation*, not the *transaction* that reveals it. That transaction is still a signed
+extrinsic with a signer `AccountId`, a fee-payment source, and a block timestamp. If that account
+is funded by a direct on-chain transfer from the citizen's real, identity-linked account, or
+submits in close temporal proximity to other citizen-linked activity, ordinary chain analysis —
+not cryptanalysis — can still deanonymize it. This is the same class of gap already documented
+for MACI's `commit_vote` in `pallets/pallet-voting/src/lib.rs`'s doc comment and in `CLAUDE.md`'s
+Voting System section; neither this repo nor `court-oracle/`/`committee-node/` (both authenticate
+as a known council/committee member, not a pattern for pseudonymous relaying) nor
 `pallets/pallet-treasury-ledger` (no faucet-like account-funding mechanism exists) currently has
-any relayer, mixnet, or unsigned/ZK-gated submission path that would close it. Closing it is a
-genuine standalone-infrastructure project, separate from finishing the persona/backing-commitment
-circuits themselves — do not treat completion of those circuits as delivering full anonymity for
-delegate registration or backing.
+any relayer, mixnet, or unsigned/ZK-gated submission path that would close it.
 
 ### Backing threshold
 
 A delegate becomes `Active` only once they have `BackingCount` ≥ `BackingThreshold` citizen
 backers — this makes backing a meaningful signal rather than noise. Each citizen may back at
-most `MaxBackingsPerCitizen` delegates simultaneously (constitutional parameter, default 5).
+most `MaxBackingsPerCitizen` delegates simultaneously (constitutional parameter, default 5),
+enforced by the `backing-nullifier` circuit's own in-circuit range check on `slot_index`, not by
+any plaintext per-citizen counter on-chain.
 
 ### Legislature elections
 
@@ -118,9 +138,18 @@ Delegate registry:
 - `Delegates`: `AccountId` → `DelegateInfo { display_name, profile_ipfs_hash, status,
   consecutive_terms, term_start_block, break_until_block, warning_emitted }`
 - `DelegateSweepCursor`: `Option<AccountId>` — resume point for the bounded per-block term sweep
-- `BackingCount`: `AccountId` (delegate) → `u32`
-- `BackingOf`: `(AccountId backer, AccountId delegate)` → `()` — prevents double-backing
-- `CitizenBackingCount`: `AccountId` (citizen) → `u32` — enforced against `MaxBackingsPerCitizen`
+- `BackingCount`: `AccountId` (delegate) → `u32` — incrementally maintained by
+  `back_delegate`/`remove_backing`
+- `DelegatePersonaUsed`: `[u8; 32]` (`delegate_persona_id`) → `()` — insert-once nullifier set,
+  prevents a citizen from minting a second persona
+- `DelegatePersonaIdOf`: `AccountId` (`persona_account`) → `[u8; 32]` (`delegate_persona_id`) —
+  set once at registration, used by `back_delegate`/`remove_backing` to check a proof's claimed
+  target actually matches the named delegate
+- `UsedBackingNullifier`: `[u8; 32]` (`backing_nullifier`) → `(AccountId submitter,
+  [u8; 32] delegate_persona_id)` — replaces the old plaintext `BackingOf`/`CitizenBackingCount`
+  entirely; no on-chain record of which citizen backs which delegate, only that a nullifier
+  currently backs a given persona. `submitter` is required again by `remove_backing` (see
+  above)
 
 Governance-controlled parameters (stored, changeable by governance, seeded from `Default*`
 config at genesis):
@@ -138,13 +167,18 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
 
 ### Calls
 
-- `register_as_delegate(display_name, profile_ipfs_hash)` — active citizen; fails if already
-  registered
-- `back_delegate(delegate)` — active citizen; enforces `MaxBackingsPerCitizen`, rejects
-  self-backing and backing an `OnBreak` delegate; auto-activates the delegate on crossing
-  `BackingThreshold`
-- `remove_backing(delegate)` — frees one backing slot; auto-deactivates (back to `Pending`) if
-  the delegate falls below `BackingThreshold`
+- `register_as_delegate(persona_account, delegate_persona_id, zk_proof, public_inputs,
+  scheme_version, oprf_pk_hashes, display_name, profile_ipfs_hash)` — active citizen;
+  `persona_account` must equal the caller; verifies a real `delegate-persona` ZK proof (see
+  above); fails if already registered or `delegate_persona_id` was already used
+- `back_delegate(delegate, zk_proof, public_inputs)` — active citizen; verifies a real
+  `backing-nullifier` proof against `delegate`'s persona id and the live
+  `MaxBackingsPerCitizen`/backing-commitment-root state; rejects backing an `OnBreak` delegate
+  or a reused nullifier; auto-activates the delegate on crossing `BackingThreshold`. No
+  `CannotBackSelf` check (see above)
+- `remove_backing(delegate, zk_proof, public_inputs)` — must be called by the same account that
+  originally called `back_delegate` for this nullifier; frees the slot for reuse;
+  auto-deactivates (back to `Pending`) if the delegate falls below `BackingThreshold`
 - `set_backing_threshold(threshold)` — `GovernanceOrigin`; must stay within
   `BackingThresholdFloor`/`BackingThresholdCeiling`
 - `set_backing_bounds(floor, ceiling)` — `ConstitutionalOrigin`; also clamps the current
@@ -175,6 +209,21 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
 - `SeatLegislature<AccountId>` — implemented by pallet-legislature; `replace_members(winners)`
   is called at the end of each election cycle to install the winning delegates as the full
   legislature membership.
+- `AccountIdToBytes<AccountId>` — implemented by the runtime as a real byte-identity conversion
+  (`AccountId32` is genuinely 32 raw bytes); binds `persona_account` into a delegate-persona
+  proof's `param_commitment`.
+- `ZkProofVerifier` — verifies the outer ZKPassport proof `register_as_delegate` submits; the
+  same real bb 5.0.0 pairing check (`crate::verifier::ZkPassportUltraHonkVerifier`)
+  `pallet_identity_zk::Config::ZkVerifier` uses.
+- `DelegatePersonaVerifier` — recomputes and checks the `delegate-persona` circuit's
+  `param_commitment`; backed by `runtime/src/anchor_verifier.rs::check_delegate_persona`.
+- `CommitteeKeyChecker` — checks a set of committee-key hashes against pallet-identity-zk's
+  governance-approved keys (`are_committee_keys_approved`), the same Sybil-resistance guarantee
+  `register_citizen` enforces on itself.
+- `BackingProofVerifier` — real standalone UltraHonk pairing check for a `backing-nullifier`
+  proof; backed by `runtime/src/backing_nullifier_verifier.rs`.
+- `BackingRootChecker` — checks a backing-commitment tree root against pallet-identity's own
+  root history (`is_valid_backing_commitment_root`).
 - `DisclosureChecker<AccountId>` — implemented directly on `pallet_anticorruption::Pallet<T>`
   (wrapping its `has_current_disclosure`); re-checked per candidate at election time in
   `run_election`, same as `CitizenChecker` above. Wired in the runtime as

@@ -13,6 +13,17 @@
 //! pallet_elections` against the real built runtime will still fail those extrinsics until
 //! pallet-identity-zk grows an equivalent benchmark-only hook. Documented rather than
 //! silently broken.
+//!
+//! The same limitation now also applies, independently, to every ZK-proof-gated call
+//! (`register_as_delegate`/`back_delegate`/`remove_backing`): there is no generic way for this
+//! benchmark to construct a *genuinely valid* ZK proof for an arbitrary `T::Config` (that would
+//! require a real Noir witness/proving run, not benchmark-harness code). The fixtures below are
+//! shaped only to satisfy `crate::mock`'s deterministic marker-byte test doubles
+//! (`TestZkVerifier`/`TestDelegatePersonaVerifier`/`TestCommitteeKeyChecker`/
+//! `TestBackingProofVerifier`/`TestBackingRootChecker` — see that module's doc comments), so
+//! these three benchmarks are only meaningful via `impl_benchmark_test_suite!` against
+//! `crate::mock::Test` below, same as the pre-existing `CitizenChecker` limitation this doc
+//! comment already described.
 
 use super::*;
 use frame_benchmarking::v2::*;
@@ -32,14 +43,57 @@ fn governance_origin<T: Config>(tag: &'static [u8], params: impl codec::Encode) 
 mod benchmarks {
 	use super::*;
 
+	/// Byte marker `crate::mock::TestZkVerifier`/`TestBackingProofVerifier` treat as "valid" —
+	/// duplicated here (rather than importing `crate::mock`, which is `#[cfg(test)]`-only and
+	/// unavailable when this benchmark is compiled into a real runtime) since it only needs to
+	/// match when this benchmark actually runs, i.e. via `impl_benchmark_test_suite!` below.
+	const VALID_PROOF_MARKER: u8 = 1;
+
+	fn delegate_persona_proof<T: Config>(
+		delegate_persona_id: [u8; 32],
+		persona_account: &T::AccountId,
+	) -> (BoundedVec<u8, ConstU32<4096>>, BoundedVec<[u8; 32], ConstU32<18>>) {
+		let persona_bytes = T::AccountIdToBytes::to_bytes(persona_account);
+		let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(alloc::vec![
+			[0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+			delegate_persona_id,
+			persona_bytes,
+			[0u8; 32], [0u8; 32],
+		])
+		.unwrap();
+		(BoundedVec::try_from(alloc::vec![VALID_PROOF_MARKER]).unwrap(), public_inputs)
+	}
+
+	fn backing_proof<T: Config>(
+		delegate_persona_id: [u8; 32],
+		backing_nullifier: [u8; 32],
+	) -> (BoundedVec<u8, ConstU32<8192>>, [[u8; 32]; 4]) {
+		let mut max_backings = [0u8; 32];
+		max_backings[28..32].copy_from_slice(&MaxBackingsPerCitizen::<T>::get().to_be_bytes());
+		let inputs = [[3u8; 32], delegate_persona_id, max_backings, backing_nullifier];
+		(BoundedVec::try_from(alloc::vec![VALID_PROOF_MARKER]).unwrap(), inputs)
+	}
+
 	#[benchmark]
 	fn register_as_delegate() {
 		let caller: T::AccountId = whitelisted_caller();
 		T::BenchmarkHelper::make_active_citizen(&caller);
 		let name: BoundedVec<u8, ConstU32<64>> = BoundedVec::try_from(b"alice".to_vec()).unwrap();
+		let delegate_persona_id = [5u8; 32];
+		let (zk_proof, public_inputs) = delegate_persona_proof::<T>(delegate_persona_id, &caller);
 
 		#[extrinsic_call]
-		register_as_delegate(RawOrigin::Signed(caller.clone()), name, [5u8; 32]);
+		register_as_delegate(
+			RawOrigin::Signed(caller.clone()),
+			caller.clone(),
+			delegate_persona_id,
+			zk_proof,
+			public_inputs,
+			1,
+			[[0u8; 32]; 5],
+			name,
+			[5u8; 32],
+		);
 
 		assert!(Delegates::<T>::contains_key(&caller));
 	}
@@ -49,14 +103,30 @@ mod benchmarks {
 		let delegate: T::AccountId = account("delegate", 0, 0);
 		T::BenchmarkHelper::make_active_citizen(&delegate);
 		let name: BoundedVec<u8, ConstU32<64>> = BoundedVec::try_from(b"bob".to_vec()).unwrap();
-		Pallet::<T>::register_as_delegate(RawOrigin::Signed(delegate.clone()).into(), name, [6u8; 32]).unwrap();
+		let delegate_persona_id = [6u8; 32];
+		let (persona_proof, persona_inputs) =
+			delegate_persona_proof::<T>(delegate_persona_id, &delegate);
+		Pallet::<T>::register_as_delegate(
+			RawOrigin::Signed(delegate.clone()).into(),
+			delegate.clone(),
+			delegate_persona_id,
+			persona_proof,
+			persona_inputs,
+			1,
+			[[0u8; 32]; 5],
+			name,
+			[6u8; 32],
+		)
+		.unwrap();
 		let backer: T::AccountId = whitelisted_caller();
 		T::BenchmarkHelper::make_active_citizen(&backer);
+		let backing_nullifier = [10u8; 32];
+		let (zk_proof, public_inputs) = backing_proof::<T>(delegate_persona_id, backing_nullifier);
 
 		#[extrinsic_call]
-		back_delegate(RawOrigin::Signed(backer.clone()), delegate.clone());
+		back_delegate(RawOrigin::Signed(backer.clone()), delegate.clone(), zk_proof, public_inputs);
 
-		assert!(BackingOf::<T>::contains_key(&backer, &delegate));
+		assert!(UsedBackingNullifier::<T>::contains_key(backing_nullifier));
 	}
 
 	#[benchmark]
@@ -64,15 +134,38 @@ mod benchmarks {
 		let delegate: T::AccountId = account("delegate", 0, 0);
 		T::BenchmarkHelper::make_active_citizen(&delegate);
 		let name: BoundedVec<u8, ConstU32<64>> = BoundedVec::try_from(b"carol".to_vec()).unwrap();
-		Pallet::<T>::register_as_delegate(RawOrigin::Signed(delegate.clone()).into(), name, [7u8; 32]).unwrap();
+		let delegate_persona_id = [7u8; 32];
+		let (persona_proof, persona_inputs) =
+			delegate_persona_proof::<T>(delegate_persona_id, &delegate);
+		Pallet::<T>::register_as_delegate(
+			RawOrigin::Signed(delegate.clone()).into(),
+			delegate.clone(),
+			delegate_persona_id,
+			persona_proof,
+			persona_inputs,
+			1,
+			[[0u8; 32]; 5],
+			name,
+			[7u8; 32],
+		)
+		.unwrap();
 		let backer: T::AccountId = whitelisted_caller();
 		T::BenchmarkHelper::make_active_citizen(&backer);
-		Pallet::<T>::back_delegate(RawOrigin::Signed(backer.clone()).into(), delegate.clone()).unwrap();
+		let backing_nullifier = [11u8; 32];
+		let (back_proof, back_inputs) = backing_proof::<T>(delegate_persona_id, backing_nullifier);
+		Pallet::<T>::back_delegate(
+			RawOrigin::Signed(backer.clone()).into(),
+			delegate.clone(),
+			back_proof,
+			back_inputs,
+		)
+		.unwrap();
+		let (zk_proof, public_inputs) = backing_proof::<T>(delegate_persona_id, backing_nullifier);
 
 		#[extrinsic_call]
-		remove_backing(RawOrigin::Signed(backer.clone()), delegate.clone());
+		remove_backing(RawOrigin::Signed(backer.clone()), delegate.clone(), zk_proof, public_inputs);
 
-		assert!(!BackingOf::<T>::contains_key(&backer, &delegate));
+		assert!(!UsedBackingNullifier::<T>::contains_key(backing_nullifier));
 	}
 
 	#[benchmark]

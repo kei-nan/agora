@@ -217,6 +217,27 @@ impl pallet_identity_zk::ZkProofVerifier for PassthroughZkVerifier {
 	}
 }
 
+/// Same passthrough, reused for `pallet_elections::Config::ZkVerifier` (the outer proof a
+/// `register_as_delegate` call submits — cryptographically the same kind of proof
+/// `pallet_identity_zk::register_citizen` verifies) and `pallet_elections::Config::
+/// BackingProofVerifier` (the standalone `backing-nullifier` proof) alike — both traits have
+/// the identical `verify(proof_bytes, public_inputs) -> bool` shape as
+/// `pallet_identity_zk::ZkProofVerifier` above, and dev-mode's whole point is "accept
+/// everything", so one struct covers all three rather than three near-identical stubs.
+#[cfg(feature = "dev-mode")]
+impl pallet_elections::ZkProofVerifier for PassthroughZkVerifier {
+	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		true
+	}
+}
+
+#[cfg(feature = "dev-mode")]
+impl pallet_elections::BackingProofVerifier for PassthroughZkVerifier {
+	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		true
+	}
+}
+
 /// Passthrough OPRF identity-anchor verifier: accepts any registration/reverification/
 /// migration proof. Only wired in for the `dev-mode` `pallet_identity_zk::Config` impl below
 /// (this struct itself isn't `#[cfg]`-gated so it stays available to reference from doc comments
@@ -257,6 +278,23 @@ impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
 		_new_scheme_version: u32,
 		_old_oprf_pk_hashes: [[u8; 32]; 5],
 		_new_oprf_pk_hashes: [[u8; 32]; 5],
+	) -> bool {
+		true
+	}
+}
+
+/// Same passthrough, reused for `pallet_elections::Config::DelegatePersonaVerifier` — only ever
+/// assigned inside the `dev-mode` `pallet_elections::Config` impl below, same restriction as
+/// `AnchorProofVerifier` above. The non-dev-mode impl wires in the real
+/// `crate::anchor_verifier::Poseidon2AnchorVerifier` instead (see that type's own
+/// `DelegatePersonaVerifier` impl).
+impl pallet_elections::DelegatePersonaVerifier for PassthroughAnchorVerifier {
+	fn check_delegate_persona(
+		_outer_public_inputs: &[[u8; 32]],
+		_delegate_persona_id: [u8; 32],
+		_persona_account: [u8; 32],
+		_scheme_version: u32,
+		_oprf_pk_hashes: [[u8; 32]; pallet_elections::NUM_COMMITTEES],
 	) -> bool {
 		true
 	}
@@ -948,6 +986,39 @@ impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 	}
 }
 
+/// `AccountId` (`<<Signature as Verify>::Signer as IdentifyAccount>::AccountId`, `sp_runtime::
+/// AccountId32` under `MultiSignature`) is genuinely 32 raw bytes end-to-end, so this is a real
+/// byte-identity conversion, not a placeholder — see `pallet_elections::AccountIdToBytes`'s doc
+/// comment for why it's a pluggable Config item rather than a bare trait bound.
+impl pallet_elections::AccountIdToBytes<AccountId> for Runtime {
+	fn to_bytes(who: &AccountId) -> [u8; 32] {
+		who.clone().into()
+	}
+}
+
+/// Delegates to the same `OprfCommitteeKeys`-backed check `pallet_identity_zk::register_citizen`
+/// performs on itself — see `pallet_identity_zk::Pallet::are_committee_keys_approved`'s doc
+/// comment.
+impl pallet_elections::CommitteeKeyChecker for Runtime {
+	fn are_committee_keys_approved(
+		scheme_version: u32,
+		oprf_pk_hashes: &[[u8; 32]; pallet_elections::NUM_COMMITTEES],
+	) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::are_committee_keys_approved(
+			scheme_version,
+			oprf_pk_hashes,
+		)
+	}
+}
+
+/// Delegates to pallet-identity's own backing-commitment root history — see
+/// `pallet_identity_zk::Pallet::is_valid_backing_commitment_root`'s doc comment.
+impl pallet_elections::BackingRootChecker for Runtime {
+	fn is_valid_backing_commitment_root(root: [u8; 32]) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::is_valid_backing_commitment_root(root)
+	}
+}
+
 impl pallet_elections::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	/// Hard cap on registered delegates.
@@ -971,6 +1042,39 @@ impl pallet_elections::Config for Runtime {
 	/// `pallet_elections::DisclosureChecker`'s doc comment for the full rationale). Points at
 	/// the real pallet-anticorruption implementation, not a no-op.
 	type DisclosureChecker = PalletAntiCorruption;
+	/// Real byte-identity `AccountId` conversion — see `AccountIdToBytes`'s impl comment above.
+	/// Not dev-mode-gated: it performs no cryptographic verification, just a structural
+	/// conversion, so there is nothing for dev-mode to stub out.
+	type AccountIdToBytes = Runtime;
+	/// Dev builds accept every `register_as_delegate` outer proof unconditionally
+	/// (`PassthroughZkVerifier`); non-dev builds run the real bb 5.0.0 UltraHonk pairing check
+	/// — the same verifier `pallet_identity_zk::Config::ZkVerifier` uses, since a delegate-
+	/// persona proof is cryptographically just another outer ZKPassport proof.
+	#[cfg(feature = "dev-mode")]
+	type ZkVerifier = PassthroughZkVerifier;
+	#[cfg(not(feature = "dev-mode"))]
+	type ZkVerifier = crate::verifier::ZkPassportUltraHonkVerifier;
+	/// Dev builds accept every delegate-persona commitment unconditionally
+	/// (`PassthroughAnchorVerifier`); non-dev builds genuinely recompute and check the
+	/// Poseidon2 `param_commitment` (`crate::anchor_verifier::Poseidon2AnchorVerifier`, see its
+	/// `DelegatePersonaVerifier` impl).
+	#[cfg(feature = "dev-mode")]
+	type DelegatePersonaVerifier = PassthroughAnchorVerifier;
+	#[cfg(not(feature = "dev-mode"))]
+	type DelegatePersonaVerifier = crate::anchor_verifier::Poseidon2AnchorVerifier;
+	/// Not dev-mode-gated: delegates to pallet-identity-zk's own real `OprfCommitteeKeys`
+	/// storage check regardless of build mode, same as the two checkers below — there is no
+	/// "passthrough" version of a storage lookup.
+	type CommitteeKeyChecker = Runtime;
+	/// Dev builds accept every `backing-nullifier` proof unconditionally
+	/// (`PassthroughZkVerifier`); non-dev builds run the real standalone UltraHonk pairing
+	/// check (`crate::backing_nullifier_verifier::BackingNullifierVerifier`).
+	#[cfg(feature = "dev-mode")]
+	type BackingProofVerifier = PassthroughZkVerifier;
+	#[cfg(not(feature = "dev-mode"))]
+	type BackingProofVerifier = crate::backing_nullifier_verifier::BackingNullifierVerifier;
+	/// Not dev-mode-gated — see `CommitteeKeyChecker` above.
+	type BackingRootChecker = Runtime;
 	/// 100 legislature seats (constitutional, changeable via set_election_params).
 	type DefaultLegislatureSeats = ConstU32<100>;
 	/// 2-year election cycle: 2 * 365 * 7200 blocks at 12 s/block.

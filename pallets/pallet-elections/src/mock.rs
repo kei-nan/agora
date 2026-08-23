@@ -72,6 +72,100 @@ impl pallet_elections::SeatLegislature<u64> for TestSeatLegislature {
     }
 }
 
+// ── Test-only ZK verifier mocks ─────────────────────────────────────────────
+//
+// Mirrors pallet-identity-zk's own `mock.rs` (`TestZkVerifier`/`TestAnchorVerifier`):
+// deterministic, proof-bytes/public-inputs-driven doubles, not real cryptography -- real
+// cryptographic correctness for these exact circuit shapes is already covered by
+// `runtime/src/anchor_verifier.rs`'s and `runtime/src/backing_nullifier_verifier.rs`'s own
+// real-bb-proof test suites. These mocks only need to let pallet-level tests drive both the
+// accept and reject paths of *this pallet's* logic.
+
+/// Byte marker `TestZkVerifier`/`TestBackingProofVerifier` treat as "this proof passes".
+pub const VALID_PROOF_MARKER: u8 = 1;
+/// Any other first byte (including this one) is treated as "this proof fails".
+pub const INVALID_PROOF_MARKER: u8 = 0;
+
+/// Outer-proof pairing check double: valid iff `proof_bytes[0] == VALID_PROOF_MARKER`.
+pub struct TestZkVerifier;
+impl pallet_elections::ZkProofVerifier for TestZkVerifier {
+    fn verify(proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+        matches!(proof_bytes.first(), Some(&VALID_PROOF_MARKER))
+    }
+}
+
+/// `delegate-persona` commitment-check double: valid iff `outer_public_inputs` contains both
+/// the claimed `delegate_persona_id` and the claimed `persona_account` bytes anywhere -- not
+/// how the real `check_delegate_persona` computes a match (a single Poseidon2 recomputation),
+/// but deterministic and lets tests drive both the accept path and a persona/account mismatch
+/// rejection without depending on the crypto crate.
+pub struct TestDelegatePersonaVerifier;
+impl pallet_elections::DelegatePersonaVerifier for TestDelegatePersonaVerifier {
+    fn check_delegate_persona(
+        outer_public_inputs: &[[u8; 32]],
+        delegate_persona_id: [u8; 32],
+        persona_account: [u8; 32],
+        _scheme_version: u32,
+        _oprf_pk_hashes: [[u8; 32]; pallet_elections::NUM_COMMITTEES],
+    ) -> bool {
+        outer_public_inputs.contains(&delegate_persona_id)
+            && outer_public_inputs.contains(&persona_account)
+    }
+}
+
+/// Committee-key-approval double: approves everything by default so tests that don't care
+/// about this check don't need to thread anything extra through. A slot's key hash with its
+/// first byte set to `UNAPPROVED_COMMITTEE_KEY_MARKER` is treated as unapproved, for the one
+/// test that exercises the rejection path.
+pub const UNAPPROVED_COMMITTEE_KEY_MARKER: u8 = 0xFF;
+
+pub struct TestCommitteeKeyChecker;
+impl pallet_elections::CommitteeKeyChecker for TestCommitteeKeyChecker {
+    fn are_committee_keys_approved(
+        _scheme_version: u32,
+        oprf_pk_hashes: &[[u8; 32]; pallet_elections::NUM_COMMITTEES],
+    ) -> bool {
+        oprf_pk_hashes.iter().all(|h| h[0] != UNAPPROVED_COMMITTEE_KEY_MARKER)
+    }
+}
+
+/// `u64` `AccountId` -> 32 bytes: the value right-aligned into the low 8 bytes, zero elsewhere.
+/// Not how the real runtime's `AccountId32` conversion works (that's a genuine byte-identity
+/// mapping); just deterministic and injective enough to exercise this pallet's logic.
+pub struct TestAccountIdToBytes;
+impl pallet_elections::AccountIdToBytes<u64> for TestAccountIdToBytes {
+    fn to_bytes(who: &u64) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[24..32].copy_from_slice(&who.to_be_bytes());
+        bytes
+    }
+}
+
+/// Backing-nullifier pairing-check double: same marker convention as `TestZkVerifier`.
+pub struct TestBackingProofVerifier;
+impl pallet_elections::BackingProofVerifier for TestBackingProofVerifier {
+    fn verify(proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+        matches!(proof_bytes.first(), Some(&VALID_PROOF_MARKER))
+    }
+}
+
+thread_local! {
+    static INVALID_BACKING_ROOTS: RefCell<BTreeSet<[u8; 32]>> = RefCell::new(BTreeSet::new());
+}
+
+/// Marks `root` as one `TestBackingRootChecker` should reject, for the one test that exercises
+/// that rejection path. Every other root is accepted by default.
+pub fn set_invalid_backing_root(root: [u8; 32]) {
+    INVALID_BACKING_ROOTS.with(|r| { r.borrow_mut().insert(root); });
+}
+
+pub struct TestBackingRootChecker;
+impl pallet_elections::BackingRootChecker for TestBackingRootChecker {
+    fn is_valid_backing_commitment_root(root: [u8; 32]) -> bool {
+        INVALID_BACKING_ROOTS.with(|r| !r.borrow().contains(&root))
+    }
+}
+
 // ── Mock runtime constants ──────────────────────────────────────────────────
 //
 // Small, deterministic values chosen for fast tests — not real-world day/year counts.
@@ -142,6 +236,12 @@ impl pallet_elections::Config for Test {
     type ConstitutionalOrigin = EnsureRoot<u64>;
     type LegislatureSeating = TestSeatLegislature;
     type DisclosureChecker = TestDisclosureChecker;
+    type AccountIdToBytes = TestAccountIdToBytes;
+    type ZkVerifier = TestZkVerifier;
+    type DelegatePersonaVerifier = TestDelegatePersonaVerifier;
+    type CommitteeKeyChecker = TestCommitteeKeyChecker;
+    type BackingProofVerifier = TestBackingProofVerifier;
+    type BackingRootChecker = TestBackingRootChecker;
     type DefaultLegislatureSeats = ConstU32<DEFAULT_LEGISLATURE_SEATS>;
     type DefaultElectionCycleBlocks = ConstU32<DEFAULT_ELECTION_CYCLE_BLOCKS>;
     type DefaultMaxBackingsPerCitizen = ConstU32<DEFAULT_MAX_BACKINGS_PER_CITIZEN>;

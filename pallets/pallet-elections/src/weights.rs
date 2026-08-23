@@ -53,25 +53,32 @@ pub trait WeightInfo {
 /// See the module doc comment: manually estimated, not machine-benchmarked.
 pub struct SubstrateWeight<T>(PhantomData<T>);
 impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
-	/// Reads `Delegates`; writes `Delegates`.
+	/// Reads `Delegates`, `DelegatePersonaUsed`; writes `Delegates`, `DelegatePersonaUsed`,
+	/// `DelegatePersonaIdOf`. Also performs a real UltraHonk pairing check
+	/// (`T::ZkVerifier::verify`) and a Poseidon2 commitment recomputation
+	/// (`T::DelegatePersonaVerifier`) — genuine cryptographic cost this manually-reasoned
+	/// estimate does not itself model; see the module doc comment.
 	fn register_as_delegate() -> Weight {
 		Weight::from_parts(14_000_000, 2_600)
-			.saturating_add(T::DbWeight::get().reads(1_u64))
-			.saturating_add(T::DbWeight::get().writes(1_u64))
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(3_u64))
 	}
-	/// Reads `Delegates`, `BackingOf`, `CitizenBackingCount`, `BackingCount`,
-	/// `BackingThreshold`; writes `BackingOf`, `CitizenBackingCount`, `BackingCount`, and
-	/// (on the activation path) `Delegates` — costed at the activation worst case.
+	/// Reads `Delegates`, `DelegatePersonaIdOf`, `UsedBackingNullifier`, `BackingCount`,
+	/// `MaxBackingsPerCitizen`, `BackingThreshold`; writes `UsedBackingNullifier`,
+	/// `BackingCount`, and (on the activation path) `Delegates` — costed at the activation
+	/// worst case. Also performs a real standalone UltraHonk pairing check
+	/// (`T::BackingProofVerifier::verify`) — genuine cryptographic cost this manually-reasoned
+	/// estimate does not itself model.
 	fn back_delegate() -> Weight {
 		Weight::from_parts(22_000_000, 4_600)
-			.saturating_add(T::DbWeight::get().reads(5_u64))
-			.saturating_add(T::DbWeight::get().writes(4_u64))
+			.saturating_add(T::DbWeight::get().reads(6_u64))
+			.saturating_add(T::DbWeight::get().writes(3_u64))
 	}
 	/// Same shape as `back_delegate` (mirror-image deactivation path).
 	fn remove_backing() -> Weight {
 		Weight::from_parts(22_000_000, 4_600)
-			.saturating_add(T::DbWeight::get().reads(4_u64))
-			.saturating_add(T::DbWeight::get().writes(4_u64))
+			.saturating_add(T::DbWeight::get().reads(6_u64))
+			.saturating_add(T::DbWeight::get().writes(3_u64))
 	}
 	/// Reads `BackingThresholdFloor`, `BackingThresholdCeiling`; writes `BackingThreshold`.
 	fn set_backing_threshold() -> Weight {

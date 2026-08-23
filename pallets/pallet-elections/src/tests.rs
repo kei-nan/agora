@@ -1,15 +1,20 @@
 use crate::{
-    mock::*, BackingCount, BackingOf, BackingThreshold, BackingThresholdCeiling,
-    BackingThresholdFloor, CitizenBackingCount,
+    mock::*, BackingCount, BackingThreshold, BackingThresholdCeiling,
+    BackingThresholdFloor, DelegatePersonaIdOf, DelegatePersonaUsed,
     DelegateInfo, DelegateStatus, DelegateSweepCursor, Delegates,
     ElectionCycleBlocks, Error, Event,
     LastElectionBlock, LegislatureSeats, MandatoryBreakBlocks, MaxBackingsPerCitizen,
-    MaxConsecutiveTerms, TermLengthBlocks, WarningWindowPct,
+    MaxConsecutiveTerms, TermLengthBlocks, UsedBackingNullifier, WarningWindowPct,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+//
+// None of these helpers exercise real cryptography -- see mock.rs's own module doc comment.
+// They build deterministic fixtures shaped to satisfy the mock verifiers there, so that the
+// large majority of this file's tests (delegate lifecycle, term limits, election seating) can
+// keep exercising pallet logic without needing to think about proof internals at all.
 
 fn name() -> BoundedVec<u8, ConstU32<64>> {
     BoundedVec::try_from(b"Alice".to_vec()).unwrap()
@@ -17,6 +22,59 @@ fn name() -> BoundedVec<u8, ConstU32<64>> {
 
 fn ipfs(byte: u8) -> [u8; 32] {
     [byte; 32]
+}
+
+/// Deterministic per-delegate `delegate_persona_id`, tagged in byte 0 so it can never collide
+/// with `backing_nullifier_for`'s output space.
+fn delegate_persona_id_for(delegate: u64) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[0] = 0xDE;
+    id[24..32].copy_from_slice(&delegate.to_be_bytes());
+    id
+}
+
+/// Must match `TestAccountIdToBytes::to_bytes`.
+fn persona_account_bytes_for(who: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[24..32].copy_from_slice(&who.to_be_bytes());
+    bytes
+}
+
+/// Deterministic per-(backer, delegate) nullifier, tagged in byte 0. Depending on both `who`
+/// and `delegate` (rather than `who` alone) lets a single mock "citizen" back several different
+/// delegates simultaneously with distinct nullifiers, matching what `MaxBackingsPerCitizen`
+/// distinct real slot indices would produce.
+fn backing_nullifier_for(who: u64, delegate: u64) -> [u8; 32] {
+    let mut n = [0u8; 32];
+    n[0] = 0xBA;
+    n[8..16].copy_from_slice(&who.to_be_bytes());
+    n[24..32].copy_from_slice(&delegate.to_be_bytes());
+    n
+}
+
+fn max_backings_field() -> [u8; 32] {
+    let mut f = [0u8; 32];
+    f[28..32].copy_from_slice(&MaxBackingsPerCitizen::<Test>::get().to_be_bytes());
+    f
+}
+
+fn backing_root() -> [u8; 32] {
+    [0xAAu8; 32]
+}
+
+/// A `backing-nullifier` proof/public-input fixture for `who` backing `delegate`, shaped to
+/// pass `TestBackingProofVerifier`/`TestBackingRootChecker` and match whatever
+/// `DelegatePersonaIdOf::get(delegate)` currently holds (so it only actually verifies once
+/// `delegate` has been registered via `register_delegate`).
+fn backing_proof(who: u64, delegate: u64) -> (BoundedVec<u8, ConstU32<8192>>, [[u8; 32]; 4]) {
+    let proof = BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap();
+    let inputs = [
+        backing_root(),
+        delegate_persona_id_for(delegate),
+        max_backings_field(),
+        backing_nullifier_for(who, delegate),
+    ];
+    (proof, inputs)
 }
 
 fn register_delegate(who: u64) {
@@ -27,12 +85,39 @@ fn register_delegate(who: u64) {
     // registered delegates to a current disclosure here too. Tests that specifically exercise
     // the disclosure gate call `set_current_disclosure(who, false)` afterward to override this.
     set_current_disclosure(who, true);
-    assert_ok!(Elections::register_as_delegate(RuntimeOrigin::signed(who), name(), ipfs(2)));
+
+    let delegate_persona_id = delegate_persona_id_for(who);
+    let persona_bytes = persona_account_bytes_for(who);
+    let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+        [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+        delegate_persona_id,
+        persona_bytes,
+        [0u8; 32], [0u8; 32],
+    ])
+    .unwrap();
+
+    assert_ok!(Elections::register_as_delegate(
+        RuntimeOrigin::signed(who),
+        who,
+        delegate_persona_id,
+        BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+        public_inputs,
+        1,
+        [[0u8; 32]; 5],
+        name(),
+        ipfs(2),
+    ));
 }
 
 fn back(who: u64, delegate: u64) {
     set_active_citizen(who, true);
-    assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(who), delegate));
+    let (proof, inputs) = backing_proof(who, delegate);
+    assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(who), delegate, proof, inputs));
+}
+
+fn unback(who: u64, delegate: u64) {
+    let (proof, inputs) = backing_proof(who, delegate);
+    assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(who), delegate, proof, inputs));
 }
 
 fn delegate_info_with_status(status: DelegateStatus) -> DelegateInfo<u64> {
@@ -58,8 +143,12 @@ fn register_as_delegate_works() {
         let info = Delegates::<Test>::get(1).unwrap();
         assert_eq!(info.status, DelegateStatus::Pending);
         assert_eq!(info.display_name, name());
+        let delegate_persona_id = delegate_persona_id_for(1);
+        assert_eq!(DelegatePersonaIdOf::<Test>::get(1), Some(delegate_persona_id));
+        assert!(DelegatePersonaUsed::<Test>::contains_key(delegate_persona_id));
         System::assert_last_event(
-            Event::DelegateRegistered { delegate: 1, display_name: name() }.into(),
+            Event::DelegateRegistered { delegate: 1, delegate_persona_id, display_name: name() }
+                .into(),
         );
     });
 }
@@ -68,8 +157,26 @@ fn register_as_delegate_works() {
 fn register_as_delegate_fails_when_not_active_citizen() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
         assert_noop!(
-            Elections::register_as_delegate(RuntimeOrigin::signed(1), name(), ipfs(2)),
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
             Error::<Test>::NotActiveCitizen
         );
     });
@@ -80,10 +187,193 @@ fn register_as_delegate_fails_when_already_registered() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         register_delegate(1);
+        set_active_citizen(1, true);
 
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
         assert_noop!(
-            Elections::register_as_delegate(RuntimeOrigin::signed(1), name(), ipfs(2)),
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
             Error::<Test>::AlreadyRegisteredAsDelegate
+        );
+    });
+}
+
+#[test]
+fn register_as_delegate_fails_when_persona_account_does_not_match_signer() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(2),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                2, // persona_account != who
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::PersonaAccountMismatch
+        );
+    });
+}
+
+#[test]
+fn register_as_delegate_fails_when_zk_proof_invalid() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::InvalidZKProof
+        );
+    });
+}
+
+/// A "0xFF"-marked committee key hash is deliberately treated as unapproved by
+/// `TestCommitteeKeyChecker` -- this is the pallet-level manifestation of the Sybil-resistance
+/// guarantee `CommitteeKeyChecker`'s doc comment describes: a proof cryptographically valid
+/// against attacker-chosen "committee" keys must still be rejected if those keys were never
+/// governance-approved.
+#[test]
+fn register_as_delegate_fails_when_committee_key_not_approved() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        let mut oprf_pk_hashes = [[0u8; 32]; 5];
+        oprf_pk_hashes[0][0] = UNAPPROVED_COMMITTEE_KEY_MARKER;
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                oprf_pk_hashes,
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::CommitteeKeyMismatch
+        );
+    });
+}
+
+#[test]
+fn register_as_delegate_fails_when_proof_persona_account_mismatch() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        // public_inputs is missing account 1's own persona bytes -- TestDelegatePersonaVerifier
+        // must reject.
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(99), // wrong account's bytes
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::InvalidDelegatePersonaProof
+        );
+    });
+}
+
+/// The whole point of `DelegatePersonaUsed`: a second registration (even under a different
+/// `persona_account`/signer) claiming a `delegate_persona_id` that was already consumed must be
+/// rejected.
+#[test]
+fn register_as_delegate_fails_when_delegate_persona_id_already_used() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        let reused_id = delegate_persona_id_for(1);
+
+        set_active_citizen(2, true);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            reused_id,
+            persona_account_bytes_for(2),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(2),
+                2,
+                reused_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::DelegatePersonaAlreadyUsed
         );
     });
 }
@@ -100,7 +390,10 @@ fn back_delegate_stays_pending_below_threshold() {
 
         assert_eq!(BackingCount::<Test>::get(1), 1);
         assert_eq!(Delegates::<Test>::get(1).unwrap().status, DelegateStatus::Pending);
-        System::assert_last_event(Event::DelegateBacked { delegate: 1, backer: 2 }.into());
+        System::assert_last_event(
+            Event::DelegateBacked { delegate: 1, backing_nullifier: backing_nullifier_for(2, 1) }
+                .into(),
+        );
     });
 }
 
@@ -126,24 +419,32 @@ fn back_delegate_fails_when_backer_not_active_citizen() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         register_delegate(1);
+        let (proof, inputs) = backing_proof(2, 1);
 
         assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(2), 1),
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
             Error::<Test>::NotActiveCitizen
         );
     });
 }
 
+/// `back_delegate` no longer has a `CannotBackSelf` check -- see this pallet's module doc
+/// comment for why one would give false assurance under the nullifier-based design (the tx
+/// signer is not cryptographically tied to the backing-nullifier's underlying secret, so it
+/// cannot actually prevent a delegate from spending one of their own slots on themselves via a
+/// cooperating relayer). This test documents the resulting behavior explicitly rather than
+/// leaving it untested: a delegate's own account can now submit a `back_delegate` call
+/// targeting itself, and it succeeds like any other backing.
 #[test]
-fn back_delegate_fails_when_backing_self() {
+fn back_delegate_no_longer_rejects_backing_your_own_delegate_account() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         register_delegate(1);
+        set_active_citizen(1, true);
+        let (proof, inputs) = backing_proof(1, 1);
 
-        assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(1), 1),
-            Error::<Test>::CannotBackSelf
-        );
+        assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(1), 1, proof, inputs));
+        assert_eq!(BackingCount::<Test>::get(1), 1);
     });
 }
 
@@ -152,9 +453,10 @@ fn back_delegate_fails_when_delegate_not_found() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         set_active_citizen(2, true);
+        let (proof, inputs) = backing_proof(2, 1);
 
         assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(2), 1),
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
             Error::<Test>::DelegateNotFound
         );
     });
@@ -168,9 +470,10 @@ fn back_delegate_fails_when_delegate_on_break() {
         // (separately tested) term-limit machinery that produces it in practice.
         Delegates::<Test>::insert(1, delegate_info_with_status(DelegateStatus::OnBreak));
         set_active_citizen(2, true);
+        let (proof, inputs) = backing_proof(2, 1);
 
         assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(2), 1),
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
             Error::<Test>::DelegateOnBreak
         );
     });
@@ -182,35 +485,90 @@ fn back_delegate_fails_when_already_backing() {
         System::set_block_number(1);
         register_delegate(1);
         back(2, 1);
+        let (proof, inputs) = backing_proof(2, 1);
 
         assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(2), 1),
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
             Error::<Test>::AlreadyBacking
         );
     });
 }
 
 #[test]
-fn back_delegate_fails_when_backing_limit_reached() {
+fn back_delegate_fails_when_backing_proof_invalid() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        set_active_citizen(2, true);
+        let (_, inputs) = backing_proof(2, 1);
+        let bad_proof = BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap();
+
+        assert_noop!(
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, bad_proof, inputs),
+            Error::<Test>::InvalidBackingProof
+        );
+    });
+}
+
+#[test]
+fn back_delegate_fails_when_backing_root_invalid() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        set_active_citizen(2, true);
+        set_invalid_backing_root(backing_root());
+        let (proof, inputs) = backing_proof(2, 1);
+
+        assert_noop!(
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
+            Error::<Test>::InvalidBackingRoot
+        );
+    });
+}
+
+#[test]
+fn back_delegate_fails_when_delegate_persona_id_does_not_match_target() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         register_delegate(1);
         register_delegate(2);
-        register_delegate(3);
-        register_delegate(4);
-        register_delegate(5);
-        register_delegate(6);
-        register_delegate(7); // 7 delegates, cap is DEFAULT_MAX_BACKINGS_PER_CITIZEN (6)
-
-        set_active_citizen(10, true);
-        for delegate in 1..=6u64 {
-            assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(10), delegate));
-        }
-        assert_eq!(CitizenBackingCount::<Test>::get(10), 6);
+        set_active_citizen(3, true);
+        // Proof built for delegate 2's persona id, submitted against delegate 1.
+        let (proof, mut inputs) = backing_proof(3, 1);
+        inputs[1] = delegate_persona_id_for(2);
 
         assert_noop!(
-            Elections::back_delegate(RuntimeOrigin::signed(10), 7),
-            Error::<Test>::BackingLimitReached
+            Elections::back_delegate(RuntimeOrigin::signed(3), 1, proof, inputs),
+            Error::<Test>::DelegatePersonaMismatch
+        );
+    });
+}
+
+/// The pallet-level half of the backing-cap enforcement split (see `Error::MaxBackingsMismatch`'s
+/// doc comment): a proof whose claimed `max_backings_per_citizen` public input doesn't match the
+/// live governance value is rejected outright, regardless of what the (mocked, always-passing)
+/// pairing check says. The other half -- that a citizen cannot even construct a valid proof for
+/// a `slot_index` beyond the real cap -- is a property of the circuit itself, already covered by
+/// `circuits/oprf-identity-anchor/backing-nullifier`'s own `rejects_slot_index_far_beyond_the_cap`
+/// test and `runtime/src/backing_nullifier_verifier.rs`'s real-proof suite, not re-provable here
+/// without a mock that would defeat the point.
+#[test]
+fn back_delegate_fails_when_max_backings_public_input_does_not_match_governance_value() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        set_active_citizen(2, true);
+        let (proof, mut inputs) = backing_proof(2, 1);
+        // Claim a stale cap different from the live MaxBackingsPerCitizen value.
+        inputs[2] = {
+            let mut f = [0u8; 32];
+            f[31] = (MaxBackingsPerCitizen::<Test>::get() + 1) as u8;
+            f
+        };
+
+        assert_noop!(
+            Elections::back_delegate(RuntimeOrigin::signed(2), 1, proof, inputs),
+            Error::<Test>::MaxBackingsMismatch
         );
     });
 }
@@ -224,11 +582,10 @@ fn remove_backing_works_and_deactivates_below_threshold() {
         back(3, 1);
         back(4, 1); // activates at 3
 
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(4), 1));
+        unback(4, 1);
 
         assert_eq!(BackingCount::<Test>::get(1), 2);
-        assert_eq!(CitizenBackingCount::<Test>::get(4), 0);
-        assert!(!BackingOf::<Test>::contains_key(4, 1));
+        assert!(!UsedBackingNullifier::<Test>::contains_key(backing_nullifier_for(4, 1)));
         assert_eq!(Delegates::<Test>::get(1).unwrap().status, DelegateStatus::Pending);
         System::assert_last_event(Event::DelegateDeactivated { delegate: 1 }.into());
     });
@@ -244,12 +601,16 @@ fn remove_backing_works_without_deactivating_when_still_above_threshold() {
         back(4, 1);
         back(5, 1); // 4 backers, still above threshold(3) after one removal
 
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(5), 1));
+        unback(5, 1);
 
         assert_eq!(BackingCount::<Test>::get(1), 3);
         assert_eq!(Delegates::<Test>::get(1).unwrap().status, DelegateStatus::Active);
         System::assert_last_event(
-            Event::DelegateBackingRemoved { delegate: 1, backer: 5 }.into(),
+            Event::DelegateBackingRemoved {
+                delegate: 1,
+                backing_nullifier: backing_nullifier_for(5, 1),
+            }
+            .into(),
         );
     });
 }
@@ -259,10 +620,56 @@ fn remove_backing_fails_when_not_backing() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         register_delegate(1);
+        set_active_citizen(2, true);
+        let (proof, inputs) = backing_proof(2, 1);
 
         assert_noop!(
-            Elections::remove_backing(RuntimeOrigin::signed(2), 1),
+            Elections::remove_backing(RuntimeOrigin::signed(2), 1, proof, inputs),
             Error::<Test>::NotBacking
+        );
+    });
+}
+
+/// Closes the replay-griefing hole `UsedBackingNullifier`'s doc comment describes: an observer
+/// who lifts the exact `(zk_proof, public_inputs)` bytes from `back_delegate`'s own public call
+/// data cannot resubmit them as a *different* signer to strip someone else's backing.
+#[test]
+fn remove_backing_fails_when_submitted_by_a_different_account_than_the_original_backer() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        set_active_citizen(3, true);
+        let (proof, inputs) = backing_proof(2, 1); // the same proof account 2 used to back
+
+        assert_noop!(
+            Elections::remove_backing(RuntimeOrigin::signed(3), 1, proof, inputs),
+            Error::<Test>::NotBacking
+        );
+        // The backing survives the failed attempt.
+        assert_eq!(BackingCount::<Test>::get(1), 1);
+    });
+}
+
+/// `remove_backing` frees the slot for reuse: after removal, the exact same (deterministic)
+/// nullifier can back again.
+#[test]
+fn remove_backing_frees_the_slot_for_reuse() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 1);
+
+        unback(2, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 0);
+        assert!(!UsedBackingNullifier::<Test>::contains_key(backing_nullifier_for(2, 1)));
+
+        back(2, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 1);
+        assert_eq!(
+            UsedBackingNullifier::<Test>::get(backing_nullifier_for(2, 1)),
+            Some((2, delegate_persona_id_for(1)))
         );
     });
 }
@@ -588,13 +995,13 @@ fn backing_drop_cycling_does_not_evade_term_limit() {
         // at block 101), backer 4 cooperates: drops their backing, then immediately restores
         // it -- the exact two-transaction exploit described in the audit finding.
         System::set_block_number(95);
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(4), 1));
+        unback(4, 1);
         let mid = Delegates::<Test>::get(1).unwrap();
         assert_eq!(mid.status, DelegateStatus::Pending);
         assert_eq!(mid.term_start_block, Some(1), "a transient gap must not touch the clock");
         assert_eq!(mid.consecutive_terms, 0);
 
-        assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(4), 1));
+        back(4, 1);
         let reactivated = Delegates::<Test>::get(1).unwrap();
         assert_eq!(reactivated.status, DelegateStatus::Active);
         assert_eq!(
@@ -616,8 +1023,8 @@ fn backing_drop_cycling_does_not_evade_term_limit() {
         // Repeat the exact same cooperating-backer cycle right before the second term
         // (which would complete at block 201) finishes.
         System::set_block_number(195);
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(4), 1));
-        assert_ok!(Elections::back_delegate(RuntimeOrigin::signed(4), 1));
+        unback(4, 1);
+        back(4, 1);
         let reactivated_2 = Delegates::<Test>::get(1).unwrap();
         assert_eq!(
             reactivated_2.term_start_block,
@@ -681,8 +1088,8 @@ fn on_initialize_ends_break_to_pending_when_below_threshold() {
         let _ = Elections::on_initialize(201); // now OnBreak, break_until = 211
 
         // Backers desert during the break, dropping BackingCount below threshold.
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(2), 1));
-        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(3), 1));
+        unback(2, 1);
+        unback(3, 1);
 
         System::set_block_number(211);
         let _ = Elections::on_initialize(211);

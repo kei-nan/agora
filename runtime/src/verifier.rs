@@ -193,6 +193,17 @@ impl pallet_identity_zk::ZkProofVerifier for ZkPassportUltraHonkVerifier {
     }
 }
 
+/// Second trait impl, same struct: `pallet_elections::register_as_delegate` submits an outer
+/// ZKPassport proof of the exact same shape `pallet_identity_zk::register_citizen` does (a
+/// `delegate-persona` disclosure subproof rides inside it, just like `disclosure` does for
+/// registration) — so the identical real bb 5.0.0 pairing check applies unchanged, just
+/// reachable via a second, differently-named trait.
+impl pallet_elections::ZkProofVerifier for ZkPassportUltraHonkVerifier {
+    fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
+        verify_inner(proof_bytes, public_inputs).is_some()
+    }
+}
+
 /// The parsed envelope: everything the header pins down, plus the raw bb proof.
 struct Envelope<'a> {
     outer_count: u8,
