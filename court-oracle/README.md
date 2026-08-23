@@ -261,7 +261,8 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 ## Test coverage — what's real, what isn't
 
-`cargo test` (47 tests, all passing in this environment): case-context rendering for all four
+`cargo test` (52 tests, all passing in this environment, confirmed via `cargo test --release`
+2026-08-23 — up from the 47 previously cited here): case-context rendering for all four
 `CaseSubject` variants, including that IPFS-sourced law text is wrapped in
 `<untrusted_external_content>` delimiters (prompt-injection mitigation, see below); Claude
 request formatting and `VERDICT:`/`REASONING:` response parsing, including a realistic-shaped

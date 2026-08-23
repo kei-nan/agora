@@ -144,10 +144,12 @@ pub fn twox128_hex(input: &str) -> String {
     h1.write(input.as_bytes());
     let r1 = h1.finish();
 
-    // `to_le()` is a no-op on any little-endian host and, even where it isn't, only swaps the
-    // *value* — `{:016x}` then formats that value's hex digits in big-endian order regardless.
-    // Neither step produces the little-endian *byte sequence* TwoX-128 actually needs; that
-    // requires hex-encoding `to_le_bytes()` byte-by-byte instead of formatting the integer.
+    // A naive `to_le()` + `format!("{:016x}", ...)` approach was considered and rejected: `to_le()`
+    // is a no-op on any little-endian host and, even where it isn't, only swaps the *value* —
+    // `{:016x}` then formats that value's hex digits in big-endian order regardless, so neither
+    // step would produce the little-endian *byte sequence* TwoX-128 actually needs. The correct
+    // approach, used below, is to hex-encode `to_le_bytes()` byte-by-byte instead of formatting
+    // the integer — verified against the standard `twox128("System")` reference vector below.
     let mut bytes = Vec::with_capacity(16);
     bytes.extend_from_slice(&r0.to_le_bytes());
     bytes.extend_from_slice(&r1.to_le_bytes());

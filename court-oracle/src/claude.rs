@@ -107,11 +107,11 @@ struct ClaudeResponse {
     stop_reason: Option<String>,
 }
 
-/// A parsed, structured ruling extracted from Claude's response text. `verdict`/`reasoning` are
-/// what get combined into the document published to IPFS (see `ipfs.rs`) — neither is
-/// submitted on-chain directly by `submit_ai_ruling`, which only takes a ruling *hash*; see
-/// this crate's README for the discovered gap this implies (this service does not call the
-/// separate `finalize_ruling` that would actually apply the verdict on-chain).
+/// A parsed, structured ruling extracted from Claude's response text. `reasoning` is what gets
+/// published to IPFS (see `ipfs.rs`); `verdict` is submitted on-chain directly as an argument to
+/// `submit_ai_ruling` (not reconstructed from the published document). `main.rs` separately
+/// schedules the follow-up `finalize_ruling` call once the appeal window closes unappealed — see
+/// this crate's README for the full flow.
 #[derive(Debug, PartialEq, Clone)]
 pub enum Verdict {
     Upheld,

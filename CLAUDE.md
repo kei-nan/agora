@@ -18,7 +18,9 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `mobile/android/` is a real, committed native project (Gradle 8.6, hand-written
   `NfcPassportModule.kt`/`com.agora.facematch` native modules) with the JS/TS test suite passing
-  (210 tests across 15 suites, up from the 77 changelog #80 originally verified); no JDK/Android
+  (297 tests across 21 suites, confirmed by running `npx jest` in `mobile/` 2026-08-23 — up from
+  the 77 changelog #80 originally verified, most recently 228→297 per commit `4a628d1`'s own
+  message); no JDK/Android
   SDK in this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
   exist (see `docs/project/apps/mobile.md`, changelog #80)
 
@@ -130,9 +132,12 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   if it was funded by a direct on-chain transfer from the citizen's known account, or if it
   submits in close temporal proximity to other citizen-linked activity, that funding-source or
   timing correlation breaks pseudonymity regardless of what the extrinsic's payload proves. This
-  applies to `commit_vote` today and would equally apply to the delegate-persona-creation and
-  backing-proof schemes discussed in `docs/project/pallets/elections.md` once built (not built as
-  of 2026-08-22 — see that file) — a mathematically unlinkable ZK derivation does not anonymize
+  applies to `commit_vote` today and, as of commits `2e07f68`/`e31257a`/`786b792`/`4a628d1`
+  (2026-08-22 through 2026-08-23), now also applies for real to the delegate-persona-creation and
+  backing-proof schemes — real ZK circuits, pallet wiring in `pallet-elections`
+  (`register_as_delegate`/`back_delegate`/`remove_backing`), and mobile integration, all built and
+  confirmed non-stub by three independent review agents; see `docs/project/pallets/elections.md`,
+  which documents this as done — a mathematically unlinkable ZK derivation does not anonymize
   the *transaction* that reveals it. Checked for a real mitigation before writing this down: no
   relayer, mixnet, or unsigned/ZK-gated submission path exists anywhere in this repo
   (`pallets/pallet-voting`'s and `pallets/pallet-anticorruption`'s own doc comments already
@@ -363,8 +368,9 @@ authoritative version of this list; treat this section as a summary, not the sou
    whatever was already committed, closing the hole where a compromised oracle credential could
    publish reasoning saying one thing and finalize with a different verdict. Still PARTIAL, not
    done: never run against a real chain/Claude API/IPFS daemon (unit-tested at the pure-logic
-   level only, 47/47 passing — added IPFS content-hash verification and Claude prompt-injection
-   delimiting after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
+   level only, 52/52 passing as of 2026-08-23 (`cargo test --release` in `court-oracle/`), up from
+   the 47/47 this line previously cited — added IPFS content-hash verification and Claude
+   prompt-injection delimiting after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
    `Sudo::sudo(Courts::set_oracle_account(...))` was called for real against a dedicated oracle
    account, confirmed via storage query — `court-oracle` was then built and run for real against
    a real chain and a real local IPFS daemon and got as far as a genuine (rejected) call to the

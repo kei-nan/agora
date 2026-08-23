@@ -352,3 +352,83 @@
     this simply an accepted residual risk of any single-factor biometric-recovery scheme) before
     any implementation is attempted. Not attempted in the 2026-08-22 pass, deliberately.
 
+16. [DONE] **Independent Accountability Council + auditor/investigator appointment origins** —
+    2026-08-22, three-commit sequence closing a real self-oversight gap: `pallet-audit`'s
+    `add_auditor`/`remove_auditor` and `pallet-anticorruption`'s
+    `add_investigator`/`remove_investigator` were bare `ensure_root` with no configurable
+    `EnsureOrigin` at all, and routing them through the legislature (the obvious alternative)
+    would have reproduced the exact self-oversight failure real Supreme Audit Institutions exist
+    to prevent, since the legislature already controls the treasury budget it would then also be
+    choosing the auditors for. Commit `ca43602` adds a new `pallet-accountability-council` pallet,
+    wired into the runtime at index 19: a small (7–9 member) council explicitly barred from
+    `pallet-legislature`/`pallet-executive` membership overlap, mechanically mirroring
+    `pallet-courts`' Oracle Council admin-action pattern (call-hash-bound propose/approve) but
+    requiring a genuine 2/3 supermajority rather than the Oracle Council's plain >1/2, exposed as
+    `EnsureAccountabilityCouncilApproved<T>`; membership is self-perpetuating once bootstrapped
+    (`Root` seeds initial members and calls `close_bootstrap()` once, after which
+    `add_member`/`remove_member` require the Council's own supermajority vote instead of `Root`).
+    Commit `735d876` then routes both pallets' appointment calls through a new `AppointmentOrigin`
+    config item wired to this Council. Commit `dcdb1f3` separately gates
+    `pallet-treasury-ledger`'s `register_department_spender`/`remove_department_spender` (also
+    previously bare `ensure_root`) behind the pallet's existing `LegislatureOrigin` instead —
+    deliberately *not* routed through the new Accountability Council, since department-spender
+    designation is an operational, Executive-branch-like power distinct from the independent
+    oversight appointments the Council governs, and routing it there would dilute that Council's
+    independence. `cargo test -p pallet-accountability-council` (26/26), `-p pallet-audit`
+    (47/47), `-p pallet-anticorruption` (46/46, pre-`0529508`), `-p agora-runtime` (64/64) all
+    passing; `cargo check -p agora-runtime` clean with and without `--features dev-mode`. See
+    `docs/project/pallets/accountability-council.md`.
+
+17. [DONE] **Anti-corruption: two different investigators required to clear/refer a report** —
+    2026-08-22, commit `0529508`. Any single current investigator could unilaterally
+    `clear_report` or `refer_report_to_courts` on *any* report, including one about themselves —
+    and report content is deliberately encrypted to the investigator's key, so the chain can never
+    check on-chain whether a report concerns the caller, ruling out a content-based fix. Fix is
+    structural instead: `clear_report`/`refer_report_to_courts` now only propose a transition
+    (recorded in new `PendingReportAction` storage, keyed by `report_id`), leaving the report at
+    `UnderInvestigation`; a second, *different* investigator must call the new
+    `approve_report_action` to actually apply it, and the same investigator proposing twice is
+    rejected with `Error::SameInvestigator` — the same 2-of-N peer-sign-off shape
+    `pallet-accountability-council` (item 16) and `pallet-courts`' Oracle Council both already use
+    elsewhere, scoped down from a supermajority vote to a plain 2-of-N here. 52/52 pallet tests
+    and 64/64 runtime tests passing; `cargo check` clean on `agora-runtime` with default and
+    `--features dev-mode`.
+
+18. [DONE] **Delegate-persona and backing-proof ZK schemes — circuit, pallet wiring, and mobile,
+    now all real** — 2026-08-22 through 2026-08-23, a five-commit sequence (`2e07f68`, `ca99c7d`,
+    `e31257a`, `786b792`, `4a628d1`) that closes what `CLAUDE.md`'s Voting System section used to
+    flag as "discussed... once built (not built as of 2026-08-22)". Confirmed as genuinely
+    non-stub — real circuits, real pallet-level verification, real mobile call-shape wiring — by
+    three independent review agents, and now documented as done in
+    `docs/project/pallets/elections.md`. In order: `2e07f68` added a **delegate-persona** ZK
+    circuit (a citizen proving eligibility to register a chosen `persona_account` as their
+    delegate identity, riding inside ZKPassport's outer proof the same way `disclosure` does);
+    `ca99c7d` added a bare per-citizen `BackingCommitment` map with no tree yet; `bae1cbd` (see
+    below) built the actual depth-32 Poseidon2 incremental Merkle tree over it; `e31257a` added a
+    standalone **backing-nullifier** circuit (a Semaphore/nullifier-scheme proof of Merkle-path
+    membership in that tree, binding `delegate_persona_id` as a plain checked public input rather
+    than folding it into a `param_commitment` hash, since — unlike `delegate-persona` — this
+    circuit isn't constrained by ZKPassport's fixed 8-field outer interface) plus a standalone
+    Rust UltraHonk verifier (`runtime/src/backing_nullifier_verifier.rs`); `786b792` wired both
+    into `pallet-elections` for real — `register_as_delegate` now verifies a real delegate-persona
+    proof via `T::ZkVerifier` → `T::CommitteeKeyChecker` → `T::DelegatePersonaVerifier` instead of
+    trusting `ensure_signed`'s caller identity directly, and `back_delegate`/`remove_backing` now
+    verify a real backing-nullifier proof via `T::BackingProofVerifier`/`T::BackingRootChecker`,
+    replacing the old plaintext `BackingOf`/`CitizenBackingCount` maps with a nullifier map
+    (closing the "who backs whom" linkability the old plaintext design had); `4a628d1` wired the
+    mobile app to all of it (new `backingNullifierEncoding.ts`/`backingTree.ts`/`backingState.ts`,
+    `zkProving.ts`'s `proveDelegatePersona`/`proveBackingNullifier`, updated
+    `governance.ts`/delegate screens). Verified per-commit: `cargo test -p pallet-elections`
+    59/59 (66/66 with `runtime-benchmarks`); `cargo test -p pallet-identity-zk` 141/141
+    (`bae1cbd`'s Merkle-tree work, including 14 new tests checked against an independently-written
+    recursive reference implementation); `nargo test --workspace` 50/50 for the circuits; `npx
+    tsc --noEmit` clean and `npx jest` 297/297 in `mobile/` (see item 2 in Current State above).
+    **Still not real end-to-end**: like every other proof-submitting call in this codebase, both
+    schemes remain gated on the standing OPRF committee blocker (item 1) — no genuine on-device
+    proof can be produced without it — and the submission-metadata-linkability gap `CLAUDE.md`'s
+    Voting System section documents for `commit_vote` applies identically here (a mathematically
+    unlinkable ZK derivation does not anonymize the transaction that reveals it). See
+    `docs/project/changelog/093.md`, `094.md`, `095.md`, `096.md` for the full per-commit trail,
+    and `docs/project/pallets/elections.md`/`docs/project/pallets/identity.md` for current pallet
+    documentation.
+

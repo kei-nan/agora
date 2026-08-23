@@ -77,10 +77,10 @@
 //! responsible for checking `max_backings_per_citizen` equals the *current* on-chain value
 //! before accepting the proof — exactly the same split `runtime/src/anchor_verifier.rs`'s
 //! module docs describe for `oprf_pk_hashes`/`current_date`: this module does the
-//! cryptographic/structural work, a future pallet extrinsic (not built yet — no pallet consumes
-//! this circuit's output today, see "Status" below) does the storage-dependent checks, mirroring
-//! how `register_citizen` already checks `AllowedMerkleRoots`/`OprfCommitteeKeys` itself rather
-//! than delegating that to `T::ZkVerifier`.
+//! cryptographic/structural work, a pallet extrinsic (now built as of commit `786b792` — see
+//! "Status" below) does the storage-dependent checks, mirroring how `register_citizen` already
+//! checks `AllowedMerkleRoots`/`OprfCommitteeKeys` itself rather than delegating that to
+//! `T::ZkVerifier`.
 //!
 //! The tradeoff this buys: a proof proves "slot_index is within *some* claimed bound", not
 //! "within the bound governance has actually set" — that second, load-bearing half is a
@@ -95,10 +95,15 @@
 //!
 //! Compiles, produces a bb 5.0.0 verification key, and has a full real `nargo execute` ->
 //! `bb prove` -> `bb verify` round-trip (see `Prover.toml`, built from a genuine
-//! `pallets/pallet-identity`-side vector — see that file's header comment). No pallet extrinsic
-//! consumes this circuit's output yet (that is future work, presumably in
-//! `pallet-elections`/`pallet-voting`, per the task this circuit was built for) — this package
-//! and `runtime/src/backing_nullifier_verifier.rs` are the circuit + verifier only.
+//! `pallets/pallet-identity`-side vector — see that file's header comment). **Update, commit
+//! `786b792`**: a pallet extrinsic now genuinely consumes this circuit's output —
+//! `pallet_elections::back_delegate`/`remove_backing` (`pallets/pallet-elections/src/lib.rs`,
+//! via the `verify_backing_proof` helper) check proof validity (`T::BackingProofVerifier`), root
+//! freshness (`T::BackingRootChecker`), the proof's public `delegate_persona_id` against the
+//! call's target delegate, `max_backings_per_citizen` against the live `MaxBackingsPerCitizen`
+//! storage value, and reuse of `backing_nullifier` against `UsedBackingNullifier` — all of the
+//! storage-dependent checks this module's docs above describe as this circuit's own
+//! responsibility to leave to a future consumer.
 
 use identity_anchor::{
     backing_tree_node_hash, derive_backing_commitment, derive_backing_nullifier,

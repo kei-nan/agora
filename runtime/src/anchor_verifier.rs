@@ -312,11 +312,12 @@ pub fn calculate_delegate_param_commitment(
 /// `T::ZkVerifier::verify` — this function performs no pairing check itself, deliberately
 /// mirroring [`check_registration_anchor`]/[`check_migration_anchor`]'s split (see this module's
 /// top-of-file docs for why the pairing check and the commitment recomputation are kept
-/// separate). No pallet extrinsic calls this yet — see
-/// `circuits/oprf-identity-anchor/delegate-persona/src/main.nr`'s module docs for the intended
-/// call shape a future `pallet-elections`/`pallet-identity` extrinsic would use: run
-/// `T::ZkVerifier::verify(zk_proof, public_inputs)` first, then this recomputation, exactly as
-/// `register_citizen` already does for [`check_registration_anchor`].
+/// separate). **Update, commit `786b792`**: `pallet_elections::register_as_delegate` now calls
+/// this for real, via its `T::DelegatePersonaVerifier` config item (wired in
+/// `runtime/src/configs/mod.rs` to [`Poseidon2AnchorVerifier`]'s `DelegatePersonaVerifier` impl
+/// below) — `T::ZkVerifier::verify(zk_proof, public_inputs)` runs first, then this recomputation,
+/// exactly as `register_citizen` already does for [`check_registration_anchor`], matching the
+/// call shape `circuits/oprf-identity-anchor/delegate-persona/src/main.nr`'s module docs describe.
 pub fn check_delegate_persona(
     outer_public_inputs: &[[u8; 32]],
     delegate_persona_id: [u8; 32],
