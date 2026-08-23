@@ -31,6 +31,7 @@ function fakeCaptureModule() {
       rightEyeOpenProbability: 0.9,
       headEulerAngleY: 2.5,
     })),
+    deleteCaptureFile: jest.fn(async (_uri: string) => undefined),
   };
 }
 
@@ -109,6 +110,29 @@ describe('capturePhoto', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const native = require('react-native').NativeModules.FaceCaptureModule;
     expect(native.capturePhoto).toHaveBeenCalledWith('blink');
+  });
+});
+
+describe('deleteCaptureFile', () => {
+  it('does not throw when unavailable — resolves silently instead', async () => {
+    const mod = loadModule({ captureLinked: false, matchLinked: false });
+    await expect(mod.deleteCaptureFile('file:///fake/baseline.jpg')).resolves.toBeUndefined();
+  });
+
+  it('passes the uri through to the native module when available', async () => {
+    const mod = loadModule({ captureLinked: true, matchLinked: true });
+    await mod.deleteCaptureFile('file:///fake/baseline-123.jpg');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const native = require('react-native').NativeModules.FaceCaptureModule;
+    expect(native.deleteCaptureFile).toHaveBeenCalledWith('file:///fake/baseline-123.jpg');
+  });
+
+  it('swallows a native-side rejection rather than throwing', async () => {
+    const mod = loadModule({ captureLinked: true, matchLinked: true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const native = require('react-native').NativeModules.FaceCaptureModule;
+    native.deleteCaptureFile.mockRejectedValueOnce(new Error('delete failed'));
+    await expect(mod.deleteCaptureFile('file:///fake/baseline-123.jpg')).resolves.toBeUndefined();
   });
 });
 

@@ -57,6 +57,7 @@ interface FaceCaptureModuleNative {
     rightEyeOpenProbability: number;
     headEulerAngleY: number;
   }>;
+  deleteCaptureFile(uri: string): Promise<void>;
 }
 
 interface FaceMatchModuleNative {
@@ -120,6 +121,28 @@ export async function requestCameraPermission(): Promise<boolean> {
  */
 export async function capturePhoto(challenge: LivenessChallenge): Promise<CapturedPhoto> {
   return requireCaptureModule().capturePhoto(challenge);
+}
+
+/**
+ * Deletes one specific capture file returned by an earlier {@link capturePhoto}
+ * call, once the caller knows it's stale — e.g. a baseline/challenge shot
+ * that failed its liveness check and is about to be retried, or a
+ * passed-baseline shot left over because the user abandoned registration
+ * before finishing the challenge substep. See `FaceCaptureModule.kt`'s
+ * `deleteCaptureFile` doc comment for why this exists as a single-file
+ * delete rather than reusing the `matchAgainstPassport` directory sweep
+ * (a blanket sweep at these call sites could delete a *different*
+ * still-needed capture file). Best-effort: this never throws — a cleanup
+ * helper must not block or fail the registration flow it's cleaning up
+ * after, so unavailability (e.g. iOS) or a native-side delete failure are
+ * both silently swallowed.
+ */
+export async function deleteCaptureFile(uri: string): Promise<void> {
+  try {
+    await requireCaptureModule().deleteCaptureFile(uri);
+  } catch {
+    // Swallowed — see doc comment above.
+  }
 }
 
 /**

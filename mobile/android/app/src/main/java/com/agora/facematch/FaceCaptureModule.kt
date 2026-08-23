@@ -93,6 +93,19 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
         runCatching { file.delete() }
       }
     }
+
+    /**
+     * `true` iff [file] is one of this module's own `facematch-*.jpg` cache
+     * captures — the same prefix/suffix check [sweepCaptureFiles] uses, plus
+     * a parent-directory check, so [deleteCaptureFile] below can never be
+     * used (even via a malformed/foreign `uri` argument from the JS side) to
+     * delete a file outside this module's own capture directory.
+     */
+    private fun isOwnCaptureFile(file: File, cacheDir: File): Boolean {
+      return file.parentFile == cacheDir &&
+        file.name.startsWith(CAPTURE_FILE_PREFIX) &&
+        file.name.endsWith(CAPTURE_FILE_SUFFIX)
+    }
   }
 
   /** Set while a `requestCameraPermission` call is waiting on the user's response; see `onRequestPermissionsResult`. */
@@ -135,6 +148,37 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
   }
 
   /**
+   * Deletes one specific still-outstanding capture file by its `file://`
+   * URI — the pre-compare-step counterpart to `FaceMatchModule`'s
+   * `matchAgainstPassport` finally-block sweep (see `sweepCaptureFiles`'s
+   * doc comment). `RegisterScreen.tsx` calls this right after a baseline or
+   * challenge shot fails its liveness check (eyes-closed/angle threshold)
+   * and is about to be retried — that shot will never reach
+   * `matchAgainstPassport`, so nothing else will ever clean it up — and
+   * again from a screen-unmount cleanup for a passed-baseline shot left
+   * over if the user abandons the flow before finishing the challenge
+   * substep. A full [sweepCaptureFiles] sweep isn't right for either call
+   * site: at both points there can be a *different* still-needed capture
+   * file on disk (e.g. a just-passed baseline while the challenge substep
+   * is retried) that a blanket sweep would wrongly delete too. Restricted
+   * to this module's own capture files ([isOwnCaptureFile]) so a bad/foreign
+   * `uri` can't be used to delete something else. Best-effort and always
+   * resolves — a cleanup helper must never surface an error that blocks
+   * the registration flow.
+   */
+  @ReactMethod
+  fun deleteCaptureFile(uri: String, promise: Promise) {
+    runCatching {
+      val path = Uri.parse(uri).path ?: return@runCatching
+      val file = File(path)
+      if (isOwnCaptureFile(file, reactContext.cacheDir)) {
+        file.delete()
+      }
+    }
+    promise.resolve(null)
+  }
+
+  /**
    * Takes one still frame from the already-bound live preview and runs ML
    * Kit face detection against it synchronously — this native-module method
    * already runs off the JS thread (RN dispatches `@ReactMethod` calls to
@@ -169,6 +213,13 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
             )
             val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
             if (face == null) {
+              // The frame was still written to outputFile even though it has no usable
+              // face in it — this rejection is a dead end for the caller (RegisterScreen
+              // retries with a brand-new capturePhoto call), so nothing else will ever
+              // clean this file up. Delete it now rather than leaving it for the next
+              // sweep (matchAgainstPassport won't run, and the app may not restart for
+              // a long time). Best-effort: a delete failure must not mask the real error.
+              runCatching { outputFile.delete() }
               promise.reject("NO_FACE_DETECTED", "No face was detected in the captured frame")
               return
             }
@@ -180,11 +231,18 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
             }
             promise.resolve(result)
           } catch (e: Exception) {
+            // Same reasoning as the NO_FACE_DETECTED branch above — outputFile was
+            // written before decode/detection failed, and this rejection is likewise
+            // a dead end for the caller.
+            runCatching { outputFile.delete() }
             promise.reject("FACE_DETECT_ERROR", e.message ?: "Face detection failed", e)
           }
         }
 
         override fun onError(exception: ImageCaptureException) {
+          // CameraX may or may not have written a partial file before failing —
+          // best-effort delete either way, same reasoning as above.
+          runCatching { outputFile.delete() }
           promise.reject("CAMERA_CAPTURE_ERROR", exception.message ?: "Photo capture failed", exception)
         }
       },

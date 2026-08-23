@@ -12,6 +12,7 @@ import {
   hasCameraPermission,
   requestCameraPermission,
   capturePhoto,
+  deleteCaptureFile,
   matchAgainstPassport,
   CapturedPhoto,
   LivenessChallenge,
@@ -199,6 +200,11 @@ export default function RegisterScreen({ navigation }: Props) {
       if (livenessUi.substep === 'baseline') {
         const photo = await capturePhoto('baseline');
         if (!baselinePassed(photo)) {
+          // This shot failed the liveness heuristic and will never be passed to
+          // matchAgainstPassport (whose own finally-block sweep is the only other
+          // thing that ever cleans these up) — the retry below captures a brand-new
+          // file, so this one is now permanently orphaned unless deleted here.
+          await deleteCaptureFile(photo.uri);
           setLivenessUi({ ...livenessUi, capturing: false, error: 'Look straight at the camera with both eyes open, then try again.' });
           return;
         }
@@ -208,6 +214,11 @@ export default function RegisterScreen({ navigation }: Props) {
       }
       const photo = await capturePhoto(livenessUi.challenge);
       if (!challengePassed(livenessUi.challenge, photo)) {
+        // Same reasoning as the baseline branch above — this failed challenge shot
+        // is never reused, so clean it up now rather than leaving it for the next
+        // app-launch sweep. Note: only this challenge shot, not baselineUriRef.current
+        // — the passed baseline is still needed for the eventual matchAgainstPassport call.
+        await deleteCaptureFile(photo.uri);
         setLivenessUi({ ...livenessUi, capturing: false, error: "That didn't register — try again." });
         return;
       }
@@ -247,6 +258,24 @@ export default function RegisterScreen({ navigation }: Props) {
   useEffect(() => {
     return () => {
       cancelPendingScan();
+    };
+  }, []);
+
+  // Mirrors the cleanup above for the liveness step: if the user abandons
+  // registration after the baseline shot has passed (so it's held in
+  // baselineUriRef, see handleLivenessCapture) but before finishing the
+  // challenge substep, that file would otherwise never reach
+  // matchAgainstPassport's sweep and would sit on disk until the next app
+  // launch's startup sweep. `baselineUriRef.current` is read at unmount
+  // time (not captured by this closure), so it reflects whatever the flow
+  // last set it to. deleteCaptureFile is a no-op if the ref is already
+  // null (never captured, or already consumed by a completed match) or
+  // points to a file already swept by matchAgainstPassport's own finally.
+  useEffect(() => {
+    return () => {
+      if (baselineUriRef.current) {
+        deleteCaptureFile(baselineUriRef.current);
+      }
     };
   }, []);
 
