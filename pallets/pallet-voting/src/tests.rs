@@ -609,6 +609,118 @@ fn delegate_vote_retargeting_hub_successfully_moves_weight_between_hubs() {
     });
 }
 
+/// Regression test for the "hub delegates out BEFORE upstream leaves join" ordering — the
+/// mirror image of `delegate_vote_retargeting_hub_uses_real_transitive_weight_for_cap_check`
+/// above (which covers leaves joining B *before* B delegates onward). Here the order is
+/// reversed:
+///   1. B delegates to hub C first (B's own first outgoing edge — nothing upstream of B yet,
+///      so its own snapshot is correctly 1 at this point under both old and new code).
+///   2. A then delegates to B. B already has an outgoing edge, so A's weight resolves
+///      transitively straight through to C: `DelegatedWeight[C]` becomes 2 (A + B). *Before
+///      this fix*, B's own stored `resolved_weight` (captured back in step 1, when B's only
+///      real weight was its own vote) was never updated to reflect that it's now forwarding
+///      2, not 1 — a stale snapshot that only `DelegatedWeight[C]` (not B's own record) knew
+///      about.
+///   3. B re-targets from C to a fresh delegate D — an ordinary, unprivileged `delegate_vote`
+///      call touching only B's own edge. *Before this fix*, the code trusted B's stale
+///      snapshot (1) to move off C and onto D, leaving a phantom weight-1 stuck at C (nothing
+///      resolves there any more) and permanently undercounting D by A's real weight.
+///
+/// This fix keeps B's own snapshot live via `propagate_weight_along_chain`, so step 2 updates
+/// it to 2, and step 3 correctly moves the full 2 off C and onto D.
+#[test]
+fn delegate_vote_retargeting_hub_after_upstream_join_moves_full_transitive_weight() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10); // cap allows at most weight 4 (40%)
+
+        // Step 1: B (200) delegates to C (300) first — B's own first outgoing edge, nothing
+        // upstream of B yet, so this is correctly snapshotted as weight 1 under both old and
+        // new code.
+        activate_citizen(200); // B
+        activate_citizen(300); // C
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(200), 300, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 1);
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().resolved_weight, 1);
+
+        // Step 2: A (100) delegates to B — B already has an outgoing edge to C, so A's weight
+        // resolves transitively straight through: DelegatedWeight[C] becomes 2.
+        activate_citizen(100); // A
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(100), 200, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 2);
+        // The fix: B's own stored snapshot must now reflect the full transitive weight (2),
+        // not the stale value (1) captured when B's edge to C was first created.
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().resolved_weight, 2);
+        // B itself still carries 0 in DelegatedWeight — it has an active outgoing edge, so its
+        // incoming weight is (correctly) re-attributed to C, not left sitting at B.
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 200u64)), 0);
+
+        // Step 3: B re-targets from C to a fresh delegate D (400) — an ordinary,
+        // unprivileged call touching only B's own edge.
+        activate_citizen(400); // D
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(200), 400, 0, MIN_DELEGATION_DURATION));
+
+        // C must drop back to 0 — nothing resolves there any more (the bug left a phantom 1
+        // permanently stuck at C instead).
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 300u64)), 0);
+        // D must reflect the FULL transitive weight of 2 (A + B), not the stale 1 the bug
+        // would have moved.
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 2);
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().resolved_weight, 2);
+        assert_eq!(Delegations::<Test>::get(0u32, 200u64).unwrap().delegate, 400);
+    });
+}
+
+/// Companion to the test above: proves the staleness bug wasn't merely a bookkeeping
+/// curiosity but a genuine `DelegationCap` bypass. Continues the same B-then-A-then-retarget
+/// scenario, then adds three more direct delegators onto D one at a time. With the fix, D's
+/// real weight (2 from A+B, correctly tracked after the re-target) plus two more direct
+/// delegators reaches exactly the cap (4); a third is correctly rejected, since it would push
+/// D's real weight to 5 — over the 40%-of-10 = 4 cap.
+///
+/// *Before* this fix, D's tracked weight after the re-target would have been the stale 1 (not
+/// the real 2). The same three additional delegators would then each individually pass their
+/// own cap check against that understated base — 1+1=2, +1=3, +1=4, "under" the cap the whole
+/// way — silently letting D end up with real weight 5 (2 real + 3 more), 50% of the
+/// electorate, despite every single `delegate_vote` call along the way passing its own
+/// `DelegationCapExceeded` check.
+#[test]
+fn delegate_vote_stale_hub_snapshot_would_have_let_delegation_cap_be_bypassed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10); // cap allows at most weight 4 (40%)
+
+        activate_citizen(200); // B
+        activate_citizen(300); // C
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(200), 300, 0, MIN_DELEGATION_DURATION));
+
+        activate_citizen(100); // A
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(100), 200, 0, MIN_DELEGATION_DURATION));
+
+        activate_citizen(400); // D
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(200), 400, 0, MIN_DELEGATION_DURATION));
+        // D correctly starts at the real transitive weight of 2 (A + B), not the stale 1 the
+        // pre-fix bug would have shown here.
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 2);
+
+        // Two more direct delegators bring D to exactly the cap (2 + 1 + 1 = 4).
+        activate_citizen(501);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(501), 400, 0, MIN_DELEGATION_DURATION));
+        activate_citizen(502);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(502), 400, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 4);
+
+        // A third would push D's real weight to 5 (50% of 10) — over the cap. Correctly
+        // rejected by the fix.
+        activate_citizen(503);
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(503), 400, 0, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 400u64)), 4);
+    });
+}
+
 /// Lazy expiry cleanup (triggered from within `has_delegation_cycle` when walking a
 /// prospective new chain) must restore weight to the account whose expired delegation was
 /// removed, exactly like an explicit `revoke_delegation` does — otherwise an expired link

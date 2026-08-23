@@ -106,13 +106,15 @@ pub mod pallet {
         /// Delegation is valid for referenda whose close block ≤ expires_at.
         /// After this block the record is treated as absent and cleaned up lazily.
         pub expires_at: BlockNumber,
-        /// The weight this delegation edge contributed to its resolved terminal delegate's
-        /// `DelegatedWeight` entry at the moment it was created (this delegator's own vote,
-        /// plus whatever weight this delegator had itself accumulated as a terminal delegate
-        /// for others before delegating onward). Snapshotted here — rather than recomputed —
-        /// so `revoke_delegation` and lazy expiry cleanup can remove *exactly* this amount
-        /// later without drift. See `DelegatedWeight`'s doc comment for why it can't simply be
-        /// recomputed at removal time.
+        /// The weight this delegation edge currently contributes to its resolved terminal
+        /// delegate's `DelegatedWeight` entry (this delegator's own vote, plus whatever weight
+        /// this delegator had itself accumulated as a terminal delegate for others before
+        /// delegating onward). Snapshotted here — rather than recomputed on demand — so
+        /// `revoke_delegation` and lazy expiry cleanup can remove *exactly* this amount later
+        /// without drift; kept live thereafter by `propagate_weight_along_chain`, which updates
+        /// this field on every account still along an affected chain whenever weight joins or
+        /// leaves upstream of it (a later re-target trusts this field as-is, so it must stay
+        /// current, not just accurate at creation time — see `DelegatedWeight`'s doc comment).
         pub resolved_weight: u32,
     }
 
@@ -255,9 +257,15 @@ pub mod pallet {
     /// here — its incoming weight is immediately re-attributed to whatever it resolves to
     /// instead, so only current *terminal* delegates ever carry a nonzero balance. Maintained
     /// incrementally by `delegate_vote`, `revoke_delegation`, and `has_delegation_cycle`'s
-    /// lazy expiry cleanup — see `delegate_vote`'s doc comment for exactly how, and for the
-    /// one documented case (an intermediate delegate re-delegating to a *different* target)
-    /// this bookkeeping cannot perfectly follow.
+    /// lazy expiry cleanup, all via the shared `propagate_weight_along_chain` helper — see
+    /// `delegate_vote`'s doc comment for exactly how. Every weight change (a new upstream join,
+    /// a departure, a re-target) is walked and applied to *every* intermediate hop's own stored
+    /// `DelegationRecord::resolved_weight` along the affected chain, not just the terminal's
+    /// bucket here — this is what lets an intermediate delegate that later re-targets to a
+    /// *different* new delegate trust its own stored snapshot as accurate, closing what used to
+    /// be a silent `DelegationCap` bypass (an upstream account joining *after* an intermediate's
+    /// own outgoing edge already existed left that intermediate's snapshot stale until it next
+    /// re-targeted, understating the weight it actually carried).
     ///
     /// Used solely to enforce `DelegationCap` at delegation time. The actual vote tally in
     /// `apply_delegated_weight` never reads this — it always re-resolves the real
@@ -583,17 +591,22 @@ pub mod pallet {
         ///    there, see the invariant in `DelegatedWeight`'s doc comment).
         /// 3. Rejects the delegation if the terminal's resulting total would exceed the cap.
         ///
-        /// This keeps the whole cost bounded by `MaxDelegationDepth` (two bounded forward
-        /// walks plus O(1) storage reads) rather than rescanning every delegation on-chain, and
-        /// it keeps the invariant "no delegate exceeds the cap" true for every edge that is
-        /// itself being added or moved. The one gap this does **not** close: if an
-        /// *intermediate* delegate later re-delegates to a *different* new target (not
-        /// touching `who`'s own edge at all), the weight `who` contributed upstream of that
-        /// intermediate is not re-walked and moved to the intermediate's new terminal — see
-        /// `DelegatedWeight`'s doc comment for why that would require tracking per-hop subtree
-        /// weight (a much larger change) rather than per-terminal totals. That gap can only
-        /// ever make this check *too permissive* in that one specific scenario, never let a
-        /// cap violation go undetected on the edge actually being submitted here.
+        /// This keeps the whole cost bounded by `MaxDelegationDepth` (a handful of bounded
+        /// forward walks over storage) rather than rescanning every delegation on-chain, and it
+        /// keeps the invariant "no delegate exceeds the cap" true for every edge that is itself
+        /// being added or moved.
+        ///
+        /// Both the weight *added* by a new/moved edge (step 2 above) and the weight *removed*
+        /// from an old edge being replaced (further down, when `maybe_old` is `Some`) are applied
+        /// via `propagate_weight_along_chain`, which walks the whole affected chain — not just
+        /// its terminal — and updates every intermediate hop's own stored
+        /// `DelegationRecord::resolved_weight` by the same delta. This closes what used to be a
+        /// real cap bypass: if an upstream account joins an intermediate delegate's chain
+        /// *after* that intermediate's own outgoing edge already exists (e.g. B delegates to C,
+        /// then A delegates to B), the intermediate's stored snapshot now reflects the join
+        /// immediately, so if that intermediate later re-delegates to a *different* new target,
+        /// the weight it carries there is the real, current total — not a stale figure captured
+        /// only at the moment its own edge was first created.
         #[pallet::call_index(2)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn delegate_vote(
@@ -686,9 +699,11 @@ pub mod pallet {
                         Error::<T>::DelegationCapExceeded
                     );
                 }
-                DelegatedWeight::<T>::mutate((topic_id, &new_terminal), |w| {
-                    *w = w.saturating_add(who_weight)
-                });
+                // Propagate `who_weight` all the way to the terminal, fixing up every
+                // intermediate hop's own stored `resolved_weight` along the way (not just the
+                // terminal's `DelegatedWeight` bucket) — see `propagate_weight_along_chain`'s
+                // doc comment for why that matters.
+                Self::propagate_weight_along_chain(&delegate, topic_id, now, who_weight as i64);
                 who_weight
             };
 
@@ -700,13 +715,16 @@ pub mod pallet {
                     DelegatorCount::<T>::mutate((topic_id, &old_record.delegate), |c| {
                         *c = c.saturating_sub(1)
                     });
-                    // Move the weight this delegation used to carry away from wherever the
-                    // OLD chain resolved to.
-                    let old_terminal =
-                        Self::resolve_delegate_readonly(&old_record.delegate, topic_id, now);
-                    DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
-                        *w = w.saturating_sub(old_record.resolved_weight)
-                    });
+                    // Move the weight this delegation used to carry away from wherever the OLD
+                    // chain resolved to, fixing up every intermediate hop's own stored
+                    // `resolved_weight` along that old chain too (see
+                    // `propagate_weight_along_chain`'s doc comment).
+                    Self::propagate_weight_along_chain(
+                        &old_record.delegate,
+                        topic_id,
+                        now,
+                        -(old_record.resolved_weight as i64),
+                    );
                 }
             }
             if !replacing_same_delegate {
@@ -739,12 +757,16 @@ pub mod pallet {
             DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
             // Move the weight this delegation carried back from wherever it resolved to
             // onto `who` themselves — they are a terminal delegate again now that they have
-            // no outgoing delegation on this topic.
+            // no outgoing delegation on this topic. Also fixes up every intermediate hop's own
+            // stored `resolved_weight` along the old chain (see
+            // `propagate_weight_along_chain`'s doc comment).
             let now = frame_system::Pallet::<T>::block_number();
-            let old_terminal = Self::resolve_delegate_readonly(&record.delegate, topic_id, now);
-            DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
-                *w = w.saturating_sub(record.resolved_weight)
-            });
+            Self::propagate_weight_along_chain(
+                &record.delegate,
+                topic_id,
+                now,
+                -(record.resolved_weight as i64),
+            );
             DelegatedWeight::<T>::mutate((topic_id, &who), |w| {
                 *w = w.saturating_add(record.resolved_weight)
             });
@@ -1272,13 +1294,15 @@ pub mod pallet {
                     Some(record) => {
                         // Expired — clean up lazily, including moving the weight this edge
                         // carried back onto `current` (which becomes a terminal delegate again)
-                        // from wherever the now-invalid chain used to resolve to. Mirrors what
-                        // `revoke_delegation` does for an explicit revoke.
-                        let old_terminal =
-                            Self::resolve_delegate_readonly(&record.delegate, topic_id, now);
-                        DelegatedWeight::<T>::mutate((topic_id, &old_terminal), |w| {
-                            *w = w.saturating_sub(record.resolved_weight)
-                        });
+                        // from wherever the now-invalid chain used to resolve to, fixing up every
+                        // intermediate hop's own stored `resolved_weight` along that old chain too.
+                        // Mirrors what `revoke_delegation` does for an explicit revoke.
+                        Self::propagate_weight_along_chain(
+                            &record.delegate,
+                            topic_id,
+                            now,
+                            -(record.resolved_weight as i64),
+                        );
                         DelegatedWeight::<T>::mutate((topic_id, &current), |w| {
                             *w = w.saturating_add(record.resolved_weight)
                         });
@@ -1323,6 +1347,60 @@ pub mod pallet {
         /// tracked as follow-up, not attempted here.
         pub(crate) fn topic_id_of(topic_hash: &[u8; 32]) -> u32 {
             u32::from_le_bytes([topic_hash[0], topic_hash[1], topic_hash[2], topic_hash[3]])
+        }
+
+        /// Applies a signed weight `delta` (positive = weight newly arriving from upstream,
+        /// negative = weight departing) along the delegation chain starting at `start`, walking
+        /// exactly the same hops `resolve_delegate_readonly` would (same expiry semantics, same
+        /// `MaxDelegationDepth` bound) — but mutating storage instead of only reading it.
+        ///
+        /// Every intermediate hop on the way (an account whose own `Delegations` record is still
+        /// active) has its *own* stored `resolved_weight` adjusted by `delta`, not just the final
+        /// terminal's `DelegatedWeight` bucket. This is what closes the staleness gap described in
+        /// `DelegatedWeight`'s doc comment: `resolved_weight` is the snapshot a later
+        /// re-delegation or revocation by *that same account* will trust verbatim (see
+        /// `delegate_vote`'s `who_weight` computation), so if an upstream join or departure
+        /// changes how much weight is really flowing through an intermediate, that intermediate's
+        /// own snapshot has to move too — not just the number sitting at whatever it currently
+        /// forwards to. Without this, an intermediate that later re-targets to a *different* new
+        /// delegate would carry forward its stale, pre-join/pre-departure snapshot, letting the
+        /// cap check at the new target silently pass on less weight than is actually about to
+        /// land there.
+        ///
+        /// Returns the terminal account reached (mirroring `resolve_delegate_readonly`'s return
+        /// value), whose `DelegatedWeight` bucket receives the same `delta`.
+        fn propagate_weight_along_chain(
+            start: &T::AccountId,
+            topic_id: u32,
+            reference_block: BlockNumberFor<T>,
+            delta: i64,
+        ) -> T::AccountId {
+            let mut current = start.clone();
+            for _ in 0..T::MaxDelegationDepth::get() {
+                match Delegations::<T>::get(topic_id, current.clone()) {
+                    Some(mut record) if record.expires_at >= reference_block => {
+                        record.resolved_weight = Self::apply_weight_delta(record.resolved_weight, delta);
+                        let next = record.delegate.clone();
+                        Delegations::<T>::insert(topic_id, current.clone(), record);
+                        current = next;
+                    }
+                    _ => break,
+                }
+            }
+            DelegatedWeight::<T>::mutate((topic_id, &current), |w| {
+                *w = Self::apply_weight_delta(*w, delta);
+            });
+            current
+        }
+
+        /// Adds a signed `delta` to an unsigned weight value with saturating semantics in either
+        /// direction. Shared by `propagate_weight_along_chain`'s per-hop and terminal updates.
+        fn apply_weight_delta(base: u32, delta: i64) -> u32 {
+            if delta >= 0 {
+                base.saturating_add(delta as u32)
+            } else {
+                base.saturating_sub(delta.unsigned_abs() as u32)
+            }
         }
 
         /// Read-only variant of the chain walk `has_delegation_cycle` performs: follows
