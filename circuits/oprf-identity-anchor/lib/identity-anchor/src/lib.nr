@@ -73,6 +73,29 @@ pub global DS_BACKING_ROOT: Field = 95404713695560287137769915241250939547227302
 pub global DS_BACKING_COMMITMENT: Field =
     26854039565544635344688987002232158116294794610509940030217082417;
 
+/// Domain-separation tag for the backing-commitment tree's internal-node hash:
+/// `Poseidon2(DS_BACKING_TREE_NODE, left, right)`.
+///
+/// This is **not** an ASCII-string separator like the constants above — it must be the exact
+/// numeric byte value `210`, because it has to agree bit-for-bit with
+/// `pallets/pallet-identity/src/lib.rs`'s own `DS_BACKING_TREE_NODE: u8 = 210` (that pallet
+/// builds and maintains the real on-chain tree this constant hashes against; see
+/// `backing_tree_node_hash` below). `210`/`211`/`212` are that pallet's own small numeric-tag
+/// namespace for its Merkle tree's hashing, deliberately disjoint from `runtime/src/
+/// anchor_verifier.rs`'s proof-type tags (`200`-`202`) even though both ultimately feed the
+/// same Poseidon2 permutation — see that pallet's own doc comment on the constant for why.
+pub global DS_BACKING_TREE_NODE: Field = 210;
+
+/// Domain separator for the backing-nullifier proof's nullifier output, ASCII
+/// "AGORA_BACKING_NULLIFIER_V1". See [`derive_backing_nullifier`].
+pub global DS_BACKING_NULLIFIER: Field =
+    104898592052908731815191355477469371053360463582615993256465969;
+
+/// Depth of the on-chain incremental Merkle tree over `backing_commitment` values. Must match
+/// `pallets/pallet-identity/src/lib.rs`'s `BACKING_TREE_DEPTH` exactly — see that constant's
+/// doc comment for why 32 (this pallet's own `u32` citizen-count ceiling).
+pub global BACKING_TREE_DEPTH: u32 = 32;
+
 /// Domain separator for the delegate-persona OPRF *client input*, ASCII
 /// "AGORA_DELEGATE_INPUT_V1" read as a big-endian integer. See
 /// `derive_delegate_identity_input` for why delegate-persona creation uses a **distinctly
@@ -343,6 +366,38 @@ pub fn derive_backing_root_term(
 /// avoid for `anchor` itself.
 pub fn derive_backing_commitment(backing_root_secret: Field) -> Field {
     Poseidon2::hash([DS_BACKING_COMMITMENT, backing_root_secret], 2)
+}
+
+/// The backing-commitment tree's 2-to-1 internal-node hash: `Poseidon2(DS_BACKING_TREE_NODE,
+/// left, right)`. Byte-for-byte identical to `pallets/pallet-identity/src/lib.rs`'s
+/// `backing_tree_node_hash` (that pallet uses `poseidon2_bn254::hash_bytes`, which is
+/// byte-compatible with this crate's `Poseidon2::hash` — see that crate's own module docs) —
+/// used by `../backing-nullifier` to walk a private authentication path up to a root the
+/// pallet actually published, rather than a locally-invented tree shape.
+pub fn backing_tree_node_hash(left: Field, right: Field) -> Field {
+    Poseidon2::hash([DS_BACKING_TREE_NODE, left, right], 3)
+}
+
+/// Derives the public `backing_nullifier` for one of a citizen's `MaxBackingsPerCitizen`
+/// backing "slots": `Poseidon2(DS_BACKING_NULLIFIER, backing_root_secret, slot_index)`.
+///
+/// Deliberately does **not** take the target delegate as an input — `../backing-nullifier`
+/// binds the target separately (see that circuit's module docs for why a plain public
+/// parameter is the correct — and sufficient — binding there, unlike the delegate-persona
+/// circuit's `param_commitment` fold). A slot's nullifier is therefore stable across the
+/// citizen retargeting that same slot to a different delegate over time: the pallet consumer
+/// this backs is expected to track "nullifier -> currently-backed delegate" and allow a fresh
+/// proof over the same `(backing_root_secret, slot_index)` pair to overwrite that mapping, the
+/// same way a Semaphore signal keyed by a stable external nullifier can be resubmitted.
+///
+/// `slot_index` ranges over `0..MaxBackingsPerCitizen` — the *only* real enforcement of that
+/// governance-configured cap is this circuit's `assert_lt(slot_index, max_backings_per_citizen)`
+/// range check on the value that also feeds this hash: since `backing_root_secret` is fixed
+/// per citizen, a citizen can produce at most `MaxBackingsPerCitizen` distinct valid nullifiers,
+/// full stop, with no per-citizen counting needed (impossible anyway, since nullifiers are
+/// deliberately unlinkable to any citizen identity) — see `../backing-nullifier`'s module docs.
+pub fn derive_backing_nullifier(backing_root_secret: Field, slot_index: Field) -> Field {
+    Poseidon2::hash([DS_BACKING_NULLIFIER, backing_root_secret, slot_index], 3)
 }
 
 /// Combines all 5 committees' hashed terms into the final published anchor by field addition.

@@ -1,0 +1,56 @@
+# Real vector, not fabricated: `backing_root_secret = 424242` walked through the identical
+# authentication path `pallets/pallet-identity/src/lib.rs`'s own `recompute_backing_tree_path`
+# computes for `leaf_index = 0` in an otherwise-empty tree (so every sibling here is that
+# pallet's `backing_tree_zero_hash(level)`), read via a temporary `#[test]` added to and then
+# removed from `pallets/pallet-identity/src/tests.rs` (`cargo test -p pallet-identity-zk`) that
+# calls the pallet's own `poseidon2_bn254`/`backing_tree_node_hash`/`backing_tree_zero_hash`
+# functions directly. `root`/`nullifier` are cross-checked against this circuit's own
+# `nargo test` vectors in `src/main.nr` (`backing_commitment_and_nullifier_match_the_real_rust_
+# side_vector` / `backing_tree_root_matches_the_real_rust_side_vector_for_an_empty_tree_first_
+# leaf`, in `lib/identity-anchor/src/tests.nr`), which independently reproduce the same values
+# from this crate's own `Poseidon2::hash` — the two toolchains agree byte-for-byte.
+#
+# delegate_persona_id/max_backings_per_citizen/slot_index are arbitrary small test values, not
+# derived from anything — this circuit does not constrain their provenance beyond the in-circuit
+# `assert_lt(slot_index, max_backings_per_citizen)` check (see src/main.nr's module docs).
+
+root = "0x09efbc7edc789c162ded75ed12f2d9e84fb8822535552d9d2f80ce535762f46e"
+delegate_persona_id = "777"
+max_backings_per_citizen = "5"
+backing_root_secret = "424242"
+slot_index = "2"
+leaf_index = "0"
+merkle_siblings = [
+    "0x16a6d47edce7b0993b10816d6d4460cc0f9c01845de1d399e3b0f8aaadef0b6b",
+    "0x0ff1c447d1ef5a528694a4136c2fb5a73c39955431759aa4933b26c82804d869",
+    "0x127a2e0a0fabf20e79b74f0b1dc142ef34b1a2b96897949ca8eda9c44cc15cec",
+    "0x24f38748daca7d742ff1e89fd2e392bc1b6f1350f2c6b535510bec20072653ee",
+    "0x17cc1dad0ceb51eac2e61ae17ce872aa685f220975666a8219c0c48acd07a3d8",
+    "0x2338faeb8f671731e719db24bc3120cd8fdca925f14222339790fb30096e4485",
+    "0x2fd1363825730a9c256b4065cb46a7e077e3a7dd18d63a7fe43e9590a4b6491a",
+    "0x0a074ddb0ca408f791508933f10d1d366b66aa53eeb1f57ecefd940eaba47d68",
+    "0x2d393d8911c5db59aa9abfcc0e48a751bb1b0cbaad41dd2e60de454540dd65dc",
+    "0x02b94f4247a758aac8c3142a10174941a1fc077bf9cbaad6ce5e3677d0e3d0ff",
+    "0x1275a9f2fd5bebca3e76d36a0cea99034f873e8c91765de4b2bbe641a094b4d3",
+    "0x0f937d9589069a406c8603b2ef608cf6213db4fc77fb036260a1fa5e41bafe49",
+    "0x2888aff9c0711a4e9df287fb43f8db4dfe5d6cb6d2b44fce6c25fb657255e0be",
+    "0x068d823f95c20eff7403f57dd08391ecddfb573af764bda91e4a7439c31cea44",
+    "0x25c4e39a8e9fb74b45aa01654c45c8f35888c57a7073fe01d4db2dec3df3abf3",
+    "0x1195bbd616681e2decf0aa8b5b1095e3418f8716eb12b2b852b772730d486ab4",
+    "0x277e87d20bcad693093566d14a8f52ec11ba52e4a7f2bb4817dd24c2a382bb0f",
+    "0x2ff5ff52088def59592b99e9ca9cfc806a11eb6529dc7a1d8804aff43ab919d7",
+    "0x18f2680546dd4484f95f7e8a77881634cdf0053917e7142cce299f888ba35ebd",
+    "0x2fdfd0706606aa1bdebaabb1a9252c40abacd3ee03006803e08ec7a6cc5a8dbd",
+    "0x2c4f3fa50306c38d44f2c971a74767fddc6f34e094f06b01c19a25e6cbe80316",
+    "0x16b241d5acc77ee8ff7c79930ccc934764c73a76e79049d4a1ca01ed347bc6ae",
+    "0x2eae37a1dbdacf6b9ce433f16bd0103b7f5a52f923ba70e84a501de61a9da063",
+    "0x2fab8211545d236550cbbab4fc8e8a37b68c639fadd87439f54d471427b0f747",
+    "0x1a28702748167233ae3d78271b4ca3c924a4d20ceb3ed5e17ea44447b18e28ad",
+    "0x2ea9b8751a33a12b4ff276ef8765edfbbde123e7744c1dd0666b3576deedd911",
+    "0x2483d2673ca9c6860686a40d7273071a50e016d302d4b2b496983bb1595d54a7",
+    "0x028e020c54878eb003e669b88af37968fc6c264937fece4ab11272dbf799f531",
+    "0x0eb394a8caf49da0ec70349d38670a0624afa9240454be94242b63419f33ad0b",
+    "0x19efdb04021cfb721d0f072340c01a4ab6de724381f9a3275152a40b0b6713ce",
+    "0x15f5e50cac7670592a741d1151f2f0a3de253681590dc38b37a6f69e1a0ed54a",
+    "0x1d74c0426d92db677c2ed90ca6d5ada72afc805a44c6bfa0e84bd81a90ce04da",
+]

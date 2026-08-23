@@ -8,11 +8,12 @@
 
 use super::{
     ASCII_CODE_FOR_LESS_THAN, assert_dg1_clear_value, assert_personal_number_populated,
-    combine_committee_anchors, derive_backing_commitment, derive_backing_root_term,
-    derive_committee_anchor_term, derive_delegate_identity_input, derive_delegate_persona_term,
-    derive_identity_input, DS_ANCHOR, DS_BACKING_COMMITMENT, DS_BACKING_ROOT, DS_DELEGATE,
-    DS_DELEGATE_IDENTITY_INPUT, DS_DELEGATE_OUT, DS_IDENTITY_INPUT, get_personal_number_from_dg1,
-    NUM_COMMITTEES, PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
+    backing_tree_node_hash, combine_committee_anchors, derive_backing_commitment,
+    derive_backing_nullifier, derive_backing_root_term, derive_committee_anchor_term,
+    derive_delegate_identity_input, derive_delegate_persona_term, derive_identity_input,
+    DS_ANCHOR, DS_BACKING_COMMITMENT, DS_BACKING_ROOT, DS_DELEGATE, DS_DELEGATE_IDENTITY_INPUT,
+    DS_DELEGATE_OUT, DS_IDENTITY_INPUT, get_personal_number_from_dg1, NUM_COMMITTEES,
+    PASSPORT_MRZ_PERSONAL_NUMBER_LENGTH,
 };
 use utils::constants::{DG1_LENGTH, ID_CARD_SAMPLE_DG1, SAMPLE_DG1};
 use utils::types::{DG1Data, SaltedValue};
@@ -360,4 +361,116 @@ fn backing_commitment_differs_from_a_same_valued_anchor() {
         derive_backing_commitment(shared_combined_secret) != shared_combined_secret,
         "Backing commitment must not be the identity function",
     );
+}
+
+// --- backing_tree_node_hash / derive_backing_nullifier (../backing-nullifier) ---
+
+#[test]
+fn backing_tree_node_hash_is_order_sensitive() {
+    assert(
+        backing_tree_node_hash(1, 2) != backing_tree_node_hash(2, 1),
+        "Swapping left/right must change the node hash, or a forged path could reorder siblings",
+    );
+}
+
+#[test]
+fn backing_nullifier_changes_with_secret_or_slot() {
+    let secret = 424242;
+    assert(
+        derive_backing_nullifier(secret, 0) != derive_backing_nullifier(secret, 1),
+        "Two different slots for the same citizen must produce different nullifiers",
+    );
+    assert(
+        derive_backing_nullifier(111, 0) != derive_backing_nullifier(222, 0),
+        "Two different citizens' secrets must produce different nullifiers for the same slot",
+    );
+}
+
+/// A backing-commitment leaf must never collide, under Poseidon2 domain separation, with an
+/// internal node built from the same field values — the standard second-preimage defense a
+/// Merkle tree's own hash function needs (RFC 6962-style leaf/node separation), here resting
+/// on `DS_BACKING_COMMITMENT` (a leaf-domain tag) and `DS_BACKING_TREE_NODE` (a node-domain
+/// tag, `210`) being different Poseidon2 preimages.
+#[test]
+fn backing_commitment_leaf_does_not_collide_with_a_node_hash_of_the_same_secret() {
+    let secret = 424242;
+    let leaf = derive_backing_commitment(secret);
+    assert(
+        leaf != backing_tree_node_hash(secret, secret),
+        "Leaf domain and node domain must stay separated",
+    );
+}
+
+/// Real cross-check vector: `poseidon2_bn254::hash_bytes` (the Rust port
+/// `pallets/pallet-identity`/`runtime` both build on) computing
+/// `Poseidon2(DS_BACKING_COMMITMENT, 424242)` and `Poseidon2(DS_BACKING_NULLIFIER, 424242, 2)`
+/// — read via a temporary `#[test]` added to and then removed from
+/// `pallets/pallet-identity/src/tests.rs` (`cargo test -p pallet-identity-zk`), not fabricated.
+/// Confirms this crate's `Poseidon2::hash` and the Rust-side `poseidon2_bn254` crate agree on
+/// these two new preimages, the same way `anchor_verifier.rs`'s existing
+/// `calculate_param_commitment_matches_the_real_nargo_and_bb_vector` confirms it for the
+/// preexisting ones.
+#[test]
+fn backing_commitment_and_nullifier_match_the_real_rust_side_vector() {
+    let expected_commitment =
+        0x1f071df975e292fcbe1b3abc7042d88b0e063cd17af79a73ec1c47c7f0a84610;
+    assert_eq(derive_backing_commitment(424242), expected_commitment);
+
+    let expected_nullifier =
+        0x22b020294a8f8b82c34471b0c189da23fdacbbeaa2fec1427c327efa2b4d56e4;
+    assert_eq(derive_backing_nullifier(424242, 2), expected_nullifier);
+}
+
+/// Real cross-check of the full 32-level tree walk against `pallets/pallet-identity`'s own
+/// `recompute_backing_tree_path` for `leaf_index = 0` in an otherwise-empty tree (every
+/// sibling on the path is that pallet's `backing_tree_zero_hash(level)`, and the leaf is
+/// always the left child, since index stays even at every level of a `0` leaf index) — read
+/// via the same temporary pallet-side test as the vector above. This is the exact computation
+/// `../backing-nullifier` performs, so agreement here is what confirms this crate's tree
+/// hashing genuinely matches the tree the pallet publishes on-chain, not just a
+/// same-shaped-but-different one.
+#[test]
+fn backing_tree_root_matches_the_real_rust_side_vector_for_an_empty_tree_first_leaf() {
+    let leaf = derive_backing_commitment(424242);
+    let siblings: [Field; 32] = [
+        0x16a6d47edce7b0993b10816d6d4460cc0f9c01845de1d399e3b0f8aaadef0b6b,
+        0x0ff1c447d1ef5a528694a4136c2fb5a73c39955431759aa4933b26c82804d869,
+        0x127a2e0a0fabf20e79b74f0b1dc142ef34b1a2b96897949ca8eda9c44cc15cec,
+        0x24f38748daca7d742ff1e89fd2e392bc1b6f1350f2c6b535510bec20072653ee,
+        0x17cc1dad0ceb51eac2e61ae17ce872aa685f220975666a8219c0c48acd07a3d8,
+        0x2338faeb8f671731e719db24bc3120cd8fdca925f14222339790fb30096e4485,
+        0x2fd1363825730a9c256b4065cb46a7e077e3a7dd18d63a7fe43e9590a4b6491a,
+        0x0a074ddb0ca408f791508933f10d1d366b66aa53eeb1f57ecefd940eaba47d68,
+        0x2d393d8911c5db59aa9abfcc0e48a751bb1b0cbaad41dd2e60de454540dd65dc,
+        0x02b94f4247a758aac8c3142a10174941a1fc077bf9cbaad6ce5e3677d0e3d0ff,
+        0x1275a9f2fd5bebca3e76d36a0cea99034f873e8c91765de4b2bbe641a094b4d3,
+        0x0f937d9589069a406c8603b2ef608cf6213db4fc77fb036260a1fa5e41bafe49,
+        0x2888aff9c0711a4e9df287fb43f8db4dfe5d6cb6d2b44fce6c25fb657255e0be,
+        0x068d823f95c20eff7403f57dd08391ecddfb573af764bda91e4a7439c31cea44,
+        0x25c4e39a8e9fb74b45aa01654c45c8f35888c57a7073fe01d4db2dec3df3abf3,
+        0x1195bbd616681e2decf0aa8b5b1095e3418f8716eb12b2b852b772730d486ab4,
+        0x277e87d20bcad693093566d14a8f52ec11ba52e4a7f2bb4817dd24c2a382bb0f,
+        0x2ff5ff52088def59592b99e9ca9cfc806a11eb6529dc7a1d8804aff43ab919d7,
+        0x18f2680546dd4484f95f7e8a77881634cdf0053917e7142cce299f888ba35ebd,
+        0x2fdfd0706606aa1bdebaabb1a9252c40abacd3ee03006803e08ec7a6cc5a8dbd,
+        0x2c4f3fa50306c38d44f2c971a74767fddc6f34e094f06b01c19a25e6cbe80316,
+        0x16b241d5acc77ee8ff7c79930ccc934764c73a76e79049d4a1ca01ed347bc6ae,
+        0x2eae37a1dbdacf6b9ce433f16bd0103b7f5a52f923ba70e84a501de61a9da063,
+        0x2fab8211545d236550cbbab4fc8e8a37b68c639fadd87439f54d471427b0f747,
+        0x1a28702748167233ae3d78271b4ca3c924a4d20ceb3ed5e17ea44447b18e28ad,
+        0x2ea9b8751a33a12b4ff276ef8765edfbbde123e7744c1dd0666b3576deedd911,
+        0x2483d2673ca9c6860686a40d7273071a50e016d302d4b2b496983bb1595d54a7,
+        0x028e020c54878eb003e669b88af37968fc6c264937fece4ab11272dbf799f531,
+        0x0eb394a8caf49da0ec70349d38670a0624afa9240454be94242b63419f33ad0b,
+        0x19efdb04021cfb721d0f072340c01a4ab6de724381f9a3275152a40b0b6713ce,
+        0x15f5e50cac7670592a741d1151f2f0a3de253681590dc38b37a6f69e1a0ed54a,
+        0x1d74c0426d92db677c2ed90ca6d5ada72afc805a44c6bfa0e84bd81a90ce04da,
+    ];
+    let mut current = leaf;
+    for level in 0..32 {
+        // leaf_index = 0 stays even (left child) at every level.
+        current = backing_tree_node_hash(current, siblings[level]);
+    }
+    let expected_root = 0x09efbc7edc789c162ded75ed12f2d9e84fb8822535552d9d2f80ce535762f46e;
+    assert_eq(current, expected_root);
 }

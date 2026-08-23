@@ -7,6 +7,7 @@ pub mod apis;
 #[cfg(feature = "runtime-benchmarks")]
 mod benchmarks;
 pub mod anchor_verifier;
+pub mod backing_nullifier_verifier;
 pub mod configs;
 pub mod verifier;
 

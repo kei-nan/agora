@@ -65,10 +65,10 @@ Consequences:
 
 ## The circuits
 
-Seven binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
+Eight binaries and one shared library. The OPRF protocol is inherently two-round (blind → the
 committee evaluates → unblind), so a single circuit cannot cover it; `query`/`delegate-query`
 are round one and `anchor`/`disclosure`/`migrate`/`migrate-disclosure`/`delegate-persona` are
-round two.
+round two. `backing-nullifier` is neither — see below.
 
 | Package | ACIR opcodes | bb circuit size | Role |
 |---|---:|---:|---|
@@ -79,10 +79,15 @@ round two.
 | `migrate-disclosure` | 435,707 | 558,896 | Round 2, **pipeline-integrated** form of `migrate` (changelog entry 76) — same dual evaluation, shaped as a disclosure subproof, with an expiry check. Backs `verify_migration`. |
 | `delegate-query` | 6,733 | 12,113 | Round 1 for **delegate-persona creation** — a separate on-demand flow, not folded into registration. Structurally identical to `query`, blinds a *distinctly-scoped* delegate identity input instead. |
 | `delegate-persona` | 219,603 | 283,900 | Round 2, **pipeline-integrated**, for delegate-persona creation. Verifies 5 committees' responses to the delegate-scoped query, emits `delegate_persona_id`, and binds the citizen's chosen `persona_account` into `param_commitment` (anti-front-running). See "Delegate-persona derivation" below. |
+| `backing-nullifier` | 165 | 61 | **Not an OPRF circuit at all.** A standalone Semaphore/nullifier-scheme proof: Merkle-path membership in `pallet-identity`'s backing-commitment tree plus a range-checked slot index, over a secret the citizen already derived at registration. No passport, no committee round-trip. See "Backing-nullifier derivation" below. |
 
 `delegate-query`/`delegate-persona` are new in changelog entry 093 and are a genuinely separate
 feature from citizen registration: they run once, on demand, whenever a registered citizen
 chooses to become a delegate, never as part of `register_citizen`/`reverify_citizen`.
+`backing-nullifier` is separate again — see below — and is dramatically cheaper than every other
+circuit here (165 opcodes vs. the OPRF circuits' 200,000+) precisely because it does no OPRF
+verification and no passport parsing, only 32 levels of Poseidon2 hashing plus one field
+comparison.
 
 For reference, unmodified upstream `oprf-auth` measures **6,644** ACIR opcodes with the same
 toolchain. `query`'s fork costs **+89 opcodes** — the personal-number slice, the populated
@@ -202,6 +207,82 @@ so `check_delegate_persona` rejects it even though the underlying SNARK pairing 
 passes. `202` is a third Agora-specific proof-type tag (`delegate-persona/src/main.nr`'s
 `PROOF_TYPE_AGORA_DELEGATE_PERSONA`), deliberately distinct from registration's `200` and
 migration's `201`.
+
+### Backing-nullifier derivation
+
+`backing-nullifier` proves: "I know `backing_root_secret` (see `derive_backing_root_term`'s doc
+comment — the same value `anchor`/`disclosure` already derive and the citizen's wallet caches
+at registration) and a `slot_index` such that `Poseidon2(DS_BACKING_COMMITMENT,
+backing_root_secret)` is a leaf of `pallet-identity`'s published backing-commitment tree, and I
+derive `backing_nullifier` from them."
+
+```
+leaf              = Poseidon2(DS_BACKING_COMMITMENT, backing_root_secret)     // derive_backing_commitment, reused unchanged
+node_hash(l, r)   = Poseidon2(210, l, r)                                      // backing_tree_node_hash — must match pallet-identity's own tag 210 exactly
+backing_nullifier = Poseidon2(DS_BACKING_NULLIFIER, backing_root_secret, slot_index)
+
+assert slot_index < max_backings_per_citizen                                  // std::field::bn254::assert_lt — see below
+assert (leaf, walked up 32 levels via node_hash using leaf_index's bits) == root
+```
+
+`leaf_index`'s bit `level` selects direction at that level exactly the way
+`pallets/pallet-identity/src/lib.rs`'s `recompute_backing_tree_path` does (`index % 2 == 0` →
+left child, `index /= 2` per level) — confirmed by a real cross-check vector: a temporary
+pallet-side test computed a real root and 32 real siblings via the pallet's own
+`poseidon2_bn254`/`backing_tree_node_hash`/`backing_tree_zero_hash` functions, and this
+circuit's own `nargo test`/`nargo execute` reproduce the identical root and nullifier from the
+same inputs (see `lib/identity-anchor/src/tests.nr`'s
+`backing_tree_root_matches_the_real_rust_side_vector_for_an_empty_tree_first_leaf` and
+`backing-nullifier/Prover.toml`'s header). This is the load-bearing correctness property: the
+circuit's tree hashing genuinely matches the tree `pallet-identity` publishes on-chain, not a
+same-shaped-but-independently-invented one.
+
+**Why this is a standalone circuit, unlike the other seven.** Every other circuit here either
+parses DG1 directly or rides inside ZKPassport's outer proof because a standalone proof's
+`comm_in` would otherwise be an unauthenticated value the prover could pick freely (see "Why
+`disclosure`/`migrate-disclosure` exist" below). `backing-nullifier` touches no passport data —
+`backing_root_secret` is a value already derived once, at registration — so there is nothing to
+unsafely unbind *from*. It is verified as a genuine standalone UltraHonk pairing check, the same
+way `crate::verifier` verifies the outer passport proof, against its own VK
+(`runtime/src/backing_nullifier_verifier.rs`), never folded into any `param_commitments` array.
+
+**Why `delegate_persona_id` is a plain public input, not a `param_commitment`-style fold.**
+`delegate-persona` had to fold `persona_account` into `param_commitment` because the outer
+circuit's disclosure-subproof interface is a *fixed* 8-field layout with no room for a 9th slot.
+`backing-nullifier` has no such constraint — it is a standalone SNARK with a public-input list of
+its own choosing — and a SNARK's public inputs are cryptographically bound into the verification
+equation whether or not the circuit body's constraints reference them (this codebase already
+relies on exactly that for `disclosure`/`migrate-disclosure`'s unused-but-`pub`
+`service_scope`/`service_subscope`). `runtime/src/backing_nullifier_verifier.rs`'s
+`rejects_a_real_proof_resubmitted_against_a_different_delegate_persona_id` test confirms this
+empirically against a real bb 5.0.0 proof: flipping one bit of `delegate_persona_id` alone, with
+the proof bytes and every other public input untouched, is rejected. So an observer who lifts a
+valid `(proof, root, delegate_persona_id, max_backings_per_citizen, backing_nullifier)` tuple
+from the mempool cannot resubmit it against a different delegate — no hash-fold needed to
+achieve that here. `backing_nullifier`'s own formula deliberately excludes
+`delegate_persona_id` for a different reason: a citizen's slot nullifier should stay stable
+while they retarget that slot to a different delegate over time (a resubmitted-with-a-different-
+target proof is a *different SNARK statement*, rejected as above — it is not reusing the same
+nullifier for a different delegate, since nothing on-chain can force the caller to actually
+enforce that pairing; that enforcement is a future pallet consumer's job, same as everything
+else in "What this module does not check" in `backing_nullifier_verifier.rs`).
+
+**Why `max_backings_per_citizen` is a checked public input, not a compile-time circuit
+constant.** `pallet_elections::MaxBackingsPerCitizen` (`pallets/pallet-elections/src/lib.rs`) is
+a `StorageValue`, changeable via `set_election_params` under `ConstitutionalOrigin` — genuinely
+governance-mutable, not a fixed deployment constant. Baking a bound into the circuit would mean
+every governance change to the cap needs a new circuit, a new VK, and a hard migration cutover.
+Instead the bound travels as a public input, checked in-circuit only for internal consistency
+(`assert_lt(slot_index, max_backings_per_citizen)`); a future caller must additionally check it
+against the live `MaxBackingsPerCitizen` value before accepting the proof — the same
+storage-dependent-check split `runtime/src/anchor_verifier.rs`'s docs describe for
+`oprf_pk_hashes`. The comparison itself is `std::field::bn254::assert_lt`, a genuine full-field
+range-checked comparison — deliberately not a truncating `slot_index as u32 < max as u32` cast
+(Noir casts a `Field` to a smaller integer type by taking its low bits, not by range-checking
+it — see `noir-lang/noir`'s own `explainer-writing-noir.md`), which would let a `slot_index` far
+outside `u32` range pass a narrowed check while still producing a distinct, unbounded
+`backing_nullifier`, defeating the entire cap. `rejects_slot_index_far_beyond_the_cap` in
+`backing-nullifier/src/main.nr` pins this down as a regression test.
 
 ### Deliberate constraints
 
@@ -390,6 +471,25 @@ current_date, service_scope, service_subscope, param_commitment, 0, 0, 0]`, and 
 accepted the proof. Like `disclosure`/`migrate-disclosure` before it, this has not been run
 inside an actual outer proof or against a live (non-simulated) OPRF committee.
 
+### `oprf_backing_nullifier` — 4 fields
+
+| # | Name | Notes |
+|---|---|---|
+| 0 | `root` | a backing-commitment tree root; caller must check via `is_valid_backing_commitment_root` |
+| 1 | `delegate_persona_id` | the backing's target; caller must check this matches what the extrinsic claims |
+| 2 | `max_backings_per_citizen` | caller must check this equals the live `pallet_elections::MaxBackingsPerCitizen` |
+| 3 | `backing_nullifier` | the circuit's sole return value |
+
+Confirmed against a real `bb prove -t evm` run (this circuit's own `Prover.toml` fixture, built
+from the real cross-check vector "Backing-nullifier derivation" above describes): the
+`public_inputs` file is exactly 128 bytes (4 × 32), in this order — public parameters in
+declaration order followed by the one return value, the same Barretenberg convention every
+other layout in this document follows. Unlike every `..._disclosure`/`..._query` layout above,
+this one is **not** shaped by ZKPassport's outer-circuit interface at all — it is this circuit's
+own, freely-chosen public ABI, verified standalone by `runtime/src/backing_nullifier_verifier.rs`
+against its own VK (`runtime/assets/vk_backing_nullifier.bin`, the real `bb write_vk -t evm`
+output, 1888 bytes).
+
 ### Why `disclosure`/`migrate-disclosure` exist, and why a Rust verifier must use them
 
 `anchor` (and, identically, `migrate`) alone is **not safe to verify on-chain**. Each proves its
@@ -477,10 +577,10 @@ The `--workspace` flag on each command below is load-bearing, not decoration: th
 `Nargo.toml` sets `default-member = "anchor"`, which has no `#[test]`s of its own, so a bare
 `nargo test` run from this directory silently reports "Running 0 test functions" instead of
 erroring — it's *not* telling you the tests are broken, just that it only ran the default
-member. The real 21 tests live in `lib/identity-anchor` and only run with `--workspace` (or by
+member. The real 32 tests live in `lib/identity-anchor` and only run with `--workspace` (or by
 `cd`ing into `lib/identity-anchor` directly, or `--package identity_anchor`). We keep
 `default-member = "anchor"` rather than removing it, because removing it also changes the
-default scope of `nargo compile`/`nargo info`/`nargo execute` (they'd default to all 7 bin
+default scope of `nargo compile`/`nargo info`/`nargo execute` (they'd default to all 8 bin
 packages instead of just `anchor`), which is a bigger behavior change than this note is worth
 fixing via workspace restructuring. `default-member` also only accepts a single package path in
 this nargo version (1.0.0-beta.22), not an array, so listing both `anchor` and
@@ -489,12 +589,14 @@ this nargo version (1.0.0-beta.22), not an array, so listing both `anchor` and
 ```bash
 cd circuits/oprf-identity-anchor
 
-nargo compile --workspace     # 7 ACIR artifacts into target/
-nargo test --workspace        # 28 tests (21 in identity_anchor, 3 in oprf_identity_anchor_query,
+nargo compile --workspace     # 8 ACIR artifacts into target/
+nargo test --workspace        # 50 tests (32 in identity_anchor, 11 in oprf_backing_nullifier,
+                               #           3 in oprf_identity_anchor_query,
                                #           4 in oprf_delegate_persona_query)
 nargo info --workspace        # opcode counts
 
-# End-to-end on the query circuits (the only ones runnable without a committee):
+# End-to-end on the query circuits (round 1 of the OPRF flow — runnable without a committee,
+# but only produces a blinded query, not a usable anchor/nullifier on their own):
 nargo execute --package oprf_identity_anchor_query query_witness
 nargo execute --package oprf_delegate_persona_query delegate_query_witness
 mkdir -p target/bb
@@ -502,6 +604,20 @@ bb write_vk --scheme ultra_honk -b target/oprf_identity_anchor_query.json -o tar
 bb prove    --scheme ultra_honk -b target/oprf_identity_anchor_query.json \
             -w target/query_witness.gz -k target/bb/vk -o target/bb
 bb verify   --scheme ultra_honk -k target/bb/vk -p target/bb/proof -i target/bb/public_inputs
+
+# backing-nullifier needs no committee at all, ever (see "Backing-nullifier derivation" above) —
+# the only circuit in this workspace with a genuinely complete, self-contained round trip. Uses
+# `-t evm`/`-t evm-no-zk`, not the generic `--scheme ultra_honk` above, because that is the exact
+# target `runtime/src/backing_nullifier_verifier.rs`'s `ultrahonk::verify` primitive expects
+# (bb's `-t evm` VK/proof format, not its native poseidon2-transcript one):
+nargo execute --package oprf_backing_nullifier backing_nullifier_witness
+mkdir -p target/bb-backing-nullifier
+bb write_vk -t evm -b target/oprf_backing_nullifier.json -o target/bb-backing-nullifier
+bb prove    -t evm -b target/oprf_backing_nullifier.json \
+            -w target/backing_nullifier_witness.gz -k target/bb-backing-nullifier/vk \
+            -o target/bb-backing-nullifier
+bb verify   -t evm -k target/bb-backing-nullifier/vk -p target/bb-backing-nullifier/proof \
+            -i target/bb-backing-nullifier/public_inputs
 ```
 
 `query/Prover.toml` holds a fixture built on ZKPassport's own `SAMPLE_DG1` specimen. Its
@@ -595,6 +711,15 @@ Honest list. Several of these are blocking.
   resulting `(scheme_version, delegate_persona_id) -> persona_account` mapping on-chain, and
   rejects a reused `delegate_persona_id` (mirroring `IdentityAnchorRegistry`'s
   `AnchorAlreadyUsed` check) is future work.
+- **No pallet extrinsic calls `BackingNullifierVerifier::verify` yet.** `backing-nullifier`
+  and `runtime/src/backing_nullifier_verifier.rs` are the circuit and standalone verifier only —
+  a real, genuine end-to-end `nargo execute` → `bb write_vk -t evm` → `bb prove` → `bb verify`
+  round trip (both `-t evm` and `-t evm-no-zk`), but nothing on-chain checks `root` against
+  `is_valid_backing_commitment_root`, checks `delegate_persona_id` against what an extrinsic
+  claims, checks `max_backings_per_citizen` against the live `pallet_elections` value, or checks
+  `backing_nullifier` for prior reuse. Wiring a `pallet-elections` extrinsic that performs all
+  four and records the resulting backing is future work — see "Backing-nullifier derivation"
+  above and `backing-nullifier/src/main.nr`'s "Status" section.
 - **The 8-field layout was measured on a stubbed copy** of `disclosure` (in scratch, not in
   this repo) with the `verified_oprf` call replaced, since the real circuit cannot execute.
   Only the function body differed; the signature and returns were identical, and the ABI

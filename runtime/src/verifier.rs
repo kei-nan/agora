@@ -360,7 +360,7 @@ fn verify_inner(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> Option<()> {
 /// asset rather than caller data, so the one arithmetic edge in the crate's own
 /// public-input check (`combined_input_size - 8` underflowing for a nonsense VK) is not
 /// reachable from an extrinsic.
-mod ultrahonk {
+pub(crate) mod ultrahonk {
     use super::ProofVariant;
     use alloc::boxed::Box;
     use ultrahonk_no_std::{errors::VerifyError, ProofType};

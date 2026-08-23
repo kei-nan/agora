@@ -1,0 +1,10 @@
+[package]
+name = "oprf_backing_nullifier"
+type = "bin"
+authors = ["Agora"]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+# No `utils`/`common`/`oprf` deps: unlike every other circuit in this workspace, this one
+# is not a passport-parsing/OPRF-committee circuit at all — see src/main.nr's module docs.
+identity_anchor = { path = "../lib/identity-anchor" }
