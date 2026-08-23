@@ -372,6 +372,14 @@ impl pallet_identity_zk::Config for Runtime {
 	/// window; see `pallet_identity_zk::Config::MaxBackingRootHistoryEntries`'s doc comment for
 	/// why a large cap here stays cheap (a `StorageMap` ring, not a bounded vector).
 	type MaxBackingRootHistoryEntries = ConstU32<100_000>;
+	/// Real `Balances` -- backs `recover_account`'s `RecoveryBlockedNonzeroBalance` guard.
+	/// Not dev-mode-gated: it's a plain balance read, not a proof/ZK check, so there is
+	/// nothing for dev-mode to stub out (same reasoning as `CommitteeKeyChecker` below).
+	type Currency = Balances;
+	/// See `pallet_identity_zk::RecoveryStateChecker`'s doc comment. Not dev-mode-gated,
+	/// same reasoning as `Currency` above -- these are plain storage reads against
+	/// pallet-elections/pallet-legislature/pallet-executive, not proof checks.
+	type RecoveryStateChecker = Runtime;
 }
 
 #[cfg(not(feature = "dev-mode"))]
@@ -421,6 +429,10 @@ impl pallet_identity_zk::Config for Runtime {
 	type BackingRootHistoryWindowBlocks = ConstU32<{ 30 * DAYS }>;
 	/// See the `dev-mode` impl above for the same rationale.
 	type MaxBackingRootHistoryEntries = ConstU32<100_000>;
+	/// See the `dev-mode` impl above for the same rationale.
+	type Currency = Balances;
+	/// See the `dev-mode` impl above for the same rationale.
+	type RecoveryStateChecker = Runtime;
 }
 
 /// Passthrough MACI tally verifier — accepts all proofs. Dev-mode only, same mechanism as
@@ -698,6 +710,26 @@ impl pallet_courts::CitizenSuspender<BlockNumber> for Runtime {
 			suspension_until,
 			jury_reviewed,
 		)
+	}
+}
+
+/// Runtime implements `RecoveryStateChecker` by reading pallet-elections/pallet-legislature/
+/// pallet-executive's own storage directly — see `pallet_identity_zk::RecoveryStateChecker`'s
+/// doc comment for why this lives on `Runtime` rather than as a direct impl on any of those
+/// three pallets' own `Pallet<T>` (a circular crate dependency back onto pallet-identity-zk,
+/// the same reason `CitizenSuspender` above is Runtime-glue rather than a direct impl).
+impl pallet_identity_zk::RecoveryStateChecker<AccountId> for Runtime {
+	fn is_registered_delegate(who: &AccountId) -> bool {
+		pallet_elections::Delegates::<Runtime>::contains_key(who)
+	}
+
+	fn holds_legislature_seat(who: &AccountId) -> bool {
+		pallet_legislature::Members::<Runtime>::get().contains(who)
+	}
+
+	fn holds_cabinet_role(who: &AccountId) -> bool {
+		pallet_executive::MinisterPortfolio::<Runtime>::contains_key(who)
+			|| pallet_executive::PrimeMinister::<Runtime>::get().as_ref() == Some(who)
 	}
 }
 

@@ -28,6 +28,10 @@ sp-runtime.workspace = true
 # `pallet_emergency_council::EnsureActiveEmergency` origin rather than a hand-rolled stand-in —
 # see `src/mock.rs` and the `emergency_rotate_oprf_scheme_*` tests in `src/tests.rs`.
 pallet-emergency-council = { default-features = true, workspace = true }
+# Backs `Config::Currency` in the mock runtime (real `Currency<AccountId>`, not a stub) so
+# `recover_account`'s `RecoveryBlockedNonzeroBalance` guard is tested against genuine balance
+# storage — same idiom `pallet-courts`' own mock already uses for its `Config::Currency`.
+pallet-balances = { default-features = true, workspace = true }
 sp-core = { default-features = true, workspace = true }
 sp-io = { default-features = true, workspace = true }
 sp-runtime = { default-features = true, workspace = true }

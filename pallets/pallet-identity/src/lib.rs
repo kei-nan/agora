@@ -40,9 +40,9 @@ pub mod pallet {
 
     use codec::DecodeWithMemTracking;
     use frame_support::pallet_prelude::*;
-    use frame_support::traits::{EnsureOriginWithArg, UnixTime};
+    use frame_support::traits::{Currency, EnsureOriginWithArg, UnixTime};
     use frame_system::pallet_prelude::*;
-    use sp_runtime::traits::Saturating;
+    use sp_runtime::traits::{Saturating, Zero};
 
     /// Computes the domain-separated hash a legislature motion's `call_hash` must equal for
     /// `AdminOrigin` to authorize `tag`'s call with `params`. See
@@ -389,6 +389,23 @@ pub mod pallet {
         /// cap here cheap (each push/prune touches O(1) storage keys, not the whole history).
         #[pallet::constant]
         type MaxBackingRootHistoryEntries: Get<u32>;
+        /// AGR balance source for `recover_account`'s cross-pallet-orphaning guard (see
+        /// `Error::RecoveryBlockedNonzeroBalance`): rejects recovery outright if `old_account`
+        /// holds a nonzero free balance that would otherwise be silently stranded on an
+        /// account this call is about to fully invalidate. A plain `Currency<AccountId>` bound
+        /// — the same trait `pallet_courts::Config::Currency` already uses — rather than a
+        /// bespoke trait: nothing was already in this pallet's scope for reading a balance, and
+        /// `Currency` is the standard, off-the-shelf primitive for "does this account hold
+        /// funds", so no new bespoke coupling is needed beyond the ordinary `pallet_balances`
+        /// wiring every other balance-reading pallet in this runtime already has. Wired to
+        /// `Balances` in the runtime.
+        type Currency: Currency<Self::AccountId>;
+        /// See `RecoveryStateChecker`'s doc comment above for the full rationale (the
+        /// delegate/legislature-seat/cabinet-role legs of the same `recover_account` guard
+        /// `Config::Currency` above covers the balance leg of) and why this is a Runtime-glue
+        /// trait rather than a direct provider impl on pallet-elections/pallet-legislature/
+        /// pallet-executive's own `Pallet<T>`.
+        type RecoveryStateChecker: RecoveryStateChecker<Self::AccountId>;
     }
 
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
@@ -474,6 +491,45 @@ pub mod pallet {
             old_oprf_pk_hashes: [[u8; 32]; 5],
             new_oprf_pk_hashes: [[u8; 32]; 5],
         ) -> bool;
+    }
+
+    /// Checked by `recover_account` before rebinding a citizen's per-account identity storage
+    /// from `old_account` to a fresh `who`, to guard against silently orphaning state that
+    /// lives in *other* pallets and is keyed on `old_account`: a registered delegate persona
+    /// (pallet-elections), a legislature seat (pallet-legislature), or a cabinet role
+    /// (pallet-executive). See `recover_account`'s doc comment for the full rationale — this is
+    /// a divest-first guard, not a migration: a citizen who currently holds any of this state
+    /// must resign/withdraw via that pallet's own normal mechanism first, then recover. (An AGR
+    /// balance is checked the same way but via the separate `Config::Currency` bound below, not
+    /// this trait — see that item's doc comment for why. A pallet-anticorruption asset-
+    /// disclosure check was deliberately *not* added here: `submit_asset_disclosure` is callable
+    /// by any account at any time with no eligibility gate, so a lapsed or missing disclosure
+    /// under `old_account` is trivially re-filable under the new account in one call after
+    /// recovering — unlike a delegate persona/seat/cabinet role, there is no exclusive resource
+    /// to lose, so blocking on it would just be friction with no real protection.)
+    ///
+    /// Implemented by `Runtime` (see `runtime/src/configs/mod.rs`), not directly by
+    /// pallet-elections'/pallet-legislature's/pallet-executive's own `Pallet<T>` the way
+    /// `pallet_elections::DisclosureChecker` is implemented directly on
+    /// `pallet_anticorruption::Pallet<T>`: pallet-identity-zk is the foundational identity
+    /// crate other pallets already depend on (directly or transitively — pallet-elections
+    /// depends on it for `BackingRootChecker`'s provider side, for instance), so those pallets
+    /// implementing a pallet-identity-zk trait directly on their own `Pallet<T>` would need
+    /// pallet-identity-zk to depend on them in turn, a circular crate dependency. This mirrors
+    /// the existing `CitizenSuspender`-style Runtime-glue pattern instead (see `impl
+    /// pallet_courts::CitizenSuspender<BlockNumberFor<Runtime>> for Runtime` in
+    /// `runtime/src/configs/mod.rs`), just with the call direction reversed: there,
+    /// pallet-identity-zk is the provider being called *into*; here it's the consumer calling
+    /// *out*.
+    pub trait RecoveryStateChecker<AccountId> {
+        /// `true` if `who` currently has a registered delegate persona
+        /// (`pallet_elections::Delegates`), in any status (Pending/Active/OnBreak).
+        fn is_registered_delegate(who: &AccountId) -> bool;
+        /// `true` if `who` currently holds a legislature seat (`pallet_legislature::Members`).
+        fn holds_legislature_seat(who: &AccountId) -> bool;
+        /// `true` if `who` currently holds a cabinet role — Prime Minister or a portfolio
+        /// minister (`pallet_executive::PrimeMinister`/`MinisterPortfolio`).
+        fn holds_cabinet_role(who: &AccountId) -> bool;
     }
 
     /// Maps nullifier hash -> registered AccountId. Prevents double-registration.
@@ -969,6 +1025,20 @@ pub mod pallet {
         /// `recover_account`: `Config::MinBlocksBetweenRecoveries` has not yet passed since the
         /// last successful recovery for this nullifier.
         RecoveryCooldownActive,
+        /// `recover_account`: `old_account` holds a nonzero AGR balance. Recovery would strand
+        /// it on an account this call is about to fully invalidate — transfer it out (e.g. to
+        /// the new account) first, then recover.
+        RecoveryBlockedNonzeroBalance,
+        /// `recover_account`: `old_account` is a registered delegate persona
+        /// (`pallet-elections`). Deregister/resign the delegate persona first, then recover.
+        RecoveryBlockedActiveDelegate,
+        /// `recover_account`: `old_account` currently holds a legislature seat
+        /// (`pallet-legislature`). The seat cannot follow an account rebind — resign first,
+        /// then recover.
+        RecoveryBlockedLegislatureSeat,
+        /// `recover_account`: `old_account` currently holds a cabinet role — Prime Minister or
+        /// a portfolio minister (`pallet-executive`). Resign the role first, then recover.
+        RecoveryBlockedCabinetRole,
     }
 
     #[pallet::call]
@@ -1787,22 +1857,30 @@ pub mod pallet {
         /// tool under coercion (e.g. compelling someone to re-scan their own passport onto an
         /// attacker-controlled account). See `docs/project/next-steps.md` for the open item.
         ///
-        /// **Known, current gap — cross-pallet orphaning (not fixed by this call):** everything
-        /// rebound above is pallet-identity's own per-account storage, and *only* that. This
-        /// call does NOT touch, and has no visibility into, any other pallet's per-account
-        /// state. Concretely, after a successful recovery, all of the following stay bound to
-        /// `old_account` and are silently orphaned there — not moved, not frozen, not flagged:
-        /// the citizen's AGR balance, pallet-voting's budget/delegation state, pallet-elections'
-        /// delegate registration/backing, a legislature seat, a cabinet role, and
-        /// pallet-anticorruption's asset disclosures/conflict registry entries. A citizen who
-        /// recovers loses practical access to all of it unless they separately still hold
-        /// `old_account`'s keys (in which case they didn't need to recover in the first place).
-        /// Closing this needs a real cross-pallet `AccountMigrator` trait (mirroring the
-        /// existing `CitizenSuspender` pattern) spanning pallet-voting/elections/legislature/
-        /// executive/anticorruption — genuine, separate design/implementation work, not
-        /// attempted here. See `docs/project/pallets/identity.md`'s "Known limitation" section
-        /// and `docs/project/next-steps.md`. Any UI that calls this extrinsic must disclose this
-        /// plainly to the citizen before they confirm — see `mobile/src/screens/
+        /// **Cross-pallet orphaning — partially guarded, not migrated.** Everything rebound
+        /// above is pallet-identity's own per-account storage, and this call still does not
+        /// *move* any other pallet's per-account state — there is no cross-pallet
+        /// `AccountMigrator`, and building one (genuine, separate design/implementation work
+        /// spanning pallet-voting/elections/legislature/executive/anticorruption) is not
+        /// attempted here. What this call *does* do instead, since the fix above landed: reject
+        /// outright, before touching any storage, if `old_account` currently holds a nonzero
+        /// AGR balance (`Error::RecoveryBlockedNonzeroBalance`, `Config::Currency`), a
+        /// registered pallet-elections delegate persona
+        /// (`Error::RecoveryBlockedActiveDelegate`), a pallet-legislature seat
+        /// (`Error::RecoveryBlockedLegislatureSeat`), or a pallet-executive cabinet role
+        /// (`Error::RecoveryBlockedCabinetRole`) — see `RecoveryStateChecker`'s doc comment for
+        /// the full rationale and why a pallet-anticorruption asset-disclosure check was
+        /// deliberately left out of this list. This is a divest-first guard, not a migration: a
+        /// citizen who holds any of this state must resign/withdraw via that pallet's own
+        /// normal mechanism (e.g. transfer the balance, deregister the delegate persona, resign
+        /// the seat/role) *before* recovering, rather than either silently abandoning it (the
+        /// old behavior) or this call attempting to move it itself. pallet-voting's
+        /// budget/delegation state and pallet-anticorruption's conflict-registry entries remain
+        /// genuinely unguarded and still silently orphan on a successful recovery — real,
+        /// separate future work, tracked in `docs/project/next-steps.md`. See
+        /// `docs/project/pallets/identity.md`'s "Known limitation" section for the fuller
+        /// accounting. Any UI that calls this extrinsic must disclose the remaining gap plainly
+        /// to the citizen before they confirm — see `mobile/src/screens/
         /// RecoverAccountScreen.tsx`.
         #[pallet::call_index(20)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
@@ -1857,6 +1935,27 @@ pub mod pallet {
                 ));
                 ensure!(now >= earliest_next, Error::<T>::RecoveryCooldownActive);
             }
+
+            // ---- Guard: reject if old_account currently holds state this rebind would
+            // silently orphan in another pallet (see `RecoveryStateChecker`'s doc comment).
+            // A divest-first guard, not a migration — checked, and must fail closed, before
+            // any storage below is touched. ----
+            ensure!(
+                T::Currency::free_balance(&old_account).is_zero(),
+                Error::<T>::RecoveryBlockedNonzeroBalance
+            );
+            ensure!(
+                !T::RecoveryStateChecker::is_registered_delegate(&old_account),
+                Error::<T>::RecoveryBlockedActiveDelegate
+            );
+            ensure!(
+                !T::RecoveryStateChecker::holds_legislature_seat(&old_account),
+                Error::<T>::RecoveryBlockedLegislatureSeat
+            );
+            ensure!(
+                !T::RecoveryStateChecker::holds_cabinet_role(&old_account),
+                Error::<T>::RecoveryBlockedCabinetRole
+            );
 
             // ---- Rebind every per-account identity storage from old_account to who. ----
             NullifierRegistry::<T>::insert(nullifier, &who);

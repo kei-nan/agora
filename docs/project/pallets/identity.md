@@ -108,19 +108,45 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   recovery cannot be used to launder away an active court-ordered suspension. Emits
   `CitizenAccountRecovered { old_account, new_account, nullifier_hash }`.
 
-  **Known limitation — cross-pallet orphaning.** This call rebinds only the pallet-identity
-  storage listed above. It has no knowledge of, and does not touch, any other pallet's
-  per-account state. After a successful recovery, all of the following remain bound to
-  `old_account` and are silently orphaned there (not moved, not frozen, not flagged): the
-  citizen's AGR balance, pallet-voting budget/delegation state, pallet-elections delegate
-  registration/backing, a legislature seat, a cabinet role, and pallet-anticorruption asset
-  disclosures/conflict-registry entries. Closing this needs a real cross-pallet
-  `AccountMigrator` trait (mirroring the existing `CitizenSuspender` pattern) spanning
-  pallet-voting/elections/legislature/executive/anticorruption — real, separate future work,
-  tracked in `docs/project/next-steps.md`, not attempted as part of adding this call. A mobile
-  UI wrapper exists (`mobile/src/chain/identity.ts`'s `recoverAccount`,
-  `mobile/src/screens/RecoverAccountScreen.tsx`) and discloses this plainly to the citizen
-  before they can confirm — but the underlying gap is on-chain, not something any UI can fix.
+  **Cross-pallet orphaning — guarded, not migrated.** This call still only *rebinds*
+  pallet-identity's own storage listed above; it never moves any other pallet's per-account
+  state, and no cross-pallet `AccountMigrator` trait (mirroring `CitizenSuspender`) exists. What
+  it does do instead: before touching any storage, it now rejects outright if `old_account`
+  currently holds state the rebind would silently orphan. Four checks, each with its own error:
+  - a nonzero AGR balance — `Error::RecoveryBlockedNonzeroBalance`, via a plain
+    `Currency<AccountId>` bound (`Config::Currency`, wired to `Balances` in the runtime)
+  - a registered pallet-elections delegate persona (`Delegates`, any status) —
+    `Error::RecoveryBlockedActiveDelegate`
+  - a currently-held pallet-legislature seat (`Members`) —
+    `Error::RecoveryBlockedLegislatureSeat`
+  - a currently-held pallet-executive cabinet role, Prime Minister or portfolio minister
+    (`PrimeMinister`/`MinisterPortfolio`) — `Error::RecoveryBlockedCabinetRole`
+
+  The latter three are backed by a single `RecoveryStateChecker<AccountId>` trait pallet-identity
+  defines and `Runtime` implements (`runtime/src/configs/mod.rs`) by reading
+  pallet-elections'/pallet-legislature's/pallet-executive's storage directly — a Runtime-glue
+  impl rather than a direct impl on any of those pallets' own `Pallet<T>`, for the same reason
+  `CitizenSuspender` is Runtime-glue: pallet-identity-zk is the foundational identity crate those
+  pallets already depend on, so a direct impl on their `Pallet<T>` would need pallet-identity-zk
+  to depend back on them, a circular crate dependency.
+
+  This is a **divest-first guard, not a migration**: a citizen holding any of the above must
+  resign/withdraw via that pallet's own normal mechanism (transfer the balance, deregister the
+  delegate persona, resign the seat/role) *before* recovering — recovery then proceeds exactly
+  as before once nothing is left to orphan. A pallet-anticorruption asset-disclosure check was
+  deliberately **not** added: `submit_asset_disclosure` has no eligibility gate and is callable
+  by any account at any time, so a lapsed or missing disclosure under `old_account` is trivially
+  re-filable under the new account in a single call after recovering — unlike a delegate
+  persona/seat/cabinet role, there is no exclusive resource to lose, so blocking on it would add
+  friction without closing any real gap.
+
+  What's still genuinely unguarded and still silently orphans on a successful recovery:
+  pallet-voting's budget/delegation state and pallet-anticorruption's conflict-registry entries.
+  Closing those (and replacing the whole guard-based approach with an actual migration, should
+  that ever be wanted) remains real, separate future work, tracked in
+  `docs/project/next-steps.md`. A mobile UI wrapper exists (`mobile/src/chain/identity.ts`'s
+  `recoverAccount`, `mobile/src/screens/RecoverAccountScreen.tsx`) and discloses the remaining
+  gap plainly to the citizen before they can confirm.
 
 `AdminOrigin`, like `pallet-legislature::EnsureLegislatureMotion` elsewhere, is `EnsureOriginWithArg<_, [u8; 32]>`: each call above passes a domain-separated hash of its own parameters, checked against the specific motion that authorized it, so one passed motion can't be replayed to authorize a different call.
 

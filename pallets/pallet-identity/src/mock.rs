@@ -1,8 +1,12 @@
 use crate as pallet_identity_zk;
 use frame_support::derive_impl;
 use sp_runtime::BuildStorage;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 type Block = frame_system::mocking::MockBlock<Test>;
+pub type AccountId = u64;
+pub type Balance = u64;
 
 /// Test ZK proof verifier. Validity is controlled entirely by the proof bytes so tests
 /// stay deterministic and don't need any shared/thread-local state: a non-empty proof
@@ -109,11 +113,25 @@ mod runtime {
     // runtime actually wires `EmergencyRotationOrigin` in `runtime/src/configs/mod.rs`.
     #[runtime::pallet_index(2)]
     pub type EmergencyCouncil = pallet_emergency_council::Pallet<Test>;
+
+    // Wired only so `Config::Currency` below can be tested against real balance storage (the
+    // `recover_account` `RecoveryBlockedNonzeroBalance` guard) rather than a hand-rolled stand-
+    // in — same idiom `pallet-courts`' own mock uses for its `Config::Currency`.
+    #[runtime::pallet_index(3)]
+    pub type Balances = pallet_balances::Pallet<Test>;
 }
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
     type Block = Block;
+    type AccountId = AccountId;
+    type AccountData = pallet_balances::AccountData<Balance>;
+}
+
+#[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
+impl pallet_balances::Config for Test {
+    type AccountStore = System;
+    type Balance = Balance;
 }
 
 impl pallet_emergency_council::Config for Test {
@@ -182,6 +200,76 @@ impl pallet_identity_zk::Config for Test {
     // Small on purpose: big enough for tests to push a handful of roots and exercise the
     // count-cap eviction path without a large fixture.
     type MaxBackingRootHistoryEntries = frame_support::traits::ConstU32<3>;
+    // Real `pallet_balances::Pallet<Test>` (see the runtime block above), not a stub — so the
+    // `RecoveryBlockedNonzeroBalance` guard is tested against genuine balance storage, mirroring
+    // `pallet-courts`' own mock convention for its `Config::Currency`.
+    type Currency = Balances;
+    type RecoveryStateChecker = TestRecoveryStateChecker;
+}
+
+thread_local! {
+    /// Accounts `TestRecoveryStateChecker::is_registered_delegate` should report `true` for.
+    static REGISTERED_DELEGATES: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
+    /// Accounts `TestRecoveryStateChecker::holds_legislature_seat` should report `true` for.
+    static LEGISLATURE_SEAT_HOLDERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
+    /// Accounts `TestRecoveryStateChecker::holds_cabinet_role` should report `true` for.
+    static CABINET_ROLE_HOLDERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
+}
+
+/// Marks/unmarks `who` as a registered delegate for `TestRecoveryStateChecker` to report.
+/// Mirrors `pallet-elections`' own mock `set_current_disclosure`-style helper convention.
+pub fn set_registered_delegate(who: AccountId, registered: bool) {
+    REGISTERED_DELEGATES.with(|d| {
+        if registered {
+            d.borrow_mut().insert(who);
+        } else {
+            d.borrow_mut().remove(&who);
+        }
+    });
+}
+
+/// Marks/unmarks `who` as holding a legislature seat for `TestRecoveryStateChecker` to report.
+pub fn set_legislature_seat(who: AccountId, holds_seat: bool) {
+    LEGISLATURE_SEAT_HOLDERS.with(|s| {
+        if holds_seat {
+            s.borrow_mut().insert(who);
+        } else {
+            s.borrow_mut().remove(&who);
+        }
+    });
+}
+
+/// Marks/unmarks `who` as holding a cabinet role for `TestRecoveryStateChecker` to report.
+pub fn set_cabinet_role(who: AccountId, holds_role: bool) {
+    CABINET_ROLE_HOLDERS.with(|c| {
+        if holds_role {
+            c.borrow_mut().insert(who);
+        } else {
+            c.borrow_mut().remove(&who);
+        }
+    });
+}
+
+/// Test-only `RecoveryStateChecker`: reports membership in the thread-local sets above rather
+/// than depending on real pallet-elections/pallet-legislature/pallet-executive instances (this
+/// pallet's mock intentionally stays decoupled from those crates — the real cross-pallet
+/// wiring is exercised by the runtime's own integration, not by this pallet's unit tests).
+/// Mirrors `TestZkVerifier`/`TestAnchorVerifier`'s convention of a deterministic, data-driven
+/// stub above.
+pub struct TestRecoveryStateChecker;
+
+impl pallet_identity_zk::RecoveryStateChecker<AccountId> for TestRecoveryStateChecker {
+    fn is_registered_delegate(who: &AccountId) -> bool {
+        REGISTERED_DELEGATES.with(|d| d.borrow().contains(who))
+    }
+
+    fn holds_legislature_seat(who: &AccountId) -> bool {
+        LEGISLATURE_SEAT_HOLDERS.with(|s| s.borrow().contains(who))
+    }
+
+    fn holds_cabinet_role(who: &AccountId) -> bool {
+        CABINET_ROLE_HOLDERS.with(|c| c.borrow().contains(who))
+    }
 }
 
 // Build genesis storage according to the mock runtime.

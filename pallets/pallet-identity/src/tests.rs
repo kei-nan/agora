@@ -10,7 +10,7 @@ use crate::{
     OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
     SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens, BACKING_TREE_DEPTH,
 };
-use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
+use frame_support::{assert_noop, assert_ok, traits::{ConstU32, Currency}, BoundedVec};
 use sp_runtime::DispatchError;
 
 fn valid_proof() -> BoundedVec<u8, ConstU32<4096>> {
@@ -2591,6 +2591,173 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
 
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(3));
         assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(10));
+    });
+}
+
+// ─── recover_account: cross-pallet orphaning guard ─────────────────────────
+
+#[test]
+fn recover_account_fails_when_old_account_has_nonzero_balance() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        Balances::make_free_balance_be(&1, 100);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedNonzeroBalance
+        );
+        // The failed attempt must not have touched anything — still bound to account 1.
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // Divesting (transferring the balance out) unblocks recovery.
+        Balances::make_free_balance_be(&1, 0);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_fails_when_old_account_is_registered_delegate() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        set_registered_delegate(1, true);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedActiveDelegate
+        );
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // Divesting (deregistering the delegate persona) unblocks recovery.
+        set_registered_delegate(1, false);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_fails_when_old_account_holds_legislature_seat() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        set_legislature_seat(1, true);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedLegislatureSeat
+        );
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // Divesting (resigning the seat) unblocks recovery.
+        set_legislature_seat(1, false);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_fails_when_old_account_holds_cabinet_role() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        set_cabinet_role(1, true);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedCabinetRole
+        );
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // Divesting (resigning the cabinet role) unblocks recovery.
+        set_cabinet_role(1, false);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_succeeds_when_old_account_holds_none_of_the_blocking_state() {
+    // The happy path: an ordinary citizen with no balance, no delegate persona, no
+    // legislature seat, and no cabinet role recovers exactly as before the guard was added
+    // (mirrors `recover_account_rebinds_identity_storage_and_invalidates_old_account`, but
+    // stated explicitly here as the guard's own baseline/non-regression case).
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_eq!(Balances::free_balance(1), 0);
+
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
 }
 

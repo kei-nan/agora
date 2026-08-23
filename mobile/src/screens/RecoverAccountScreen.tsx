@@ -16,12 +16,18 @@
  * disclosure that must be visible and explicitly acknowledged before the citizen can
  * even start the re-scan. `recover_account` is instant, irreversible, and has no
  * dispute window (see the pallet's own doc comment on the extrinsic) — the old account
- * stops working the moment this succeeds, and it does NOT bring along the old
- * account's AGR balance, pallet-voting delegations/budget, pallet-elections delegate
- * backing, a legislature seat, a cabinet role, or anticorruption disclosures (see
- * `docs/project/pallets/identity.md`'s "Known limitation" section and
- * `../chain/identity.ts`'s `recoverAccount` doc comment). Undersell that here and a
- * citizen could lose access to funds/roles with no warning.
+ * stops working the moment this succeeds. The chain now REJECTS the call outright (see
+ * `Error::RecoveryBlocked*` on the pallet) if the old account still holds a nonzero AGR
+ * balance, a registered pallet-elections delegate persona, a legislature seat, or a
+ * cabinet role — so those specific losses can no longer happen silently, but the citizen
+ * still needs to divest/resign each one via its own normal flow before recovery will go
+ * through, and this screen has no UI yet to guide them through that (surfacing the
+ * rejected-call error as-is is the current state). Two things are NOT chain-guarded and
+ * still silently orphan on a successful recovery: pallet-voting delegations/budget and
+ * anticorruption conflict-registry entries (see `docs/project/pallets/identity.md`'s
+ * "Cross-pallet orphaning" section and `../chain/identity.ts`'s `recoverAccount` doc
+ * comment). Undersell either of those here and a citizen could lose access with no
+ * warning.
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
@@ -300,8 +306,10 @@ export default function RecoverAccountScreen({ navigation }: Props) {
       title: 'Recover this account?',
       message:
         'This cannot be undone. As soon as recovery succeeds, your old account stops working ' +
-        'immediately, and its AGR balance, delegations, delegate backing, legislature seat, and ' +
-        'cabinet role (if any) are NOT moved here — they stay on the old account and are lost.',
+        'immediately. If your old account still holds an AGR balance, a registered delegate ' +
+        'persona, a legislature seat, or a cabinet role, the chain will reject this recovery — ' +
+        'you must divest/resign each one from the old account first. Pallet-voting delegations ' +
+        'or budget tied to the old account are NOT chain-guarded and will still be lost.',
       confirmLabel: 'I understand, continue',
       destructive: true,
       onConfirm: () => setStep('form'),
@@ -330,10 +338,12 @@ export default function RecoverAccountScreen({ navigation }: Props) {
               access to it.
             </Text>
             <Text style={s.warnItem}>
-              • Your AGR token balance, pallet-voting delegations/budget, delegate registration and
-              backing, a legislature seat, and a cabinet role tied to the old account are NOT
-              transferred to this new account. They stay on the old, now-unusable account and are
-              effectively lost.
+              • None of this is transferred to the new account. For an AGR token balance, a
+              registered delegate persona, a legislature seat, or a cabinet role tied to the old
+              account, the chain will refuse to recover until you divest/resign each one from the
+              old account first — nothing here is silently lost. Pallet-voting delegations/budget
+              tied to the old account are the exception: those are NOT chain-checked and will be
+              lost.
             </Text>
             <Text style={s.warnItem}>
               • Only your core citizen identity (passport-linked registration) moves to this device.

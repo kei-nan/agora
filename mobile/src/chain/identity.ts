@@ -344,13 +344,18 @@ export interface RecoverAccountParams extends OuterProofPayload {
  * the extrinsic for the exact storage items rebound and the (deliberate) absence of a
  * dispute window.
  *
- * IMPORTANT — known gap this wrapper does NOT close (see `docs/project/pallets/identity.md`
- * and `docs/project/next-steps.md`): `recover_account` only rebinds pallet-identity's own
- * per-account storage. It does not move the old account's AGR balance, pallet-voting
- * budget/delegations, pallet-elections delegate registration/backing, a legislature seat,
- * a cabinet role, or pallet-anticorruption disclosures — all of that silently stays on the
- * old, now-unusable account. Any UI calling this must disclose that plainly before the
- * citizen confirms, not just document it here — see `RecoverAccountScreen.tsx`.
+ * IMPORTANT — remaining gap this wrapper does NOT close (see `docs/project/pallets/identity.md`
+ * and `docs/project/next-steps.md`): `recover_account` only *rebinds* pallet-identity's own
+ * per-account storage, it never moves any other pallet's state. As of the on-chain
+ * cross-pallet-orphaning guard, the call now REJECTS outright — before this promise resolves —
+ * if the old account holds a nonzero AGR balance, a registered pallet-elections delegate
+ * persona, a pallet-legislature seat, or a pallet-executive cabinet role (see the pallet's own
+ * `recover_account` doc comment for the exact `Error::RecoveryBlocked*` variants); callers of
+ * this function should surface that rejection as "divest/resign first, then recover" rather
+ * than a generic failure. What's still genuinely unguarded and silently orphaned: pallet-voting
+ * budget/delegations and pallet-anticorruption conflict-registry entries. Any UI calling this
+ * must disclose the remaining gap plainly before the citizen confirms, not just document it
+ * here — see `RecoverAccountScreen.tsx`.
  */
 export async function recoverAccount(params: RecoverAccountParams): Promise<void> {
   assertValidPublicInputs(params.outerCount, params.publicInputs);
