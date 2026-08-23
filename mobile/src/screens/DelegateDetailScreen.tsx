@@ -3,20 +3,30 @@ import {
   ActivityIndicator, ScrollView, StyleSheet,
   Text, TouchableOpacity, View,
 } from 'react-native';
+import { Buffer } from 'buffer';
 import { useFocusEffect } from '@react-navigation/native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
 import {
   fetchDelegateProfile, DelegateProfile,
-  backDelegate, removeBackingFromDelegate, isBackingDelegate,
+  isBackingDelegate,
+  fetchDelegatePersonaId, fetchMaxBackingsPerCitizen,
   delegateVote, revokeDelegation, fetchDelegateRegistry,
 } from '../chain/governance';
 import { getAllDelegations } from '../chain/citizenState';
+import { getBackingSlotFor, nextFreeBackingSlot } from '../chain/backingState';
 import { getSigningKeypair } from '../chain/identity';
 import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'DelegateDetail'>;
+
+/**
+ * Thrown at the exact point a real backing-nullifier proof would need to be generated — see
+ * `toggleBacking()`. Mirrors `RegisterDelegateScreen.tsx`/`RegisterScreen.tsx`'s own local
+ * `NotImplementedError`.
+ */
+class NotImplementedError extends Error {}
 
 const TOPICS = [
   { id: 0, label: 'General' },
@@ -42,7 +52,7 @@ export default function DelegateDetailScreen({ route }: Props) {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [durationDays, setDurationDays] = useState(90);
-  const { showError, showConfirm } = useAppModal();
+  const { showError, showConfirm, showInfo } = useAppModal();
 
   const DURATIONS = [
     { label: '30d',  days: 30 },
@@ -55,14 +65,14 @@ export default function DelegateDetailScreen({ route }: Props) {
   useFocusEffect(useCallback(() => {
     async function load() {
       const allDelegations = getAllDelegations();
-      // isBackingDelegate needs the signed-in citizen's own address, not the
-      // delegate's — passing '' (as this used to) always short-circuits to
-      // false (see governance.ts's isBackingDelegate doc comment), so the
-      // "Your Backing" section could never reflect a real existing backing.
-      const { keypair } = await getSigningKeypair();
+      // isBackingDelegate is now a local, this-session-only lookup, not a chain query — see
+      // governance.ts's/backingState.ts's doc comments for why nothing on-chain can answer
+      // "is citizen X backing delegate Y" any more under the unlinkable backing-nullifier
+      // design (commit 786b792). It genuinely can't reflect a backing made in a previous
+      // session or on another device.
       const [p, backing, registry] = await Promise.all([
         fetchDelegateProfile(address),
-        isBackingDelegate(keypair.address, address),
+        isBackingDelegate(address),
         fetchDelegateRegistry(),
       ]);
       setProfile(p);
@@ -94,7 +104,9 @@ export default function DelegateDetailScreen({ route }: Props) {
     if (isBacking) {
       showConfirm({
         title: 'Remove backing?',
-        message: 'Your account will no longer publicly back this delegate.',
+        message: "This removes your backing of this delegate. It was never publicly linkable "
+          + "to your account in the first place — the chain only ever saw an unlinkable "
+          + "cryptographic nullifier, never which delegate it targeted.",
         confirmLabel: 'Remove',
         destructive: true,
         onConfirm: toggleBacking,
@@ -103,8 +115,12 @@ export default function DelegateDetailScreen({ route }: Props) {
     }
     showConfirm({
       title: 'Back this delegate?',
-      message: 'Backing is public and permanent: it links your account to this delegate, and '
-        + 'anyone can query on-chain that you back them. This is not an anonymous endorsement.',
+      message: 'Backing proves — via a zero-knowledge proof — that a citizen in good standing '
+        + 'backs this delegate, without revealing which citizen. Only the delegate you name '
+        + 'here, in this dialog, and your own wallet, ever know it was you. Note this only '
+        + 'protects the content of your backing, not the fact that you submitted *some* '
+        + 'transaction: the account and timing of this action are still ordinary public chain '
+        + 'data, the same residual gap every identity-gated action in this app has.',
       confirmLabel: 'Back',
       onConfirm: toggleBacking,
     });
@@ -115,18 +131,55 @@ export default function DelegateDetailScreen({ route }: Props) {
     try {
       const { keypair } = await getSigningKeypair();
       if (isBacking) {
-        await removeBackingFromDelegate(keypair, address);
-        setIsBacking(false);
-        setProfile(p => p ? { ...p, backingCount: p.backingCount - 1 } : p);
+        const slotIndex = getBackingSlotFor(address);
+        if (slotIndex === null) {
+          throw new Error('No locally recorded backing slot for this delegate — cannot remove it this session.');
+        }
+        // Real, once it exists: re-proving the SAME (backingRootSecret, slotIndex) pair — the
+        // only thing that reproduces the exact backing_nullifier already recorded on-chain for
+        // this backing (`pallet-elections`' `remove_backing` requires it to match exactly) —
+        // needs the citizen's own cached backing_root_secret, which needs the same real OPRF
+        // committee round-trip `oprfCombine.ts` documents as unimplemented (see
+        // `zkProving.ts`'s `proveBackingNullifier` doc comment). Once it exists, that proof
+        // feeds `removeBackingFromDelegate(keypair, address, proof)` (`governance.ts`).
+        throw new NotImplementedError(
+          `Would re-prove backing-nullifier slot ${slotIndex} to remove this backing, but no ` +
+            'real backing_root_secret exists yet (blocked on the OPRF committee).',
+        );
       } else {
-        await backDelegate(keypair, address);
-        setIsBacking(true);
-        setProfile(p => p ? { ...p, backingCount: p.backingCount + 1 } : p);
+        const [delegatePersonaId, maxBackings] = await Promise.all([
+          fetchDelegatePersonaId(address),
+          fetchMaxBackingsPerCitizen(),
+        ]);
+        if (!delegatePersonaId) {
+          throw new Error('This delegate has no registered persona id on file — cannot back them.');
+        }
+        const slotIndex = nextFreeBackingSlot(maxBackings);
+        // Real, once it exists: `zkProving.ts`'s `proveBackingNullifier` — needs a fresh Merkle
+        // witness (`backingTree.ts`'s `fetchBackingMerkleWitness`, real today) over the
+        // citizen's own `leaf_index` (needs a real ZKPassport nullifier — not produced yet, see
+        // `identity.ts`'s `getSigningKeypair` doc comment) and `backing_root_secret` (needs the
+        // real OPRF committee round-trip — `oprfCombine.ts`'s documented stub).
+        throw new NotImplementedError(
+          `Would prove backing-nullifier slot ${slotIndex} targeting delegate_persona_id ` +
+            `0x${Buffer.from(delegatePersonaId).toString('hex')} — but real backing_root_secret ` +
+            'and leaf_index material do not exist yet (blocked on the OPRF committee and on a ' +
+            'real ZKPassport nullifier).',
+        );
       }
     } catch (e: any) {
-      showError('Backing failed', e, isBacking
-        ? 'Your backing could not be removed. Please try again.'
-        : 'Your backing could not be submitted. Please try again.');
+      if (e instanceof NotImplementedError) {
+        showInfo(
+          'Almost there',
+          "Backing a delegate needs the same on-device proving system as citizen registration, "
+            + "which isn't finished yet — please check back in a future update.",
+          __DEV__ ? e.message : undefined,
+        );
+      } else {
+        showError('Backing failed', e, isBacking
+          ? 'Your backing could not be removed. Please try again.'
+          : 'Your backing could not be submitted. Please try again.');
+      }
     } finally {
       setActionLoading(null);
     }
@@ -258,8 +311,8 @@ export default function DelegateDetailScreen({ route }: Props) {
             </Text>
             <Text style={s.backingRowSub}>
               {isBacking
-                ? 'You are endorsing this delegate — counts towards their 50-backer threshold. This is public and permanent, linked to your account.'
-                : 'Endorse them to help reach the 50-backer activation threshold. Backing is public and permanent — anyone can query that your account backs this delegate.'}
+                ? 'A zero-knowledge proof counts you towards their 50-backer threshold, without revealing which citizen you are. Shown here only because this device remembers backing them this session.'
+                : 'A zero-knowledge proof counts you towards the 50-backer activation threshold — unlike an ordinary on-chain action, it does not reveal which citizen backed them.'}
             </Text>
           </View>
           <TouchableOpacity
@@ -355,8 +408,10 @@ export default function DelegateDetailScreen({ route }: Props) {
       <View style={s.infoBox}>
         <Text style={s.infoText}>
           Backing and delegation are independent. Backing counts towards a delegate's eligibility
-          threshold. Delegation transfers your vote on a specific topic. You can do either or both.
-          No single delegate may hold more than 33% of total votes.
+          threshold, via an unlinkable zero-knowledge proof — nobody, including this delegate,
+          learns which citizens backed them. Delegation transfers your vote on a specific topic
+          and is an ordinary signed transaction, not private. You can do either or both. No
+          single delegate may hold more than 33% of total votes.
         </Text>
       </View>
     </ScrollView>

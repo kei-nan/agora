@@ -3,11 +3,10 @@ import {
   ActivityIndicator, ScrollView, StyleSheet,
   Text, TextInput, TouchableOpacity, View,
 } from 'react-native';
-// TextInput kept for the bio field
+// TextInput kept for the display-name and bio fields
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
-import { registerAsDelegate } from '../chain/governance';
-import { getSigningKeypair } from '../chain/identity';
+import { getOrCreateDelegatePersonaKeypair } from '../chain/keystoreWallet';
 import { getPassportName } from '../chain/citizenState';
 import { useAppModal } from '../components/AppModal';
 import { colors } from '../theme';
@@ -15,23 +14,59 @@ import { colors } from '../theme';
 type Props = NativeStackScreenProps<RootStackParamList, 'RegisterDelegate'>;
 type Step = 'idle' | 'submitting' | 'done';
 
+/**
+ * Thrown at the exact point real delegate-persona proving would need to run — see `submit()`.
+ * Mirrors `RegisterScreen.tsx`/`RecoverAccountScreen.tsx`'s own local `NotImplementedError`:
+ * a precise "everything real up to here worked, this specific next step doesn't exist yet"
+ * signal, not a generic failure.
+ */
+class NotImplementedError extends Error {}
+
 export default function RegisterDelegateScreen({ navigation }: Props) {
-  const passportName = getPassportName();
+  const isRegisteredCitizen = !!getPassportName();
+  const [displayName, setDisplayName] = useState('');
   const [bio, setBio] = useState('');
   const [step, setStep] = useState<Step>('idle');
-  const { showError } = useAppModal();
+  const { showError, showInfo } = useAppModal();
 
-  const canSubmit = !!passportName && step === 'idle';
+  const canSubmit = isRegisteredCitizen && displayName.trim().length > 0 && step === 'idle';
 
   async function submit() {
-    if (!passportName) return;
+    if (!canSubmit) return;
     setStep('submitting');
     try {
-      const { keypair } = await getSigningKeypair();
-      await registerAsDelegate(keypair, passportName, bio.trim());
-      setStep('done');
+      // Real: the delegate-persona account is a second, independent keypair — never the
+      // citizen's main wallet — generated/loaded the same hardware-backed way
+      // `keystoreWallet.ts` already does for it. This is the actual account the proof below
+      // would bind and that would sign register_as_delegate.
+      const personaKeypair = await getOrCreateDelegatePersonaKeypair();
+
+      // Real, once it exists: a fresh delegate-persona ZK proof (`zkProving.ts`'s
+      // `proveDelegatePersona`, circuit `circuits/oprf-identity-anchor/delegate-persona`)
+      // binding `personaKeypair.address` via a dedicated 5-committee OPRF round-trip, then
+      // `registerAsDelegate(personaKeypair, { ... })` (`governance.ts`) submitting it. Neither
+      // step can run yet: proving needs a real on-device Noir prover
+      // (`zkProving.ts`'s `NoirProverUnavailableError`) AND a real OPRF committee to answer
+      // the query round (`oprfCombine.ts`'s `combineCommitteeSlotResponses` is a documented,
+      // deliberate stub) — the same two dependencies ordinary citizen registration itself is
+      // blocked on (`RegisterScreen.tsx`).
+      throw new NotImplementedError(
+        `Delegate-persona account ready (${personaKeypair.address}) — but proving the ` +
+          'delegate-persona circuit needs both a real on-device Noir prover and a real OPRF ' +
+          'committee to answer its query round, neither of which exist in this build yet.',
+      );
     } catch (e: any) {
-      showError('Registration failed', e, 'Your delegate registration could not be submitted. Please try again.');
+      if (e instanceof NotImplementedError) {
+        showInfo(
+          'Almost there',
+          "Delegate registration needs the same on-device proving system as citizen " +
+            "registration, which isn't finished yet — please check back in a future update.",
+          __DEV__ ? e.message : undefined,
+        );
+      } else {
+        showError('Registration failed', e, 'Your delegate registration could not be submitted. Please try again.');
+      }
+    } finally {
       setStep('idle');
     }
   }
@@ -40,30 +75,42 @@ export default function RegisterDelegateScreen({ navigation }: Props) {
     <ScrollView style={s.container} contentContainerStyle={s.content} keyboardShouldPersistTaps="handled">
       <Text style={s.title}>Become a Delegate</Text>
       <Text style={s.subtitle}>
-        As a delegate your real name is publicly visible on-chain. Delegate registration uses
-        this same account you already vote with — there is no separate delegate identity, so
-        your full on-chain activity is publicly linkable to your public name once you register.
-        A future unlinkable delegate identity is planned but not built yet — and even once it
-        exists, funding that account from your known citizen account, or registering right
-        after other citizen activity, would still let outside observers connect the two by
-        ordinary chain analysis, not just by the missing cryptography.
+        Becoming a delegate now uses a genuinely separate on-chain identity — a second account,
+        proven by a dedicated ZK circuit to belong to a citizen in good standing, without
+        revealing which one. Your delegate persona's on-chain activity (this registration,
+        receiving vote delegations, term history) is not linkable back to your personal citizen
+        account by the cryptography itself. What this does NOT hide: your chosen display name
+        below is whatever you type — if you use your real name, or something recognizable, that
+        is a public choice, not something the protocol protects. And no cryptography can prevent
+        ordinary chain-analysis clues — funding this new persona account from your known citizen
+        account, or registering right after other identifiable activity, can still let an
+        outside observer connect the two. Finally, this whole feature — like every part of this
+        app gated on identity proofs — cannot actually be exercised yet: it depends on a real
+        OPRF committee that does not exist yet (see the in-app status note on the Identity
+        screen), so registering as a delegate isn't possible in this build.
       </Text>
 
       <View style={s.infoBox}>
-        <InfoRow icon="👤" text="Your display name is permanently public" />
-        <InfoRow icon="🔗" text="Links your public name to this account's full on-chain activity" />
+        <InfoRow icon="🕶️" text="A separate persona account — not your citizen account" />
+        <InfoRow icon="✍️" text="Your display name is whatever you choose to make public" />
         <InfoRow icon="📊" text="You need 50 citizen backers to become active" />
         <InfoRow icon="⏱" text="Max 3 consecutive terms, then a mandatory break" />
       </View>
 
-      <Text style={s.label}>Public Name</Text>
-      <View style={s.passportNameBox}>
-        <View style={s.passportNameLeft}>
-          <Text style={s.passportName}>{passportName ?? '—'}</Text>
-          <Text style={s.passportNameSub}>Verified from your passport · cannot be changed</Text>
-        </View>
-        <Text style={s.passportLock}>🔒</Text>
-      </View>
+      <Text style={s.label}>Display Name</Text>
+      <TextInput
+        style={s.input}
+        value={displayName}
+        onChangeText={setDisplayName}
+        placeholder="Chosen public name for this delegate persona"
+        placeholderTextColor={colors.textDim}
+        maxLength={64}
+        editable={step === 'idle'}
+        accessibilityLabel="Delegate display name"
+      />
+      {!isRegisteredCitizen && (
+        <Text style={s.notCitizenNote}>You must be a registered citizen to become a delegate.</Text>
+      )}
 
       <Text style={s.label}>Bio / Policy Positions <Text style={s.optional}>(optional)</Text></Text>
       <TextInput
@@ -142,15 +189,7 @@ const s = StyleSheet.create({
     borderRadius: 12, padding: 14, color: colors.textPrimary, fontSize: 14, marginBottom: 4,
   },
   bioInput: { height: 120, textAlignVertical: 'top', marginBottom: 4 },
-  passportNameBox: {
-    backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border,
-    borderRadius: 12, padding: 14, flexDirection: 'row', alignItems: 'center',
-    marginBottom: 20, gap: 12,
-  },
-  passportNameLeft: { flex: 1 },
-  passportName: { fontSize: 16, fontWeight: '600', color: colors.textPrimary, marginBottom: 3 },
-  passportNameSub: { fontSize: 11, color: colors.textDim },
-  passportLock: { fontSize: 18 },
+  notCitizenNote: { fontSize: 12, color: colors.warning, marginBottom: 20 },
   charCount: { fontSize: 11, color: colors.textDim, textAlign: 'right', marginBottom: 28 },
   submitBtn: {
     backgroundColor: colors.accent, paddingVertical: 16,

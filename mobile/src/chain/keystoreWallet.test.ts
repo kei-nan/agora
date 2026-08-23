@@ -176,3 +176,75 @@ describe('getOrCreateKeystoreKeypair', () => {
     expect(file.version).toBe(1); // overwritten with a freshly generated, correctly-versioned wallet
   });
 });
+
+const DELEGATE_PERSONA_WALLET_FILE_PATH = '/mock-documents/agora-delegate-persona-key.enc.json';
+
+describe('getOrCreateDelegatePersonaKeypair', () => {
+  it('throws when the Keystore module is not linked, without touching the filesystem', async () => {
+    jest.resetModules();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    require('react-native-fs').__reset();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rn = require('react-native');
+    delete rn.NativeModules.KeystoreSigningModule;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod: typeof KeystoreWalletModule = require('./keystoreWallet');
+
+    await expect(mod.getOrCreateDelegatePersonaKeypair()).rejects.toThrow(/not available/);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    await expect(require('react-native-fs').exists(DELEGATE_PERSONA_WALLET_FILE_PATH)).resolves.toBe(false);
+  });
+
+  it('generates and persists its own wallet file, distinct from the citizen wallet\'s', async () => {
+    const mod = loadModule();
+    await mod.getOrCreateDelegatePersonaKeypair();
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const rnfs = require('react-native-fs');
+    await expect(rnfs.exists(DELEGATE_PERSONA_WALLET_FILE_PATH)).resolves.toBe(true);
+    await expect(rnfs.exists(WALLET_FILE_PATH)).resolves.toBe(false); // the citizen wallet was never touched
+  });
+
+  it('is a genuinely different keypair (and address) than the citizen wallet, from an independent random seed', async () => {
+    const mod = loadModule();
+    const citizen = await mod.getOrCreateKeystoreKeypair();
+    const persona = await mod.getOrCreateDelegatePersonaKeypair();
+
+    expect(persona.address).not.toBe(citizen.address);
+    expect(Buffer.from(persona.publicKey)).not.toEqual(Buffer.from(citizen.publicKey));
+  });
+
+  it('reuses the same persisted seed across a simulated app restart, independent of the citizen wallet', async () => {
+    const first = loadModule();
+    const personaA = await first.getOrCreateDelegatePersonaKeypair();
+
+    jest.resetModules();
+    installFakeKeystoreModule();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const second: typeof KeystoreWalletModule = require('./keystoreWallet');
+    const personaB = await second.getOrCreateDelegatePersonaKeypair();
+
+    expect(personaB.address).toBe(personaA.address);
+  });
+
+  it('_resetCachedKeystoreKeypairForTests clears both cached keypairs', async () => {
+    const mod = loadModule();
+    const citizenA = await mod.getOrCreateKeystoreKeypair();
+    const personaA = await mod.getOrCreateDelegatePersonaKeypair();
+
+    mod._resetCachedKeystoreKeypairForTests();
+
+    // Same underlying files still exist, so re-deriving reaches the same addresses — this only
+    // proves the in-memory cache was actually cleared and re-populated (decrypt gets called
+    // again), not that a fresh seed was minted.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const native = require('react-native').NativeModules.KeystoreSigningModule;
+    const decryptCallsBefore = native.decryptSecret.mock.calls.length;
+    const citizenB = await mod.getOrCreateKeystoreKeypair();
+    const personaB = await mod.getOrCreateDelegatePersonaKeypair();
+
+    expect(citizenB.address).toBe(citizenA.address);
+    expect(personaB.address).toBe(personaA.address);
+    expect(native.decryptSecret.mock.calls.length).toBeGreaterThan(decryptCallsBefore);
+  });
+});

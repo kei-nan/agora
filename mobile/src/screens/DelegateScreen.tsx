@@ -21,11 +21,11 @@ const HELP = {
   registry:
     'Delegates are citizens who have publicly registered with their verified passport name. They represent other citizens on specific topics. You choose which topics — and for how long — you trust each delegate.',
   backing:
-    'Backing endorses a delegate as trustworthy. A delegate needs at least 50 backers to become Active and eligible to receive vote delegations. Backing is separate from delegation — you can back without delegating. Backing is public and permanent: it links your own account to the delegate\'s, and anyone can query exactly which citizens back which delegate — it is not an anonymous endorsement.',
+    'Backing endorses a delegate as trustworthy. A delegate needs at least 50 backers to become Active and eligible to receive vote delegations. Backing is separate from delegation — you can back without delegating. Backing is proven with a zero-knowledge proof that reveals only "some citizen in good standing backs this delegate" — not which citizen. Nobody, including the delegate, can query which citizens back them. This protects the content of your backing, not the fact that your account submitted some transaction at some time — that is still ordinary, publicly analyzable chain data, the same residual gap every identity-gated action in this app has.',
   termLimit:
     'To prevent permanent concentration of power, delegates serve a maximum number of consecutive terms before a mandatory break. The progress bar shows how far through their current term they are.',
   becomeDelegate:
-    'Registering as a delegate makes your verified name publicly visible and links it to this account permanently — there is no separate delegate identity, so this account\'s full on-chain activity becomes publicly attributable to your name. You start as Pending and need 50 backers to become Active. A private delegate identity is planned but not built; even once it exists, where the account\'s funds came from and when it submits transactions would remain publicly analyzable clues, separate from the cryptography itself.',
+    'Registering as a delegate now uses a genuinely separate on-chain identity — a second account, proven by a dedicated zero-knowledge circuit to belong to a citizen in good standing, without revealing which one. Your delegate persona\'s on-chain activity is not linkable back to your personal citizen account by the cryptography itself. This does not hide your chosen display name (whatever you type is public), and it does not prevent ordinary chain-analysis clues — e.g. funding the new persona account from your known citizen account. You start as Pending and need 50 backers to become Active.',
 };
 
 function HelpIcon({ title, message }: { title: string; message: string }) {

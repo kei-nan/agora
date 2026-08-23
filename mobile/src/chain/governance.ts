@@ -15,12 +15,12 @@
  */
 import { ApiPromise } from '@polkadot/api';
 import { KeyringPair } from '@polkadot/keyring/types';
-import { stringToU8a } from '@polkadot/util';
-import { sha256AsU8a } from '@polkadot/util-crypto';
 import { getApi } from './api';
 import * as votingChain from './voting';
 import * as constitutionChain from './constitution';
 import { removeDelegation, setDelegation } from './citizenState';
+import { clearBacking, isBackingDelegateLocally, recordBacking } from './backingState';
+import { OprfCommitteeKeyHashes } from './identity';
 import { submitExtrinsic } from './submitExtrinsic';
 
 // 12s block time (see runtime/src/lib.rs MILLI_SECS_PER_BLOCK) => 7200
@@ -314,40 +314,140 @@ export async function fetchDelegateProfile(address: string): Promise<DelegatePro
   );
 }
 
-export async function backDelegate(keypair: KeyringPair, address: string): Promise<void> {
-  const api = await getApi();
-  return submitExtrinsic(api.tx.palletElections.backDelegate(address), keypair);
-}
-
-export async function removeBackingFromDelegate(keypair: KeyringPair, address: string): Promise<void> {
-  const api = await getApi();
-  return submitExtrinsic(api.tx.palletElections.removeBacking(address), keypair);
+/**
+ * A proved `backing-nullifier` proof, ready for `back_delegate`/`remove_backing` — the exact
+ * shape `zkProving.ts`'s `proveBackingNullifier` returns. `remove_backing` requires *the same*
+ * proof `back_delegate` originally submitted (same `backingRootSecret`/`slotIndex`, hence the
+ * same `backing_nullifier`) — see `pallet-elections`' `remove_backing` doc comment for why a
+ * fresh proof over a different slot cannot unback an existing one.
+ */
+export interface BackingProofSubmission {
+  zkProof: Uint8Array;
+  publicInputs: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
 }
 
 /**
- * `address` is the checking citizen's own address, not the delegate's — pass
- * ''/undefined-ish values are treated as "not signed in yet" and short-circuit
- * to false rather than issuing an invalid storage query.
+ * Backs `delegate` with a real `backing-nullifier` proof (`pallet_elections::back_delegate`,
+ * call index 8, commit 786b792). `slotIndex` is whichever of the citizen's
+ * `0..maxBackingsPerCitizen` slots `proof` was built for (see `backingState.ts`'s
+ * `nextFreeBackingSlot`) — recorded locally on success via `backingState.ts`'s
+ * `recordBacking`, since nothing on-chain can answer "which slot did I use for this delegate"
+ * back to this wallet later (see that module's doc comment).
  */
-export async function isBackingDelegate(address: string, delegate: string): Promise<boolean> {
-  if (!address) return false;
-  const api = await getApi();
-  const entry = await api.query.palletElections.backingOf(address, delegate);
-  return (entry as any).isSome;
-}
-
-export async function registerAsDelegate(
+export async function backDelegate(
   keypair: KeyringPair,
-  displayName: string,
-  bio: string,
+  delegate: string,
+  proof: BackingProofSubmission,
+  slotIndex: number,
 ): Promise<void> {
   const api = await getApi();
-  // register_as_delegate requires a real 32-byte profile_ipfs_hash. No IPFS
-  // upload client exists yet in this app (see CLAUDE.md's P1 remaining-work
-  // item / constitution.ts's TODO for the same gap on proposeAmendment). This
-  // hashes the bio text locally as a placeholder purely so the call is
-  // well-typed — it is NOT a real IPFS content hash and nothing is actually
-  // pinned anywhere.
-  const profileHash = sha256AsU8a(stringToU8a(bio || displayName));
-  return submitExtrinsic(api.tx.palletElections.registerAsDelegate(displayName, profileHash), keypair);
+  await submitExtrinsic(
+    api.tx.palletElections.backDelegate(delegate, proof.zkProof, proof.publicInputs),
+    keypair,
+  );
+  recordBacking(delegate, slotIndex);
+}
+
+/**
+ * Removes an existing backing of `delegate` (`pallet_elections::remove_backing`, call index 9).
+ * `proof` must be *the same* proof (same `backingRootSecret`/`slotIndex`, hence the same
+ * `backing_nullifier`) that originally backed `delegate` — see `BackingProofSubmission`'s doc
+ * comment.
+ */
+export async function removeBackingFromDelegate(
+  keypair: KeyringPair,
+  delegate: string,
+  proof: BackingProofSubmission,
+): Promise<void> {
+  const api = await getApi();
+  await submitExtrinsic(
+    api.tx.palletElections.removeBacking(delegate, proof.zkProof, proof.publicInputs),
+    keypair,
+  );
+  clearBacking(delegate);
+}
+
+/**
+ * Whether this session's wallet currently records backing `delegate`.
+ *
+ * Unlike before commit 786b792, this is **not** a chain query — `pallet-elections`' old
+ * plaintext `BackingOf(citizen, delegate)` map is gone, replaced by a nullifier that reveals
+ * nothing about which delegate it targets to an outside observer (that is the entire point of
+ * the redesign — see `backingState.ts`'s doc comment). A citizen's own wallet is now the only
+ * thing that can answer this question, and only for the session it made the backing in (no
+ * durable persistence yet — same doc comment). This is a synchronous local lookup, kept `async`
+ * only so existing `await isBackingDelegate(...)` call sites did not need to change.
+ */
+export async function isBackingDelegate(delegate: string): Promise<boolean> {
+  return isBackingDelegateLocally(delegate);
+}
+
+/** `pallet-elections`' `DelegatePersonaIdOf(delegate)` — the delegate's stable persona id, needed as a `backing-nullifier` proof's `delegate_persona_id` public input. `null` if `delegate` has no registered persona (not actually a delegate). */
+export async function fetchDelegatePersonaId(delegate: string): Promise<Uint8Array | null> {
+  const api = await getApi();
+  const entry = await api.query.palletElections.delegatePersonaIdOf(delegate);
+  if ((entry as any).isNone) return null;
+  return (entry as any).unwrap().toU8a() as Uint8Array;
+}
+
+/** `pallet-elections`' live `MaxBackingsPerCitizen` governance parameter — needed as a `backing-nullifier` proof's `max_backings_per_citizen` public input, and by `backingState.ts`'s `nextFreeBackingSlot`. */
+export async function fetchMaxBackingsPerCitizen(): Promise<number> {
+  const api = await getApi();
+  const value = await api.query.palletElections.maxBackingsPerCitizen();
+  return (value as any).toNumber();
+}
+
+/**
+ * Parameters for `register_as_delegate` (`pallet_elections`, call index 7, commits 2e07f68/
+ * 786b792): a real delegate-persona ZK proof (`zkProving.ts`'s `proveDelegatePersona`) plus the
+ * OPRF material it was derived under. Must be submitted signed by the delegate-persona account
+ * itself (`persona_account == ensure_signed(origin)`, `Error::PersonaAccountMismatch`
+ * otherwise) — see `registerAsDelegate`'s `personaKeypair` parameter, sourced from
+ * `keystoreWallet.ts`'s `getOrCreateDelegatePersonaKeypair`, never the citizen's main wallet
+ * keypair.
+ */
+export interface RegisterAsDelegateParams {
+  delegatePersonaId: Uint8Array;
+  zkProof: Uint8Array;
+  publicInputs: readonly Uint8Array[];
+  schemeVersion: number;
+  oprfPkHashes: OprfCommitteeKeyHashes;
+  displayName: string;
+  /**
+   * A real 32-byte IPFS content hash. No IPFS upload client exists yet in this app (see
+   * CLAUDE.md's P1 remaining-work item / constitution.ts's TODO for the same gap on
+   * proposeAmendment) — a caller with nothing real to upload yet may pass a locally-hashed
+   * placeholder (e.g. `sha256AsU8a(stringToU8a(bio))`), but that is NOT a real IPFS content
+   * hash and nothing is actually pinned anywhere; this function does not fabricate one itself.
+   */
+  profileIpfsHash: Uint8Array;
+}
+
+/**
+ * Registers `personaKeypair`'s account as a delegate under a fresh, ZK-derived persona.
+ *
+ * `personaKeypair` — NOT the citizen's regular signing keypair — is both the transaction's
+ * signer and the `persona_account` the proof binds (see `RegisterAsDelegateParams`'s doc
+ * comment); this is what makes the resulting delegate identity genuinely separate from the
+ * citizen's own on-chain activity, unlike the pre-786b792 scheme where delegate registration
+ * reused the citizen's own account outright.
+ */
+export async function registerAsDelegate(
+  personaKeypair: KeyringPair,
+  params: RegisterAsDelegateParams,
+): Promise<void> {
+  const api = await getApi();
+  return submitExtrinsic(
+    api.tx.palletElections.registerAsDelegate(
+      personaKeypair.address,
+      params.delegatePersonaId,
+      params.zkProof,
+      params.publicInputs,
+      params.schemeVersion,
+      params.oprfPkHashes,
+      params.displayName,
+      params.profileIpfsHash,
+    ),
+    personaKeypair,
+  );
 }

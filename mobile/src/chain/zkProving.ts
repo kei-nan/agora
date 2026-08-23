@@ -53,6 +53,7 @@
 import { hexToU8a } from '@polkadot/util';
 import bs58 from 'bs58';
 import RNFS from 'react-native-fs';
+import { encodeBackingNullifierProof } from './backingNullifierEncoding';
 import { encodeUltraHonkProof, splitPublicInputs } from './proofEncoding';
 
 /** Default public IPFS gateway — matches the desktop app's `fetch_ipfs_content` default (desktop/src-tauri/src/commands/chain.rs). */
@@ -413,6 +414,127 @@ export async function proveMigration(
   options: ProvingOptions = {},
 ): Promise<RegistrationProof> {
   return proveRegistration(baseSubproofs, disclosureSubproofs, outer, options);
+}
+
+/**
+ * Produces the outer ZKPassport proof for delegate-persona creation
+ * (`pallet_elections::register_as_delegate`, commit 2e07f68's `delegate-persona` circuit).
+ *
+ * Mechanically identical to registration/reverification/migration — a `delegate-persona` proof
+ * is disclosure-shaped and rides inside the outer circuit exactly the way `disclosure` does (see
+ * `circuits/oprf-identity-anchor/delegate-persona/src/main.nr`'s module docs for why: its
+ * `comm_in` needs the same outer-proof authentication `disclosure`'s does, closing the same
+ * unauthenticated-private-witness gap). Pass a single `delegate-persona` circuit request as
+ * `disclosureSubproofs[0]` — its `inputs` must include `persona_account` (the delegate-persona
+ * `AccountId` being bound, see `runtime/src/anchor_verifier.rs`'s `check_delegate_persona`) in
+ * addition to the same passport-derived salted fields `disclosure` itself needs.
+ *
+ * Unlike registration/reverification, this proof is not about the citizen's own passport-bound
+ * identity continuing to hold — `delegate_persona_id` is a *fresh*, distinctly-scoped OPRF
+ * evaluation (see `derive_delegate_identity_input`'s doc comment in
+ * `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr` for why fresh scoping, not
+ * reuse, is what makes the resulting persona unlinkable from the citizen's registration
+ * identity) — so `outer.inputs`' OPRF-proof material (`oprf_proofs`) must come from that
+ * distinctly-scoped `delegate-query` round, not whatever round produced the citizen's
+ * registration `anchor`.
+ */
+export async function proveDelegatePersona(
+  baseSubproofs: readonly SubproofRequest[],
+  delegatePersonaSubproof: SubproofRequest,
+  outer: OuterProofInputs,
+  options: ProvingOptions = {},
+): Promise<RegistrationProof> {
+  return proveRegistration(baseSubproofs, [delegatePersonaSubproof], outer, options);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone Noir circuits (not ZKPassport subproofs)
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything the `backing-nullifier` circuit
+ * (`circuits/oprf-identity-anchor/backing-nullifier`) needs to prove — see that circuit's
+ * `main.nr` doc comment for the full statement. `root`/`merkleSiblings` should come from a
+ * *fresh* call to `backingTree.ts`'s `fetchBackingMerkleWitness` made right before proving (see
+ * that module's doc comment for why a cached witness goes stale); `delegatePersonaId` from
+ * `pallet-elections`' `DelegatePersonaIdOf(delegate)`; `maxBackingsPerCitizen` from
+ * `MaxBackingsPerCitizen`. `backingRootSecret`/`slotIndex`/`leafIndex` are the citizen's own
+ * stable secret material — this function does not derive them (see this module's and
+ * `oprfCombine.ts`'s doc comments for why: deriving `backingRootSecret` needs the same
+ * OPRF-committee round-trip `combineCommitteeSlotResponses` documents as unimplemented, and
+ * `leafIndex` needs a real ZKPassport nullifier `identity.ts` does not yet produce either) —
+ * a caller supplies them, mirroring `identity.ts`'s `RegisterCitizenParams.anchor` convention of
+ * taking already-derived anchor material as a parameter rather than deriving it inline.
+ */
+export interface BackingNullifierProveRequest {
+  root: bigint;
+  delegatePersonaId: bigint;
+  maxBackingsPerCitizen: bigint;
+  backingRootSecret: bigint;
+  slotIndex: bigint;
+  leafIndex: bigint;
+  /** Exactly `BACKING_TREE_DEPTH` (32) sibling hashes, level 0 (adjacent to the leaf) first. */
+  merkleSiblings: readonly bigint[];
+  /** 32-byte SHA-256 content hash (hex) of the compiled `backing-nullifier` ACIR artifact. */
+  bytecodeHash: string;
+}
+
+/** The finished `backing-nullifier` proof, ready for `pallet_elections::back_delegate`/`remove_backing`'s `zk_proof`/`public_inputs` arguments. */
+export interface BackingNullifierProveResult {
+  /** `zk_proof` — the envelope `backing_nullifier_verifier.rs` parses. */
+  zkProof: Uint8Array;
+  /** `public_inputs` — `[root, delegate_persona_id, max_backings_per_citizen, backing_nullifier]`, 32-byte big-endian fields. */
+  publicInputs: [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
+}
+
+const BACKING_NULLIFIER_MERKLE_DEPTH = 32;
+
+/**
+ * Proves the `backing-nullifier` circuit and encodes the result for on-chain submission.
+ *
+ * Unlike every ZKPassport-pipeline function above, this circuit is standalone — it never rides
+ * inside an outer proof, so it is proved directly with the `evm` (keccak) target, the same
+ * target the outer ZKPassport proof itself uses, since this is the proof that gets verified
+ * on-chain (see `circuits/oprf-identity-anchor/backing-nullifier/src/main.nr`'s module docs —
+ * "verified the same way `crate::verifier` verifies the outer ZKPassport proof: a genuine
+ * standalone UltraHonk pairing check").
+ */
+export async function proveBackingNullifier(
+  request: BackingNullifierProveRequest,
+  options: ProvingOptions = {},
+): Promise<BackingNullifierProveResult> {
+  if (request.merkleSiblings.length !== BACKING_NULLIFIER_MERKLE_DEPTH) {
+    throw new RangeError(
+      `proveBackingNullifier: expected ${BACKING_NULLIFIER_MERKLE_DEPTH} merkle siblings, got ${request.merkleSiblings.length}`,
+    );
+  }
+
+  const prover = getNoirProver();
+  const bytecodePath = await fetchZkAsset(request.bytecodeHash, options.gatewayUrl);
+  const witness = await prover.execute(bytecodePath, {
+    root: request.root,
+    delegate_persona_id: request.delegatePersonaId,
+    max_backings_per_citizen: request.maxBackingsPerCitizen,
+    backing_root_secret: request.backingRootSecret,
+    slot_index: request.slotIndex,
+    leaf_index: request.leafIndex,
+    merkle_siblings: request.merkleSiblings,
+  });
+  const proved = await prover.prove(bytecodePath, witness, 'evm');
+  options.onProgress?.('backing-nullifier', 1, 1);
+
+  const publicInputWords = splitPublicInputs(proved.publicInputs);
+  if (publicInputWords.length !== 4) {
+    throw new Error(
+      `proveBackingNullifier: prover returned ${publicInputWords.length} public-input words, expected 4 ` +
+        '(root, delegate_persona_id, max_backings_per_citizen, backing_nullifier)',
+    );
+  }
+
+  return {
+    zkProof: encodeBackingNullifierProof(proved.proof, 'zk'),
+    publicInputs: publicInputWords as [Uint8Array, Uint8Array, Uint8Array, Uint8Array],
+  };
 }
 
 /**

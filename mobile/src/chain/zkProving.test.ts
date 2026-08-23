@@ -10,12 +10,16 @@
  * Those are exactly the things that are easy to get quietly wrong and produce proofs that
  * fail with no useful diagnostic.
  */
+import { decodeBackingNullifierProof } from './backingNullifierEncoding';
 import { decodeUltraHonkProof } from './proofEncoding';
 import {
+  BackingNullifierProveRequest,
   BASE_SUBPROOF_CIRCUITS,
   NoirProver,
   NoirProverUnavailableError,
   outerCircuitFor,
+  proveBackingNullifier,
+  proveDelegatePersona,
   proveMigration,
   proveRegistration,
   proveReverification,
@@ -306,6 +310,141 @@ describe('proveMigration', () => {
       'migrate-disclosure/bytes',
       'main/outer/count_4',
     ]);
+  });
+});
+
+/**
+ * `proveDelegatePersona` (commit 2e07f68's `delegate-persona` circuit): another thin wrapper
+ * over `proveRegistration`'s exact mechanics, this time over exactly one `delegate-persona`
+ * subproof — see `proveReverification`'s test block above for the precedent this mirrors.
+ */
+describe('proveDelegatePersona', () => {
+  it('produces the identical outer-proof shape proveRegistration does, over a single delegate-persona subproof', async () => {
+    const { prover, proveCalls } = fakeProver();
+    setNoirProver(prover);
+
+    const result = await proveDelegatePersona(
+      baseRequests,
+      request('delegate-persona/bytes', 6),
+      { bytecodeHash: assetHash(9), inputs: {} },
+    );
+
+    expect(proveCalls).toHaveLength(5); // 3 base + 1 delegate-persona + 1 outer
+    expect(proveCalls[4].target).toBe('evm');
+    expect(result.outerCount).toBe(4);
+    expect(decodeUltraHonkProof(result.zkProof).header.outerCount).toBe(4);
+    expect(result.publicInputs).toHaveLength(9);
+  });
+
+  it('fails loudly when no prover is registered, same as proveRegistration', async () => {
+    setNoirProver(null);
+    await expect(
+      proveDelegatePersona(baseRequests, request('delegate-persona/bytes', 6), {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(NoirProverUnavailableError);
+  });
+
+  it('still enforces base-subproof ordering', async () => {
+    const { prover } = fakeProver();
+    setNoirProver(prover);
+
+    const swapped = [baseRequests[1], baseRequests[0], baseRequests[2]];
+    await expect(
+      proveDelegatePersona(swapped, request('delegate-persona/bytes', 6), {
+        bytecodeHash: assetHash(9),
+        inputs: {},
+      }),
+    ).rejects.toThrow(/order matters/);
+  });
+});
+
+/**
+ * `proveBackingNullifier` (`circuits/oprf-identity-anchor/backing-nullifier`): unlike every
+ * function above, this circuit is standalone — no base subproofs, no outer circuit, a single
+ * `execute`/`prove` round trip against the `evm` target directly (see that circuit's module
+ * docs: verified the same way the outer ZKPassport proof itself is, a genuine standalone
+ * pairing check, not folded into anything).
+ */
+describe('proveBackingNullifier', () => {
+  function fakeBackingProver(): { prover: NoirProver; proveCalls: ProveCall[] } {
+    const proveCalls: ProveCall[] = [];
+    const prover: NoirProver = {
+      async execute() {
+        return new Uint8Array([9, 9, 9]);
+      },
+      async prove(bytecodePath, _witness, target) {
+        proveCalls.push({ bytecodePath, target });
+        const publicInputs = new Uint8Array(32 * 4); // root, delegate_persona_id, max_backings_per_citizen, backing_nullifier
+        publicInputs[32 * 3 + 31] = 0xab; // a non-zero backing_nullifier
+        return {
+          proof: new Uint8Array(32 * 61).fill(0xef), // this circuit's real bb-reported size, per e31257a
+          publicInputs,
+          verificationKey: new Uint8Array(1888),
+        };
+      },
+    };
+    return { prover, proveCalls };
+  }
+
+  function backingRequest(): BackingNullifierProveRequest {
+    return {
+      root: 1n,
+      delegatePersonaId: 2n,
+      maxBackingsPerCitizen: 50n,
+      backingRootSecret: 3n,
+      slotIndex: 0n,
+      leafIndex: 4n,
+      merkleSiblings: Array.from({ length: 32 }, (_, i) => BigInt(i)),
+      bytecodeHash: assetHash(11),
+    };
+  }
+
+  it('fails loudly when no prover is registered', async () => {
+    setNoirProver(null);
+    await expect(proveBackingNullifier(backingRequest())).rejects.toThrow(NoirProverUnavailableError);
+  });
+
+  it('proves directly against the evm target — no recursive subproofs', async () => {
+    const { prover, proveCalls } = fakeBackingProver();
+    setNoirProver(prover);
+
+    await proveBackingNullifier(backingRequest());
+
+    expect(proveCalls).toHaveLength(1);
+    expect(proveCalls[0].target).toBe('evm');
+  });
+
+  it('produces an envelope the backing-nullifier runtime verifier will parse, with 4 public inputs', async () => {
+    const { prover } = fakeBackingProver();
+    setNoirProver(prover);
+
+    const result = await proveBackingNullifier(backingRequest());
+
+    const decoded = decodeBackingNullifierProof(result.zkProof);
+    expect(decoded.header).toEqual({ variant: 'zk', proofLength: 32 * 61 });
+    expect(result.publicInputs).toHaveLength(4);
+    expect(result.publicInputs.every((value) => value.length === 32)).toBe(true);
+  });
+
+  it('rejects a request with the wrong number of merkle siblings', async () => {
+    const { prover } = fakeBackingProver();
+    setNoirProver(prover);
+
+    await expect(
+      proveBackingNullifier({ ...backingRequest(), merkleSiblings: [1n, 2n] }),
+    ).rejects.toThrow(/merkle siblings/);
+  });
+
+  it('reports progress once, for the single proving step', async () => {
+    const { prover } = fakeBackingProver();
+    setNoirProver(prover);
+
+    const stages: string[] = [];
+    await proveBackingNullifier(backingRequest(), { onProgress: (stage) => stages.push(stage) });
+
+    expect(stages).toEqual(['backing-nullifier']);
   });
 });
 
