@@ -87,6 +87,92 @@ pub mod pallet {
         acc as u8
     }
 
+    // ── ZKPassport proof-scope domain separation ────────────────────────────────
+    //
+    // `service_scope`/`service_subscope` (`public_inputs[SERVICE_SCOPE_INDEX]`/
+    // `public_inputs[SERVICE_SUBSCOPE_INDEX]`) are ZKPassport's own request-time
+    // domain-separation fields: `service_scope` is whatever domain string the calling app
+    // requests a proof under (there is no registration/approval process with ZKPassport —
+    // it's simply a string the app picks), and `service_subscope` is a second, app-chosen
+    // string layered on top of it per use-case, both folded into the proof's public inputs
+    // via Poseidon2 hashing together with the passport chip data. Mirrors
+    // `pallets/pallet-anticorruption/src/lib.rs`'s `zero_padded_scope_tag`/
+    // `WHISTLEBLOWER_REPORT_SERVICE_SCOPE`/`WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE` pattern
+    // exactly, including keeping this pallet's own local copy of the tag-padding helper
+    // rather than importing anticorruption's — each ZK-proof-consuming pallet in this
+    // codebase defines its own domain-separation constants locally (pallet-elections does
+    // the same for `register_as_delegate`, with its own distinct scope entirely, not by
+    // importing this pallet's), which avoids a purely-for-a-constant cross-crate dependency
+    // and keeps each pallet's proof-scope story self-contained and independently auditable.
+
+    /// Index of `service_scope` in an outer ZKPassport proof's `public_inputs` — fixed
+    /// regardless of disclosure-subproof count. See `runtime/src/verifier.rs`'s module docs
+    /// for the full public-input layout.
+    const SERVICE_SCOPE_INDEX: usize = 3;
+    /// Index of `service_subscope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SUBSCOPE_INDEX: usize = 4;
+
+    /// Zero-pads a 31-byte ASCII tag into a canonical 32-byte big-endian BN254 `Fr` element —
+    /// identical construction to, and for the identical reason as,
+    /// `pallet_anticorruption::pallet::zero_padded_scope_tag` (see that function's doc
+    /// comment for the full canonicality argument).
+    const fn zero_padded_scope_tag(tag: &[u8; 31]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 31 {
+            out[i + 1] = tag[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Domain-separation constant every pallet-identity call that verifies an outer
+    /// ZKPassport proof (`register_citizen`, `reverify_citizen`, `recover_account`,
+    /// `migrate_oprf_scheme` — anything going through `Self::verify_outer_proof`) requires as
+    /// the proof's `service_scope`. Shared across all four calls (they are all genuinely the
+    /// same ZKPassport-integrated app/domain — only the *use-case*, checked via the
+    /// call-specific subscope constants below, differs between them).
+    ///
+    /// PLACEHOLDER: replace with Agora's real, actually-registered production domain string
+    /// before this ever verifies a real ZKPassport proof — there is no approval process, this
+    /// just needs to be the true domain the mobile app requests proofs under.
+    pub const AGORA_IDENTITY_SERVICE_SCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_IDENTITY_SERVICE_SCOPE_V1");
+
+    /// `service_subscope` required for `register_citizen` specifically. Distinct from the
+    /// other three subscopes below on purpose, not merely for tidiness: `zk_proof`/
+    /// `public_inputs` are ordinary, permanently-public call arguments once an extrinsic
+    /// lands on-chain, so if all four calls accepted the same subscope, an observer could
+    /// capture *any* citizen's proof off one call (e.g. a `reverify_citizen` transaction) and
+    /// replay the exact same bytes into a *different* call — most dangerously
+    /// `recover_account`, whose whole job is to rebind a citizen's identity to a new
+    /// `AccountId` given nothing but a proof of the same nullifier. A captured, still-fresh
+    /// `reverify_citizen` proof replayed into `recover_account` by a third party would (absent
+    /// this check) satisfy every guard that call has today — nullifier match, on-file anchor
+    /// match, on-file backing_commitment match — and hijack the account to the replayer's own
+    /// address. Giving each call its own subscope closes this the same way
+    /// `WHISTLEBLOWER_REPORT_SERVICE_SCOPE` stops a `register_citizen` proof from being
+    /// replayed into `submit_whistleblower_report`.
+    pub const AGORA_IDENTITY_REGISTER_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_IDENTITY_REGISTER_SUB_V01");
+
+    /// `service_subscope` required for `reverify_citizen` specifically. See
+    /// [`AGORA_IDENTITY_REGISTER_SUBSCOPE`] for why this must differ from the other three.
+    pub const AGORA_IDENTITY_REVERIFY_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_IDENTITY_REVERIFY_SUB_V01");
+
+    /// `service_subscope` required for `recover_account` specifically. See
+    /// [`AGORA_IDENTITY_REGISTER_SUBSCOPE`] for why this must differ from the other three —
+    /// this is the highest-stakes of the four, since a replayed proof accepted here rebinds a
+    /// citizen's identity to a different `AccountId`.
+    pub const AGORA_IDENTITY_RECOVER_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_IDENTITY_RECOVER_SUB_V001");
+
+    /// `service_subscope` required for `migrate_oprf_scheme` specifically. See
+    /// [`AGORA_IDENTITY_REGISTER_SUBSCOPE`] for why this must differ from the other three.
+    pub const AGORA_IDENTITY_MIGRATE_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_IDENTITY_MIGRATE_SUB_V001");
+
     // ── Backing-commitment incremental Merkle tree ──────────────────────────────
     //
     // Builds and maintains an on-chain incremental Merkle tree over every citizen's
@@ -496,21 +582,38 @@ pub mod pallet {
     /// Checked by `recover_account` before rebinding a citizen's per-account identity storage
     /// from `old_account` to a fresh `who`, to guard against silently orphaning state that
     /// lives in *other* pallets and is keyed on `old_account`: a registered delegate persona
-    /// (pallet-elections), a legislature seat (pallet-legislature), or a cabinet role
-    /// (pallet-executive). See `recover_account`'s doc comment for the full rationale — this is
-    /// a divest-first guard, not a migration: a citizen who currently holds any of this state
-    /// must resign/withdraw via that pallet's own normal mechanism first, then recover. (An AGR
-    /// balance is checked the same way but via the separate `Config::Currency` bound below, not
-    /// this trait — see that item's doc comment for why. A pallet-anticorruption asset-
-    /// disclosure check was deliberately *not* added here: `submit_asset_disclosure` is callable
-    /// by any account at any time with no eligibility gate, so a lapsed or missing disclosure
-    /// under `old_account` is trivially re-filable under the new account in one call after
-    /// recovering — unlike a delegate persona/seat/cabinet role, there is no exclusive resource
-    /// to lose, so blocking on it would just be friction with no real protection.)
+    /// (pallet-elections), a legislature seat (pallet-legislature), a cabinet role
+    /// (pallet-executive), an open (not-yet-finalized) referendum vote, or an already-claimed
+    /// current-epoch budget allocation (both pallet-voting). See `recover_account`'s doc
+    /// comment for the full rationale — this is a divest-first guard, not a migration: a
+    /// citizen who currently holds any of this state must resign/withdraw/wait via that
+    /// pallet's own normal mechanism first, then recover. (An AGR balance is checked the same
+    /// way but via the separate `Config::Currency` bound below, not this trait — see that
+    /// item's doc comment for why. A pallet-anticorruption asset-disclosure check was
+    /// deliberately *not* added here: `submit_asset_disclosure` is callable by any account at
+    /// any time with no eligibility gate, so a lapsed or missing disclosure under `old_account`
+    /// is trivially re-filable under the new account in one call after recovering — unlike a
+    /// delegate persona/seat/cabinet role/open vote/unclaimed budget, there is no exclusive
+    /// resource or one-shot action to lose or repeat, so blocking on it would just be friction
+    /// with no real protection. pallet-voting's liquid-democracy delegation relationships
+    /// — as opposed to the direct-vote/budget-claim state guarded here — remain genuinely
+    /// unguarded and still silently orphan on a successful recovery, but that orphaning is
+    /// passive: an inert delegation from `old_account` doesn't count towards anything once
+    /// `old_account`'s citizen status is removed by this call, unlike an open vote or an
+    /// unclaimed budget allocation, either of which is directly repeatable under `who` if left
+    /// unguarded. See `docs/project/next-steps.md` item 14.)
+    ///
+    /// The two pallet-voting checks close a real double-vote/double-claim vector, not just a
+    /// data-hygiene gap: since only one `ActiveEpoch` can be open network-wide at a time but
+    /// `MaxEpochDurationBlocks` (30 days) exceeds `MinBlocksBetweenRecoveries` (7 days), a
+    /// citizen could vote (or claim+spend a fiscal-epoch budget) under `old_account`, drain its
+    /// balance to zero (already required for recovery), wait out the cooldown, and recover to a
+    /// fresh `who` with no record of having voted/claimed — letting them vote again on the same
+    /// still-open referendum, or claim a second full budget allocation for the same epoch.
     ///
     /// Implemented by `Runtime` (see `runtime/src/configs/mod.rs`), not directly by
-    /// pallet-elections'/pallet-legislature's/pallet-executive's own `Pallet<T>` the way
-    /// `pallet_elections::DisclosureChecker` is implemented directly on
+    /// pallet-elections'/pallet-legislature's/pallet-executive's/pallet-voting's own
+    /// `Pallet<T>` the way `pallet_elections::DisclosureChecker` is implemented directly on
     /// `pallet_anticorruption::Pallet<T>`: pallet-identity-zk is the foundational identity
     /// crate other pallets already depend on (directly or transitively — pallet-elections
     /// depends on it for `BackingRootChecker`'s provider side, for instance), so those pallets
@@ -530,6 +633,17 @@ pub mod pallet {
         /// `true` if `who` currently holds a cabinet role — Prime Minister or a portfolio
         /// minister (`pallet_executive::PrimeMinister`/`MinisterPortfolio`).
         fn holds_cabinet_role(who: &AccountId) -> bool;
+        /// `true` if `who` has cast a direct vote (`pallet_voting::ReferendumHasVoted`) in any
+        /// referendum still in `pallet_voting::ReferendumState::Voting`. Checked against
+        /// `pallet_voting::OpenReferenda`, a bounded list of currently-open referendum ids
+        /// (bounded by `pallet_voting::Config::MaxConcurrentReferenda`) — not an unbounded scan
+        /// over every referendum ever created. See that storage item's doc comment for why the
+        /// bound is safe in practice and why it fails closed rather than silently overflowing.
+        fn has_open_referendum_vote(who: &AccountId) -> bool;
+        /// `true` if `who` has already claimed (`pallet_voting::CitizenClaimedEpoch`) their
+        /// quadratic budget allocation for the currently active fiscal epoch
+        /// (`pallet_voting::FiscalYearEpoch`). O(1) — no iteration involved.
+        fn has_unclaimed_current_epoch_budget(who: &AccountId) -> bool;
     }
 
     /// Maps nullifier hash -> registered AccountId. Prevents double-registration.
@@ -927,6 +1041,12 @@ pub mod pallet {
         AlreadyRegistered,
         NullifierAlreadyUsed,
         InvalidZKProof,
+        /// The proof's `service_scope`/`service_subscope` public inputs don't match the
+        /// domain-separation constants this specific call requires — either a proof generated
+        /// for an entirely different ZKPassport-integrated service, or (see
+        /// `AGORA_IDENTITY_REGISTER_SUBSCOPE`'s doc comment) a genuine same-app proof captured
+        /// off a different pallet-identity call and replayed here.
+        InvalidProofScope,
         NotRegistered,
         NotSuspended,
         /// The proof's certificate_registry_root is not in the on-chain allowlist of
@@ -1039,6 +1159,16 @@ pub mod pallet {
         /// `recover_account`: `old_account` currently holds a cabinet role — Prime Minister or
         /// a portfolio minister (`pallet-executive`). Resign the role first, then recover.
         RecoveryBlockedCabinetRole,
+        /// `recover_account`: `old_account` has cast a direct vote in a referendum that is
+        /// still open (`pallet-voting`, `ReferendumState::Voting`). Rebinding without this
+        /// guard would let the same citizen vote again on the same still-open referendum under
+        /// the new account. Wait for the referendum to finalize, then recover.
+        RecoveryBlockedOpenReferendumVote,
+        /// `recover_account`: `old_account` has already claimed its quadratic budget
+        /// allocation (`pallet-voting`) for the currently active fiscal epoch. Rebinding
+        /// without this guard would let the same citizen claim a second full allocation under
+        /// the new account within the same epoch. Wait for the next fiscal epoch, then recover.
+        RecoveryBlockedUnclaimedEpochBudget,
     }
 
     #[pallet::call]
@@ -1085,9 +1215,13 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
 
-            // 1-2. Allowlist + ZK proof verification (expensive BN254 pairing) — see
-            //    `Self::verify_outer_proof`.
-            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            // 1-2. Allowlist + proof-scope + ZK proof verification (expensive BN254 pairing) —
+            //    see `Self::verify_outer_proof`.
+            Self::verify_outer_proof(
+                zk_proof.as_slice(),
+                public_inputs.as_slice(),
+                AGORA_IDENTITY_REGISTER_SUBSCOPE,
+            )?;
 
             // 3. Only after the proof is authenticated, extract and check the nullifier.
             //    Checking nullifier uniqueness before proof verification would let an attacker
@@ -1337,7 +1471,11 @@ pub mod pallet {
                 Error::<T>::BackingCommitmentMismatch
             );
 
-            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            Self::verify_outer_proof(
+                zk_proof.as_slice(),
+                public_inputs.as_slice(),
+                AGORA_IDENTITY_REVERIFY_SUBSCOPE,
+            )?;
             Self::check_outer_proof_freshness(public_inputs.as_slice())?;
             Self::check_committee_keys(scheme_version, &oprf_pk_hashes)?;
 
@@ -1401,7 +1539,11 @@ pub mod pallet {
             // the returned error alone and at zero real proof-computation cost, whether that
             // `(new_version, new_anchor)` pair already belongs to another citizen — leaking
             // cross-citizen anchor-registry membership ahead of proof authentication.
-            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            Self::verify_outer_proof(
+                zk_proof.as_slice(),
+                public_inputs.as_slice(),
+                AGORA_IDENTITY_MIGRATE_SUBSCOPE,
+            )?;
             Self::check_outer_proof_freshness(public_inputs.as_slice())?;
             Self::check_committee_keys(old_version, &old_oprf_pk_hashes)?;
             Self::check_committee_keys(new_version, &new_oprf_pk_hashes)?;
@@ -1862,26 +2004,31 @@ pub mod pallet {
         /// *move* any other pallet's per-account state — there is no cross-pallet
         /// `AccountMigrator`, and building one (genuine, separate design/implementation work
         /// spanning pallet-voting/elections/legislature/executive/anticorruption) is not
-        /// attempted here. What this call *does* do instead, since the fix above landed: reject
-        /// outright, before touching any storage, if `old_account` currently holds a nonzero
-        /// AGR balance (`Error::RecoveryBlockedNonzeroBalance`, `Config::Currency`), a
+        /// attempted here. What this call *does* do instead, since the fixes below landed:
+        /// reject outright, before touching any storage, if `old_account` currently holds a
+        /// nonzero AGR balance (`Error::RecoveryBlockedNonzeroBalance`, `Config::Currency`), a
         /// registered pallet-elections delegate persona
         /// (`Error::RecoveryBlockedActiveDelegate`), a pallet-legislature seat
-        /// (`Error::RecoveryBlockedLegislatureSeat`), or a pallet-executive cabinet role
-        /// (`Error::RecoveryBlockedCabinetRole`) — see `RecoveryStateChecker`'s doc comment for
-        /// the full rationale and why a pallet-anticorruption asset-disclosure check was
-        /// deliberately left out of this list. This is a divest-first guard, not a migration: a
-        /// citizen who holds any of this state must resign/withdraw via that pallet's own
-        /// normal mechanism (e.g. transfer the balance, deregister the delegate persona, resign
-        /// the seat/role) *before* recovering, rather than either silently abandoning it (the
-        /// old behavior) or this call attempting to move it itself. pallet-voting's
-        /// budget/delegation state and pallet-anticorruption's conflict-registry entries remain
-        /// genuinely unguarded and still silently orphan on a successful recovery — real,
-        /// separate future work, tracked in `docs/project/next-steps.md`. See
-        /// `docs/project/pallets/identity.md`'s "Known limitation" section for the fuller
-        /// accounting. Any UI that calls this extrinsic must disclose the remaining gap plainly
-        /// to the citizen before they confirm — see `mobile/src/screens/
-        /// RecoverAccountScreen.tsx`.
+        /// (`Error::RecoveryBlockedLegislatureSeat`), a pallet-executive cabinet role
+        /// (`Error::RecoveryBlockedCabinetRole`), a still-open pallet-voting referendum vote
+        /// (`Error::RecoveryBlockedOpenReferendumVote`), or an already-claimed current-epoch
+        /// pallet-voting budget allocation (`Error::RecoveryBlockedUnclaimedEpochBudget`) — see
+        /// `RecoveryStateChecker`'s doc comment for the full rationale, including why the last
+        /// two close a real double-vote/double-claim vector rather than just orphaned data, and
+        /// why a pallet-anticorruption asset-disclosure check was deliberately left out of this
+        /// list. This is a divest-first guard, not a migration: a citizen who holds any of this
+        /// state must resign/withdraw/wait via that pallet's own normal mechanism (e.g.
+        /// transfer the balance, deregister the delegate persona, resign the seat/role, wait for
+        /// the open referendum to finalize or the fiscal epoch to roll over) *before*
+        /// recovering, rather than either silently abandoning it (the old behavior) or this call
+        /// attempting to move it itself. pallet-voting's liquid-democracy delegation
+        /// relationships (distinct from the direct-vote/budget-claim state now guarded above)
+        /// and pallet-anticorruption's conflict-registry entries remain genuinely unguarded and
+        /// still silently orphan on a successful recovery — real, separate future work, tracked
+        /// in `docs/project/next-steps.md`. See `docs/project/pallets/identity.md`'s "Known
+        /// limitation" section for the fuller accounting. Any UI that calls this extrinsic must
+        /// disclose the remaining gap plainly to the citizen before they confirm — see
+        /// `mobile/src/screens/RecoverAccountScreen.tsx`.
         #[pallet::call_index(20)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn recover_account(
@@ -1900,7 +2047,11 @@ pub mod pallet {
             // Verify the real proof before touching any registry state keyed on its claimed
             // nullifier — same ordering rationale used throughout this pallet: an
             // unauthenticated caller must never learn anything about registry contents.
-            Self::verify_outer_proof(zk_proof.as_slice(), public_inputs.as_slice())?;
+            Self::verify_outer_proof(
+                zk_proof.as_slice(),
+                public_inputs.as_slice(),
+                AGORA_IDENTITY_RECOVER_SUBSCOPE,
+            )?;
             let nullifier = public_inputs[public_inputs.len() - 2];
 
             let old_account = NullifierRegistry::<T>::get(nullifier)
@@ -1955,6 +2106,14 @@ pub mod pallet {
             ensure!(
                 !T::RecoveryStateChecker::holds_cabinet_role(&old_account),
                 Error::<T>::RecoveryBlockedCabinetRole
+            );
+            ensure!(
+                !T::RecoveryStateChecker::has_open_referendum_vote(&old_account),
+                Error::<T>::RecoveryBlockedOpenReferendumVote
+            );
+            ensure!(
+                !T::RecoveryStateChecker::has_unclaimed_current_epoch_budget(&old_account),
+                Error::<T>::RecoveryBlockedUnclaimedEpochBudget
             );
 
             // ---- Rebind every per-account identity storage from old_account to who. ----
@@ -2106,14 +2265,27 @@ pub mod pallet {
             Ok(new_version)
         }
 
-        /// Shared by `register_citizen`/`reverify_citizen`/`migrate_oprf_scheme` (HANDOFF log
-        /// #76): allowlist check (cheap, no proof work yet) then the expensive BN254 pairing
-        /// check. `public_inputs.len() >= 9` is the smallest real outer-circuit variant
-        /// (count_4: 8 fixed inputs + 1 disclosure subproof) — anything shorter cannot be a
-        /// genuine ZKPassport proof.
-        fn verify_outer_proof(zk_proof: &[u8], public_inputs: &[[u8; 32]]) -> DispatchResult {
+        /// Shared by `register_citizen`/`reverify_citizen`/`recover_account`/
+        /// `migrate_oprf_scheme` (HANDOFF log #76): allowlist check (cheap, no proof work yet),
+        /// then the domain-separation scope check (also cheap — see
+        /// `AGORA_IDENTITY_REGISTER_SUBSCOPE`'s doc comment for why each caller passes a
+        /// different `expected_subscope`), then the expensive BN254 pairing check last.
+        /// `public_inputs.len() >= 9` is the smallest real outer-circuit variant (count_4: 8
+        /// fixed inputs + 1 disclosure subproof) — anything shorter cannot be a genuine
+        /// ZKPassport proof, and must be checked before indexing `SERVICE_SCOPE_INDEX`/
+        /// `SERVICE_SUBSCOPE_INDEX` (3/4) below.
+        fn verify_outer_proof(
+            zk_proof: &[u8],
+            public_inputs: &[[u8; 32]],
+            expected_subscope: [u8; 32],
+        ) -> DispatchResult {
             ensure!(public_inputs.len() >= 9, Error::<T>::InvalidZKProof);
             ensure!(AllowedMerkleRoots::<T>::get(public_inputs[0]), Error::<T>::IssuerNotAllowed);
+            ensure!(
+                public_inputs[SERVICE_SCOPE_INDEX] == AGORA_IDENTITY_SERVICE_SCOPE
+                    && public_inputs[SERVICE_SUBSCOPE_INDEX] == expected_subscope,
+                Error::<T>::InvalidProofScope
+            );
             ensure!(T::ZkVerifier::verify(zk_proof, public_inputs), Error::<T>::InvalidZKProof);
             Ok(())
         }

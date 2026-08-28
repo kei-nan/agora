@@ -1,5 +1,8 @@
 use crate as pallet_courts;
-use crate::pallet::{CitizenChecker, CitizenSelector, CitizenSuspender, LawEnforcer, TreasuryEnforcer};
+use crate::pallet::{
+	CitizenChecker, CitizenSelector, CitizenSuspender, LawEnforcer, TreasuryEnforcer,
+	ZkProofVerifier,
+};
 use frame_support::{derive_impl, traits::{ConstU32, ConstU64}};
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
@@ -156,6 +159,21 @@ impl TreasuryEnforcer for MockTreasuryEnforcer {
 	}
 }
 
+/// Test ZK proof verifier for anonymized case filing. Mirrors
+/// `pallet_anticorruption::mock::TestZkVerifier`: validity is controlled entirely by the proof
+/// bytes (first byte `1` = valid) so tests stay deterministic with no shared/thread-local state.
+pub struct MockZkVerifier;
+impl ZkProofVerifier for MockZkVerifier {
+	fn verify(proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		matches!(proof_bytes.first(), Some(1))
+	}
+}
+
+/// Byte marker used by `MockZkVerifier` to signal a proof that should pass verification.
+pub const VALID_PROOF_MARKER: u8 = 1;
+/// Byte marker used by `MockZkVerifier` to signal a proof that should fail verification.
+pub const INVALID_PROOF_MARKER: u8 = 0;
+
 pub struct MockCitizenSuspender;
 impl CitizenSuspender<BlockNumber> for MockCitizenSuspender {
 	fn suspend_citizen(
@@ -199,6 +217,7 @@ impl pallet_courts::Config for Test {
 	// 2/3 supermajority, matching pallet-executive's cabinet threshold in the runtime.
 	type AIModelSupermajorityNumerator = ConstU32<2>;
 	type AIModelSupermajorityDenominator = ConstU32<3>;
+	type ZkVerifier = MockZkVerifier;
 }
 
 // Build genesis storage according to the mock runtime. Accounts 1..=30 start with a balance

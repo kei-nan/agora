@@ -213,6 +213,24 @@ pub mod pallet {
         /// guarantee `on_initialize` otherwise provides. See `PendingFinalization`'s doc comment.
         #[pallet::constant]
         type MaxReferendaPerBlock: Get<u32>;
+        /// Bounds `OpenReferenda`, the flat list of referendum ids currently in
+        /// `ReferendumState::Voting`. Exists so `RecoveryStateChecker::has_open_referendum_vote`
+        /// (`pallet-identity-zk`) can check "has this account voted in any currently-open
+        /// referendum" without an unbounded scan over `Referenda` (which grows with the total
+        /// referendum count ever created, not just currently-open ones). Referendum creation is
+        /// low-frequency (gated by a legislature motion or a petition threshold) and only
+        /// referenda created within one `ReferendumDurationBlocks` window can be concurrently
+        /// open, so this cap is not expected to bind in practice.
+        ///
+        /// Unlike `MaxReferendaPerBlock`/`PendingFinalization` above — where overflow is safe to
+        /// silently skip because the permissionless `finalize_referendum` extrinsic is still a
+        /// correct fallback — there is no equivalent fallback here: a referendum silently
+        /// dropped from this list would become invisible to the recovery guard, reopening the
+        /// double-vote gap it exists to close. So referendum creation itself fails outright
+        /// (`Error::TooManyOpenReferenda`) if adding to this list would overflow the bound,
+        /// rather than silently proceeding without tracking it.
+        #[pallet::constant]
+        type MaxConcurrentReferenda: Get<u32>;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -375,6 +393,18 @@ pub mod pallet {
         ValueQuery,
     >;
 
+    /// Flat bounded list of referendum ids currently in `ReferendumState::Voting` — i.e.
+    /// currently open for voting. Maintained by all three referendum-creation call sites
+    /// (`create_constitutional_referendum`, `create_foundational_referendum`,
+    /// `create_referendum_internal`, each of which pushes on creation) and by
+    /// `do_finalize_referendum` (which removes an id when the referendum's state transitions
+    /// out of `Voting`). See `Config::MaxConcurrentReferenda`'s doc comment for why this exists
+    /// and why, unlike `PendingFinalization`, it fails closed on overflow instead of silently
+    /// dropping entries.
+    #[pallet::storage]
+    pub type OpenReferenda<T: Config> =
+        StorageValue<_, BoundedVec<u32, T::MaxConcurrentReferenda>, ValueQuery>;
+
     // ── Voting epoch storage ─────────────────────────────────────────────────
 
     /// Current active voting epoch: (start_block, end_block). None = no epoch open.
@@ -394,6 +424,12 @@ pub mod pallet {
     pub enum Event<T: Config> {
         ProposalCreated { id: u32, ends_at: BlockNumberFor<T>, topic_hash: [u8; 32], tier: ReferendumTier },
         VoteCommitted { proposal_id: u32, nullifier: [u8; 32] },
+        /// A citizen overwrote their own previously-stored commitment for this
+        /// (proposal_id, nullifier) with a new one before the proposal's voting window closed —
+        /// e.g. to override a vote cast under coercion. Distinct from `VoteCommitted` (which
+        /// only fires on a nullifier's first commitment) so first-time vs. override commits
+        /// remain separately observable on-chain. See `commit_vote`'s doc comment.
+        VoteResubmitted { proposal_id: u32, nullifier: [u8; 32] },
         DelegationSet {
             delegator: T::AccountId,
             delegate: T::AccountId,
@@ -438,6 +474,10 @@ pub mod pallet {
     pub enum Error<T> {
         ProposalNotFound,
         ProposalEnded,
+        /// No longer raised by `commit_vote`: a resubmission for a nullifier that already has a
+        /// commitment now overwrites it (see `commit_vote`'s doc comment and
+        /// `Event::VoteResubmitted`) instead of being rejected. Kept as a variant for storage/
+        /// metadata compatibility rather than removed.
         AlreadyVoted,
         DelegationCycleDetected,
         DelegationCapExceeded,
@@ -463,6 +503,10 @@ pub mod pallet {
         ReferendumStillActive,
         /// A referendum for this petition already exists.
         ReferendumAlreadyExists,
+        /// `OpenReferenda` is already at `MaxConcurrentReferenda` capacity — see that storage
+        /// item's and `Config::MaxConcurrentReferenda`'s doc comments for why referendum
+        /// creation fails outright here instead of silently proceeding untracked.
+        TooManyOpenReferenda,
         /// A tally has already been submitted for this proposal.
         TallyAlreadySubmitted,
         /// The MACI tally ZK proof did not verify.
@@ -479,6 +523,14 @@ pub mod pallet {
         EpochStillActive,
         /// duration_blocks is outside [MinEpochDurationBlocks, MaxEpochDurationBlocks].
         InvalidEpochDuration,
+        /// `delegate_vote`: this topic has a referendum whose voting window has already closed
+        /// (`end_block` has passed) but that has not yet been finalized (still
+        /// `ReferendumState::Voting` — e.g. `PendingFinalization` overflowed and
+        /// `finalize_referendum` hasn't been called yet). Creating or modifying a delegation for
+        /// this topic is rejected until that referendum is finalized, closing the window where a
+        /// delegation created after voting effectively ends could still swing that referendum's
+        /// tally — see `delegate_vote`'s doc comment.
+        ReferendumVotingWindowClosed,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────
@@ -515,6 +567,17 @@ pub mod pallet {
         /// Commit an encrypted vote (MACI commitment). Actual tally done off-chain with ZK proof.
         /// The nullifier is derived from the caller's registered identity — callers cannot supply
         /// an arbitrary nullifier, which enforces 1-person-1-vote.
+        ///
+        /// ## Resubmission overwrites (coercion resistance)
+        /// Calling this again for a `(proposal_id, nullifier)` that already has a stored
+        /// commitment does **not** fail with an already-voted error — it overwrites the stored
+        /// commitment with the new one (emitting `Event::VoteResubmitted` instead of
+        /// `Event::VoteCommitted`), bounded by the same `ends_at` window check as a first-time
+        /// commit. This lets a citizen coerced into voting a certain way quietly cast a
+        /// superseding vote later. See the inline comment at the storage write below for what
+        /// this does and does not cover (in short: on-chain override, yes; a tally that actually
+        /// honors "only the last commitment per nullifier counts," not yet — that's the separate,
+        /// already-tracked off-chain MACI coordinator work).
         ///
         /// ## Known sender-anonymity gap
         /// This call requires `ensure_signed`, so the extrinsic's signing `AccountId` (`who`
@@ -565,9 +628,34 @@ pub mod pallet {
                 .ok_or(Error::<T>::NotRegisteredCitizen)?;
             let (ends_at, _, _) = Proposals::<T>::get(proposal_id).ok_or(Error::<T>::ProposalNotFound)?;
             ensure!(frame_system::Pallet::<T>::block_number() < ends_at, Error::<T>::ProposalEnded);
-            ensure!(!VoteCommitments::<T>::contains_key((proposal_id, nullifier)), Error::<T>::AlreadyVoted);
+            // ── Coercion-resistant vote override ────────────────────────────────────────
+            // A resubmission for the same (proposal_id, nullifier) is deliberately allowed to
+            // overwrite the previously stored commitment rather than being rejected with
+            // `Error::AlreadyVoted`, so a citizen coerced into voting a certain way — by an
+            // abuser, or under threat — can quietly cast a new commitment afterward that
+            // supersedes the coerced one. `commit_vote` is a normal signed/proven extrinsic
+            // applied to storage in block order, so on-chain state already has a natural "last
+            // write wins" property: no off-chain coordinator is needed for *this* part. The
+            // `ends_at` check above (identical to the one gating the original vote) is what
+            // bounds this — a resubmission is rejected with `Error::ProposalEnded` once the
+            // window has closed, exactly like a first-time commit, so the last commitment
+            // written before window-close is what counts.
+            //
+            // This is on-chain override only. It does NOT provide a privacy-preserving *tally*
+            // that only counts each nullifier's latest commitment — that requires the off-chain
+            // MACI coordinator this repo doesn't have yet (see this pallet's module-level doc
+            // comment and `runtime/src/configs/mod.rs`'s `FailClosedMACIVerifier`, which already
+            // fails closed outside `dev-mode` because no real MACI tally verifier is wired in).
+            // `submit_maci_tally` is what would need to know "only the last commitment per
+            // nullifier counts" — that's a separate, larger, already-tracked follow-up, not
+            // something this change attempts to solve.
+            let is_resubmission = VoteCommitments::<T>::contains_key((proposal_id, nullifier));
             VoteCommitments::<T>::insert((proposal_id, nullifier), commitment);
-            Self::deposit_event(Event::VoteCommitted { proposal_id, nullifier });
+            if is_resubmission {
+                Self::deposit_event(Event::VoteResubmitted { proposal_id, nullifier });
+            } else {
+                Self::deposit_event(Event::VoteCommitted { proposal_id, nullifier });
+            }
             Ok(())
         }
 
@@ -576,6 +664,20 @@ pub mod pallet {
         /// `duration_blocks` must be within [MinDelegationDurationBlocks, MaxDelegationDurationBlocks].
         /// Replaces any existing (including expired) delegation for that topic.
         /// The delegation is valid for any referendum whose close block ≤ (now + duration_blocks).
+        ///
+        /// ## Rejected if the topic has a closed-but-unfinalized referendum outstanding
+        /// `resolve_delegate_readonly`/`apply_delegated_weight` (used at finalization) validate a
+        /// delegation only by `expires_at >= reference_block`, with no check on when the
+        /// delegation was *created*. Left unguarded, that would let a delegation created after a
+        /// referendum's `end_block` has already passed still swing that referendum's tally during
+        /// the window between `end_block` and whenever `finalize_referendum` actually runs (normally
+        /// closed to nothing by same-block `on_initialize` finalization, but `PendingFinalization`
+        /// is capped by `MaxReferendaPerBlock` and silently falls back to the permissionless
+        /// `finalize_referendum` extrinsic with no promptness guarantee on overflow — see that
+        /// storage item's doc comment). `topic_has_closed_unfinalized_referendum` closes this: if
+        /// `topic_id` currently has any `OpenReferenda` entry whose `end_block` has already passed,
+        /// this call is rejected with `Error::ReferendumVotingWindowClosed` until that referendum is
+        /// finalized.
         ///
         /// ## DelegationCap enforcement is against *transitively resolved* weight
         /// `DelegationCap` bounds the percentage of total voting power any single delegate may
@@ -627,6 +729,21 @@ pub mod pallet {
                 Error::<T>::DelegationCycleDetected
             );
 
+            let now = frame_system::Pallet::<T>::block_number();
+            // Close the post-window delegation race: `resolve_delegate_readonly`/
+            // `apply_delegated_weight` validate a delegation only by `expires_at >=
+            // reference_block`, not by when the delegation was *created* — so without this
+            // check, a delegation created after a referendum's `end_block` has already passed
+            // could still swing that referendum's tally during the (normally near-zero, but not
+            // zero — see `PendingFinalization`'s doc comment) window between `end_block` and
+            // whenever `finalize_referendum` actually runs. Reject creating/modifying a
+            // delegation for a topic that currently has such a closed-but-unfinalized
+            // referendum outstanding.
+            ensure!(
+                !Self::topic_has_closed_unfinalized_referendum(topic_id, now),
+                Error::<T>::ReferendumVotingWindowClosed
+            );
+
             // Read the old delegation record without mutating yet.
             // We must do all cap checks before touching any storage, otherwise a failed cap
             // check would leave DelegatorCount decremented while the old Delegations record
@@ -648,8 +765,6 @@ pub mod pallet {
                 new_count <= T::MaxDelegationsPerDelegate::get(),
                 Error::<T>::DelegationCapExceeded
             );
-
-            let now = frame_system::Pallet::<T>::block_number();
 
             // The weight to record against the (possibly new) resolved terminal for this edge.
             // When replacing the same delegate, nothing about the resolved chain or its weight
@@ -1023,6 +1138,10 @@ pub mod pallet {
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
             let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
+            // Checked before any storage write below, so a `TooManyOpenReferenda` failure here
+            // leaves no partial state behind regardless of whether the caller happens to be
+            // running inside its own transactional wrapper.
+            Self::track_open_referendum(id)?;
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Constitutional),
@@ -1059,6 +1178,9 @@ pub mod pallet {
             let id = NextReferendumId::<T>::get();
             let now = frame_system::Pallet::<T>::block_number();
             let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
+            // Checked before any storage write below — see the equivalent comment in
+            // `create_constitutional_referendum` above for why.
+            Self::track_open_referendum(id)?;
             Referenda::<T>::insert(
                 id,
                 (u32::MAX, topic_hash, ends_at, ReferendumState::Voting, ReferendumTier::Foundational),
@@ -1157,6 +1279,9 @@ pub mod pallet {
             // a referendum created near the end of an epoch still has adequate voting time.
             // Citizens may vote in any overlapping future epoch within the window.
             let ends_at = now.saturating_add(BlockNumberFor::<T>::from(T::ReferendumDurationBlocks::get()));
+            // Checked before any storage write below — see the equivalent comment in
+            // `create_constitutional_referendum` above for why.
+            Self::track_open_referendum(id)?;
             Referenda::<T>::insert(
                 id,
                 (petition_id, topic_hash, ends_at, ReferendumState::Voting, tier.clone()),
@@ -1187,6 +1312,32 @@ pub mod pallet {
             let finalize_at = end_block.saturating_add(BlockNumberFor::<T>::from(1u32));
             PendingFinalization::<T>::mutate(finalize_at, |scheduled| {
                 let _ = scheduled.try_push(referendum_id);
+            });
+        }
+
+        /// Adds `referendum_id` to `OpenReferenda`. Unlike `schedule_finalization` above, an
+        /// overflow here is NOT silently swallowed: there is no permissionless fallback that
+        /// re-derives `OpenReferenda`'s contents the way `finalize_referendum` backstops
+        /// `PendingFinalization`, so an untracked open referendum would be invisible to
+        /// `RecoveryStateChecker::has_open_referendum_vote` and reopen the double-vote gap that
+        /// check exists to close. Called from all three referendum-creation call sites; a
+        /// failure here aborts the whole creation extrinsic (dispatch is atomic), so
+        /// `Referenda`/`NextReferendumId`/etc. are all rolled back together with it.
+        fn track_open_referendum(referendum_id: u32) -> DispatchResult {
+            OpenReferenda::<T>::try_mutate(|open| {
+                open.try_push(referendum_id).map_err(|_| Error::<T>::TooManyOpenReferenda)
+            })?;
+            Ok(())
+        }
+
+        /// Removes `referendum_id` from `OpenReferenda`. Called once a referendum's state
+        /// transitions out of `Voting` (`do_finalize_referendum`). A no-op if the id isn't
+        /// present (e.g. it was never tracked because creation would have overflowed the bound —
+        /// which can't happen since creation fails outright in that case, but this stays a safe
+        /// no-op rather than panicking either way).
+        fn untrack_open_referendum(referendum_id: u32) {
+            OpenReferenda::<T>::mutate(|open| {
+                open.retain(|id| *id != referendum_id);
             });
         }
 
@@ -1264,6 +1415,7 @@ pub mod pallet {
                 referendum_id,
                 (petition_id, topic_hash, end_block, new_state, tier.clone()),
             );
+            Self::untrack_open_referendum(referendum_id);
             if passed {
                 T::LawEnactor::enact_law(tier, topic_hash)?;
                 Self::deposit_event(Event::ReferendumPassed { referendum_id, topic_hash });
@@ -1347,6 +1499,30 @@ pub mod pallet {
         /// tracked as follow-up, not attempted here.
         pub(crate) fn topic_id_of(topic_hash: &[u8; 32]) -> u32 {
             u32::from_le_bytes([topic_hash[0], topic_hash[1], topic_hash[2], topic_hash[3]])
+        }
+
+        /// Whether `topic_id` currently has a referendum that is still `ReferendumState::Voting`
+        /// (i.e. not yet finalized) but whose voting window has already closed (`now >
+        /// end_block`). `delegate_vote` uses this to reject creating/modifying a delegation for
+        /// a topic in exactly this state — see its doc comment for the race this closes.
+        ///
+        /// Scans `OpenReferenda` — the flat, bounded (`MaxConcurrentReferenda`) list of
+        /// currently-`Voting` referendum ids also used by `RecoveryStateChecker` — rather than
+        /// all of `Referenda`, which grows with the total historical referendum count. This
+        /// mirrors `vote_referendum`'s own pattern of reading a referendum's `(topic_hash,
+        /// end_block, state)` tuple straight out of `Referenda` to decide whether it is still
+        /// open, just applied across the bounded open set instead of one known id.
+        fn topic_has_closed_unfinalized_referendum(topic_id: u32, now: BlockNumberFor<T>) -> bool {
+            OpenReferenda::<T>::get().iter().any(|&referendum_id| {
+                match Referenda::<T>::get(referendum_id) {
+                    Some((_, topic_hash, end_block, state, _)) => {
+                        state == ReferendumState::Voting
+                            && Self::topic_id_of(&topic_hash) == topic_id
+                            && now > end_block
+                    }
+                    None => false,
+                }
+            })
         }
 
         /// Applies a signed weight `delta` (positive = weight newly arriving from upstream,

@@ -174,6 +174,13 @@ pub mod pallet {
         Overflow,
         NotAuthorizedSpender,
         DepartmentHasNoSpender,
+        /// `record_expenditure` was called with `amount == 0`. A zero-amount expenditure is
+        /// never legitimate spending, but `checked_add` with 0 always succeeds and the budget
+        /// check trivially holds even at `budget == 0`, so without this check any authorized
+        /// `DepartmentSpenders` key could loop free calls that each write a new `ExpenditureLog`
+        /// entry and a new `DepartmentExpenditures` map entry at no real cost — an unbounded
+        /// state-growth DoS.
+        ZeroExpenditureAmount,
     }
 
     #[pallet::call]
@@ -230,6 +237,7 @@ pub mod pallet {
                 .ok_or(Error::<T>::DepartmentHasNoSpender)?;
             ensure!(authorized == who, Error::<T>::NotAuthorizedSpender);
             ensure!(!Self::is_frozen(department_id), Error::<T>::DepartmentFrozen);
+            ensure!(amount > T::Balance::default(), Error::<T>::ZeroExpenditureAmount);
             let budget = DepartmentBudgets::<T>::get(department_id);
             let spent = DepartmentSpent::<T>::get(department_id);
             let new_spent = spent.checked_add(&amount).ok_or(Error::<T>::Overflow)?;

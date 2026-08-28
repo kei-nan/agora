@@ -232,6 +232,21 @@ fn nominate_pm_fails_for_non_member_candidate() {
 }
 
 #[test]
+fn nominate_pm_fails_for_accountability_council_member_candidate() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        set_legislature_member(2, true);
+        set_accountability_council_member(2, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_noop!(
+            Executive::nominate_pm(RuntimeOrigin::signed(1), 2),
+            Error::<Test>::AccountabilityCouncilMember
+        );
+    });
+}
+
+#[test]
 fn nominate_pm_fails_after_nomination_window_closes() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -555,6 +570,20 @@ fn remove_and_replace_prime_minister_fails_when_successor_not_a_member() {
 }
 
 #[test]
+fn remove_and_replace_prime_minister_fails_when_successor_is_accountability_council_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        set_legislature_member(2, true);
+        set_accountability_council_member(2, true);
+        assert_noop!(
+            Executive::remove_and_replace_prime_minister(RuntimeOrigin::root(), 2),
+            Error::<Test>::AccountabilityCouncilMember
+        );
+    });
+}
+
+#[test]
 fn remove_and_replace_prime_minister_fails_for_unauthorized_origin() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -641,6 +670,21 @@ fn appoint_minister_works() {
         assert_eq!(crate::MinisterPortfolio::<Test>::get(2), Some(p0));
         assert!(PendingMinisterNomination::<Test>::get(p0).is_none());
         System::assert_last_event(Event::MinisterAppointed { portfolio_id: p0, who: 2 }.into());
+    });
+}
+
+#[test]
+fn appoint_minister_fails_for_accountability_council_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        appoint_pm(1);
+        let p0 = define_portfolio(1);
+        set_accountability_council_member(2, true);
+        assert_ok!(Executive::nominate_minister(RuntimeOrigin::signed(1), p0, 2));
+        assert_noop!(
+            Executive::appoint_minister(RuntimeOrigin::root(), p0, 2),
+            Error::<Test>::AccountabilityCouncilMember
+        );
     });
 }
 
@@ -1060,9 +1104,46 @@ fn vote_declare_emergency_locks_terms_from_first_voter() {
         System::set_block_number(1);
         cabinet_of_three();
         assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 30));
-        // Second voter proposes different terms — should be ignored in favor of the locked-in terms.
-        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(9), 90));
+        // Second voter votes with the *same* terms as the first — counts normally.
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 30));
 
+        let info = ActiveEmergency::<Test>::get().unwrap();
+        assert_eq!(info.reason_hash, hash(1));
+        assert_eq!(info.expires_at, 1 + 30);
+    });
+}
+
+// Previously, a second voter's own `reason_hash`/`duration_blocks` arguments were silently
+// discarded once `PendingEmergencyProposal` was locked in by the first voter — only their
+// `who` counted as a yes-vote toward whatever the first caller had proposed, with no check
+// their submitted terms actually matched. That's a confused-deputy gap: a minister's vote
+// silently endorsed terms they never saw. Fixed: a mismatched vote is now rejected outright.
+#[test]
+fn vote_declare_emergency_fails_when_terms_mismatch_pending_proposal() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 30));
+
+        // Different reason_hash, same duration.
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(9), 30),
+            Error::<Test>::EmergencyProposalMismatch
+        );
+        // Same reason_hash, different duration.
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 90),
+            Error::<Test>::EmergencyProposalMismatch
+        );
+
+        // The mismatched attempts must not have been recorded as a vote for account 2, nor
+        // altered the locked-in proposal.
+        assert!(!DeclareVotes::<Test>::get(2));
+        assert_eq!(PendingEmergencyProposal::<Test>::get(), Some((hash(1), 30)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        // Voting with the correct, matching terms still works.
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 30));
         let info = ActiveEmergency::<Test>::get().unwrap();
         assert_eq!(info.reason_hash, hash(1));
         assert_eq!(info.expires_at, 1 + 30);
@@ -1294,6 +1375,92 @@ fn vote_declare_emergency_succeeds_once_cooldown_elapses() {
     });
 }
 
+// ─── cross-pallet sibling cooldown coordination (pallet-emergency-council) ─
+//
+// pallet-emergency-council has its own, independent council-level emergency mechanism with
+// its own `CooldownUntil`. Without `SiblingEmergencyCooldown`, a coalition controlling both
+// bodies could declare an emergency via one, let it lapse, and immediately declare a fresh one
+// via the other — this pallet's own `EmergencyCooldownBlocks` would never even see it happen.
+// The mock sibling here (`mock::MockSiblingCooldown`) stands in for the real `Runtime`-level
+// implementation that bridges to pallet-emergency-council's actual `CooldownUntil`.
+
+#[test]
+fn emergency_lapse_notifies_sibling_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+        assert!(sibling_notified_at().is_none());
+
+        // Legislature never ratifies -- emergency lapses at block 12 (ratify_by == 11).
+        System::set_block_number(12);
+        let _ = Executive::on_initialize(12);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        // The sibling (pallet-emergency-council, in the real runtime) was told to start its
+        // own cooldown at the same block this pallet started its own.
+        assert_eq!(sibling_notified_at(), Some(12));
+    });
+}
+
+#[test]
+fn emergency_sunset_expiry_notifies_sibling_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 5));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 5));
+        assert_ok!(Executive::ratify_emergency(RuntimeOrigin::root()));
+
+        System::set_block_number(6);
+        let _ = Executive::on_initialize(6);
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_eq!(sibling_notified_at(), Some(6));
+    });
+}
+
+#[test]
+fn vote_end_emergency_notifies_sibling_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(1), 50));
+
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_eq!(sibling_notified_at(), Some(1));
+    });
+}
+
+#[test]
+fn vote_declare_emergency_fails_while_sibling_in_cooldown_even_with_own_cooldown_elapsed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        cabinet_of_three();
+        // This pallet's own CooldownUntil defaults to 0 (never touched) — only the sibling's
+        // reported cooldown can be blocking the declare below.
+        assert_eq!(CooldownUntil::<Test>::get(), 0);
+        set_sibling_cooldown_until(1000);
+
+        assert_noop!(
+            Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50),
+            Error::<Test>::EmergencyCooldownActive
+        );
+
+        // Once the sibling's (simulated) cooldown passes, declaration succeeds again — this
+        // is the regression case: a coalition alternating between pallet-emergency-council and
+        // pallet-executive can no longer chain declarations past either pallet's cooldown,
+        // only past both.
+        System::set_block_number(1000);
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(1), hash(1), 50));
+    });
+}
+
 // ─── vote_end_emergency ─────────────────────────────────────────────────────
 
 #[test]
@@ -1514,9 +1681,11 @@ fn retract_emergency_vote_resets_pending_proposal_when_last_vote_removed() {
         assert_ok!(Executive::retract_emergency_vote(RuntimeOrigin::signed(1)));
         assert!(PendingEmergencyProposal::<Test>::get().is_none());
 
-        // A fresh proposal from a different first voter should now set new terms.
+        // A fresh proposal from a different first voter should now set new terms — the third
+        // voter must match those new terms exactly (hash(1)/30 from before the retraction no
+        // longer applies).
         assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(2), hash(7), 60));
-        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(3), hash(1), 30));
+        assert_ok!(Executive::vote_declare_emergency(RuntimeOrigin::signed(3), hash(7), 60));
 
         let info = ActiveEmergency::<Test>::get().unwrap();
         assert_eq!(info.reason_hash, hash(7));

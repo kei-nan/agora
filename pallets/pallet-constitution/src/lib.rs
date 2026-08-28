@@ -141,6 +141,32 @@ pub mod pallet {
         fn auto_challenge_law(law_id: u32) -> DispatchResult;
     }
 
+    /// Called by `challenge_law_tier` to permissionlessly open a `pallet_courts::CaseSubject::
+    /// TierConflict` case alleging `law_id` was enacted at the wrong `LawTier` — the fix for
+    /// the tier-laundering gap where `enact_law`'s caller-supplied `tier` has no check tying it
+    /// to the law's actual content, so a bare Ordinary-majority vote could enact constitutionally-
+    /// weighted law while declaring it Ordinary, skipping both the entrenchment pipeline and the
+    /// mandatory `AutoChallengeHook` review that only fires for Structural/Foundational tiers.
+    ///
+    /// Implemented by the runtime, delegating to pallet-courts' `file_case_for` (the same
+    /// citizen-filing pipeline `file_case` itself uses) with `CaseSubject::TierConflict { law_id
+    /// }` — mirrors `AutoChallengeHook` immediately above: pallet-constitution defines the
+    /// capability it needs as a trait rather than depending on pallet-courts directly, and the
+    /// runtime wires the two together. Unlike `AutoChallengeHook` (system-initiated, no filer,
+    /// no proof), this is citizen-initiated and anonymized — see `pallet_courts::CaseFiler`'s
+    /// doc comment for why `TierConflict` (challenging a legislature's own tier declaration) is
+    /// one of the case types that files under a ZK nullifier rather than the caller's plain
+    /// `AccountId` — so it carries the same `zk_proof`/`public_inputs` a citizen-filed
+    /// `pallet_courts::file_case` call for that subject would.
+    pub trait TierConflictHook<AccountId> {
+        fn file_tier_conflict_case(
+            filer: AccountId,
+            law_id: u32,
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
+        ) -> DispatchResult;
+    }
+
     /// Benchmark-only hook: makes an account satisfy `CitizenChecker::is_active_citizen` for
     /// extrinsics gated on citizen status (`submit_petition`, `sign_petition`). Real citizen
     /// registration goes through pallet-identity-zk's full ZK-proof flow, which a generic
@@ -253,6 +279,10 @@ pub mod pallet {
         /// Automatically opens a court case for AI review — the opposition can also file
         /// challenges manually via pallet-courts at any time.
         type AutoChallengeHook: AutoChallengeHook;
+
+        /// Called by `challenge_law_tier` to open a permissionless `TierConflict` court case
+        /// alleging a law was enacted at the wrong tier. See `TierConflictHook`'s doc comment.
+        type TierConflictHook: TierConflictHook<Self::AccountId>;
 
         // ── Courts ───────────────────────────────────────────────────────────────
         /// Origin permitted to pause a law via court ruling (manual Oracle Council override,
@@ -767,6 +797,32 @@ pub mod pallet {
 
             Self::deposit_event(Event::AmendmentRevoked { law_id, restored_hash });
             Ok(())
+        }
+
+        /// Permissionlessly open a `pallet_courts::CaseSubject::TierConflict` case alleging
+        /// `law_id` was enacted at the wrong tier — the fix for the tier-laundering gap
+        /// described on `TierConflictHook`'s doc comment. Any citizen may call this; it's the
+        /// citizen-initiated counterpart to the automatic `AutoChallengeHook` review that only
+        /// fires for Structural/Foundational tiers at enactment time.
+        ///
+        /// Only checks that `law_id` actually exists before delegating to
+        /// `T::TierConflictHook::file_tier_conflict_case` — everything else (active-citizenship
+        /// gate, ZK proof verification, bond reservation, duplicate-case dedup) is pallet-courts'
+        /// own `file_case`/`file_case_for` pipeline, reused rather than reimplemented here (see
+        /// `TierConflictHook`'s doc comment). `zk_proof`/`public_inputs` are required because
+        /// `TierConflict` is one of the anonymized case types — see
+        /// `pallet_courts::CaseFiler`'s doc comment.
+        #[pallet::call_index(11)]
+        #[pallet::weight(T::WeightInfo::challenge_law_tier())]
+        pub fn challenge_law_tier(
+            origin: OriginFor<T>,
+            law_id: u32,
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Laws::<T>::contains_key(law_id), Error::<T>::LawNotFound);
+            T::TierConflictHook::file_tier_conflict_case(who, law_id, zk_proof, public_inputs)
         }
     }
 

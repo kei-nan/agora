@@ -1,6 +1,8 @@
 use crate as pallet_constitution;
-use crate::{AutoChallengeHook, CitizenChecker, FreshLegislatureChecker, PetitionApprover};
-use frame_support::derive_impl;
+use crate::{
+	AutoChallengeHook, CitizenChecker, FreshLegislatureChecker, PetitionApprover, TierConflictHook,
+};
+use frame_support::{derive_impl, traits::ConstU32, BoundedVec};
 use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
@@ -21,6 +23,12 @@ thread_local! {
 	static AUTO_CHALLENGES: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
 	static AUTO_CHALLENGE_SHOULD_FAIL: RefCell<bool> = const { RefCell::new(false) };
 	static REFERENDA_CREATED: RefCell<Vec<(u32, [u8; 32])>> = const { RefCell::new(Vec::new()) };
+	/// (filer, law_id) pairs `TestTierConflictHook::file_tier_conflict_case` has been called
+	/// with, in call order. The zk_proof/public_inputs arguments aren't recorded — this mock
+	/// only needs to prove `challenge_law_tier` reached the hook with the right (filer, law_id),
+	/// not re-verify pallet-courts' own ZK logic, which is covered by that pallet's own tests.
+	static TIER_CONFLICT_CHALLENGES: RefCell<Vec<(u64, u32)>> = const { RefCell::new(Vec::new()) };
+	static TIER_CONFLICT_SHOULD_FAIL: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Test helper: set the set of accounts considered active citizens by `TestCitizenChecker`.
@@ -57,6 +65,17 @@ pub fn referenda_created() -> Vec<(u32, [u8; 32])> {
 	REFERENDA_CREATED.with(|v| v.borrow().clone())
 }
 
+/// Test helper: (filer, law_id) pairs `TestTierConflictHook` has recorded, in call order.
+pub fn tier_conflict_challenges() -> Vec<(u64, u32)> {
+	TIER_CONFLICT_CHALLENGES.with(|v| v.borrow().clone())
+}
+
+/// Test helper: makes `TestTierConflictHook::file_tier_conflict_case` return `Err(..)` instead
+/// of recording the call — mirrors `set_auto_challenge_should_fail`.
+pub fn set_tier_conflict_should_fail(should_fail: bool) {
+	TIER_CONFLICT_SHOULD_FAIL.with(|f| *f.borrow_mut() = should_fail);
+}
+
 pub struct TestCitizenChecker;
 impl CitizenChecker<u64> for TestCitizenChecker {
 	fn is_active_citizen(who: &u64) -> bool {
@@ -78,6 +97,22 @@ impl AutoChallengeHook for TestAutoChallengeHook {
 			return Err(sp_runtime::DispatchError::Other("auto_challenge_law failed (test)"));
 		}
 		AUTO_CHALLENGES.with(|v| v.borrow_mut().push(law_id));
+		Ok(())
+	}
+}
+
+pub struct TestTierConflictHook;
+impl TierConflictHook<u64> for TestTierConflictHook {
+	fn file_tier_conflict_case(
+		filer: u64,
+		law_id: u32,
+		_zk_proof: BoundedVec<u8, ConstU32<4096>>,
+		_public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
+	) -> DispatchResult {
+		if TIER_CONFLICT_SHOULD_FAIL.with(|f| *f.borrow()) {
+			return Err(sp_runtime::DispatchError::Other("file_tier_conflict_case failed (test)"));
+		}
+		TIER_CONFLICT_CHALLENGES.with(|v| v.borrow_mut().push((filer, law_id)));
 		Ok(())
 	}
 }
@@ -181,6 +216,7 @@ impl pallet_constitution::Config for Test {
 	type CitizenChecker = TestCitizenChecker;
 
 	type AutoChallengeHook = TestAutoChallengeHook;
+	type TierConflictHook = TestTierConflictHook;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = TestBenchmarkHelper;
@@ -194,5 +230,7 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
 	clear_auto_challenges();
 	set_auto_challenge_should_fail(false);
 	REFERENDA_CREATED.with(|v| v.borrow_mut().clear());
+	TIER_CONFLICT_CHALLENGES.with(|v| v.borrow_mut().clear());
+	set_tier_conflict_should_fail(false);
 	frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into()
 }

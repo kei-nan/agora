@@ -125,6 +125,48 @@ pub mod pallet {
         }
     }
 
+    // ── Cross-pallet cooldown coordination with pallet-executive ────────────────
+
+    /// Lets this pallet coordinate its `CooldownUntil` cooldown with pallet-executive's
+    /// independent, cabinet-level emergency mechanism (see this pallet's module doc comment).
+    /// Without this, a coalition controlling both bodies could alternate — declare an
+    /// emergency here, let it lapse (starting *this* pallet's cooldown), then immediately
+    /// declare a fresh one via pallet-executive (whose cooldown was never touched), and vice
+    /// versa — producing a near-unbroken declared-emergency state neither pallet's own
+    /// intra-pallet cooldown fix anticipated.
+    ///
+    /// Consumer-defines/provider-implements idiom, as `pallet_elections::DisclosureChecker`
+    /// established — with one difference: that relationship is one-directional (only
+    /// pallet-elections needs a checker), but this one is symmetric (each pallet needs to both
+    /// read and notify the other), so having each pallet implement this trait directly on its
+    /// own `Pallet<T>` in both directions would require each pallet's crate to depend on the
+    /// other's — a dependency cycle. Instead, `runtime/src/configs/mod.rs` implements this
+    /// trait (and pallet-executive's own mirror-image `SiblingEmergencyCooldown` trait)
+    /// directly on `Runtime`, delegating into the sibling pallet's own `CooldownUntil` storage
+    /// item directly. That storage item is deliberately reused as-is rather than adding a new
+    /// "cooldown imposed by the sibling" item: both pallets already treat `CooldownUntil`
+    /// purely as "the block before which a fresh declaration is refused," with no other logic
+    /// anywhere that distinguishes *why* it was set, so a shared meaning needs no separate
+    /// storage slot.
+    pub trait SiblingEmergencyCooldown<BlockNumber> {
+        /// Whether pallet-executive currently considers itself in cooldown.
+        fn is_in_cooldown(now: BlockNumber) -> bool;
+        /// Start pallet-executive's own cooldown too. Called at the same point this pallet
+        /// starts its own (see `on_initialize` and `vote_end_emergency`), so the two cooldowns
+        /// always end together no matter which pallet's emergency actually ran.
+        fn notify_emergency_ended(now: BlockNumber);
+    }
+
+    /// No-op implementation used by this pallet's own mock (`mock.rs`) so its unit tests don't
+    /// need to know pallet-executive exists at all. The real runtime wires the real
+    /// `Runtime`-level implementation described above instead.
+    impl<BlockNumber> SiblingEmergencyCooldown<BlockNumber> for () {
+        fn is_in_cooldown(_now: BlockNumber) -> bool {
+            false
+        }
+        fn notify_emergency_ended(_now: BlockNumber) {}
+    }
+
     // ── Config ───────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -157,6 +199,8 @@ pub mod pallet {
         /// Denominator of the supermajority fraction (e.g. 3 for 2/3).
         #[pallet::constant]
         type SupermajorityDenominator: Get<u32>;
+        /// See `SiblingEmergencyCooldown`'s doc comment above.
+        type SiblingEmergencyCooldown: SiblingEmergencyCooldown<BlockNumberFor<Self>>;
         /// Weight functions needed for this pallet's extrinsics.
         type WeightInfo: crate::weights::WeightInfo;
     }
@@ -215,6 +259,9 @@ pub mod pallet {
                     CooldownUntil::<T>::put(
                         n.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
                     );
+                    // Also start pallet-executive's cooldown — see `SiblingEmergencyCooldown`'s
+                    // doc comment for why.
+                    T::SiblingEmergencyCooldown::notify_emergency_ended(n);
                     Self::deposit_event(Event::EmergencyExpired { at_block: n });
                     weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 }
@@ -257,6 +304,11 @@ pub mod pallet {
         /// Cannot declare a new emergency until `EmergencyCooldownBlocks` have passed since
         /// the previous one ended.
         EmergencyCooldownActive,
+        /// `vote_declare_emergency`: a `PendingEmergencyProposal` already exists (from an
+        /// earlier voter) and this caller's own `reason_hash`/`duration_blocks` arguments
+        /// don't match its locked-in terms. A vote only counts toward the specific terms the
+        /// voter actually submitted — see `vote_declare_emergency`'s doc comment.
+        EmergencyProposalMismatch,
         /// Cannot add member: council is at maximum capacity.
         CouncilAtCapacity,
         /// The account is not in the council list.
@@ -320,15 +372,30 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(now >= CooldownUntil::<T>::get(), Error::<T>::EmergencyCooldownActive);
+            ensure!(
+                !T::SiblingEmergencyCooldown::is_in_cooldown(now),
+                Error::<T>::EmergencyCooldownActive
+            );
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
-            // Lock in the proposal terms from the first vote. Subsequent voters' args are
-            // ignored so a decisive late voter cannot override the agreed-upon reason or duration.
-            if PendingEmergencyProposal::<T>::get().is_none() {
-                PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
-            }
-            let (agreed_reason, agreed_duration) =
-                PendingEmergencyProposal::<T>::get().unwrap_or((reason_hash, duration_blocks));
+            // Lock in the proposal terms from the first vote. A subsequent voter's own
+            // `reason_hash`/`duration_blocks` must exactly match those locked-in terms — their
+            // vote only counts toward what they actually submitted, not silently toward
+            // whatever the first caller happened to propose (which they may never have seen).
+            // A mismatch is rejected outright rather than silently discarding their arguments.
+            let (agreed_reason, agreed_duration) = match PendingEmergencyProposal::<T>::get() {
+                None => {
+                    PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
+                    (reason_hash, duration_blocks)
+                }
+                Some((pending_reason, pending_duration)) => {
+                    ensure!(
+                        pending_reason == reason_hash && pending_duration == duration_blocks,
+                        Error::<T>::EmergencyProposalMismatch
+                    );
+                    (pending_reason, pending_duration)
+                }
+            };
             let clamped = agreed_duration.min(T::MaxEmergencyBlocks::get());
 
             DeclareVotes::<T>::insert(&who, true);
@@ -390,6 +457,9 @@ pub mod pallet {
                 CooldownUntil::<T>::put(
                     now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
                 );
+                // Also start pallet-executive's cooldown — see `SiblingEmergencyCooldown`'s
+                // doc comment for why.
+                T::SiblingEmergencyCooldown::notify_emergency_ended(now);
                 Self::deposit_event(Event::EmergencyLifted);
             }
             Ok(())

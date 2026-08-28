@@ -122,6 +122,19 @@ pub mod pallet {
         fn is_member(who: &AccountId) -> bool;
     }
 
+    /// Checks whether an account currently sits on the Accountability Council. Implemented by
+    /// pallet-accountability-council in the runtime. `pallet_accountability_council::add_member`
+    /// already bars the reverse direction (a current minister/PM joining the Council) at
+    /// Council-join time — this is the other half: a sitting Council member must not later be
+    /// appointed a minister or invested as PM either, closing what would otherwise be a one-way
+    /// gate. Checked at `nominate_pm` (candidate), `remove_and_replace_prime_minister`
+    /// (successor), and `appoint_minister` (who) — the three points that actually install
+    /// someone into executive power, mirroring where `LegislatureMembership` is already checked
+    /// for the analogous "must currently hold a legislature seat" rule.
+    pub trait AccountabilityCouncilChecker<AccountId> {
+        fn is_current_member(who: &AccountId) -> bool;
+    }
+
     /// Benchmark-only seeding for `CitizenChecker`/`LegislatureMembership` state, which the
     /// real runtime backs with pallet-identity-zk/pallet-legislature storage this pallet
     /// otherwise has no generic way to reach into from a benchmark. Same pattern as
@@ -130,6 +143,43 @@ pub mod pallet {
     pub trait BenchmarkHelper<AccountId> {
         fn make_active_citizen(who: &AccountId);
         fn make_legislature_member(who: &AccountId);
+    }
+
+    // ── Cross-pallet cooldown coordination with pallet-emergency-council ────────
+
+    /// Lets this pallet coordinate its `CooldownUntil` cooldown with pallet-emergency-council's
+    /// independent, council-level emergency mechanism (see this pallet's module doc comment,
+    /// "Emergency powers" section). Without this, a coalition controlling both bodies could
+    /// alternate — declare an emergency here, let it lapse (starting *this* pallet's cooldown),
+    /// then immediately declare a fresh one via pallet-emergency-council (whose cooldown was
+    /// never touched), and vice versa — producing a near-unbroken declared-emergency state
+    /// neither pallet's own intra-pallet cooldown fix anticipated.
+    ///
+    /// Mirror-image trait of `pallet_emergency_council::SiblingEmergencyCooldown` — see that
+    /// trait's doc comment for the full rationale on why this relationship is defined as two
+    /// separate consumer traits (one per pallet) implemented directly on `Runtime` in
+    /// `runtime/src/configs/mod.rs`, rather than the one-directional
+    /// consumer-defines/provider-implements-on-its-own-Pallet idiom
+    /// `pallet_elections::DisclosureChecker` uses: that idiom would require each of these two
+    /// pallets' crates to depend on the other's, which is a dependency cycle since this
+    /// relationship is symmetric.
+    pub trait SiblingEmergencyCooldown<BlockNumber> {
+        /// Whether pallet-emergency-council currently considers itself in cooldown.
+        fn is_in_cooldown(now: BlockNumber) -> bool;
+        /// Start pallet-emergency-council's own cooldown too. Called at the same point this
+        /// pallet starts its own (see `on_initialize` and `vote_end_emergency`), so the two
+        /// cooldowns always end together no matter which pallet's emergency actually ran.
+        fn notify_emergency_ended(now: BlockNumber);
+    }
+
+    /// No-op implementation used by this pallet's own mock (`mock.rs`) so its unit tests don't
+    /// need to know pallet-emergency-council exists at all. The real runtime wires the real
+    /// `Runtime`-level implementation described above instead.
+    impl<BlockNumber> SiblingEmergencyCooldown<BlockNumber> for () {
+        fn is_in_cooldown(_now: BlockNumber) -> bool {
+            false
+        }
+        fn notify_emergency_ended(_now: BlockNumber) {}
     }
 
     // ── Config ───────────────────────────────────────────────────────────────────
@@ -159,6 +209,8 @@ pub mod pallet {
         /// early `vote_end_emergency`) before the cabinet can declare another one.
         #[pallet::constant]
         type EmergencyCooldownBlocks: Get<u32>;
+        /// See `SiblingEmergencyCooldown`'s doc comment above.
+        type SiblingEmergencyCooldown: SiblingEmergencyCooldown<BlockNumberFor<Self>>;
         /// Numerator of the cabinet supermajority required to declare/end an emergency (e.g. 2).
         #[pallet::constant]
         type SupermajorityNumerator: Get<u32>;
@@ -169,6 +221,10 @@ pub mod pallet {
         type CitizenChecker: CitizenChecker<Self::AccountId>;
         /// Checks legislature membership for PM nomination/voting/succession.
         type LegislatureMembership: LegislatureMembership<Self::AccountId>;
+        /// Checks Accountability Council membership — bars a sitting Council member from being
+        /// nominated/invested PM or appointed a minister. See `AccountabilityCouncilChecker`'s
+        /// doc comment.
+        type AccountabilityCouncilChecker: AccountabilityCouncilChecker<Self::AccountId>;
         /// How many blocks a PM-investiture nomination window stays open once opened.
         #[pallet::constant]
         type PmNominationWindowBlocks: Get<u32>;
@@ -382,6 +438,9 @@ pub mod pallet {
                     CooldownUntil::<T>::put(
                         now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
                     );
+                    // Also start pallet-emergency-council's cooldown — see
+                    // `SiblingEmergencyCooldown`'s doc comment for why.
+                    T::SiblingEmergencyCooldown::notify_emergency_ended(now);
                     Self::deposit_event(Event::EmergencyLapsed);
                     weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 // Expire: emergency ran its full constitutional duration.
@@ -392,6 +451,9 @@ pub mod pallet {
                     CooldownUntil::<T>::put(
                         now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
                     );
+                    // Also start pallet-emergency-council's cooldown — see
+                    // `SiblingEmergencyCooldown`'s doc comment for why.
+                    T::SiblingEmergencyCooldown::notify_emergency_ended(now);
                     Self::deposit_event(Event::EmergencyExpired { at_block: now });
                     weight = weight.saturating_add(T::DbWeight::get().writes(4));
                 }
@@ -488,6 +550,11 @@ pub mod pallet {
         EmergencyCooldownActive,
         /// This cabinet member has already voted to declare the current emergency.
         AlreadyVotedToDeclare,
+        /// `vote_declare_emergency`: a `PendingEmergencyProposal` already exists (from an
+        /// earlier voter) and this caller's own `reason_hash`/`duration_blocks` arguments
+        /// don't match its locked-in terms. A vote only counts toward the specific terms the
+        /// voter actually submitted — see `vote_declare_emergency`'s doc comment.
+        EmergencyProposalMismatch,
         /// This cabinet member has already voted to end the current emergency.
         AlreadyVotedToEnd,
         /// There is no active emergency.
@@ -511,6 +578,11 @@ pub mod pallet {
         /// Candidate/nominee/successor must currently hold a legislature seat — the PM
         /// is chosen by and from the legislature, not the general citizenry.
         NotLegislatureMember,
+        /// Candidate/successor/nominee currently sits on the Accountability Council — barred
+        /// from executive appointment (the reverse of the join-time check
+        /// `pallet_accountability_council::add_member` already performs). See
+        /// `AccountabilityCouncilChecker`'s doc comment.
+        AccountabilityCouncilMember,
         /// The named successor is already the current Prime Minister.
         SuccessorIsCurrentPm,
         /// Installing this account would push its total time served as Prime
@@ -601,6 +673,10 @@ pub mod pallet {
                 T::LegislatureMembership::is_member(&successor),
                 Error::<T>::NotLegislatureMember
             );
+            ensure!(
+                !T::AccountabilityCouncilChecker::is_current_member(&successor),
+                Error::<T>::AccountabilityCouncilMember
+            );
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(
                 Self::pm_occupancy_in_window(&successor, now)
@@ -683,6 +759,10 @@ pub mod pallet {
             ensure!(
                 T::LegislatureMembership::is_member(&candidate),
                 Error::<T>::NotLegislatureMember
+            );
+            ensure!(
+                !T::AccountabilityCouncilChecker::is_current_member(&candidate),
+                Error::<T>::AccountabilityCouncilMember
             );
             ensure!(
                 Self::pm_occupancy_in_window(&candidate, now)
@@ -782,6 +862,10 @@ pub mod pallet {
             let nominee = PendingMinisterNomination::<T>::get(portfolio_id)
                 .ok_or(Error::<T>::NoNominationPending)?;
             ensure!(nominee == who, Error::<T>::NoNominationPending);
+            ensure!(
+                !T::AccountabilityCouncilChecker::is_current_member(&who),
+                Error::<T>::AccountabilityCouncilMember
+            );
             PendingMinisterNomination::<T>::remove(portfolio_id);
 
             // Vacate whoever currently holds this portfolio.
@@ -859,15 +943,30 @@ pub mod pallet {
             ensure!(ActiveEmergency::<T>::get().is_none(), Error::<T>::AlreadyActiveEmergency);
             let now = frame_system::Pallet::<T>::block_number();
             ensure!(now >= CooldownUntil::<T>::get(), Error::<T>::EmergencyCooldownActive);
+            ensure!(
+                !T::SiblingEmergencyCooldown::is_in_cooldown(now),
+                Error::<T>::EmergencyCooldownActive
+            );
             ensure!(!DeclareVotes::<T>::get(&who), Error::<T>::AlreadyVotedToDeclare);
 
-            // Lock in the proposal terms from the first vote. Subsequent voters' args are
-            // ignored so a decisive late voter cannot override the agreed-upon reason or duration.
-            if PendingEmergencyProposal::<T>::get().is_none() {
-                PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
-            }
-            let (agreed_reason, agreed_duration) =
-                PendingEmergencyProposal::<T>::get().unwrap_or((reason_hash, duration_blocks));
+            // Lock in the proposal terms from the first vote. A subsequent voter's own
+            // `reason_hash`/`duration_blocks` must exactly match those locked-in terms — their
+            // vote only counts toward what they actually submitted, not silently toward
+            // whatever the first caller happened to propose (which they may never have seen).
+            // A mismatch is rejected outright rather than silently discarding their arguments.
+            let (agreed_reason, agreed_duration) = match PendingEmergencyProposal::<T>::get() {
+                None => {
+                    PendingEmergencyProposal::<T>::put((reason_hash, duration_blocks));
+                    (reason_hash, duration_blocks)
+                }
+                Some((pending_reason, pending_duration)) => {
+                    ensure!(
+                        pending_reason == reason_hash && pending_duration == duration_blocks,
+                        Error::<T>::EmergencyProposalMismatch
+                    );
+                    (pending_reason, pending_duration)
+                }
+            };
             let clamped = agreed_duration.min(T::MaxEmergencyBlocks::get());
 
             DeclareVotes::<T>::insert(&who, true);
@@ -965,6 +1064,9 @@ pub mod pallet {
                 CooldownUntil::<T>::put(
                     now.saturating_add(BlockNumberFor::<T>::from(T::EmergencyCooldownBlocks::get())),
                 );
+                // Also start pallet-emergency-council's cooldown — see
+                // `SiblingEmergencyCooldown`'s doc comment for why.
+                T::SiblingEmergencyCooldown::notify_emergency_ended(now);
                 Self::deposit_event(Event::EmergencyLifted);
             }
 

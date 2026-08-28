@@ -204,6 +204,17 @@ impl pallet_elections::ZkProofVerifier for ZkPassportUltraHonkVerifier {
     }
 }
 
+/// Third trait impl, same struct: pallet-courts' anonymized case filing
+/// (`LawChallenge`/`TreasuryDispute`/`TierConflict`) requires the same outer ZKPassport
+/// citizenship proof shape as registration/whistleblowing/delegate-persona filing do — just
+/// gated by its own `CASE_FILING_SERVICE_SCOPE`/`CASE_FILING_SERVICE_SUBSCOPE` domain-separation
+/// constants (checked in `pallet-courts` itself, not here). Same real bb 5.0.0 pairing check.
+impl pallet_courts::ZkProofVerifier for ZkPassportUltraHonkVerifier {
+    fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool {
+        verify_inner(proof_bytes, public_inputs).is_some()
+    }
+}
+
 /// The parsed envelope: everything the header pins down, plus the raw bb proof.
 struct Envelope<'a> {
     outer_count: u8,

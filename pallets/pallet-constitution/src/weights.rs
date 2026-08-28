@@ -40,6 +40,7 @@ pub trait WeightInfo {
 	fn reaffirm_amendment() -> Weight;
 	fn advance_to_entrenched() -> Weight;
 	fn revoke_amendment() -> Weight;
+	fn challenge_law_tier() -> Weight;
 }
 
 /// Weights for pallet_constitution.
@@ -121,6 +122,16 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
+	/// 1 read (`Laws::contains_key`) plus the folded cost of
+	/// `TierConflictHook::file_tier_conflict_case`, which — unlike this pallet's other hook
+	/// calls — performs a real ZK pairing check inside pallet-courts (see
+	/// `pallet_anticorruption::submit_whistleblower_report`'s identical-shaped weight for the
+	/// same reasoning), so this is priced heavier than this pallet's storage-only calls rather
+	/// than folded in as a negligible extra the way `enact_law`'s `AutoChallengeHook` call is.
+	fn challenge_law_tier() -> Weight {
+		Weight::from_parts(20_000_000, 3_600)
+			.saturating_add(T::DbWeight::get().reads(1_u64))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -179,5 +190,9 @@ impl WeightInfo for () {
 		Weight::from_parts(14_000_000, 1_957)
 			.saturating_add(RocksDbWeight::get().reads(2_u64))
 			.saturating_add(RocksDbWeight::get().writes(2_u64))
+	}
+	fn challenge_law_tier() -> Weight {
+		Weight::from_parts(20_000_000, 3_600)
+			.saturating_add(RocksDbWeight::get().reads(1_u64))
 	}
 }

@@ -2,8 +2,16 @@ use crate::{
 	mock::*, ConstitutionalAmendments, Error, Event, LawStatus, LawTier, Laws, MaturityStage,
 	NextLawId, NextPetitionId, PendingAmendments, PetitionSignatures, Petitions,
 };
-use frame_support::{assert_noop, assert_ok};
+use frame_support::{assert_noop, assert_ok, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
+
+fn dummy_zk_proof() -> BoundedVec<u8, ConstU32<4096>> {
+	BoundedVec::try_from(vec![1u8]).unwrap()
+}
+
+fn dummy_public_inputs() -> BoundedVec<[u8; 32], ConstU32<16>> {
+	BoundedVec::try_from(vec![[0u8; 32]; 9]).unwrap()
+}
 
 fn h(n: u8) -> [u8; 32] {
 	[n; 32]
@@ -865,5 +873,109 @@ fn threshold_lookup_from_law_storage_reflects_real_enacted_tier() {
 		// computed from this lookup, never from a call argument, for these three calls.
 		assert_ne!(structural_tier, LawTier::Ordinary);
 		assert_ne!(foundational_tier, LawTier::Ordinary);
+	});
+}
+
+// ── challenge_law_tier ──────────────────────────────────────────────────────
+//
+// Closes the constitutional-law-tier-laundering gap: `enact_law`'s `tier` argument has no
+// check tying it to the law's actual content, so a bare 51% majority could enact
+// constitutionally-weighted law while declaring it Ordinary. `challenge_law_tier` lets any
+// citizen permissionlessly open a `pallet_courts::CaseSubject::TierConflict` case alleging a
+// specific law was enacted at the wrong tier, via `TierConflictHook` (mocked here as
+// `TestTierConflictHook`, which just records the call -- the actual ZK-gated, anonymized
+// case-filing pipeline this hook delegates to in production lives in pallet-courts and is
+// covered by that pallet's own test suite).
+
+#[test]
+fn challenge_law_tier_forwards_to_hook_for_an_existing_law() {
+	new_test_ext().execute_with(|| {
+		let id = enact(LawTier::Ordinary, 1);
+
+		assert_ok!(Constitution::challenge_law_tier(
+			RuntimeOrigin::signed(7),
+			id,
+			dummy_zk_proof(),
+			dummy_public_inputs(),
+		));
+
+		assert_eq!(tier_conflict_challenges(), vec![(7, id)]);
+	});
+}
+
+#[test]
+fn challenge_law_tier_rejects_unknown_law_id() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Constitution::challenge_law_tier(
+				RuntimeOrigin::signed(7),
+				999,
+				dummy_zk_proof(),
+				dummy_public_inputs(),
+			),
+			Error::<Test>::LawNotFound
+		);
+		// The hook must never be reached for a law_id that doesn't exist.
+		assert!(tier_conflict_challenges().is_empty());
+	});
+}
+
+#[test]
+fn challenge_law_tier_requires_signed_origin() {
+	new_test_ext().execute_with(|| {
+		let id = enact(LawTier::Ordinary, 1);
+		assert_noop!(
+			Constitution::challenge_law_tier(
+				RuntimeOrigin::none(),
+				id,
+				dummy_zk_proof(),
+				dummy_public_inputs(),
+			),
+			DispatchError::BadOrigin
+		);
+	});
+}
+
+#[test]
+fn challenge_law_tier_propagates_hook_failure() {
+	new_test_ext().execute_with(|| {
+		let id = enact(LawTier::Ordinary, 1);
+		set_tier_conflict_should_fail(true);
+
+		assert_noop!(
+			Constitution::challenge_law_tier(
+				RuntimeOrigin::signed(7),
+				id,
+				dummy_zk_proof(),
+				dummy_public_inputs(),
+			),
+			DispatchError::Other("file_tier_conflict_case failed (test)")
+		);
+	});
+}
+
+/// Any citizen may call this -- it's genuinely permissionless, unlike the legislature-gated
+/// calls elsewhere in this pallet. Multiple different accounts can each open their own
+/// challenge (deduplication against a law that already has one open is pallet-courts' own
+/// `OpenCaseByLaw` guard, exercised in that pallet's test suite, not here).
+#[test]
+fn challenge_law_tier_is_permissionless_across_different_callers() {
+	new_test_ext().execute_with(|| {
+		let id = enact(LawTier::Structural, 1);
+
+		assert_ok!(Constitution::challenge_law_tier(
+			RuntimeOrigin::signed(1),
+			id,
+			dummy_zk_proof(),
+			dummy_public_inputs(),
+		));
+		assert_ok!(Constitution::challenge_law_tier(
+			RuntimeOrigin::signed(2),
+			id,
+			dummy_zk_proof(),
+			dummy_public_inputs(),
+		));
+
+		assert_eq!(tier_conflict_challenges(), vec![(1, id), (2, id)]);
 	});
 }

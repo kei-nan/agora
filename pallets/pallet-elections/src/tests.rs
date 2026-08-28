@@ -2,9 +2,11 @@ use crate::{
     mock::*, BackingCount, BackingThreshold, BackingThresholdCeiling,
     BackingThresholdFloor, DelegatePersonaIdOf, DelegatePersonaUsed,
     DelegateInfo, DelegateStatus, DelegateSweepCursor, Delegates,
-    ElectionCycleBlocks, Error, Event,
+    ElectionCandidateSnapshot, ElectionCycleBlocks, ElectionScanCursor, ElectionScanInProgress,
+    Error, Event, LastBackingCheckpoint,
     LastElectionBlock, LegislatureSeats, MandatoryBreakBlocks, MaxBackingsPerCitizen,
     MaxConsecutiveTerms, TermLengthBlocks, UsedBackingNullifier, WarningWindowPct,
+    AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE, AGORA_ELECTIONS_SERVICE_SCOPE,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, traits::ConstU32, BoundedVec};
 use sp_runtime::DispatchError;
@@ -89,7 +91,7 @@ fn register_delegate(who: u64) {
     let delegate_persona_id = delegate_persona_id_for(who);
     let persona_bytes = persona_account_bytes_for(who);
     let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-        [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+        [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
         delegate_persona_id,
         persona_bytes,
         [0u8; 32], [0u8; 32],
@@ -154,12 +156,79 @@ fn register_as_delegate_works() {
 }
 
 #[test]
+fn register_as_delegate_fails_when_service_scope_wrong() {
+    // A proof carrying some *other* ZKPassport-integrated service's `service_scope` (e.g. one
+    // generated for a wholly different app) must not mint a delegate persona just because the
+    // underlying passport proof is otherwise valid.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], [0xAAu8; 32], AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
+fn register_as_delegate_fails_when_service_subscope_wrong() {
+    // Same as above, but for the subscope specifically -- in particular, a citizen's own
+    // `pallet_identity_zk::register_citizen` proof (correct app, wrong use-case, and
+    // permanently public on-chain call data once submitted) must not double as a valid
+    // `register_as_delegate` proof.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_active_citizen(1, true);
+        let delegate_persona_id = delegate_persona_id_for(1);
+        let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, [0xBBu8; 32],
+            delegate_persona_id,
+            persona_account_bytes_for(1),
+            [0u8; 32], [0u8; 32],
+        ])
+        .unwrap();
+        assert_noop!(
+            Elections::register_as_delegate(
+                RuntimeOrigin::signed(1),
+                1,
+                delegate_persona_id,
+                BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap(),
+                public_inputs,
+                1,
+                [[0u8; 32]; 5],
+                name(),
+                ipfs(2),
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
 fn register_as_delegate_fails_when_not_active_citizen() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         let delegate_persona_id = delegate_persona_id_for(1);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(1),
             [0u8; 32], [0u8; 32],
@@ -191,7 +260,7 @@ fn register_as_delegate_fails_when_already_registered() {
 
         let delegate_persona_id = delegate_persona_id_for(1);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(1),
             [0u8; 32], [0u8; 32],
@@ -221,7 +290,7 @@ fn register_as_delegate_fails_when_persona_account_does_not_match_signer() {
         set_active_citizen(1, true);
         let delegate_persona_id = delegate_persona_id_for(1);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(2),
             [0u8; 32], [0u8; 32],
@@ -251,7 +320,7 @@ fn register_as_delegate_fails_when_zk_proof_invalid() {
         set_active_citizen(1, true);
         let delegate_persona_id = delegate_persona_id_for(1);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(1),
             [0u8; 32], [0u8; 32],
@@ -286,7 +355,7 @@ fn register_as_delegate_fails_when_committee_key_not_approved() {
         set_active_citizen(1, true);
         let delegate_persona_id = delegate_persona_id_for(1);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(1),
             [0u8; 32], [0u8; 32],
@@ -320,7 +389,7 @@ fn register_as_delegate_fails_when_proof_persona_account_mismatch() {
         // public_inputs is missing account 1's own persona bytes -- TestDelegatePersonaVerifier
         // must reject.
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             delegate_persona_id,
             persona_account_bytes_for(99), // wrong account's bytes
             [0u8; 32], [0u8; 32],
@@ -355,7 +424,7 @@ fn register_as_delegate_fails_when_delegate_persona_id_already_used() {
 
         set_active_citizen(2, true);
         let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(vec![
-            [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+            [0u8; 32], [0u8; 32], [0u8; 32], AGORA_ELECTIONS_SERVICE_SCOPE, AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
             reused_id,
             persona_account_bytes_for(2),
             [0u8; 32], [0u8; 32],
@@ -1361,6 +1430,292 @@ fn on_initialize_election_seats_normally_when_disclosure_current() {
                 .count(),
             0
         );
+    });
+}
+
+#[test]
+fn on_initialize_election_skips_accountability_council_member_and_falls_through() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // 4 delegates, LegislatureSeats = 3 (default). Backing ranks them 1 > 2 > 3 > 4.
+        for d in 1..=4u64 {
+            register_delegate(d);
+        }
+        let backers: [u64; 6] = [5, 6, 7, 8, 9, 10];
+        for &b in &backers[0..6] {
+            back(b, 1);
+        }
+        for &b in &backers[0..5] {
+            back(b, 2);
+        }
+        for &b in &backers[0..4] {
+            back(b, 3);
+        }
+        for &b in &backers[0..3] {
+            back(b, 4);
+        }
+
+        // Delegate 1 would win the top seat by backing alone, but they currently sit on the
+        // Accountability Council -- they must be skipped, and delegate 4 (next-highest after
+        // the top 3) should fall through into the freed seat instead of it going unfilled.
+        set_accountability_council_member(1, true);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        // 2, 3, 4 seated (3 seats) -- 1 skipped, 4 falls through to fill the freed seat.
+        assert_eq!(seat_calls(), vec![vec![2, 3, 4]]);
+        System::assert_has_event(
+            Event::SeatingSkippedAccountabilityCouncilMember { account: 1 }.into(),
+        );
+        // Only the ineligible delegate is skipped -- no spurious skip events for eligible ones.
+        assert_eq!(
+            System::events()
+                .into_iter()
+                .filter(|r| matches!(
+                    r.event,
+                    RuntimeEvent::Elections(Event::SeatingSkippedAccountabilityCouncilMember { .. })
+                ))
+                .count(),
+            1
+        );
+    });
+}
+
+#[test]
+fn on_initialize_election_seats_normally_when_not_accountability_council_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        assert_eq!(seat_calls(), vec![vec![1]]);
+        assert_eq!(
+            System::events()
+                .into_iter()
+                .filter(|r| matches!(
+                    r.event,
+                    RuntimeEvent::Elections(Event::SeatingSkippedAccountabilityCouncilMember { .. })
+                ))
+                .count(),
+            0
+        );
+    });
+}
+
+// ─── run_election: bounded multi-block scan (unbounded-hook griefing fix) ────
+//
+// Previously `run_election` collected and sorted *every* `Delegates` entry in a single
+// `on_initialize` call -- unbounded per-block weight in a mandatory hook. The fix bounds each
+// block's ranking scan to `MaxElectionScanPerBlock` entries (10 in this mock) and resumes via
+// `ElectionScanCursor`, snapshotting each examined delegate's backing count into
+// `ElectionCandidateSnapshot` so the eventual ranking is unaffected by backing changes that
+// happen mid-scan.
+
+#[test]
+fn run_election_scan_is_bounded_per_block_and_finalizes_once_complete() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        // 15 delegates -- more than MAX_ELECTION_SCAN_PER_BLOCK (10) -- each with its own
+        // 3 dedicated backers, ranked by distinct backing counts (delegate d has (15 - d + 3)
+        // backers) so seating order is unambiguous. LegislatureSeats defaults to 3.
+        for d in 1..=15u64 {
+            register_delegate(d);
+            // 1000-spaced per-delegate backer ranges (max 17 backers per delegate below) so
+            // no backer account is ever reused across two different delegates.
+            let backer_base = 100_000 + d * 1000;
+            let extra = 15 - d; // 0..=14, gives each delegate a distinct backer count
+            for i in 0..(3 + extra) {
+                back(backer_base + i, d);
+            }
+        }
+        // Highest-backed: 1 (17 backers) > 2 (16) > 3 (15) > ... > 15 (3).
+        assert_eq!(BackingCount::<Test>::get(1), 17);
+        assert_eq!(BackingCount::<Test>::get(15), 3);
+        assert!(ElectionScanCursor::<Test>::get().is_none());
+        assert!(!ElectionScanInProgress::<Test>::get());
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        // Only MAX_ELECTION_SCAN_PER_BLOCK (10) delegates examined so far -- election not
+        // finalized yet, and the snapshot holds exactly those 10 candidates' backing counts.
+        assert!(seat_calls().is_empty());
+        assert_eq!(LastElectionBlock::<Test>::get(), 0);
+        assert!(ElectionScanCursor::<Test>::get().is_some());
+        assert!(ElectionScanInProgress::<Test>::get());
+        assert_eq!(ElectionCandidateSnapshot::<Test>::iter().count(), 10);
+
+        // A second call (same block) resumes from the cursor, examines the remaining 5, and
+        // finalizes seating from the full 15-candidate snapshot -- top 3 by backing: 1, 2, 3.
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls(), vec![vec![1, 2, 3]]);
+        assert_eq!(LastElectionBlock::<Test>::get(), DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        assert!(ElectionScanCursor::<Test>::get().is_none());
+        assert!(!ElectionScanInProgress::<Test>::get());
+        // Snapshot is fully drained once seating is finalized.
+        assert_eq!(ElectionCandidateSnapshot::<Test>::iter().count(), 0);
+        System::assert_last_event(
+            Event::LegislatureElectionRun {
+                at_block: DEFAULT_ELECTION_CYCLE_BLOCKS as u64,
+                seated: 3,
+            }
+            .into(),
+        );
+    });
+}
+
+#[test]
+fn run_election_scan_snapshots_backing_counts_against_mid_scan_changes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        // 15 delegates so the scan spans two blocks (batch size 10), with backing counts
+        // spread far enough apart (3..17) that the top 3 (delegates 1, 2, 3) are unambiguous.
+        for d in 1..=15u64 {
+            register_delegate(d);
+            let backer_base = 200_000 + d * 1000;
+            let extra = 15 - d;
+            for i in 0..(3 + extra) {
+                back(backer_base + i, d);
+            }
+        }
+        assert_eq!(BackingCount::<Test>::get(1), 17);
+        assert_eq!(BackingCount::<Test>::get(3), 15);
+        assert_eq!(BackingCount::<Test>::get(15), 3);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert!(ElectionScanCursor::<Test>::get().is_some());
+
+        // `Delegates` iterates in storage (hash) order, not numeric account order, so which
+        // 10 of the 15 delegates land in this first batch isn't something to hardcode. Instead,
+        // pick whichever already-snapshotted delegate has the *smallest* snapshotted count --
+        // with only 3 delegates (1, 2, 3) holding the top counts (15-17) out of 15 total and a
+        // batch of 10, the batch necessarily contains at least 7 non-top-3 delegates, so the
+        // batch minimum is always a non-top-3 delegate (its snapshotted count is at most 14,
+        // strictly below delegate 3's snapshotted 15).
+        let snapshotted: alloc::vec::Vec<(u64, u32)> =
+            ElectionCandidateSnapshot::<Test>::iter().collect();
+        assert_eq!(snapshotted.len(), 10);
+        let (victim, victim_snapshot) =
+            *snapshotted.iter().min_by_key(|(_, count)| *count).unwrap();
+        assert!(victim != 1 && victim != 2 && victim != 3);
+        assert!(victim_snapshot < 15);
+
+        // Massively inflate the victim's *live* BackingCount, well past every other
+        // delegate's, only after it has already been snapshotted.
+        for i in 0..50u64 {
+            back(900_000 + i, victim);
+        }
+        assert!(BackingCount::<Test>::get(victim) > victim_snapshot + 40);
+
+        let _ = Elections::on_initialize(System::block_number());
+        // If finalization re-read live BackingCount instead of the snapshot taken during the
+        // scan, `victim` would now dwarf every other delegate's count and be seated in place
+        // of one of the original top 3. It isn't -- winners are still exactly the original
+        // top 3 by initial backing, confirming the snapshot (not live storage) drove seating.
+        assert_eq!(seat_calls(), vec![vec![1, 2, 3]]);
+    });
+}
+
+// ── Flash-backing defense (`LastBackingCheckpoint`/`MinBackingDurationBlocks`) ──
+
+#[test]
+fn run_election_flash_backing_does_not_win_a_seat() {
+    // The exact exploit `MinBackingDurationBlocks`' doc comment describes: a funded actor
+    // rents backing for only the blocks right before a deterministic, public election
+    // boundary. With only one seat available, a live-`BackingCount` read would let the
+    // attacker's massively-flash-backed delegate displace a genuine, long-backed delegate.
+    // With the checkpoint fix, it can't -- the attacker's checkpoint has never had a chance
+    // to mature, so it contributes 0 to the ranking regardless of how large the live count is.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_min_backing_duration_blocks(5); // well under DEFAULT_ELECTION_CYCLE_BLOCKS (20)
+        assert_ok!(Elections::set_election_params(RuntimeOrigin::root(), Some(1), None, None));
+
+        // Delegate 1 ("honest"): registered and genuinely backed from block 1, long before
+        // election 1's scan -- its checkpoint gets a full cycle to mature before election 2.
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 3);
+
+        // Election 1: delegate 1 is the only candidate, so it wins the single seat regardless
+        // of its ranking value -- this just seeds its checkpoint at (block 20, count 3).
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls(), vec![vec![1]]);
+        assert_eq!(LastBackingCheckpoint::<Test>::get(1), Some((DEFAULT_ELECTION_CYCLE_BLOCKS as u64, 3)));
+
+        // Delegate 2 ("attacker"): registered only now, in the run-up to election 2's
+        // boundary, and flash-backed by far more citizens than delegate 1 has ever had --
+        // enough that a live-BackingCount read would make it the clear winner.
+        register_delegate(2);
+        for b in 1000..1010u64 {
+            back(b, 2);
+        }
+        assert_eq!(BackingCount::<Test>::get(2), 10);
+        assert!(BackingCount::<Test>::get(2) > 3 * BackingCount::<Test>::get(1));
+
+        // Election 2: delegate 1's checkpoint has matured (20 blocks since it was set, well
+        // past the 5-block minimum) and is used for ranking (3); delegate 2 has no matured
+        // checkpoint at all (registered after election 1 already ran), so it contributes 0.
+        // Delegate 1 wins the single seat despite delegate 2's more-than-3x live lead.
+        System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls(), vec![vec![1], vec![1]]);
+
+        // The rent-and-withdraw pattern this closes: having already lost the election, the
+        // attacker's later withdrawal changes nothing -- the attack already failed regardless
+        // of whether they now unback.
+        for b in 1000..1010u64 {
+            unback(b, 2);
+        }
+        assert_eq!(BackingCount::<Test>::get(2), 0);
+    });
+}
+
+#[test]
+fn run_election_backing_counts_once_it_has_genuinely_matured() {
+    // Companion to the test above: the checkpoint mechanism delays flash backing, it doesn't
+    // permanently zero it out. A delegate's backing that survives long enough to mature (here,
+    // by simply not being withdrawn across a second election cycle) does eventually count --
+    // confirming this is a timing defense, not a de facto ban on ever seating a new delegate.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_min_backing_duration_blocks(5);
+        assert_ok!(Elections::set_election_params(RuntimeOrigin::root(), Some(1), None, None));
+
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+        register_delegate(2);
+        for b in 1000..1010u64 {
+            back(b, 2);
+        }
+
+        // Election 1: both delegates are brand new (no matured checkpoint), so both rank 0 --
+        // ties broken by drain order, seeding both checkpoints regardless of who "wins" here.
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(LastBackingCheckpoint::<Test>::get(1), Some((DEFAULT_ELECTION_CYCLE_BLOCKS as u64, 3)));
+        assert_eq!(LastBackingCheckpoint::<Test>::get(2), Some((DEFAULT_ELECTION_CYCLE_BLOCKS as u64, 10)));
+
+        // Nobody touches backing between elections 1 and 2 -- delegate 2's 10 backers are now
+        // genuinely long-standing, not a flash. Election 2's scan finds both checkpoints
+        // matured (a full cycle, 20 blocks, has passed -- well past the 5-block minimum) and
+        // ranks on the real counts: delegate 2 (10) beats delegate 1 (3) for the single seat.
+        System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls().last(), Some(&vec![2]));
     });
 }
 

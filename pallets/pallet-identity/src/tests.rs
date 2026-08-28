@@ -8,7 +8,9 @@ use crate::{
     NextBackingLeafIndex, NextQueryId, NullifierRegistry, OprfCommitteeKeys,
     PendingOprfQueryCountBySubmitter, OprfRound1Commitments, OprfRound2Responses,
     OprfSchemeVersion, PendingOprfQueries, ReverificationDeadline, SelfDeclaredSingleDocument,
-    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens, BACKING_TREE_DEPTH,
+    SuspendedByJuryReview, SuspendedNullifiers, TotalCitizens, AGORA_IDENTITY_MIGRATE_SUBSCOPE,
+    AGORA_IDENTITY_RECOVER_SUBSCOPE, AGORA_IDENTITY_REGISTER_SUBSCOPE,
+    AGORA_IDENTITY_REVERIFY_SUBSCOPE, AGORA_IDENTITY_SERVICE_SCOPE, BACKING_TREE_DEPTH,
 };
 use frame_support::{assert_noop, assert_ok, traits::{ConstU32, Currency}, BoundedVec};
 use sp_runtime::DispatchError;
@@ -33,17 +35,25 @@ fn current_date_field(secs: u64) -> [u8; 32] {
 /// 9 fields: 8 fixed + 1 disclosure subproof — see `runtime/src/verifier.rs`) with the given
 /// nullifier (index 7 = `6 + D`, `scoped_nullifier`), merkle root (index 0,
 /// `certificate_registry_root`), a fresh `current_date` (index 2, matching
-/// `mock::TEST_NOW_UNIX_SECS`), and `anchor` in the sole `param_commitments` slot (index 5)
+/// `mock::TEST_NOW_UNIX_SECS`), `anchor` in the sole `param_commitments` slot (index 5)
 /// — `TestAnchorVerifier` (see `mock.rs`) treats registration as valid whenever the outer
-/// public inputs contain the submitted anchor there. The other slots are left zeroed.
+/// public inputs contain the submitted anchor there — and `subscope` at index 4
+/// (`service_subscope`, checked by `Self::verify_outer_proof` against whichever
+/// `AGORA_IDENTITY_*_SUBSCOPE` constant the calling extrinsic requires). `service_scope`
+/// (index 3) is always `AGORA_IDENTITY_SERVICE_SCOPE` — shared across every pallet-identity
+/// call, so it never needs to vary per fixture the way `subscope` does. The other slots are
+/// left zeroed.
 fn public_inputs(
     nullifier: [u8; 32],
     merkle_root: [u8; 32],
     anchor: [u8; 32],
+    subscope: [u8; 32],
 ) -> BoundedVec<[u8; 32], ConstU32<18>> {
     let mut v = vec![[0u8; 32]; 9];
     v[0] = merkle_root;
     v[2] = current_date_field(TEST_NOW_UNIX_SECS);
+    v[3] = AGORA_IDENTITY_SERVICE_SCOPE;
+    v[4] = subscope;
     v[5] = anchor;
     v[7] = nullifier;
     BoundedVec::try_from(v).unwrap()
@@ -91,7 +101,7 @@ fn register(who: u64, nullifier: [u8; 32], anchor: [u8; 32]) {
     assert_ok!(Identity::register_citizen(
         RuntimeOrigin::signed(who),
         valid_proof(),
-        public_inputs(nullifier, ROOT, anchor),
+        public_inputs(nullifier, ROOT, anchor, AGORA_IDENTITY_REGISTER_SUBSCOPE),
         anchor,
         OPRF_PK_HASHES,
         BACKING_COMMITMENT,
@@ -110,6 +120,8 @@ fn migration_public_inputs(
     let mut v = vec![[0u8; 32]; 10];
     v[0] = merkle_root;
     v[2] = current_date_field(TEST_NOW_UNIX_SECS);
+    v[3] = AGORA_IDENTITY_SERVICE_SCOPE;
+    v[4] = AGORA_IDENTITY_MIGRATE_SUBSCOPE;
     v[5] = old_anchor;
     v[6] = new_anchor;
     BoundedVec::try_from(v).unwrap()
@@ -127,7 +139,7 @@ fn register_citizen_works() {
         assert_ok!(Identity::register_citizen(
             RuntimeOrigin::signed(1),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -169,7 +181,7 @@ fn register_citizen_fails_when_already_registered() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_B, ROOT, ANCHOR_B),
+                public_inputs(NULLIFIER_B, ROOT, ANCHOR_B, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -203,6 +215,109 @@ fn register_citizen_fails_with_too_few_public_inputs() {
 }
 
 #[test]
+fn register_citizen_fails_when_service_scope_wrong() {
+    // A proof carrying some *other* ZKPassport-integrated service's `service_scope` (e.g. a
+    // whistleblower-report proof, or one generated for a wholly different app) must not
+    // register a citizen just because the underlying passport proof is otherwise valid.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+        let mut wrong_scope = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE);
+        wrong_scope[3] = [0xAAu8; 32];
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                wrong_scope,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
+fn register_citizen_fails_when_service_subscope_wrong() {
+    // Same as above, but for the *subscope* specifically -- proves the two fields are checked
+    // independently (a proof cannot pass by matching only `service_scope`). In particular, a
+    // proof built for `reverify_citizen`/`recover_account`/`migrate_oprf_scheme` (correct
+    // `service_scope`, wrong subscope) must not register a *new* citizen either.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+        let wrong_subscope =
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE);
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                wrong_subscope,
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
+fn reverify_citizen_fails_when_proof_scope_is_actually_register_citizens() {
+    // The flash-replay scenario `AGORA_IDENTITY_REGISTER_SUBSCOPE`'s doc comment describes in
+    // miniature: a citizen's own `register_citizen` proof (permanently public on-chain call
+    // data once submitted) must not double as a valid `reverify_citizen` proof merely because
+    // it proves the same underlying passport is valid.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(1),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
+fn recover_account_fails_when_proof_scope_is_actually_reverify_citizens() {
+    // The highest-stakes case `AGORA_IDENTITY_RECOVER_SUBSCOPE`'s doc comment warns about: a
+    // captured `reverify_citizen` proof (same citizen, same nullifier, otherwise fully valid)
+    // must not be replayable into `recover_account` to hijack the citizen's identity onto a
+    // different `AccountId` the real citizen never authorized.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::InvalidProofScope
+        );
+    });
+}
+
+#[test]
 fn register_citizen_fails_when_issuer_not_allowed() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
@@ -211,7 +326,7 @@ fn register_citizen_fails_when_issuer_not_allowed() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -231,7 +346,7 @@ fn register_citizen_fails_when_proof_invalid() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 invalid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -254,7 +369,7 @@ fn register_citizen_fails_when_nullifier_already_used() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -279,7 +394,7 @@ fn register_citizen_fails_when_anchor_already_used() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_B, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_B, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -300,7 +415,7 @@ fn register_citizen_fails_when_committee_key_not_approved() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -323,7 +438,7 @@ fn register_citizen_fails_when_a_single_committee_key_is_wrong() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 wrong_hashes,
                 BACKING_COMMITMENT,
@@ -342,7 +457,7 @@ fn register_citizen_fails_when_anchor_verification_fails() {
         // public_inputs carries a *different* anchor in its param_commitments slot than the
         // one submitted — TestAnchorVerifier (mock.rs) only accepts when the outer public
         // inputs contain the submitted anchor.
-        let mismatched_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_B);
+        let mismatched_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_B, AGORA_IDENTITY_REGISTER_SUBSCOPE);
 
         assert_noop!(
             Identity::register_citizen(
@@ -365,7 +480,7 @@ fn register_citizen_fails_when_proof_is_stale() {
         allow_root();
         approve_committee_keys(0);
 
-        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE);
         // MaxAnchorProofAge is 3600 in the mock (see mock.rs); this is far older than that.
         stale_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS - 999_999);
 
@@ -390,7 +505,7 @@ fn register_citizen_fails_when_proof_is_future_dated() {
         allow_root();
         approve_committee_keys(0);
 
-        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE);
         // MaxAnchorProofClockSkew is 300 in the mock (see mock.rs); this is far beyond that.
         future_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS + 999_999);
 
@@ -415,7 +530,7 @@ fn register_citizen_fails_with_malformed_proof_date() {
         allow_root();
         approve_committee_keys(0);
 
-        let mut malformed_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut malformed_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE);
         // A genuine u64 current_date can never set byte 0 of its 32-byte field encoding —
         // only the low 8 bytes are ever populated.
         malformed_inputs[2][0] = 1;
@@ -446,7 +561,7 @@ fn register_citizen_fails_on_total_citizens_overflow() {
             Identity::register_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -901,7 +1016,7 @@ fn reverify_citizen_works() {
         assert_ok!(Identity::reverify_citizen(
             RuntimeOrigin::signed(1),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -923,7 +1038,7 @@ fn reverify_citizen_fails_when_not_registered() {
             Identity::reverify_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -945,7 +1060,7 @@ fn reverify_citizen_fails_when_anchor_does_not_match_on_file() {
             Identity::reverify_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -966,7 +1081,7 @@ fn reverify_citizen_fails_with_invalid_zk_proof() {
             Identity::reverify_citizen(
                 RuntimeOrigin::signed(1),
                 invalid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -987,7 +1102,7 @@ fn reverify_citizen_fails_when_outer_proof_does_not_contain_anchor() {
         // param_commitments slot carries a different value — TestAnchorVerifier's
         // verify_reverification (mock.rs) requires the outer public inputs to contain the
         // claimed anchor.
-        let mut mismatched = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut mismatched = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE);
         mismatched[5] = ANCHOR_B;
 
         assert_noop!(
@@ -1019,7 +1134,7 @@ fn reverify_citizen_fails_when_committee_key_not_approved() {
             Identity::reverify_citizen(
                 RuntimeOrigin::signed(1),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -1036,7 +1151,7 @@ fn reverify_citizen_fails_when_proof_is_stale() {
         allow_root();
         register(1, NULLIFIER_A, ANCHOR_A);
 
-        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut stale_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE);
         stale_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS - 999_999);
 
         assert_noop!(
@@ -1060,7 +1175,7 @@ fn reverify_citizen_fails_when_proof_is_future_dated() {
         allow_root();
         register(1, NULLIFIER_A, ANCHOR_A);
 
-        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A);
+        let mut future_inputs = public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE);
         // MaxAnchorProofClockSkew is 300 in the mock (see mock.rs); this is far beyond that.
         future_inputs[2] = current_date_field(TEST_NOW_UNIX_SECS + 999_999);
 
@@ -1107,7 +1222,7 @@ fn reverify_citizen_reactivates_a_lapsed_citizen() {
         assert_ok!(Identity::reverify_citizen(
             RuntimeOrigin::signed(1),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2348,7 +2463,7 @@ fn recover_account_rebinds_identity_storage_and_invalidates_old_account() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2398,7 +2513,7 @@ fn recover_account_carries_over_self_declaration() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2421,7 +2536,7 @@ fn recover_account_preserves_suspension_across_the_rebind() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2446,7 +2561,7 @@ fn recover_account_fails_for_a_nullifier_that_was_never_registered() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2468,7 +2583,7 @@ fn recover_account_fails_when_anchor_does_not_match_on_file() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_B, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2493,7 +2608,7 @@ fn recover_account_fails_when_target_account_is_already_registered() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2514,7 +2629,7 @@ fn recover_account_fails_with_invalid_zk_proof() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 invalid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2535,7 +2650,7 @@ fn recover_account_fails_twice_within_the_cooldown() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2549,7 +2664,7 @@ fn recover_account_fails_twice_within_the_cooldown() {
             Identity::recover_account(
                 RuntimeOrigin::signed(3),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2572,7 +2687,7 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2583,7 +2698,7 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(3),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2608,7 +2723,7 @@ fn recover_account_fails_when_old_account_has_nonzero_balance() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2623,7 +2738,7 @@ fn recover_account_fails_when_old_account_has_nonzero_balance() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2644,7 +2759,7 @@ fn recover_account_fails_when_old_account_is_registered_delegate() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2658,7 +2773,7 @@ fn recover_account_fails_when_old_account_is_registered_delegate() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2679,7 +2794,7 @@ fn recover_account_fails_when_old_account_holds_legislature_seat() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2693,7 +2808,7 @@ fn recover_account_fails_when_old_account_holds_legislature_seat() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2714,7 +2829,7 @@ fn recover_account_fails_when_old_account_holds_cabinet_role() {
             Identity::recover_account(
                 RuntimeOrigin::signed(2),
                 valid_proof(),
-                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
@@ -2728,7 +2843,83 @@ fn recover_account_fails_when_old_account_holds_cabinet_role() {
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+// The next two tests cover the double-vote/double-claim vector: recovery must be blocked
+// while old_account has voted in a still-open referendum, or already claimed the current
+// fiscal epoch's budget, since neither piece of pallet-voting state follows the rebind.
+
+#[test]
+fn recover_account_fails_when_old_account_has_open_referendum_vote() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        set_open_referendum_vote(1, true);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedOpenReferendumVote
+        );
+        // The failed attempt must not have touched anything — still bound to account 1.
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // The referendum finalizing (no longer open) unblocks recovery.
+        set_open_referendum_vote(1, false);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
+    });
+}
+
+#[test]
+fn recover_account_fails_when_old_account_has_unclaimed_current_epoch_budget() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        set_unclaimed_epoch_budget(1, true);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+            ),
+            Error::<Test>::RecoveryBlockedUnclaimedEpochBudget
+        );
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
+
+        // The fiscal epoch rolling over (this epoch's claim no longer current) unblocks
+        // recovery.
+        set_unclaimed_epoch_budget(1, false);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2752,7 +2943,7 @@ fn recover_account_succeeds_when_old_account_holds_none_of_the_blocking_state() 
         assert_ok!(Identity::recover_account(
             RuntimeOrigin::signed(2),
             valid_proof(),
-            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
@@ -2778,7 +2969,7 @@ fn register_with_backing(who: u64, nullifier: [u8; 32], anchor: [u8; 32], backin
     assert_ok!(Identity::register_citizen(
         RuntimeOrigin::signed(who),
         valid_proof(),
-        public_inputs(nullifier, ROOT, anchor),
+        public_inputs(nullifier, ROOT, anchor, AGORA_IDENTITY_REGISTER_SUBSCOPE),
         anchor,
         OPRF_PK_HASHES,
         backing_commitment,

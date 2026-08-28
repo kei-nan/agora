@@ -1,9 +1,9 @@
 use crate::{
     mock::*, ActiveEpoch, BudgetBalance, CategoryVotes, CitizenClaimedEpoch, DelegatedWeight,
     DelegatorCount, Delegations, EpochNumber, EpochTokenAllocation, Error, Event, FiscalYearEpoch,
-    NextProposalId, NextReferendumId, PendingFinalization, PetitionReferendum, ProposalResults,
-    Proposals, ReferendumHasVoted, ReferendumState, ReferendumTally, ReferendumTier, Referenda,
-    VoteCommitments,
+    NextProposalId, NextReferendumId, OpenReferenda, PendingFinalization, PetitionReferendum,
+    ProposalResults, Proposals, ReferendumHasVoted, ReferendumState, ReferendumTally,
+    ReferendumTier, Referenda, VoteCommitments,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
 
@@ -202,16 +202,42 @@ fn commit_vote_fails_after_proposal_ends() {
 }
 
 #[test]
-fn commit_vote_fails_already_voted() {
+fn commit_vote_resubmission_overwrites_before_window_closes() {
+    // Coercion-resistance: a second commit_vote for the same nullifier no longer fails with
+    // AlreadyVoted — it overwrites the stored commitment and emits VoteResubmitted, as long as
+    // the proposal's voting window is still open.
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
-        let pid = make_proposal(MIN_PROPOSAL_DURATION);
+        let pid = make_proposal(MIN_PROPOSAL_DURATION); // ends_at = 1 + 5 = 6
         activate_citizen(1);
         assert_ok!(Voting::commit_vote(RuntimeOrigin::signed(1), pid, hash(5)));
+        let nullifier = nullifier_of(1).unwrap();
+        assert_eq!(VoteCommitments::<Test>::get((pid, nullifier)), Some(hash(5)));
+        System::assert_last_event(Event::VoteCommitted { proposal_id: pid, nullifier }.into());
+
+        System::set_block_number(5); // still < ends_at (6)
+        assert_ok!(Voting::commit_vote(RuntimeOrigin::signed(1), pid, hash(6)));
+        assert_eq!(VoteCommitments::<Test>::get((pid, nullifier)), Some(hash(6)));
+        System::assert_last_event(Event::VoteResubmitted { proposal_id: pid, nullifier }.into());
+    });
+}
+
+#[test]
+fn commit_vote_resubmission_rejected_after_window_closes() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let pid = make_proposal(MIN_PROPOSAL_DURATION); // ends_at = 1 + 5 = 6
+        activate_citizen(1);
+        assert_ok!(Voting::commit_vote(RuntimeOrigin::signed(1), pid, hash(5)));
+        let nullifier = nullifier_of(1).unwrap();
+
+        System::set_block_number(6); // block == ends_at: strictly-less check must fail
         assert_noop!(
             Voting::commit_vote(RuntimeOrigin::signed(1), pid, hash(6)),
-            Error::<Test>::AlreadyVoted
+            Error::<Test>::ProposalEnded
         );
+        // Original commitment remains untouched.
+        assert_eq!(VoteCommitments::<Test>::get((pid, nullifier)), Some(hash(5)));
     });
 }
 
@@ -1632,6 +1658,120 @@ fn referendum_finalization_scheduling_overflow_falls_back_to_the_manual_extrinsi
         assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), overflow_rid));
         let (_, _, _, state, _) = Referenda::<Test>::get(overflow_rid).unwrap();
         assert_eq!(state, ReferendumState::Failed);
+    });
+}
+
+// ── delegate_vote: post-window delegation race (unfinalized-but-closed referendum) ──────────
+//
+// `resolve_delegate_readonly`/`apply_delegated_weight` validate a delegation only by
+// `expires_at >= reference_block`, not by when it was created. Normally same-block
+// `on_initialize` finalization closes the window to nothing, but `PendingFinalization` is
+// capped by `MaxReferendaPerBlock` and silently falls back to the permissionless
+// `finalize_referendum` extrinsic with no promptness guarantee on overflow. In that fallback
+// window a referendum can sit in `Voting` with its `end_block` already passed — this test
+// confirms `delegate_vote` now rejects creating a delegation for that topic during exactly
+// that window, closing the race described in `delegate_vote`'s doc comment.
+#[test]
+fn delegate_vote_fails_when_topic_has_a_closed_but_unfinalized_referendum() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+
+        // Fill this block's PendingFinalization list to capacity with unrelated referenda
+        // (different topic) so the target referendum below overflows the schedule.
+        for i in 0..MAX_REFERENDA_PER_BLOCK {
+            make_referendum_with_hash(100 + i, ReferendumTier::Ordinary, hash(1));
+        }
+        let finalize_block = 1 + REFERENDUM_DURATION as u64 + 1;
+        assert_eq!(
+            PendingFinalization::<Test>::get(finalize_block).len(),
+            MAX_REFERENDA_PER_BLOCK as usize
+        );
+
+        // The target referendum, own topic (hash(5)), never gets auto-scheduled.
+        let rid = make_referendum_with_hash(999, ReferendumTier::Ordinary, hash(5));
+        let topic_id = Voting::topic_id_of(&hash(5));
+        assert!(!PendingFinalization::<Test>::get(finalize_block).contains(&rid));
+
+        activate_citizen(1);
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(1), rid, true));
+
+        // Advance past end_block and run the hook: everything scheduled finalizes, but `rid`
+        // (never scheduled) stays stuck in `Voting` with its window already closed.
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+        let (_, _, end_block, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Voting);
+        assert!(System::block_number() > end_block);
+        assert!(OpenReferenda::<Test>::get().contains(&rid));
+
+        // An attacker tries to delegate a fresh citizen to the winning voter on this exact
+        // topic, hoping to inflate the tally once someone eventually calls the permissionless
+        // finalize_referendum fallback. Rejected outright.
+        activate_citizen(2);
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(2), 1, topic_id, MIN_DELEGATION_DURATION),
+            Error::<Test>::ReferendumVotingWindowClosed
+        );
+        assert!(Delegations::<Test>::get(topic_id, 2).is_none());
+
+        // Once the referendum is actually finalized (via the permissionless fallback), the
+        // topic is clear again and delegation works normally.
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), rid));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(2), 1, topic_id, MIN_DELEGATION_DURATION));
+        assert_eq!(ReferendumTally::<Test>::get(rid), (1, 0)); // late delegation didn't count
+    });
+}
+
+// ── OpenReferenda tracking (backs pallet-identity-zk's RecoveryStateChecker) ────────────────
+
+/// `OpenReferenda` must gain the id on creation and lose it once the referendum leaves
+/// `Voting` (whether via the automatic `on_initialize` hook or the permissionless
+/// `finalize_referendum` extrinsic) — this is exactly the invariant
+/// `RecoveryStateChecker::has_open_referendum_vote` in the runtime relies on to check
+/// "did this account vote in a still-open referendum" without scanning all of `Referenda`.
+#[test]
+fn open_referenda_tracks_creation_and_finalization() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let rid = make_referendum(1, ReferendumTier::Ordinary);
+        assert!(OpenReferenda::<Test>::get().contains(&rid));
+
+        // Auto-finalization via on_initialize removes it.
+        let finalize_block = 1 + REFERENDUM_DURATION as u64 + 1;
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+        assert!(!OpenReferenda::<Test>::get().contains(&rid));
+
+        // The permissionless extrinsic fallback also removes it (separate referendum, whose
+        // auto-scheduling we skip by finalizing manually before the hook would run).
+        let rid2 = make_referendum(2, ReferendumTier::Ordinary);
+        assert!(OpenReferenda::<Test>::get().contains(&rid2));
+        System::set_block_number(finalize_block + REFERENDUM_DURATION as u64 + 2);
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), rid2));
+        assert!(!OpenReferenda::<Test>::get().contains(&rid2));
+    });
+}
+
+/// Referendum creation must fail outright (not silently proceed untracked) once `OpenReferenda`
+/// is at `MaxConcurrentReferenda` capacity — see `Config::MaxConcurrentReferenda`'s doc comment
+/// for why this fails closed instead of mirroring `PendingFinalization`'s silent-skip behavior.
+#[test]
+fn create_referendum_fails_when_open_referenda_at_capacity() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        for i in 0..MAX_CONCURRENT_REFERENDA {
+            make_referendum_with_hash(100 + i, ReferendumTier::Ordinary, hash(1));
+        }
+        assert_eq!(OpenReferenda::<Test>::get().len(), MAX_CONCURRENT_REFERENDA as usize);
+
+        assert_noop!(
+            Voting::create_referendum_internal(9999, hash(1), ReferendumTier::Ordinary),
+            Error::<Test>::TooManyOpenReferenda
+        );
+        // The failed creation must not have leaked partial state (NextReferendumId unchanged,
+        // no petition-referendum mapping).
+        assert!(!PetitionReferendum::<Test>::contains_key(9999));
     });
 }
 

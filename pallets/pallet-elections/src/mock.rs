@@ -1,5 +1,5 @@
 use crate as pallet_elections;
-use frame_support::{derive_impl, traits::{ConstU32, ConstU8}};
+use frame_support::{derive_impl, traits::{ConstU32, ConstU8, Get}};
 use frame_system::EnsureRoot;
 use sp_runtime::{BuildStorage, DispatchResult};
 use std::cell::RefCell;
@@ -19,6 +19,7 @@ thread_local! {
     static ACTIVE_CITIZENS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
     static SEAT_CALLS: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
     static CURRENT_DISCLOSURES: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    static ACCOUNTABILITY_COUNCIL_MEMBERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or removes them.
@@ -61,6 +62,25 @@ pub struct TestDisclosureChecker;
 impl pallet_elections::DisclosureChecker<u64> for TestDisclosureChecker {
     fn has_current_disclosure(who: &u64) -> bool {
         CURRENT_DISCLOSURES.with(|c| c.borrow().contains(who))
+    }
+}
+
+/// Marks `who` as a current Accountability Council member, or removes them. Defaults to false
+/// (not a member) for any account never passed here, mirroring `set_current_disclosure`.
+pub fn set_accountability_council_member(who: u64, member: bool) {
+    ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| {
+        if member {
+            c.borrow_mut().insert(who);
+        } else {
+            c.borrow_mut().remove(&who);
+        }
+    });
+}
+
+pub struct TestAccountabilityCouncilChecker;
+impl pallet_elections::AccountabilityCouncilChecker<u64> for TestAccountabilityCouncilChecker {
+    fn is_current_member(who: &u64) -> bool {
+        ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| c.borrow().contains(who))
     }
 }
 
@@ -151,6 +171,26 @@ impl pallet_elections::BackingProofVerifier for TestBackingProofVerifier {
 
 thread_local! {
     static INVALID_BACKING_ROOTS: RefCell<BTreeSet<[u8; 32]>> = RefCell::new(BTreeSet::new());
+    // Defaults to 0 ("no minimum hold configured") so every pre-existing election-behavior test
+    // keeps reading live `BackingCount` unchanged -- see `run_election`'s handling of
+    // `MinBackingDurationBlocks == 0`. The `flash_backing_*` tests below opt into a nonzero
+    // value via `set_min_backing_duration_blocks` to exercise the checkpoint/maturity logic
+    // itself.
+    static MIN_BACKING_DURATION_BLOCKS: RefCell<u32> = RefCell::new(0);
+}
+
+/// Sets the mock's `MinBackingDurationBlocks` value for the calling test. Each `#[test]` runs
+/// on its own thread, so this thread-local starts back at the default (0) for every test --
+/// mirrors `set_active_citizen`/`set_current_disclosure`'s per-test-state pattern above.
+pub fn set_min_backing_duration_blocks(blocks: u32) {
+    MIN_BACKING_DURATION_BLOCKS.with(|b| *b.borrow_mut() = blocks);
+}
+
+pub struct MinBackingDurationBlocksGet;
+impl Get<u32> for MinBackingDurationBlocksGet {
+    fn get() -> u32 {
+        MIN_BACKING_DURATION_BLOCKS.with(|b| *b.borrow())
+    }
 }
 
 /// Marks `root` as one `TestBackingRootChecker` should reject, for the one test that exercises
@@ -175,6 +215,12 @@ pub const MAX_DELEGATES: u32 = 20;
 // `pagination_*` tests below deliberately register more than this to exercise the
 // multi-block sweep behavior itself.
 pub const MAX_DELEGATE_SWEEP_PER_BLOCK: u32 = 10;
+// Same rationale as MAX_DELEGATE_SWEEP_PER_BLOCK above, for `run_election`'s own bounded
+// ranking scan: comfortably above the delegate counts used by existing election-behavior
+// tests (a handful of delegates each), so a single `on_initialize` call still finishes the
+// scan and finalizes seating in those tests. `election_scan_*` tests below deliberately
+// register more than this to exercise the multi-block scan-and-finalize behavior itself.
+pub const MAX_ELECTION_SCAN_PER_BLOCK: u32 = 10;
 pub const DEFAULT_LEGISLATURE_SEATS: u32 = 3;
 pub const DEFAULT_ELECTION_CYCLE_BLOCKS: u32 = 20;
 // Deliberately larger than the "5-50 block" rule of thumb: on_initialize computes the term
@@ -226,6 +272,8 @@ impl pallet_elections::Config for Test {
     type RuntimeEvent = RuntimeEvent;
     type MaxDelegates = ConstU32<MAX_DELEGATES>;
     type MaxDelegateSweepPerBlock = ConstU32<MAX_DELEGATE_SWEEP_PER_BLOCK>;
+    type MaxElectionScanPerBlock = ConstU32<MAX_ELECTION_SCAN_PER_BLOCK>;
+    type MinBackingDurationBlocks = MinBackingDurationBlocksGet;
     type CitizenChecker = TestCitizenChecker;
     // Root is authorized; any signed origin is not — lets tests drive both the
     // authorized and unauthorized-origin paths for the governance/constitutional calls.
@@ -236,6 +284,7 @@ impl pallet_elections::Config for Test {
     type ConstitutionalOrigin = EnsureRoot<u64>;
     type LegislatureSeating = TestSeatLegislature;
     type DisclosureChecker = TestDisclosureChecker;
+    type AccountabilityCouncilChecker = TestAccountabilityCouncilChecker;
     type AccountIdToBytes = TestAccountIdToBytes;
     type ZkVerifier = TestZkVerifier;
     type DelegatePersonaVerifier = TestDelegatePersonaVerifier;

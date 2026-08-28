@@ -348,13 +348,61 @@ fn vote_declare_emergency_locks_in_first_voters_terms() {
             REASON_A,
             5
         ));
-        // Second voter tries to change the reason/duration; should be ignored.
+        // Second voter votes with the *same* terms as the first — counts normally.
         assert_ok!(EmergencyCouncil::vote_declare_emergency(
             RuntimeOrigin::signed(2),
-            REASON_B,
-            50
+            REASON_A,
+            5
         ));
 
+        let info = ActiveEmergency::<Test>::get().expect("emergency should be active");
+        assert_eq!(info.reason_hash, REASON_A);
+        assert_eq!(info.expires_at, 1 + 5);
+    });
+}
+
+// Previously, a second voter's own `reason_hash`/`duration_blocks` arguments were silently
+// discarded once `PendingEmergencyProposal` was locked in by the first voter — only their
+// `who` counted as a yes-vote toward whatever the first caller had proposed, with no check
+// their submitted terms actually matched. That's a confused-deputy gap: a council member's
+// vote silently endorsed terms they never saw. Fixed: a mismatched vote is now rejected
+// outright. Mirrors pallet-executive's
+// `vote_declare_emergency_fails_when_terms_mismatch_pending_proposal`.
+#[test]
+fn vote_declare_emergency_fails_when_terms_mismatch_pending_proposal() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1, 2, 3]);
+
+        assert_ok!(EmergencyCouncil::vote_declare_emergency(
+            RuntimeOrigin::signed(1),
+            REASON_A,
+            5
+        ));
+
+        // Different reason_hash, same duration.
+        assert_noop!(
+            EmergencyCouncil::vote_declare_emergency(RuntimeOrigin::signed(2), REASON_B, 5),
+            Error::<Test>::EmergencyProposalMismatch
+        );
+        // Same reason_hash, different duration.
+        assert_noop!(
+            EmergencyCouncil::vote_declare_emergency(RuntimeOrigin::signed(2), REASON_A, 50),
+            Error::<Test>::EmergencyProposalMismatch
+        );
+
+        // The mismatched attempts must not have been recorded as a vote for account 2, nor
+        // altered the locked-in proposal.
+        assert!(!DeclareVotes::<Test>::get(2));
+        assert_eq!(PendingEmergencyProposal::<Test>::get(), Some((REASON_A, 5)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        // Voting with the correct, matching terms still works.
+        assert_ok!(EmergencyCouncil::vote_declare_emergency(
+            RuntimeOrigin::signed(2),
+            REASON_A,
+            5
+        ));
         let info = ActiveEmergency::<Test>::get().expect("emergency should be active");
         assert_eq!(info.reason_hash, REASON_A);
         assert_eq!(info.expires_at, 1 + 5);
@@ -661,5 +709,73 @@ fn ensure_active_emergency_fails_again_after_auto_sunset_expiry() {
         assert!(ActiveEmergency::<Test>::get().is_none());
 
         assert!(EnsureActiveEmergency::<Test>::try_origin(RuntimeOrigin::root()).is_err());
+    });
+}
+
+// ─── cross-pallet sibling cooldown coordination (pallet-executive) ─────────
+//
+// pallet-executive has its own, independent cabinet-level emergency mechanism with its own
+// `CooldownUntil`. Without `SiblingEmergencyCooldown`, a coalition controlling both bodies
+// could declare an emergency via one, let it lapse, and immediately declare a fresh one via
+// the other — this pallet's own `EmergencyCooldownBlocks` would never even see it happen. The
+// mock sibling here (`mock::MockSiblingCooldown`) stands in for the real
+// `Runtime`-level implementation that bridges to pallet-executive's actual `CooldownUntil`.
+
+#[test]
+fn emergency_auto_expiry_notifies_sibling_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+        assert!(sibling_notified_at().is_none());
+
+        let info = ActiveEmergency::<Test>::get().unwrap();
+        System::set_block_number(info.expires_at);
+        EmergencyCouncil::on_initialize(info.expires_at);
+
+        // The sibling (pallet-executive, in the real runtime) was told to start its own
+        // cooldown at the same block this pallet started its own.
+        assert_eq!(sibling_notified_at(), Some(info.expires_at));
+    });
+}
+
+#[test]
+fn vote_end_emergency_notifies_sibling_cooldown() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        declare_active_emergency_with_council_of_3();
+
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(1)));
+        assert_ok!(EmergencyCouncil::vote_end_emergency(RuntimeOrigin::signed(2)));
+        assert!(ActiveEmergency::<Test>::get().is_none());
+
+        assert_eq!(sibling_notified_at(), Some(1));
+    });
+}
+
+#[test]
+fn vote_declare_emergency_fails_while_sibling_in_cooldown_even_with_own_cooldown_elapsed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1, 2, 3]);
+        // This pallet's own CooldownUntil defaults to 0 (never touched) — only the sibling's
+        // reported cooldown can be blocking the declare below.
+        assert_eq!(CooldownUntil::<Test>::get(), 0);
+        set_sibling_cooldown_until(1000);
+
+        assert_noop!(
+            EmergencyCouncil::vote_declare_emergency(RuntimeOrigin::signed(1), REASON_A, 10),
+            Error::<Test>::EmergencyCooldownActive
+        );
+
+        // Once the sibling's (simulated) cooldown passes, declaration succeeds again — this
+        // is the regression case: a coalition alternating between pallet-executive and
+        // pallet-emergency-council can no longer chain declarations past either pallet's
+        // cooldown, only past both.
+        System::set_block_number(1000);
+        assert_ok!(EmergencyCouncil::vote_declare_emergency(
+            RuntimeOrigin::signed(1),
+            REASON_A,
+            10
+        ));
     });
 }

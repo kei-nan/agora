@@ -1,10 +1,97 @@
 use crate::{
 	mock::*,
-	pallet::{CaseBonds, CaseStatus, CaseSubject, Error, Event, JuryPool, JuryRequestBlock, Verdict},
+	pallet::{
+		CaseBonds, CaseFiler, CaseStatus, CaseSubject, Error, Event, JuryPool, JuryRequestBlock,
+		Verdict, CASE_FILING_SERVICE_SCOPE, CASE_FILING_SERVICE_SUBSCOPE,
+	},
 };
-use frame_support::{assert_noop, assert_ok, traits::{EnsureOriginWithArg, Hooks}};
+use frame_support::{assert_noop, assert_ok, traits::{ConstU32, EnsureOriginWithArg, Hooks}, BoundedVec};
 use sp_core::H256;
-use sp_runtime::DispatchError;
+use sp_runtime::{DispatchError, DispatchResult};
+
+/// True for the case types `do_file_case` requires a ZK proof for — see `CaseFiler`'s doc
+/// comment. Mirrors the pallet's own branching so tests don't need to hand-pick which branch
+/// applies at each call site.
+fn requires_zk_proof(subject: &CaseSubject) -> bool {
+	matches!(
+		subject,
+		CaseSubject::LawChallenge { .. }
+			| CaseSubject::TreasuryDispute { .. }
+			| CaseSubject::TierConflict { .. }
+	)
+}
+
+fn valid_proof() -> BoundedVec<u8, ConstU32<4096>> {
+	BoundedVec::try_from(vec![VALID_PROOF_MARKER]).unwrap()
+}
+
+fn invalid_proof() -> BoundedVec<u8, ConstU32<4096>> {
+	BoundedVec::try_from(vec![INVALID_PROOF_MARKER]).unwrap()
+}
+
+/// A minimal, structurally valid ZKPassport `count_4` outer-circuit public-input array,
+/// carrying this pallet's own case-filing scope/subscope and the given nullifier — mirrors
+/// `pallet_anticorruption::tests::public_inputs_with`'s identical layout.
+fn public_inputs_with(
+	scope: [u8; 32],
+	subscope: [u8; 32],
+	nullifier: [u8; 32],
+) -> BoundedVec<[u8; 32], ConstU32<16>> {
+	BoundedVec::try_from(vec![
+		[9u8; 32],  // 0: certificate_registry_root (unused by this pallet)
+		[2u8; 32],  // 1: circuit_registry_root
+		[0u8; 32],  // 2: current_date
+		scope,      // 3: service_scope
+		subscope,   // 4: service_subscope
+		[3u8; 32],  // 5: param_commitments[0]
+		[4u8; 32],  // 6: nullifier_type
+		nullifier,  // 7 = len - 2: scoped_nullifier
+		[6u8; 32],  // 8 = len - 1: oprf_pk_hash
+	])
+	.unwrap()
+}
+
+/// Convenience wrapper: correct case-filing domain-separation scope/subscope, caller-chosen
+/// nullifier.
+fn public_inputs(nullifier: [u8; 32]) -> BoundedVec<[u8; 32], ConstU32<16>> {
+	public_inputs_with(CASE_FILING_SERVICE_SCOPE, CASE_FILING_SERVICE_SUBSCOPE, nullifier)
+}
+
+fn empty_public_inputs() -> BoundedVec<[u8; 32], ConstU32<16>> {
+	BoundedVec::try_from(Vec::new()).unwrap()
+}
+
+/// Structurally too-short (fewer than the real layout's 9-element floor) but non-empty.
+fn too_short_public_inputs() -> BoundedVec<[u8; 32], ConstU32<16>> {
+	BoundedVec::try_from(vec![[1u8; 32]; 5]).unwrap()
+}
+
+/// Deterministic-but-arbitrary nullifier derived from an account id — used by
+/// `file_case_as`/`file_ai_rule_and_appeal` so a citizen's own registered nullifier (via
+/// `set_citizen_nullifier`) matches the nullifier stored in a case they filed, letting
+/// `is_filer_or_oracle`'s nullifier-matching branch recognize them as the filer for
+/// `appeal_ruling`/`select_jury` on anonymized case types, exactly as a real citizen re-proving
+/// their own passport would.
+fn nullifier_for(who: AccountId) -> [u8; 32] {
+	let mut n = [7u8; 32];
+	n[0..8].copy_from_slice(&who.to_le_bytes());
+	n
+}
+
+/// Files `subject` as `who`, transparently supplying a valid ZK proof (and registering `who`'s
+/// matching nullifier via `set_citizen_nullifier`, so later `appeal_ruling`/`select_jury` calls
+/// signed by `who` are recognized as the filer) when `subject` is one of the anonymized case
+/// types, or `None`/`None` otherwise — mirrors `do_file_case`'s own branching so call sites don't
+/// need to hand-pick which applies.
+fn file_case_as(who: AccountId, subject: CaseSubject) -> DispatchResult {
+	if requires_zk_proof(&subject) {
+		let nullifier = nullifier_for(who);
+		set_citizen_nullifier(who, nullifier);
+		Courts::file_case(RuntimeOrigin::signed(who), subject, Some(valid_proof()), Some(public_inputs(nullifier)))
+	} else {
+		Courts::file_case(RuntimeOrigin::signed(who), subject, None, None)
+	}
+}
 
 /// Adds a single AI Model Governance Council member (account 100, otherwise unused in these
 /// tests) and votes to approve `model_hash`. A 1-member council trivially satisfies the 2/3
@@ -38,7 +125,7 @@ fn setup_oracle_member() -> AccountId {
 /// `InJuryAppeal` with `JuryRequestBlock` set to the current block. Returns the case id.
 fn file_ai_rule_and_appeal(filer: AccountId, subject: CaseSubject) -> u32 {
 	let case_id = crate::NextCaseId::<Test>::get();
-	assert_ok!(Courts::file_case(RuntimeOrigin::signed(filer), subject));
+	assert_ok!(file_case_as(filer, subject));
 	let model_version = approve_first_ai_model([7u8; 32]);
 	let oracle = setup_oracle_member();
 	assert_ok!(Courts::submit_ai_ruling(
@@ -141,6 +228,127 @@ fn select_jury_requires_21_jurors_for_law_challenge() {
 		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 21));
 		let jury = JuryPool::<Test>::get(case_id).unwrap();
 		assert_eq!(jury.len(), 21);
+	});
+}
+
+// ─── select_jury: conflict-of-interest exclusion ────────────────────────────
+//
+// Regression coverage for the fix closing `pick_random_jurors`' missing exclusion: previously
+// the case's own filer, and (for `CaseSubject::CitizenConduct`) the accused, could be drawn
+// onto their own jury. Both tests below shrink the citizen pool to exactly
+// `jury_size + number_excluded` citizens, so excluding the right accounts leaves *exactly*
+// enough eligible citizens to seat the jury — forcing a specific, fully-deterministic jury
+// (every remaining citizen, in order) rather than merely asserting an outcome that could also
+// happen to hold by chance against a large pool.
+
+#[test]
+fn select_jury_excludes_the_case_filer() {
+	new_test_ext().execute_with(|| {
+		// 8 citizens, 7-person jury (General is a Level-1 subject): excluding the filer
+		// (account 1) leaves exactly the other 7 — {2..=8} — as the only possible jury.
+		set_citizen_count(8);
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(
+			case_id,
+			&[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)],
+		);
+		capture_jury_seed(case_id);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_eq!(jury.len(), 7);
+		assert!(!jury.contains(&1), "the case's own filer must never be seated on its jury");
+		let mut sorted = jury.into_inner();
+		sorted.sort();
+		assert_eq!(sorted, vec![2, 3, 4, 5, 6, 7, 8]);
+	});
+}
+
+#[test]
+fn select_jury_excludes_the_citizen_conduct_defendant() {
+	new_test_ext().execute_with(|| {
+		// 9 citizens, 7-person jury: excluding the filer (account 1) AND the defendant
+		// (account 2, matched via their registered nullifier) leaves exactly {3..=9}.
+		set_citizen_count(9);
+		let defendant_nullifier = [42u8; 32];
+		set_citizen_nullifier(2, defendant_nullifier);
+		let case_id = file_ai_rule_and_appeal(
+			1,
+			CaseSubject::CitizenConduct { nullifier: defendant_nullifier, suspension_blocks: Some(10) },
+		);
+		set_window_hashes(
+			case_id,
+			&[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)],
+		);
+		capture_jury_seed(case_id);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_eq!(jury.len(), 7);
+		assert!(!jury.contains(&1), "the filer must never be seated on its own case's jury");
+		assert!(
+			!jury.contains(&2),
+			"the accused (matched by their registered nullifier) must never sit on their own jury"
+		);
+		let mut sorted = jury.into_inner();
+		sorted.sort();
+		assert_eq!(sorted, vec![3, 4, 5, 6, 7, 8, 9]);
+	});
+}
+
+// ─── select_jury: eligibility check must account for pick_random_jurors' exclusions ───────
+//
+// Regression coverage for the fix closing a gap in the eligibility check itself (distinct
+// from the exclusion tests above, which cover `pick_random_jurors` actually excluding the
+// right accounts once selection runs): `total >= required_size` alone doesn't guarantee a
+// jury can actually be filled once the filer (and, for CitizenConduct, the defendant) are
+// excluded from the draw. Before this fix, a pool sized exactly at `required_size` with an
+// excluded party inside it passed this check and only failed later, deep inside
+// `pick_random_jurors`'s retry loop, after burning through its attempt budget — same
+// terminal `NotEnoughCitizens` error, but reached the wrong way, and the case would have
+// been permanently stranded in `InJuryAppeal` had `pick_random_jurors`'s failure not also
+// mapped to the same error (it does, but only by chance of shared error variant, not because
+// anything upstream actually validated the pool was big enough).
+
+#[test]
+fn select_jury_eligibility_check_accounts_for_filer_exclusion() {
+	new_test_ext().execute_with(|| {
+		// Exactly 7 citizens (== the Level-1 required size), and the filer (account 1) is one
+		// of them. `pick_random_jurors` always excludes the filer, so only 6 citizens are
+		// actually eligible -- one short. This must be rejected immediately by the eligibility
+		// check itself, not merely eventually via pick_random_jurors' retries.
+		set_citizen_count(7);
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+
+		assert_noop!(
+			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
+			Error::<Test>::NotEnoughCitizens
+		);
+	});
+}
+
+#[test]
+fn select_jury_eligibility_check_accounts_for_citizen_conduct_exclusions() {
+	new_test_ext().execute_with(|| {
+		// 8 citizens -- one short of the 9 a CitizenConduct case actually needs (7-juror
+		// requirement + filer + defendant both excluded = 9). Filer is account 1, defendant is
+		// account 2 (matched via their registered nullifier), both within the pool of 8.
+		set_citizen_count(8);
+		let defendant_nullifier = [42u8; 32];
+		set_citizen_nullifier(2, defendant_nullifier);
+		let case_id = file_ai_rule_and_appeal(
+			1,
+			CaseSubject::CitizenConduct { nullifier: defendant_nullifier, suspension_blocks: Some(10) },
+		);
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+
+		assert_noop!(
+			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
+			Error::<Test>::NotEnoughCitizens
+		);
 	});
 }
 
@@ -377,6 +585,8 @@ fn unappealed_ai_ruling_suspends_citizen_without_jury_review_flag() {
 		assert_ok!(Courts::file_case(
 			RuntimeOrigin::signed(1),
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(50) },
+			None,
+			None,
 		));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		let oracle = setup_oracle_member();
@@ -429,6 +639,84 @@ fn jury_vote_majority_auto_finalizes_and_enforces_law_challenge() {
 	});
 }
 
+// ─── duplicate LawChallenge rejection ───────────────────────────────────────
+//
+// Regression coverage for the fix closing the revert-and-strand bug: previously, nothing
+// stopped two `LawChallenge` cases from being open against the same `law_id` at once. If the
+// first resolved Overturned (pausing the law via `T::LawEnforcer::invalidate_law`), the
+// second's own later `invalidate_law` call would fail because the law was no longer `Active`
+// — and because `auto_finalize` runs inside the same transactional extrinsic as its caller
+// (`cast_jury_vote`/`finalize_ruling`), that whole call reverted, permanently stranding the
+// second case (and its filing bond). `file_case`/`auto_file_case` now reject a second
+// `LawChallenge` for a `law_id` that already has one open.
+
+#[test]
+fn file_case_rejects_duplicate_law_challenge_while_one_is_open() {
+	new_test_ext().execute_with(|| {
+		let first_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::LawChallenge { law_id: 42 }));
+
+		// A second, different citizen filing against the same law_id is rejected while the
+		// first case is still open (Filed, i.e. nowhere near resolved).
+		assert_noop!(
+			file_case_as(2, CaseSubject::LawChallenge { law_id: 42 }),
+			Error::<Test>::DuplicateLawChallenge
+		);
+		// No state from the rejected attempt: no second case, no reserve taken from account 2,
+		// NextCaseId unchanged.
+		assert_eq!(Balances::reserved_balance(2), 0);
+		assert_eq!(crate::NextCaseId::<Test>::get(), first_id + 1);
+
+		// A LawChallenge against a *different* law_id is unaffected.
+		assert_ok!(file_case_as(2, CaseSubject::LawChallenge { law_id: 7 }));
+		// As is a non-LawChallenge case entirely.
+		assert_ok!(file_case_as(3, CaseSubject::General));
+	});
+}
+
+#[test]
+fn file_case_allows_new_law_challenge_once_the_previous_one_finalizes() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::LawChallenge { law_id: 42 });
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
+		capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 21));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		for juror in jury.iter().take(11) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Overturned));
+		}
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Enforced);
+
+		// Now that the case has fully resolved, OpenLawChallengeCase[42] must have been
+		// cleared — filing a fresh challenge against the same law must succeed.
+		assert_ok!(file_case_as(2, CaseSubject::LawChallenge { law_id: 42 }));
+	});
+}
+
+#[test]
+fn auto_file_case_rejects_duplicate_law_challenge_against_a_citizen_filed_one() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(file_case_as(1, CaseSubject::LawChallenge { law_id: 9 }));
+		assert_noop!(
+			Courts::auto_file_case(CaseSubject::LawChallenge { law_id: 9 }),
+			Error::<Test>::DuplicateLawChallenge
+		);
+	});
+}
+
+#[test]
+fn file_case_rejects_duplicate_law_challenge_against_an_auto_filed_one() {
+	new_test_ext().execute_with(|| {
+		assert_ok!(Courts::auto_file_case(CaseSubject::LawChallenge { law_id: 9 }));
+		assert_noop!(
+			file_case_as(1, CaseSubject::LawChallenge { law_id: 9 }),
+			Error::<Test>::DuplicateLawChallenge
+		);
+		assert_eq!(Balances::reserved_balance(1), 0);
+	});
+}
+
 // ─── file_case bond ────────────────────────────────────────────────────────
 //
 // `file_case` reserves `CaseFilingBond` from the filer as a spam-prevention deposit. The bond
@@ -440,15 +728,16 @@ fn jury_vote_majority_auto_finalizes_and_enforces_law_challenge() {
 fn file_case_reserves_bond_when_filer_can_afford_it() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 
 		assert_eq!(Balances::reserved_balance(1), CASE_FILING_BOND);
 		assert_eq!(CaseBonds::<Test>::get(case_id), Some(CASE_FILING_BOND));
 		let (filer, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
-		assert_eq!(filer, 1);
+		// General is not one of the anonymized case types -- the real AccountId is stored.
+		assert_eq!(filer, CaseFiler::Account(1));
 		assert_eq!(status, CaseStatus::Filed);
 		System::assert_last_event(
-			Event::CaseFiled { case_id, filer: 1, subject: CaseSubject::General }.into(),
+			Event::CaseFiled { case_id, filer: CaseFiler::Account(1), subject: CaseSubject::General }.into(),
 		);
 	});
 }
@@ -503,7 +792,7 @@ fn file_case_fails_with_insufficient_balance_and_leaves_no_dangling_reserve() {
 		let case_id = crate::NextCaseId::<Test>::get();
 		// Account 999 was never funded in genesis (only 1..=30 are).
 		assert_noop!(
-			Courts::file_case(RuntimeOrigin::signed(999), CaseSubject::General),
+			file_case_as(999, CaseSubject::General),
 			Error::<Test>::InsufficientBalance
 		);
 		assert_eq!(Balances::reserved_balance(999), 0);
@@ -528,7 +817,7 @@ fn add_ai_governance_member_requires_root() {
 fn file_case_bond_is_released_when_finalized_without_appeal() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
@@ -567,7 +856,7 @@ fn vote_approve_ai_model_rejects_double_vote() {
 fn submit_ai_ruling_rejects_when_no_model_approved() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let oracle = setup_oracle_member();
 		assert_noop!(
 			Courts::submit_ai_ruling(RuntimeOrigin::signed(oracle), case_id, [7u8; 32], 0, Verdict::Upheld),
@@ -606,7 +895,7 @@ fn file_case_bond_is_released_when_jury_finalizes_case() {
 fn submit_ai_ruling_rejects_stale_model_version() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 
 		// Approve version 1, then supersede it with version 2.
 		let v1 = approve_first_ai_model([1u8; 32]);
@@ -630,10 +919,15 @@ fn auto_file_case_does_not_reserve_bond() {
 		assert_ok!(Courts::auto_file_case(CaseSubject::General));
 
 		let (filer, _, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		// auto_file_case always uses CaseFiler::Account(AutoChallengeAccount) -- there's no
+		// citizen filer to anonymize for a system-initiated case.
+		let CaseFiler::Account(filer_account) = filer else {
+			panic!("auto_file_case must use CaseFiler::Account");
+		};
 		// AutoChallengeAccountId (account 0) is the system filer and is unfunded — if this
 		// path tried to reserve a bond it would fail with InsufficientBalance, but it
 		// succeeded above, and nothing is reserved.
-		assert_eq!(Balances::reserved_balance(filer), 0);
+		assert_eq!(Balances::reserved_balance(filer_account), 0);
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
 	});
 }
@@ -642,7 +936,7 @@ fn auto_file_case_does_not_reserve_bond() {
 fn submit_ai_ruling_succeeds_with_current_approved_version() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([9u8; 32]);
 		let oracle = setup_oracle_member();
 
@@ -674,7 +968,7 @@ fn finalize_ruling_applies_the_verdict_committed_at_submission_not_a_caller_supp
 	// there is no longer any way for the caller of finalize_ruling to choose a different one.
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::LawChallenge { law_id: 7 }));
+		assert_ok!(file_case_as(1, CaseSubject::LawChallenge { law_id: 7 }));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
@@ -702,7 +996,7 @@ fn finalize_ruling_fails_if_no_verdict_was_ever_recorded() {
 	// but finalize_ruling must fail safe rather than panic if it somehow happens.
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
@@ -729,7 +1023,7 @@ fn finalize_ruling_fails_if_no_verdict_was_ever_recorded() {
 fn appeal_ruling_rejects_unrelated_signed_account() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		let oracle = setup_oracle_member();
 		assert_ok!(Courts::submit_ai_ruling(
@@ -756,7 +1050,7 @@ fn appeal_ruling_rejects_unrelated_signed_account() {
 fn appeal_ruling_allows_the_designated_oracle() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		// DEFAULT_ORACLE (account 50) is registered as an Oracle Council member here, replacing
 		// the old `set_oracle_account` — membership alone (via `is_filer_or_oracle`) is what
@@ -818,6 +1112,8 @@ fn appeal_ruling_allows_verified_ruled_against_party_for_citizen_conduct_case() 
 		assert_ok!(Courts::file_case(
 			RuntimeOrigin::signed(1),
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(10) },
+			None,
+			None,
 		));
 		set_citizen_nullifier(5, nullifier);
 		let model_version = approve_first_ai_model([7u8; 32]);
@@ -847,6 +1143,8 @@ fn appeal_ruling_rejects_nullifier_mismatch_for_citizen_conduct_case() {
 		assert_ok!(Courts::file_case(
 			RuntimeOrigin::signed(1),
 			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(10) },
+			None,
+			None,
 		));
 		// Account 5 is registered under a *different* nullifier than the one this case names.
 		set_citizen_nullifier(5, other_nullifier);
@@ -889,7 +1187,7 @@ fn oracle_single_approval_does_not_trigger_ruling_below_threshold() {
 	new_test_ext().execute_with(|| {
 		let (m1, _m2, _m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		assert_ok!(Courts::submit_ai_ruling(
@@ -913,7 +1211,7 @@ fn oracle_threshold_reached_triggers_ruling() {
 	new_test_ext().execute_with(|| {
 		let (m1, m2, _m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		assert_ok!(Courts::submit_ai_ruling(
@@ -944,7 +1242,7 @@ fn oracle_approve_ai_ruling_rejects_double_approval_from_same_member() {
 	new_test_ext().execute_with(|| {
 		let (m1, _m2, _m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		assert_ok!(Courts::submit_ai_ruling(
@@ -968,7 +1266,7 @@ fn oracle_approve_ai_ruling_rejects_non_member() {
 	new_test_ext().execute_with(|| {
 		let (m1, _m2, _m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		assert_ok!(Courts::submit_ai_ruling(
@@ -1003,7 +1301,7 @@ fn oracle_finalize_ruling_requires_threshold_approval() {
 	new_test_ext().execute_with(|| {
 		let (m1, m2, _m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		// Get the case to AIRulingIssued first (2-of-3 submission).
@@ -1075,7 +1373,7 @@ fn removed_oracle_member_can_no_longer_propose_or_approve() {
 		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), m2));
 
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 		assert_ok!(Courts::submit_ai_ruling(
 			RuntimeOrigin::signed(m1),
@@ -1096,7 +1394,7 @@ fn remove_oracle_member_purges_stale_approval_from_in_flight_proposal() {
 	new_test_ext().execute_with(|| {
 		let (m1, m2, m3) = setup_three_member_oracle_council();
 		let case_id = crate::NextCaseId::<Test>::get();
-		assert_ok!(Courts::file_case(RuntimeOrigin::signed(1), CaseSubject::General));
+		assert_ok!(file_case_as(1, CaseSubject::General));
 		let model_version = approve_first_ai_model([7u8; 32]);
 
 		// m1 proposes and is auto-approved as the proposer -- 1 of 3, below the 2-of-3
@@ -1131,6 +1429,105 @@ fn remove_oracle_member_purges_stale_approval_from_in_flight_proposal() {
 		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
 		assert_eq!(status, CaseStatus::AIRulingIssued);
 		assert_eq!(ruling_hash, Some([7u8; 32]));
+	});
+}
+
+#[test]
+fn remove_oracle_member_reresolves_case_action_crossing_threshold_after_shrink() {
+	// The exact stuck-proposal scenario the fix closes: a 2-member council where only the
+	// proposer's own approval exists (1 of 2, below the strict-majority threshold). Removing
+	// the *other* (non-proposing) member shrinks the council to 1, and the proposer's
+	// already-cast approval alone now satisfies a 1-of-1 threshold -- this must resolve the
+	// ruling as a side effect of `remove_oracle_member`, not leave it stranded (before the fix,
+	// the proposer could not re-propose -- `OracleActionAlreadyProposed` -- and no one else
+	// could approve -- `AlreadyApprovedOracleAction` / nobody else on the council).
+	new_test_ext().execute_with(|| {
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 60));
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 61));
+		let (proposer, other) = (60, 61);
+
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// proposer submits and is auto-approved -- 1 of 2, strictly below the 2-of-2 majority
+		// a 2-member council needs, so the case stays Filed.
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(proposer),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Filed, "1 of 2 must not resolve yet");
+		assert_eq!(ruling_hash, None);
+
+		// Removing the *other*, non-proposing member (e.g. their key was compromised) shrinks
+		// the council to just {proposer}. The proposer's surviving approval alone now meets
+		// the shrunk 1-of-1 threshold, so this call must resolve the ruling itself.
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), other));
+		assert_eq!(crate::pallet::OracleMembers::<Test>::get().len(), 1);
+
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(
+			status,
+			CaseStatus::AIRulingIssued,
+			"the shrunk threshold is already met by the proposer's own approval -- must \
+			 auto-resolve instead of staying stuck"
+		);
+		assert_eq!(ruling_hash, Some([7u8; 32]));
+		// Resolved proposals are cleared, not left dangling.
+		assert!(crate::pallet::PendingOracleProposal::<Test>::get(case_id).is_none());
+		assert!(crate::pallet::OracleApprovals::<Test>::get(case_id).is_none());
+	});
+}
+
+#[test]
+fn remove_oracle_member_reresolves_finalization_crossing_threshold_after_shrink() {
+	// Same scenario as the submission-side test above, but for the Finalization pending action
+	// (`finalize_ruling`) -- the bug report's other named entry point.
+	new_test_ext().execute_with(|| {
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 60));
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 61));
+		let (proposer, other) = (60, 61);
+
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// Get the case to AIRulingIssued first (2-of-2 submission, both members approve).
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(proposer),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(other), case_id));
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued);
+
+		System::set_block_number(200); // past the 100-block appeal window in the mock.
+
+		// proposer proposes finalization alone -- 1 of 2, below threshold, stays pending.
+		assert_ok!(Courts::finalize_ruling(RuntimeOrigin::signed(proposer), case_id));
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued, "1 of 2 must not finalize yet");
+		assert!(crate::pallet::Rulings::<Test>::get(case_id).is_none());
+
+		// Removing the other member shrinks the council to {proposer}; their surviving
+		// finalization approval alone now meets the shrunk 1-of-1 threshold.
+		assert_ok!(Courts::remove_oracle_member(RuntimeOrigin::root(), other));
+
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(
+			status,
+			CaseStatus::FinalRuling,
+			"the shrunk threshold is already met -- finalization must auto-resolve"
+		);
+		assert_eq!(crate::pallet::Rulings::<Test>::get(case_id), Some(Verdict::Upheld));
+		assert!(crate::pallet::PendingOracleProposal::<Test>::get(case_id).is_none());
 	});
 }
 
@@ -1400,5 +1797,338 @@ fn admin_action_rejects_re_proposing_a_call_hash_already_pending_or_approved() {
 			Courts::propose_admin_action(RuntimeOrigin::signed(m1), call_hash),
 			Error::<Test>::OracleActionAlreadyProposed
 		);
+	});
+}
+
+// ─── TierConflict (Change 1: constitutional-law-tier-laundering fix) ───────────────────────
+//
+// `CaseSubject::TierConflict { law_id }` lets any citizen permissionlessly open a case alleging
+// `law_id` was enacted at the wrong `LawTier` -- in production reached via
+// `pallet-constitution::challenge_law_tier`, which delegates into `file_case_for` (exercised
+// directly here since this pallet has no notion of `LawTier`/`Laws` itself). An Overturned
+// ruling applies the same remedy as `LawChallenge`: `T::LawEnforcer::invalidate_law`.
+
+#[test]
+fn tier_conflict_case_can_be_opened_and_overturned_ruling_invalidates_the_law() {
+	new_test_ext().execute_with(|| {
+		let case_id =
+			file_ai_rule_and_appeal(1, CaseSubject::TierConflict { law_id: 77 });
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)]);
+		capture_jury_seed(case_id);
+		// TierConflict is a Level-2 (21-juror) subject, same as LawChallenge.
+		assert_noop!(
+			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
+			Error::<Test>::InvalidJurySize
+		);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 21));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+
+		for juror in jury.iter().take(11) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Overturned));
+		}
+
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Enforced);
+		assert_eq!(crate::Rulings::<Test>::get(case_id), Some(Verdict::Overturned));
+		System::assert_has_event(Event::RulingEnforced { case_id }.into());
+		// Same enforcement as a LawChallenge Overturned ruling: the law is invalidated.
+		assert_eq!(invalidated_laws(), vec![77]);
+	});
+}
+
+#[test]
+fn file_case_for_opens_a_tier_conflict_case_the_same_way_file_case_would() {
+	// `file_case_for` is what pallet-constitution's `challenge_law_tier` (via `TierConflictHook`)
+	// calls into -- proves it reuses the exact same citizen-filing pipeline (active-citizen
+	// gate, ZK verification, bond reservation, anonymized storage) as the `file_case`
+	// dispatchable itself, not a parallel reimplementation.
+	new_test_ext().execute_with(|| {
+		let case_id = crate::NextCaseId::<Test>::get();
+		let nullifier = nullifier_for(1);
+		set_citizen_nullifier(1, nullifier);
+		assert_ok!(Courts::file_case_for(
+			1,
+			CaseSubject::TierConflict { law_id: 5 },
+			valid_proof(),
+			public_inputs(nullifier),
+		));
+
+		assert_eq!(Balances::reserved_balance(1), CASE_FILING_BOND);
+		let (filer, status, _, subject) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(filer, CaseFiler::Nullifier(nullifier));
+		assert_eq!(status, CaseStatus::Filed);
+		assert_eq!(subject, CaseSubject::TierConflict { law_id: 5 });
+	});
+}
+
+#[test]
+fn tier_conflict_rejects_duplicate_while_one_is_open_and_allows_a_fresh_one_once_finalized() {
+	new_test_ext().execute_with(|| {
+		let first_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::TierConflict { law_id: 42 }));
+
+		assert_noop!(
+			file_case_as(2, CaseSubject::TierConflict { law_id: 42 }),
+			Error::<Test>::DuplicateTierConflict
+		);
+		assert_eq!(Balances::reserved_balance(2), 0);
+		assert_eq!(crate::NextCaseId::<Test>::get(), first_id + 1);
+
+		// A LawChallenge against the *same* law_id is now ALSO rejected while the TierConflict
+		// is open. `OpenCaseByLaw` is keyed on law_id ALONE, so a LawChallenge and a
+		// TierConflict against the same law are mutually exclusive with *each other*, not just
+		// each with itself -- this is the corrected behavior; the old, buggy behavior (two
+		// independent `OpenLawChallengeCase`/`OpenTierConflictCase` maps letting both coexist)
+		// reintroduced the exact revert-and-strand bug these guards exist to prevent. See
+		// `OpenCaseByLaw`'s doc comment.
+		assert_noop!(
+			file_case_as(3, CaseSubject::LawChallenge { law_id: 42 }),
+			Error::<Test>::DuplicateLawChallenge
+		);
+		assert_eq!(Balances::reserved_balance(3), 0);
+
+		// A TierConflict against a *different* law_id remains fully independent.
+		assert_ok!(file_case_as(2, CaseSubject::TierConflict { law_id: 7 }));
+	});
+}
+
+#[test]
+fn law_challenge_rejects_duplicate_while_a_tier_conflict_is_open_for_the_same_law() {
+	// Symmetric to the test above: opening a LawChallenge first, then attempting a
+	// TierConflict against the same law_id, must also be rejected.
+	new_test_ext().execute_with(|| {
+		assert_ok!(file_case_as(1, CaseSubject::LawChallenge { law_id: 42 }));
+
+		assert_noop!(
+			file_case_as(2, CaseSubject::TierConflict { law_id: 42 }),
+			Error::<Test>::DuplicateTierConflict
+		);
+		assert_eq!(Balances::reserved_balance(2), 0);
+	});
+}
+
+#[test]
+fn law_challenge_can_open_once_a_tier_conflict_against_the_same_law_finalizes() {
+	// Cross-kind release: `OpenCaseByLaw`'s slot for a law_id is freed once the case actually
+	// holding it (a TierConflict here) reaches FinalRuling, regardless of what kind of
+	// law-targeting case opens next against that same law_id.
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::TierConflict { law_id: 42 });
+		set_window_hashes(
+			case_id,
+			&[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)],
+		);
+		capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 21));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		for juror in jury.iter().take(11) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Overturned));
+		}
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Enforced);
+
+		// A fresh LawChallenge (a *different* kind than the one that just resolved) against
+		// the same law_id now succeeds.
+		assert_ok!(file_case_as(2, CaseSubject::LawChallenge { law_id: 42 }));
+	});
+}
+
+// ─── Anonymized vs. plain-AccountId filer storage/event (Change 2) ────────────────────────
+//
+// `LawChallenge`/`TreasuryDispute`/`TierConflict` are "citizen vs. institutional power" and
+// must file under a ZK nullifier, never the signer's `AccountId`; `CitizenConduct`/`General`
+// are citizen-vs-citizen/general and keep filing under the signer's plain `AccountId`, unchanged
+// from before this fix.
+
+#[test]
+fn law_challenge_and_treasury_dispute_store_and_emit_a_nullifier_not_an_account_id() {
+	new_test_ext().execute_with(|| {
+		let case_id_a = crate::NextCaseId::<Test>::get();
+		let nullifier_a = nullifier_for(11);
+		assert_ok!(Courts::file_case(
+			RuntimeOrigin::signed(11),
+			CaseSubject::LawChallenge { law_id: 100 },
+			Some(valid_proof()),
+			Some(public_inputs(nullifier_a)),
+		));
+		let (filer_a, _, _, _) = crate::pallet::Cases::<Test>::get(case_id_a).unwrap();
+		assert_eq!(filer_a, CaseFiler::Nullifier(nullifier_a));
+		System::assert_has_event(
+			Event::CaseFiled {
+				case_id: case_id_a,
+				filer: CaseFiler::Nullifier(nullifier_a),
+				subject: CaseSubject::LawChallenge { law_id: 100 },
+			}
+			.into(),
+		);
+
+		let case_id_b = crate::NextCaseId::<Test>::get();
+		let nullifier_b = nullifier_for(12);
+		assert_ok!(Courts::file_case(
+			RuntimeOrigin::signed(12),
+			CaseSubject::TreasuryDispute { department_id: 3 },
+			Some(valid_proof()),
+			Some(public_inputs(nullifier_b)),
+		));
+		let (filer_b, _, _, _) = crate::pallet::Cases::<Test>::get(case_id_b).unwrap();
+		assert_eq!(filer_b, CaseFiler::Nullifier(nullifier_b));
+		System::assert_has_event(
+			Event::CaseFiled {
+				case_id: case_id_b,
+				filer: CaseFiler::Nullifier(nullifier_b),
+				subject: CaseSubject::TreasuryDispute { department_id: 3 },
+			}
+			.into(),
+		);
+
+		// Neither filing account's raw AccountId (11 or 12) ever appears as a `CaseFiler` --
+		// only their nullifier does.
+		assert_ne!(filer_a, CaseFiler::Account(11));
+		assert_ne!(filer_b, CaseFiler::Account(12));
+	});
+}
+
+#[test]
+fn citizen_conduct_and_general_still_store_and_emit_a_plain_account_id() {
+	new_test_ext().execute_with(|| {
+		let case_id_a = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(21, CaseSubject::General));
+		let (filer_a, _, _, _) = crate::pallet::Cases::<Test>::get(case_id_a).unwrap();
+		assert_eq!(filer_a, CaseFiler::Account(21));
+
+		let case_id_b = crate::NextCaseId::<Test>::get();
+		let nullifier = [55u8; 32];
+		assert_ok!(file_case_as(
+			22,
+			CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(5) },
+		));
+		let (filer_b, _, _, _) = crate::pallet::Cases::<Test>::get(case_id_b).unwrap();
+		assert_eq!(filer_b, CaseFiler::Account(22));
+		System::assert_has_event(
+			Event::CaseFiled {
+				case_id: case_id_b,
+				filer: CaseFiler::Account(22),
+				subject: CaseSubject::CitizenConduct { nullifier, suspension_blocks: Some(5) },
+			}
+			.into(),
+		);
+	});
+}
+
+// ─── file_case ZK-proof validation (anonymized case types) ────────────────────────────────
+
+#[test]
+fn file_case_rejects_law_challenge_with_missing_zk_proof() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::LawChallenge { law_id: 1 },
+				None,
+				None,
+			),
+			Error::<Test>::MissingZkProof
+		);
+	});
+}
+
+#[test]
+fn file_case_rejects_general_with_an_unexpected_zk_proof() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::General,
+				Some(valid_proof()),
+				Some(public_inputs([1u8; 32])),
+			),
+			Error::<Test>::UnexpectedZkProof
+		);
+	});
+}
+
+#[test]
+fn file_case_rejects_law_challenge_with_an_invalid_proof() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::LawChallenge { law_id: 1 },
+				Some(invalid_proof()),
+				Some(public_inputs([1u8; 32])),
+			),
+			Error::<Test>::InvalidZkProof
+		);
+	});
+}
+
+#[test]
+fn file_case_rejects_law_challenge_with_too_short_public_inputs() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::LawChallenge { law_id: 1 },
+				Some(valid_proof()),
+				Some(too_short_public_inputs()),
+			),
+			Error::<Test>::MissingNullifierInput
+		);
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::LawChallenge { law_id: 1 },
+				Some(valid_proof()),
+				Some(empty_public_inputs()),
+			),
+			Error::<Test>::MissingNullifierInput
+		);
+	});
+}
+
+#[test]
+fn file_case_rejects_law_challenge_with_wrong_proof_scope() {
+	new_test_ext().execute_with(|| {
+		// Valid shape and a passing mock verifier, but scope/subscope from a different
+		// purpose's proof (e.g. citizen registration) rather than this pallet's own
+		// CASE_FILING_SERVICE_SCOPE/SUBSCOPE -- must not be accepted as a replay.
+		assert_noop!(
+			Courts::file_case(
+				RuntimeOrigin::signed(1),
+				CaseSubject::LawChallenge { law_id: 1 },
+				Some(valid_proof()),
+				Some(public_inputs_with([1u8; 32], [2u8; 32], [3u8; 32])),
+			),
+			Error::<Test>::InvalidProofScope
+		);
+	});
+}
+
+// ─── pick_random_jurors excludes an anonymized filer via their own registered nullifier ────
+
+#[test]
+fn select_jury_excludes_the_anonymized_law_challenge_filer_via_nullifier() {
+	new_test_ext().execute_with(|| {
+		// 8 citizens, 7-person jury: excluding the filer (account 1, matched via the nullifier
+		// `file_case_as` registered for them) leaves exactly {2..=8}.
+		set_citizen_count(8);
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::TreasuryDispute { department_id: 9 });
+		set_window_hashes(
+			case_id,
+			&[H256::repeat_byte(0x11), H256::repeat_byte(0x22), H256::repeat_byte(0x33)],
+		);
+		capture_jury_seed(case_id);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_eq!(jury.len(), 7);
+		assert!(
+			!jury.contains(&1),
+			"the anonymized case's own filer must never be seated on its jury, even though \
+			 the case only stores their nullifier, not their AccountId"
+		);
+		let mut sorted = jury.into_inner();
+		sorted.sort();
+		assert_eq!(sorted, vec![2, 3, 4, 5, 6, 7, 8]);
 	});
 }

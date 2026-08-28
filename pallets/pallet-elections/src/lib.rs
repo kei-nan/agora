@@ -225,6 +225,23 @@ pub mod pallet {
         fn has_current_disclosure(who: &AccountId) -> bool;
     }
 
+    /// Gate: returns `true` if `who` currently sits on the Accountability Council. Checked in
+    /// `run_election`, immediately alongside `DisclosureChecker` above and for the identical
+    /// reason: `pallet_accountability_council::add_member` only bars the *other* direction (a
+    /// current legislature/executive member joining the Council) — nothing previously stopped a
+    /// sitting Council member from later being automatically seated here, since this pallet's
+    /// seating has no join-time gate of its own to begin with. A Council member who would
+    /// otherwise be seated is skipped (not seated, not counted against `LegislatureSeats`), and
+    /// the next-highest-backed eligible delegate fills the seat instead — same skip-and-fall-
+    /// through shape as the disclosure gate, for the same reason (`run_election` is an
+    /// `on_initialize` hook, not a retryable extrinsic; one person's dual role shouldn't be able
+    /// to freeze legislature seating for everyone else). Implemented directly on
+    /// `pallet_accountability_council::Pallet<T>`, following the same consumer-defines/provider-
+    /// implements idiom as `DisclosureChecker`.
+    pub trait AccountabilityCouncilChecker<AccountId> {
+        fn is_current_member(who: &AccountId) -> bool;
+    }
+
     /// Benchmark-only hook: makes an account satisfy `CitizenChecker::is_active_citizen` for
     /// extrinsics gated on citizen status (`register_candidate`, `register_as_delegate`,
     /// `back_delegate`). Real citizen registration goes through pallet-identity-zk's full
@@ -270,6 +287,60 @@ pub mod pallet {
     #[pallet::pallet]
     pub struct Pallet<T>(_);
 
+    // ── ZKPassport proof-scope domain separation (`register_as_delegate`) ───────
+    //
+    // Mirrors `pallets/pallet-anticorruption/src/lib.rs`'s `zero_padded_scope_tag`/
+    // `WHISTLEBLOWER_REPORT_SERVICE_SCOPE`/`WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE` pattern
+    // (also mirrored independently by `pallets/pallet-identity/src/lib.rs`). This pallet
+    // defines its own scope entirely, rather than importing pallet-identity's
+    // `AGORA_IDENTITY_SERVICE_SCOPE` — the two pallets are deliberately decoupled at the
+    // crate level (`register_as_delegate` talks to pallet-identity only through the
+    // `CommitteeKeyChecker`/`DelegatePersonaVerifier` trait abstractions configured in
+    // `runtime/src/configs/mod.rs`, never a direct dependency), and a shared ZK-proof-scope
+    // constant would be a one-off exception to that just for this. Each pallet's proof-scope
+    // story stays self-contained and independently auditable this way, at the cost of one
+    // extra constant.
+
+    /// Index of `service_scope` in an outer ZKPassport proof's `public_inputs` — fixed
+    /// regardless of disclosure-subproof count. See `runtime/src/verifier.rs`'s module docs
+    /// for the full public-input layout.
+    const SERVICE_SCOPE_INDEX: usize = 3;
+    /// Index of `service_subscope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SUBSCOPE_INDEX: usize = 4;
+
+    /// Zero-pads a 31-byte ASCII tag into a canonical 32-byte big-endian BN254 `Fr` element —
+    /// identical construction to, and for the identical reason as,
+    /// `pallet_anticorruption::pallet::zero_padded_scope_tag`/
+    /// `pallet_identity_zk::pallet::zero_padded_scope_tag` (see either's doc comment for the
+    /// full canonicality argument).
+    const fn zero_padded_scope_tag(tag: &[u8; 31]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 31 {
+            out[i + 1] = tag[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Domain-separation constant `register_as_delegate` requires as its outer ZKPassport
+    /// proof's `service_scope`.
+    ///
+    /// PLACEHOLDER: replace with Agora's real, actually-registered production domain string
+    /// before this ever verifies a real ZKPassport proof — there is no approval process, this
+    /// just needs to be the true domain the mobile app requests proofs under.
+    pub const AGORA_ELECTIONS_SERVICE_SCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_ELECTIONS_SERVICE_SCOPE_1");
+
+    /// `service_subscope` `register_as_delegate` requires — distinct from every
+    /// `pallet-identity` subscope (`AGORA_IDENTITY_REGISTER_SUBSCOPE` etc.) and from
+    /// `pallet-anticorruption`'s `WHISTLEBLOWER_REPORT_SERVICE_SUBSCOPE`, so a genuine,
+    /// currently-valid proof generated for any of those other purposes — all permanently
+    /// public once submitted on-chain as ordinary call data — cannot be replayed into
+    /// `register_as_delegate` to mint a delegate persona the real prover never requested.
+    pub const AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_ELECTIONS_DELEGATE_SUB_V1");
+
     // ── Config ─────────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -286,6 +357,45 @@ pub mod pallet {
         /// scanning the whole map every block — see `DelegateSweepCursor`.
         #[pallet::constant]
         type MaxDelegateSweepPerBlock: Get<u32>;
+
+        /// Maximum number of `Delegates` entries `run_election` examines per block while
+        /// ranking candidates for legislature seating. `run_election` used to do an
+        /// unconditional `Delegates::<T>::iter().collect()` over every registered delegate
+        /// followed by an O(n log n) sort — unbounded work in `on_initialize`, the exact same
+        /// griefing pattern `MaxDelegateSweepPerBlock`/`DelegateSweepCursor` above exists to
+        /// avoid for the term-warning sweep. This bounds the ranking scan the same way — see
+        /// `ElectionScanCursor`/`ElectionCandidateSnapshot`.
+        #[pallet::constant]
+        type MaxElectionScanPerBlock: Get<u32>;
+
+        /// Minimum age, in blocks, a `BackingCount` checkpoint must reach before `run_election`
+        /// will use it for that election's seating ranking — closes a flash-backing exploit:
+        /// without this, `run_election` read live `BackingCount` at the exact block it examined
+        /// each delegate, so a funded actor could pay citizens to back a candidate in the blocks
+        /// immediately before a deterministic, publicly-known election-cycle boundary, win a
+        /// seat on backing that existed for minutes, then withdraw and redeploy elsewhere.
+        ///
+        /// Mirrors `pallet-voting`'s `MinDelegationDurationBlocks` in spirit (both exist to stop
+        /// a flash-style manipulation of a governance-weight signal), but the enforcement
+        /// mechanism is necessarily different: `pallet-voting` rejects a `delegate_vote` call
+        /// whose *requested forward* duration is too short. That shape doesn't fit here, because
+        /// the exploit this closes is about how *stale* a count must be to be trusted, not how
+        /// long a citizen commits to keep backing going forward — `back_delegate`/
+        /// `remove_backing` still take effect immediately (a citizen can still freely change
+        /// their mind moment to moment), and it is specifically the value `run_election` reads
+        /// for *seating* that must lag behind live `BackingCount` by at least this many blocks.
+        /// See `LastBackingCheckpoint`'s doc comment for the checkpoint mechanism and why it
+        /// updates only inside `run_election`'s own scan (never inside `back_delegate`/
+        /// `remove_backing`) so it cannot be timed/gamed by choosing when to submit a backing.
+        ///
+        /// Effective protection is capped at one full `ElectionCycleBlocks` regardless of how
+        /// high this is set, because a checkpoint only has an opportunity to mature once per
+        /// election scan (see `run_election`'s doc comment on this point) — setting this above
+        /// `ElectionCycleBlocks` makes maturing take multiple cycles rather than shortening
+        /// below one cycle, it never does. In practice this should be configured comfortably
+        /// below `ElectionCycleBlocks`.
+        #[pallet::constant]
+        type MinBackingDurationBlocks: Get<u32>;
 
         type CitizenChecker: CitizenChecker<Self::AccountId>;
 
@@ -305,6 +415,11 @@ pub mod pallet {
         /// Cross-pallet gate: checked per-candidate during seating (see `run_election`) so an
         /// account without a current asset disclosure is skipped rather than seated.
         type DisclosureChecker: DisclosureChecker<Self::AccountId>;
+
+        /// Cross-pallet gate: checked per-candidate during seating (see `run_election`) so a
+        /// sitting Accountability Council member is skipped rather than seated — see
+        /// `AccountabilityCouncilChecker`'s doc comment.
+        type AccountabilityCouncilChecker: AccountabilityCouncilChecker<Self::AccountId>;
 
         /// See `AccountIdToBytes`'s doc comment above.
         type AccountIdToBytes: AccountIdToBytes<Self::AccountId>;
@@ -516,6 +631,61 @@ pub mod pallet {
     #[pallet::storage]
     pub type LastElectionBlock<T: Config> = StorageValue<_, BlockNumberFor<T>, ValueQuery>;
 
+    /// Whether a multi-block election-seating scan (`run_election`) is currently in progress.
+    /// Set when `on_initialize` first detects an election-cycle boundary has been reached;
+    /// cleared once the scan completes and seating is finalized. While `true`, `on_initialize`
+    /// keeps advancing the scan every block even if governance changes `ElectionCycleBlocks`
+    /// (e.g. to 0) mid-scan — an in-progress scan always runs to completion rather than
+    /// stalling with a half-built, never-cleared `ElectionCandidateSnapshot`.
+    #[pallet::storage]
+    pub type ElectionScanInProgress<T: Config> = StorageValue<_, bool, ValueQuery>;
+
+    /// Resume point for the in-progress election ranking scan started by `run_election`: the
+    /// account *after* which the next block's scan should resume, or `None` to start from the
+    /// beginning of `Delegates`. Distinct from `DelegateSweepCursor` above — that sweep runs
+    /// continuously every block regardless of elections; this one only advances while
+    /// `ElectionScanInProgress` is `true`, and is killed once the scan completes.
+    #[pallet::storage]
+    pub type ElectionScanCursor<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
+
+    /// Backing-count snapshot for delegates that passed all eligibility filters (Active status,
+    /// active citizen, current asset disclosure, not a sitting Accountability Council member)
+    /// during the in-progress election scan. Snapshotting each delegate's *matured*
+    /// `LastBackingCheckpoint` value here, at the block it is examined, rather than re-reading
+    /// live `BackingCount` at final sort time, ensures the eventual ranking (a) compares
+    /// consistent point-in-time counts even though the scan spans several blocks and
+    /// `BackingCount` keeps changing (via `back_delegate`/`remove_backing`) while it does, and
+    /// (b) cannot be influenced by backing added too recently to have matured — see
+    /// `LastBackingCheckpoint`'s doc comment for the flash-backing exploit this closes. Drained
+    /// entirely once the scan completes and seating is finalized.
+    #[pallet::storage]
+    pub type ElectionCandidateSnapshot<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, u32>;
+
+    /// `(block, backing_count)`: the most recent *matured* checkpoint of `BackingCount` for a
+    /// delegate, used by `run_election` in place of a live read to rank that delegate's
+    /// election-seating eligibility (see `MinBackingDurationBlocks`' doc comment for the
+    /// flash-backing exploit this closes: a funded actor renting backing for only the blocks
+    /// right before a deterministic, public election boundary, winning a seat, then withdrawing
+    /// and redeploying elsewhere).
+    ///
+    /// Deliberately updated **only** inside `run_election`'s own scan — never inside
+    /// `back_delegate`/`remove_backing` — so the checkpoint's advance is tied to a fixed,
+    /// once-per-election-cycle event nobody choosing when to submit a backing can influence. An
+    /// earlier design considered rolling this checkpoint forward lazily on every
+    /// `back_delegate`/`remove_backing` call once `MinBackingDurationBlocks` had elapsed since
+    /// the last roll; that shape is vulnerable to an attacker who can read this checkpoint's
+    /// current age on-chain and time their own bribed `back_delegate` call to land exactly when
+    /// a roll would sweep in backing that is nowhere near `MinBackingDurationBlocks` old,
+    /// because the rollover trigger and the value being captured are decoupled: the trigger
+    /// only needs *some* call after the maturity deadline, not that call's own backing to be
+    /// mature. Confining the update to `run_election` removes that timing surface, at the cost
+    /// of coarser granularity — see `MinBackingDurationBlocks`' doc comment for why effective
+    /// protection is capped at one full `ElectionCycleBlocks` either way.
+    #[pallet::storage]
+    pub type LastBackingCheckpoint<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, (BlockNumberFor<T>, u32)>;
+
     // ── Events ─────────────────────────────────────────────────────────────────
 
     #[pallet::event]
@@ -548,6 +718,10 @@ pub mod pallet {
         /// delegate takes the seat instead — see `run_election`'s doc comment for why this is a
         /// skip-and-fall-through rather than a hard error.
         SeatingSkippedNoDisclosure { account: T::AccountId },
+        /// A delegate would otherwise have been seated this cycle but was skipped because they
+        /// currently sit on the Accountability Council — see `AccountabilityCouncilChecker`'s
+        /// doc comment. Same skip-and-fall-through shape as `SeatingSkippedNoDisclosure`.
+        SeatingSkippedAccountabilityCouncilMember { account: T::AccountId },
         /// Constitutional election parameters were updated.
         ElectionParamsChanged { seats: u32, cycle_blocks: u32, max_backings_per_citizen: u32 },
 
@@ -595,6 +769,12 @@ pub mod pallet {
         /// The outer ZKPassport proof failed `T::ZkVerifier`'s pairing check, or had too few
         /// public inputs to plausibly carry a `disclosure`-shaped subproof.
         InvalidZKProof,
+        /// The outer ZKPassport proof's `service_scope`/`service_subscope` public inputs don't
+        /// match [`AGORA_ELECTIONS_SERVICE_SCOPE`]/[`AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE`] —
+        /// either a proof generated for an entirely different ZKPassport-integrated service, or
+        /// a genuine Agora proof generated for a different call (e.g.
+        /// `pallet_identity_zk::register_citizen`) and replayed here.
+        InvalidProofScope,
         /// One or more of the 5 submitted committee-key hashes does not match the
         /// governance-approved key for its slot under the given OPRF scheme version.
         CommitteeKeyMismatch,
@@ -630,7 +810,13 @@ pub mod pallet {
             // ── Legislature election cycle ──────────────────────────────────────
             let last = LastElectionBlock::<T>::get();
             let cycle: BlockNumberFor<T> = ElectionCycleBlocks::<T>::get().into();
-            if !cycle.is_zero() && !now.is_zero() && now >= last.saturating_add(cycle) {
+            let cycle_boundary_reached =
+                !cycle.is_zero() && !now.is_zero() && now >= last.saturating_add(cycle);
+            // Once a scan is in progress it must run to completion regardless of whether the
+            // cycle-boundary condition still holds this block (see `ElectionScanInProgress`'s
+            // doc comment) — so this also continues an already-started scan, not just starts
+            // new ones.
+            if cycle_boundary_reached || ElectionScanInProgress::<T>::get() {
                 weight = weight.saturating_add(Self::run_election(now));
             }
 
@@ -833,11 +1019,17 @@ pub mod pallet {
                 Error::<T>::DelegatePersonaAlreadyUsed
             );
 
-            // Outer proof pairing check first (expensive, and the gate before trusting anything
-            // else in `public_inputs`) -- same ordering `pallet_identity_zk::register_citizen`
-            // uses. `> 8` mirrors that call's own `>= 9`: 8 fixed fields plus at least one
-            // `param_commitment` slot.
+            // Length check, then domain-separation scope check (both cheap), then the
+            // expensive pairing check last -- same ordering `pallet_identity_zk`'s
+            // `verify_outer_proof` uses. `> 8` mirrors that call's own `>= 9`: 8 fixed fields
+            // plus at least one `param_commitment` slot.
             ensure!(public_inputs.len() > 8, Error::<T>::InvalidZKProof);
+            ensure!(
+                public_inputs[SERVICE_SCOPE_INDEX] == AGORA_ELECTIONS_SERVICE_SCOPE
+                    && public_inputs[SERVICE_SUBSCOPE_INDEX]
+                        == AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
+                Error::<T>::InvalidProofScope
+            );
             ensure!(
                 T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
                 Error::<T>::InvalidZKProof
@@ -1148,64 +1340,177 @@ pub mod pallet {
         /// It also matches the real-world remedy: the affected delegate files an up-to-date
         /// disclosure and is eligible again next cycle, no governance action required. The skip
         /// is not silent, though — `Event::SeatingSkippedNoDisclosure` is emitted per skipped
-        /// account so it is visible on-chain.
+        /// account so it is visible on-chain. The Accountability Council overlap gate just below
+        /// it (`AccountabilityCouncilChecker`) is skip-and-fall-through for the identical reason,
+        /// emitting `Event::SeatingSkippedAccountabilityCouncilMember` instead.
+        /// Runs (or continues) the multi-block election-seating scan. Bounds each block's
+        /// ranking work to `MaxElectionScanPerBlock` `Delegates` entries via
+        /// `ElectionScanCursor`, the same cursor-based pattern `on_initialize`'s term-warning
+        /// sweep uses via `DelegateSweepCursor` above (unbounded per-block work in a mandatory
+        /// hook is a griefing vector — see that storage item's doc comment). Each examined
+        /// delegate's *matured* `LastBackingCheckpoint` value (not live `BackingCount` — see
+        /// that storage item's doc comment for the flash-backing exploit this closes) is
+        /// snapshotted into `ElectionCandidateSnapshot` so the final ranking compares
+        /// consistent point-in-time counts despite the scan spanning several blocks. Once the
+        /// scan reaches the end of `Delegates`, this same function finalizes seating: drains
+        /// the snapshot, sorts, takes the top `LegislatureSeats`, and calls `replace_members`.
         fn run_election(now: BlockNumberFor<T>) -> Weight {
-            let seats = LegislatureSeats::<T>::get() as usize;
+            let mut weight = Weight::zero();
+            let batch_size = T::MaxElectionScanPerBlock::get() as usize;
+            // A misconfigured zero batch size would never make progress; rather than fall back
+            // to an unbounded single-block scan (exactly the griefing vector this exists to
+            // close), just don't advance the scan until reconfigured — matches the analogous
+            // zero-batch handling for `MaxDelegateSweepPerBlock` above.
+            if batch_size == 0 {
+                return weight;
+            }
 
-            // Collect all delegates first so we can report exact read counts in the weight.
-            let all_delegates: alloc::vec::Vec<_> = Delegates::<T>::iter().collect();
-            let total_delegates = all_delegates.len() as u64;
+            ElectionScanInProgress::<T>::put(true);
+            weight = weight.saturating_add(T::DbWeight::get().writes(1));
 
-            let mut candidates: alloc::vec::Vec<(T::AccountId, u32)> = all_delegates
-                .into_iter()
-                .filter_map(|(addr, info)| {
-                    // Re-check citizenship now, not just trust Active status from whenever the
-                    // backing threshold was last crossed: a delegate can hold Active status for
-                    // years, and may have been suspended since (e.g. an Overturned
-                    // CitizenConduct court ruling) without ever re-registering. This is the
-                    // point power is actually granted, so it's the point that must be checked.
-                    if info.status != DelegateStatus::Active
-                        || !T::CitizenChecker::is_active_citizen(&addr)
-                    {
-                        return None;
+            let cursor = ElectionScanCursor::<T>::get();
+            weight = weight.saturating_add(T::DbWeight::get().reads(1));
+            let scan_iter = match &cursor {
+                Some(key) => Delegates::<T>::iter_from_key(key.clone()),
+                None => Delegates::<T>::iter(),
+            };
+
+            let mut examined = 0usize;
+            let mut last_key = None;
+
+            for (addr, info) in scan_iter {
+                if examined >= batch_size {
+                    break;
+                }
+                examined += 1;
+                last_key = Some(addr.clone());
+                weight = weight.saturating_add(T::DbWeight::get().reads(1));
+
+                // Re-check citizenship now, not just trust Active status from whenever the
+                // backing threshold was last crossed: a delegate can hold Active status for
+                // years, and may have been suspended since (e.g. an Overturned
+                // CitizenConduct court ruling) without ever re-registering. This is the
+                // point power is actually granted, so it's the point that must be checked.
+                if info.status != DelegateStatus::Active
+                    || !T::CitizenChecker::is_active_citizen(&addr)
+                {
+                    continue;
+                }
+                // Same reasoning, for asset-disclosure currency — see this function's doc
+                // comment for why this is a skip (excluded from the pool, next-highest
+                // eligible delegate takes the seat) rather than a hard error.
+                if !T::DisclosureChecker::has_current_disclosure(&addr) {
+                    Self::deposit_event(Event::SeatingSkippedNoDisclosure {
+                        account: addr.clone(),
+                    });
+                    continue;
+                }
+                // Same reasoning again, for the legislature/executive-Council overlap bar —
+                // see `AccountabilityCouncilChecker`'s doc comment for why this must be
+                // re-checked at seating time rather than trusted from whenever `Active`
+                // status was last crossed.
+                if T::AccountabilityCouncilChecker::is_current_member(&addr) {
+                    Self::deposit_event(Event::SeatingSkippedAccountabilityCouncilMember {
+                        account: addr.clone(),
+                    });
+                    continue;
+                }
+
+                // Flash-backing defense: rank on a *matured* checkpoint of `BackingCount`, not
+                // the live value -- see `LastBackingCheckpoint`'s doc comment for the exploit
+                // this closes and why the checkpoint only ever advances here, never inside
+                // `back_delegate`/`remove_backing`. Because this scan only ever visits a given
+                // delegate once per completed election cycle, the checkpoint it captures here
+                // is necessarily what gets *used* only on the *next* cycle's scan -- there is
+                // no way to deliver a live-this-instant value while still requiring anything be
+                // "matured" at all. `MinBackingDurationBlocks == 0` is treated as "no minimum
+                // configured" and bypasses the checkpoint entirely (reads live `BackingCount`
+                // directly, matching this function's pre-fix behavior) rather than forcing that
+                // same one-cycle lag on a deployment that asked for zero delay.
+                let min_duration =
+                    BlockNumberFor::<T>::from(T::MinBackingDurationBlocks::get());
+                let backing = if min_duration.is_zero() {
+                    weight = weight.saturating_add(T::DbWeight::get().reads(1));
+                    BackingCount::<T>::get(&addr)
+                } else {
+                    match LastBackingCheckpoint::<T>::get(&addr) {
+                        Some((checkpoint_block, checkpoint_count))
+                            if now.saturating_sub(checkpoint_block) >= min_duration =>
+                        {
+                            // Checkpoint has matured: safe to use for this election, and safe
+                            // to roll forward to the live count now -- it will next be usable
+                            // no sooner than `min_duration` from now.
+                            let live = BackingCount::<T>::get(&addr);
+                            LastBackingCheckpoint::<T>::insert(&addr, (now, live));
+                            weight = weight.saturating_add(T::DbWeight::get().reads_writes(2, 1));
+                            checkpoint_count
+                        }
+                        Some(_) => {
+                            // Checkpoint exists but hasn't matured yet (only possible when
+                            // `MinBackingDurationBlocks` exceeds `ElectionCycleBlocks`, so a
+                            // single cycle isn't enough to mature it). Must not roll forward
+                            // either -- doing so would restart the maturity clock and this
+                            // checkpoint would never mature under a cadence this tight.
+                            // Contributes 0 to this election; the existing checkpoint gets
+                            // another chance next cycle.
+                            weight = weight.saturating_add(T::DbWeight::get().reads(1));
+                            0
+                        }
+                        None => {
+                            // No checkpoint yet -- brand-new delegate, or the first election
+                            // scan since this mechanism was introduced. Seed one from the live
+                            // count so it can mature in time for a future election; contributes
+                            // 0 to this one (exactly the flash-backing case: a delegate with no
+                            // matured history cannot be seated on backing nobody has confirmed
+                            // is durable).
+                            let live = BackingCount::<T>::get(&addr);
+                            LastBackingCheckpoint::<T>::insert(&addr, (now, live));
+                            weight = weight.saturating_add(T::DbWeight::get().reads_writes(2, 1));
+                            0
+                        }
                     }
-                    // Same reasoning, for asset-disclosure currency — see this function's doc
-                    // comment for why this is a skip (excluded from the pool, next-highest
-                    // eligible delegate takes the seat) rather than a hard error.
-                    if !T::DisclosureChecker::has_current_disclosure(&addr) {
-                        Self::deposit_event(Event::SeatingSkippedNoDisclosure {
-                            account: addr.clone(),
-                        });
-                        return None;
-                    }
-                    Some((addr.clone(), BackingCount::<T>::get(&addr)))
-                })
-                .collect();
+                };
+                ElectionCandidateSnapshot::<T>::insert(&addr, backing);
+                weight = weight.saturating_add(T::DbWeight::get().writes(1));
+            }
 
-            let active_count = candidates.len() as u64;
+            if examined < batch_size {
+                // Reached the end of `Delegates` this block — the scan is complete. Finalize
+                // seating from whatever landed in the snapshot.
+                ElectionScanCursor::<T>::kill();
+                weight = weight.saturating_add(T::DbWeight::get().writes(1));
 
-            // Stable sort by backing count descending — ties broken by storage order.
-            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                let seats = LegislatureSeats::<T>::get() as usize;
+                let mut candidates: alloc::vec::Vec<(T::AccountId, u32)> =
+                    ElectionCandidateSnapshot::<T>::drain().collect();
+                let candidate_count = candidates.len() as u64;
+                weight = weight
+                    .saturating_add(T::DbWeight::get().reads_writes(candidate_count, candidate_count));
 
-            let winners: alloc::vec::Vec<T::AccountId> = candidates
-                .into_iter()
-                .take(seats)
-                .map(|(addr, _)| addr)
-                .collect();
+                // Stable sort by backing count descending — ties broken by drain order.
+                candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-            let seated = winners.len() as u32;
-            let _ = T::LegislatureSeating::replace_members(winners);
-            LastElectionBlock::<T>::put(now);
+                let winners: alloc::vec::Vec<T::AccountId> = candidates
+                    .into_iter()
+                    .take(seats)
+                    .map(|(addr, _)| addr)
+                    .collect();
 
-            Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated });
+                let seated = winners.len() as u32;
+                let _ = T::LegislatureSeating::replace_members(winners);
+                LastElectionBlock::<T>::put(now);
+                ElectionScanInProgress::<T>::put(false);
+                weight = weight.saturating_add(T::DbWeight::get().writes(3 + seated as u64));
 
-            // Reads: all delegate entries + BackingCount per active delegate + 3 overhead
-            //        (LegislatureSeats, ElectionCycleBlocks, LastElectionBlock).
-            // Writes: Members (replace_members) + LastElectionBlock.
-            T::DbWeight::get().reads_writes(
-                total_delegates.saturating_add(active_count).saturating_add(3),
-                (seated as u64).saturating_add(2),
-            )
+                Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated });
+            } else {
+                ElectionScanCursor::<T>::put(
+                    last_key.expect("examined >= batch_size > 0 implies at least one entry seen"),
+                );
+                weight = weight.saturating_add(T::DbWeight::get().writes(1));
+            }
+
+            weight
         }
     }
 }

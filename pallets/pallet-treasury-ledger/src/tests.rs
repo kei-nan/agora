@@ -353,28 +353,39 @@ fn record_expenditure_against_zero_budget_fails() {
 }
 
 #[test]
-fn record_expenditure_zero_amount_succeeds_and_still_logs_and_fires_audit_hook() {
+fn record_expenditure_zero_amount_is_rejected() {
+	// Regression test for the zero-amount DoS: `checked_add` with 0 always succeeds and the
+	// budget check trivially holds even at `budget == 0`, so without an explicit `amount > 0`
+	// check an authorized spender could loop free calls that each grow `ExpenditureLog` and the
+	// unbounded `DepartmentExpenditures` double-map for free. Supersedes the old
+	// `record_expenditure_zero_amount_succeeds_and_still_logs_and_fires_audit_hook`, which
+	// asserted the pre-fix (vulnerable) behavior.
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::allocate_budget(root(), DEPT, 1_000));
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
 
-		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 0, HASH_A));
+		assert_noop!(
+			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 0, HASH_A),
+			Error::<Test>::ZeroExpenditureAmount
+		);
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 0);
-		assert_eq!(NextExpenditureIndex::<Test>::get(), 1);
-
-		let calls = audit_calls();
-		assert_eq!(calls.len(), 1);
-		assert_eq!(calls[0], (0u64, DEPT, 0u128, HASH_A));
+		assert_eq!(NextExpenditureIndex::<Test>::get(), 0);
+		assert!(audit_calls().is_empty());
 	});
 }
 
 #[test]
-fn record_expenditure_zero_amount_against_zero_budget_succeeds() {
-	// Boundary: 0 <= 0 is a valid no-op expenditure (e.g. a zero-value
-	// justification record) and must not be rejected as InsufficientBudget.
+fn record_expenditure_zero_amount_against_zero_budget_is_rejected() {
+	// Even where InsufficientBudget wouldn't otherwise fire (0 <= 0), the zero-amount check
+	// must still reject the call. Supersedes the old
+	// `record_expenditure_zero_amount_against_zero_budget_succeeds`, which asserted the pre-fix
+	// (vulnerable) behavior.
 	new_test_ext().execute_with(|| {
 		assert_ok!(TreasuryLedger::register_department_spender(root(), DEPT, SPENDER));
-		assert_ok!(TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 0, HASH_A));
+		assert_noop!(
+			TreasuryLedger::record_expenditure(signed(SPENDER), DEPT, 0, HASH_A),
+			Error::<Test>::ZeroExpenditureAmount
+		);
 		assert_eq!(DepartmentSpent::<Test>::get(DEPT), 0);
 	});
 }

@@ -153,6 +153,14 @@ pub const FOUNDATIONAL_PASSAGE_THRESHOLD: u8 = 75;
 pub const MIN_EPOCH_DURATION: u32 = 5;
 pub const MAX_EPOCH_DURATION: u32 = 50;
 pub const MAX_REFERENDA_PER_BLOCK: u32 = 10;
+// Deliberately larger than MAX_REFERENDA_PER_BLOCK: this cap gates referendum *creation*
+// itself (fails outright on overflow, no fallback — see `Config::MaxConcurrentReferenda`'s
+// doc comment), unlike MAX_REFERENDA_PER_BLOCK which only bounds one block's auto-finalization
+// schedule and has a permissionless fallback. Existing tests (e.g.
+// `referendum_finalization_scheduling_overflow_falls_back_to_the_manual_extrinsic`)
+// deliberately create more than MAX_REFERENDA_PER_BLOCK concurrently-open referenda to exercise
+// that fallback, so this needs enough headroom not to spuriously block referendum creation.
+pub const MAX_CONCURRENT_REFERENDA: u32 = 50;
 
 #[frame_support::runtime]
 mod runtime {
@@ -211,6 +219,7 @@ impl pallet_voting::Config for Test {
     type MinEpochDurationBlocks = ConstU32<MIN_EPOCH_DURATION>;
     type MaxEpochDurationBlocks = ConstU32<MAX_EPOCH_DURATION>;
     type MaxReferendaPerBlock = ConstU32<MAX_REFERENDA_PER_BLOCK>;
+    type MaxConcurrentReferenda = ConstU32<MAX_CONCURRENT_REFERENDA>;
 }
 
 // Build genesis storage according to the mock runtime.

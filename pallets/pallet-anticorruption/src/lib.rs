@@ -37,6 +37,7 @@
 //! themselves — can never unilaterally close a report. See `clear_report`/
 //! `refer_report_to_courts`/`approve_report_action`'s doc comments below.
 #![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 pub use pallet::*;
 
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub mod pallet {
     use frame_support::pallet_prelude::*;
     use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
+    use sp_runtime::traits::Saturating;
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -325,6 +327,20 @@ pub mod pallet {
         InvestigatorAdded { who: T::AccountId },
         /// An investigator was removed.
         InvestigatorRemoved { who: T::AccountId },
+        /// An investigator rejected another investigator's pending `Clear`/`ReferToCourts`
+        /// proposal without approving it — the report returns to `UnderInvestigation` with no
+        /// pending action, open for a fresh proposal. See `reject_report_action`.
+        ReportActionRejected {
+            report_id: u32,
+            action: ReportAction,
+            proposer: T::AccountId,
+            rejecter: T::AccountId,
+        },
+        /// `remove_investigator` cleared a `PendingReportAction` entry because the removed
+        /// investigator was its sole proposer — otherwise the entry would have been
+        /// permanently stuck (no one else could approve their own proposal, and a new
+        /// proposal cannot be raised while one is outstanding). See `remove_investigator`.
+        PendingReportActionClearedOnRemoval { report_id: u32, removed_investigator: T::AccountId },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────
@@ -381,7 +397,7 @@ pub mod pallet {
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let now = frame_system::Pallet::<T>::block_number();
-            let update_due_at = now + BlockNumberFor::<T>::from(T::AssetDisclosureRenewalBlocks::get());
+            let update_due_at = now.saturating_add(BlockNumberFor::<T>::from(T::AssetDisclosureRenewalBlocks::get()));
             AssetDisclosures::<T>::insert(
                 &who,
                 AssetDeclaration { ipfs_hash, disclosed_at: now, update_due_at },
@@ -473,7 +489,30 @@ pub mod pallet {
         /// to other citizen-linked activity, regardless of `content_hash` staying hidden. See
         /// `CLAUDE.md`'s Voting System section for the general writeup.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(60_000, 0))]
+        // This call performs a real BN254/UltraHonk pairing check via `T::ZkVerifier::verify`,
+        // not just storage writes — the flat `Weight::from_parts(60_000, 0)` this used to carry
+        // was the same order of magnitude as the trivial storage-only calls elsewhere in this
+        // file (5,000-10,000), pricing a genuine cryptographic pairing check as if it were a
+        // single storage read. Checked this codebase for how other real ZK-verification calls
+        // are weighted before picking a number:
+        //   - `pallet-identity`'s `register_citizen`/`reverify_citizen`/`migrate_oprf_scheme`/
+        //     `recover_account` also call `T::ZkVerifier::verify` for a real outer-proof
+        //     pairing check, but are themselves only flat `Weight::from_parts` literals in the
+        //     20,000-50,000 range — no more benchmarked or crypto-aware than this file's own
+        //     placeholder was, so not a genuine precedent to match here.
+        //   - `pallet-elections`'s `register_as_delegate`/`back_delegate`
+        //     (`pallets/pallet-elections/src/weights.rs`) are the one place in this codebase
+        //     that actually costs a real standalone UltraHonk pairing check
+        //     (`T::BackingProofVerifier::verify`) as a `WeightInfo`-benchmarked weight rather
+        //     than a bare guess: 14,000,000-22,000,000 ref-time units plus DbWeight reads/
+        //     writes, with their own doc comment noting even that likely underestimates the
+        //     true pairing-check cost.
+        // Matching the latter's order of magnitude (same class of operation: a real UltraHonk
+        // proof verification gating a citizen-signed extrinsic) rather than the former's
+        // unbenchmarked flat constants, which share this call's original underpricing problem.
+        // Still a hand-picked placeholder, not a real `frame-benchmarking` number — pending
+        // that, sanity-check this choice against pallet-identity's ZK calls being fixed too.
+        #[pallet::weight(Weight::from_parts(20_000_000, 0))]
         pub fn submit_whistleblower_report(
             origin: OriginFor<T>,
             content_hash: [u8; 32],
@@ -611,8 +650,54 @@ pub mod pallet {
         }
 
         /// Remove an investigator. Same `AppointmentOrigin` gate as `add_investigator`.
+        ///
+        /// Also clears any `PendingReportAction` entry where the removed investigator was the
+        /// sole proposer — otherwise ejecting a bad-faith investigator would not actually
+        /// unstick the report they'd wedged: no one else can consume their proposal (a
+        /// proposer can never approve their own action — `SameInvestigator` in
+        /// `approve_report_action` — and the removed investigator can no longer call
+        /// `reject_report_action` or anything else, `is_investigator` now excludes them), and
+        /// no fresh proposal can be raised for that report while one is outstanding
+        /// (`ReportActionAlreadyPending`). Clearing it here re-opens the report for a new
+        /// proposal from a remaining investigator, exactly like `reject_report_action` would.
         #[pallet::call_index(9)]
-        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        // `PendingReportAction::<T>::iter()` below is a full, unbounded scan over every report
+        // with an outstanding Clear/ReferToCourts proposal, not the single `Investigators`
+        // write the pre-existing flat `Weight::from_parts(5_000, 0)` was sized for (see this
+        // function's doc comment on the scan's addition). `PendingReportAction` has no `Max*`
+        // bound to cost against — unlike, say, `pallet_emergency_council`'s
+        // `vote_declare_emergency`/`vote_end_emergency` (`pallets/pallet-emergency-council/src/
+        // weights.rs`), which scale their own O(n) scan's DbWeight reads by `T::MaxCouncilSize`,
+        // there is no config constant here capping how many reports can simultaneously be
+        // `UnderInvestigation` with a pending action — it's driven indirectly by
+        // `WhistleblowerReports`/`NextReportId`, themselves unbounded.
+        //
+        // Considered bounding the scan itself (`.take(N)`) instead of pricing it, mirroring
+        // `pallet_elections`'s `MaxDelegateSweepPerBlock`-capped delegate sweep — rejected: a
+        // plain iterator `.take(N)` only bounds how many *matches* get removed, not how many map
+        // entries get *visited* before finding them (worst case still touches the whole map if
+        // this investigator's entries are sparse or absent), so it wouldn't actually cap the
+        // read-side cost this weight needs to cover. A real bound would need a resumable,
+        // key-ordered cursor like `pallet_elections::DelegateSweepCursor` persisted across
+        // separate `remove_investigator` calls — a materially bigger change than this fix's
+        // scope, and not obviously worth it: even without this scan, any *other* current
+        // investigator can already unstick an individual report proposed by the removed one via
+        // `reject_report_action`, which (unlike `approve_report_action`) doesn't require the
+        // caller to differ from the proposer — see that call's doc comment. So this scan is a
+        // convenience auto-clear, not the only path to recovery.
+        //
+        // Priced instead for a generous assumed ceiling on realistic concurrent
+        // `PendingReportAction` size — 500 entries, well above `pallet_elections`'s
+        // `MaxDelegateSweepPerBlock` (100) and `pallet_emergency_council`'s `MaxCouncilSize`-
+        // scale figure (35, see that pallet's `weights.rs`) for the same class of per-call
+        // bounded/O(n) scan elsewhere in this codebase — at the same per-entry cost this file
+        // already uses for a single storage op (matching `approve_report_action`/
+        // `reject_report_action`'s own `8_000`): 5_000 (the original `Investigators` write) +
+        // 500 * 8_000 = 4_005_000. Like every other weight in this pallet, this is a manually
+        // reasoned placeholder, not a `frame-benchmarking` number — if `PendingReportAction` is
+        // ever observed approaching this ceiling in practice, that's a signal this call needs
+        // real pagination (a persisted cursor), not just a bigger constant.
+        #[pallet::weight(Weight::from_parts(4_005_000, 0))]
         pub fn remove_investigator(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             T::AppointmentOrigin::ensure_origin(
                 origin,
@@ -622,6 +707,17 @@ pub mod pallet {
                 ),
             )?;
             Investigators::<T>::mutate(|list| list.retain(|x| x != &who));
+            let stuck: alloc::vec::Vec<u32> = PendingReportAction::<T>::iter()
+                .filter(|(_, (_, proposer))| proposer == &who)
+                .map(|(report_id, _)| report_id)
+                .collect();
+            for report_id in stuck {
+                PendingReportAction::<T>::remove(report_id);
+                Self::deposit_event(Event::PendingReportActionClearedOnRemoval {
+                    report_id,
+                    removed_investigator: who.clone(),
+                });
+            }
             Self::deposit_event(Event::InvestigatorRemoved { who });
             Ok(())
         }
@@ -664,6 +760,40 @@ pub mod pallet {
                     approver: who,
                 }),
             }
+            Ok(())
+        }
+
+        /// Reject `report_id`'s pending `clear_report`/`refer_report_to_courts` proposal
+        /// without approving it, clearing `PendingReportAction` so the report (still
+        /// `UnderInvestigation`) is open for a fresh proposal.
+        ///
+        /// Fixes a stuck-report griefing path: with only `approve_report_action` available,
+        /// an investigator who proposed the *wrong* action (e.g. `Clear` when the report
+        /// should be `refer_report_to_courts`'d) permanently blocked anyone from proposing the
+        /// right one — `propose_report_action` rejects a second proposal while one is
+        /// outstanding (`ReportActionAlreadyPending`), and nothing short of approving the
+        /// wrong action could clear the entry.
+        ///
+        /// Same authorization tier as `approve_report_action` — any current investigator.
+        /// Unlike `approve_report_action`, the caller *may* be the original proposer:
+        /// rejecting doesn't apply any transition or grant anyone new power, it only returns
+        /// the report to its pre-proposal state, so the "different investigator" recusal rule
+        /// (`SameInvestigator`, which exists to stop a single investigator from unilaterally
+        /// *finalizing* an action) doesn't apply here — self-correcting a bad proposal is fine.
+        #[pallet::call_index(11)]
+        #[pallet::weight(Weight::from_parts(8_000, 0))]
+        pub fn reject_report_action(origin: OriginFor<T>, report_id: u32) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(Self::is_investigator(&who), Error::<T>::NotInvestigator);
+            let (action, proposer) = PendingReportAction::<T>::get(report_id)
+                .ok_or(Error::<T>::NoPendingReportAction)?;
+            PendingReportAction::<T>::remove(report_id);
+            Self::deposit_event(Event::ReportActionRejected {
+                report_id,
+                action,
+                proposer,
+                rejecter: who,
+            });
             Ok(())
         }
     }

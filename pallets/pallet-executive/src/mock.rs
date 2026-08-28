@@ -29,6 +29,7 @@ thread_local! {
     // `set_active_citizen(_, false)` alone models the AI-only path, which must NOT be enough
     // on its own to trigger the vacancy sweep — see `is_suspended_by_jury_reviewed_conviction`.
     static JURY_REVIEWED_SUSPENSIONS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    static ACCOUNTABILITY_COUNCIL_MEMBERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or suspended (modeling the
@@ -67,6 +68,25 @@ pub fn set_legislature_member(who: u64, member: bool) {
     });
 }
 
+/// Marks `who` as a current Accountability Council member, or removes them. Defaults to false
+/// (not a member) for any account this is never called for.
+pub fn set_accountability_council_member(who: u64, member: bool) {
+    ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| {
+        if member {
+            c.borrow_mut().insert(who);
+        } else {
+            c.borrow_mut().remove(&who);
+        }
+    });
+}
+
+pub struct TestAccountabilityCouncilChecker;
+impl pallet_executive::AccountabilityCouncilChecker<u64> for TestAccountabilityCouncilChecker {
+    fn is_current_member(who: &u64) -> bool {
+        ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| c.borrow().contains(who))
+    }
+}
+
 pub struct TestCitizenChecker;
 impl pallet_executive::CitizenChecker<u64> for TestCitizenChecker {
     fn is_active_citizen(who: &u64) -> bool {
@@ -82,6 +102,41 @@ pub struct TestLegislatureMembership;
 impl pallet_executive::LegislatureMembership<u64> for TestLegislatureMembership {
     fn is_member(who: &u64) -> bool {
         LEGISLATURE_MEMBERS.with(|m| m.borrow().contains(who))
+    }
+}
+
+// ── Mock cross-pallet sibling cooldown (stands in for pallet-emergency-council) ─
+//
+// In the real runtime, pallet-executive depends on
+// `pallet_executive::SiblingEmergencyCooldown` being backed by pallet-emergency-council's own
+// `CooldownUntil` (implemented on `Runtime`, see `runtime/src/configs/mod.rs`). Here it's
+// backed by simple thread-local state, same idiom as the mocks above. Defaults (cooldown-until
+// 0, no notification recorded) make this behave exactly like the no-op `()` impl unless a test
+// explicitly calls `set_sibling_cooldown_until`, so ordinary tests don't need to know
+// pallet-emergency-council exists.
+thread_local! {
+    static SIBLING_COOLDOWN_UNTIL: RefCell<u64> = RefCell::new(0);
+    static SIBLING_NOTIFIED_AT: RefCell<Option<u64>> = RefCell::new(None);
+}
+
+/// Simulates pallet-emergency-council currently being in cooldown until block `until`.
+pub fn set_sibling_cooldown_until(until: u64) {
+    SIBLING_COOLDOWN_UNTIL.with(|c| *c.borrow_mut() = until);
+}
+
+/// The block number this pallet last told its mock sibling to start its cooldown at, if this
+/// pallet's own cooldown has ever ended since the mock was last reset.
+pub fn sibling_notified_at() -> Option<u64> {
+    SIBLING_NOTIFIED_AT.with(|c| *c.borrow())
+}
+
+pub struct MockSiblingCooldown;
+impl pallet_executive::SiblingEmergencyCooldown<u64> for MockSiblingCooldown {
+    fn is_in_cooldown(now: u64) -> bool {
+        now < SIBLING_COOLDOWN_UNTIL.with(|c| *c.borrow())
+    }
+    fn notify_emergency_ended(now: u64) {
+        SIBLING_NOTIFIED_AT.with(|c| *c.borrow_mut() = Some(now));
     }
 }
 
@@ -129,10 +184,14 @@ impl pallet_executive::Config for Test {
     type MaxEmergencyBlocks = ConstU32<100>;
     type RatificationWindowBlocks = ConstU32<10>;
     type EmergencyCooldownBlocks = ConstU32<EMERGENCY_COOLDOWN_BLOCKS>;
+    // See the mock's doc comment above — behaves as a no-op by default, controllable per test
+    // via `set_sibling_cooldown_until`/`sibling_notified_at`.
+    type SiblingEmergencyCooldown = MockSiblingCooldown;
     type SupermajorityNumerator = ConstU32<2>;
     type SupermajorityDenominator = ConstU32<3>;
     type CitizenChecker = TestCitizenChecker;
     type LegislatureMembership = TestLegislatureMembership;
+    type AccountabilityCouncilChecker = TestAccountabilityCouncilChecker;
     type PmNominationWindowBlocks = ConstU32<5>;
     type PmVotingWindowBlocks = ConstU32<5>;
     type MaxPmCandidates = ConstU32<8>;

@@ -145,6 +145,10 @@ impl pallet_emergency_council::Config for Test {
     type MaxCouncilSize = frame_support::traits::ConstU32<10>;
     type SupermajorityNumerator = frame_support::traits::ConstU32<2>;
     type SupermajorityDenominator = frame_support::traits::ConstU32<3>;
+    // No-op: this pallet's own tests don't exercise pallet-executive's sibling-cooldown
+    // coordination, only the `EnsureActiveEmergency` origin wiring above -- see
+    // `SiblingEmergencyCooldown`'s doc comment for why `()` is the documented mock stand-in.
+    type SiblingEmergencyCooldown = ();
     type WeightInfo = ();
 }
 
@@ -214,6 +218,11 @@ thread_local! {
     static LEGISLATURE_SEAT_HOLDERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
     /// Accounts `TestRecoveryStateChecker::holds_cabinet_role` should report `true` for.
     static CABINET_ROLE_HOLDERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
+    /// Accounts `TestRecoveryStateChecker::has_open_referendum_vote` should report `true` for.
+    static OPEN_REFERENDUM_VOTERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
+    /// Accounts `TestRecoveryStateChecker::has_unclaimed_current_epoch_budget` should report
+    /// `true` for.
+    static UNCLAIMED_EPOCH_BUDGET_HOLDERS: RefCell<BTreeSet<AccountId>> = RefCell::new(BTreeSet::new());
 }
 
 /// Marks/unmarks `who` as a registered delegate for `TestRecoveryStateChecker` to report.
@@ -250,12 +259,36 @@ pub fn set_cabinet_role(who: AccountId, holds_role: bool) {
     });
 }
 
+/// Marks/unmarks `who` as having voted in a still-open referendum for
+/// `TestRecoveryStateChecker` to report.
+pub fn set_open_referendum_vote(who: AccountId, has_open_vote: bool) {
+    OPEN_REFERENDUM_VOTERS.with(|v| {
+        if has_open_vote {
+            v.borrow_mut().insert(who);
+        } else {
+            v.borrow_mut().remove(&who);
+        }
+    });
+}
+
+/// Marks/unmarks `who` as having an unclaimed (i.e. already-claimed) current-epoch budget
+/// allocation for `TestRecoveryStateChecker` to report.
+pub fn set_unclaimed_epoch_budget(who: AccountId, has_unclaimed: bool) {
+    UNCLAIMED_EPOCH_BUDGET_HOLDERS.with(|b| {
+        if has_unclaimed {
+            b.borrow_mut().insert(who);
+        } else {
+            b.borrow_mut().remove(&who);
+        }
+    });
+}
+
 /// Test-only `RecoveryStateChecker`: reports membership in the thread-local sets above rather
-/// than depending on real pallet-elections/pallet-legislature/pallet-executive instances (this
-/// pallet's mock intentionally stays decoupled from those crates — the real cross-pallet
-/// wiring is exercised by the runtime's own integration, not by this pallet's unit tests).
-/// Mirrors `TestZkVerifier`/`TestAnchorVerifier`'s convention of a deterministic, data-driven
-/// stub above.
+/// than depending on real pallet-elections/pallet-legislature/pallet-executive/pallet-voting
+/// instances (this pallet's mock intentionally stays decoupled from those crates — the real
+/// cross-pallet wiring is exercised by the runtime's own integration, not by this pallet's unit
+/// tests). Mirrors `TestZkVerifier`/`TestAnchorVerifier`'s convention of a deterministic,
+/// data-driven stub above.
 pub struct TestRecoveryStateChecker;
 
 impl pallet_identity_zk::RecoveryStateChecker<AccountId> for TestRecoveryStateChecker {
@@ -269,6 +302,14 @@ impl pallet_identity_zk::RecoveryStateChecker<AccountId> for TestRecoveryStateCh
 
     fn holds_cabinet_role(who: &AccountId) -> bool {
         CABINET_ROLE_HOLDERS.with(|c| c.borrow().contains(who))
+    }
+
+    fn has_open_referendum_vote(who: &AccountId) -> bool {
+        OPEN_REFERENDUM_VOTERS.with(|v| v.borrow().contains(who))
+    }
+
+    fn has_unclaimed_current_epoch_budget(who: &AccountId) -> bool {
+        UNCLAIMED_EPOCH_BUDGET_HOLDERS.with(|b| b.borrow().contains(who))
     }
 }
 

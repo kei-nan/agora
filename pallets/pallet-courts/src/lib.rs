@@ -59,6 +59,60 @@ pub mod pallet {
         fn freeze_department(department_id: u32) -> DispatchResult;
     }
 
+    /// Verifies a ZK citizenship proof for anonymized case filing (see `file_case`'s doc
+    /// comment and the `CaseFiler` type). Same shape as `pallet_anticorruption::
+    /// ZkProofVerifier`/`pallet_identity_zk::ZkProofVerifier` — implemented in the runtime by
+    /// delegating to the same ZKPassport outer-circuit verifier those pallets use.
+    pub trait ZkProofVerifier {
+        fn verify(proof_bytes: &[u8], public_inputs: &[[u8; 32]]) -> bool;
+    }
+
+    // ── ZKPassport public-input layout (case-filing anonymization) ─────────────
+    //
+    // Mirrors `pallet_anticorruption`'s identical section verbatim — see that pallet's module
+    // doc comment / "ZKPassport public-input layout" section for the authoritative field-by-
+    // field table (sourced from `runtime/src/verifier.rs`). Duplicated locally (rather than
+    // imported from that pallet) the same way `legislature_call_hash`-style small helpers are
+    // duplicated per-pallet elsewhere in this codebase, to avoid a needless crate dependency
+    // just for a handful of consts and a const fn.
+
+    /// Minimum length a structurally valid `public_inputs` array can have (the `count_4`
+    /// variant, `D = 1`). See `pallet_anticorruption::MIN_PUBLIC_INPUTS`'s doc comment for the
+    /// full "checked before indexing / before the verifier runs" rationale.
+    const MIN_PUBLIC_INPUTS: usize = 9;
+    /// Index of `service_scope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SCOPE_INDEX: usize = 3;
+    /// Index of `service_subscope` in `public_inputs` — fixed regardless of disclosure count.
+    const SERVICE_SUBSCOPE_INDEX: usize = 4;
+
+    /// Zero-pads a 31-byte ASCII tag into a canonical 32-byte big-endian BN254 `Fr` element.
+    /// See `pallet_anticorruption::zero_padded_scope_tag`'s doc comment for why this
+    /// construction is canonical by inspection.
+    const fn zero_padded_scope_tag(tag: &[u8; 31]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 31 {
+            out[i + 1] = tag[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Domain-separation constant this pallet requires as the proof's `service_scope`
+    /// (`public_inputs[SERVICE_SCOPE_INDEX]`) for anonymized case filing (`file_case`'s
+    /// `LawChallenge`/`TreasuryDispute`/`TierConflict` branch, and `file_case_for`). Stops a
+    /// proof generated for a different purpose (citizen registration, whistleblower reports,
+    /// etc.) from being replayed here even though the underlying passport proof is valid
+    /// citizenship — see `pallet_anticorruption::WHISTLEBLOWER_REPORT_SERVICE_SCOPE`'s doc
+    /// comment for the general rationale.
+    pub const CASE_FILING_SERVICE_SCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_COURTS_CASE_FILING_SCOPE1");
+
+    /// Domain-separation constant this pallet requires as the proof's `service_subscope`
+    /// (`public_inputs[SERVICE_SUBSCOPE_INDEX]`). See [`CASE_FILING_SERVICE_SCOPE`] above.
+    pub const CASE_FILING_SERVICE_SUBSCOPE: [u8; 32] =
+        zero_padded_scope_tag(b"AGORA_COURTS_CASE_FILING_SUBSC1");
+
     /// Implemented by the runtime to call pallet-identity's suspend_citizen_internal.
     /// `suspension_until` is an **absolute block number** when the suspension lifts
     /// (None = indefinite). The courts pallet computes this from `suspension_blocks` +
@@ -218,6 +272,44 @@ pub mod pallet {
         /// Overturned verdict (i.e. guilty) suspends them; suspension_blocks = None means indefinite.
         /// suspension_blocks is a DURATION in blocks; auto_finalize converts to an absolute block.
         CitizenConduct { nullifier: [u8; 32], suspension_blocks: Option<u32> },
+        /// Alleges `law_id` was enacted at the wrong `LawTier` (e.g. a bare Ordinary-majority
+        /// vote enacting constitutionally-weighted law while declaring it Ordinary, skipping
+        /// both the entrenchment pipeline and the mandatory auto-challenge review that only
+        /// fires for Structural/Foundational tiers — see `pallet_constitution::challenge_law_tier`,
+        /// which is the only intended way to open one of these). Overturned ruling applies the
+        /// same remedy `LawChallenge` does — `T::LawEnforcer::invalidate_law` — deliberately not
+        /// a "re-tier and re-enter entrenchment" flow: if the legislature wants the law back,
+        /// they re-enact it, and it draws scrutiny at the tier it actually deserves that time.
+        TierConflict { law_id: u32 },
+    }
+
+    /// A fieldless twin of the law-targeting `CaseSubject` variants, used only as the recorded
+    /// value in `OpenCaseByLaw` — never as part of its key. `CaseSubject` itself isn't reused
+    /// here because it carries payload (`law_id`, `department_id`, `nullifier`+
+    /// `suspension_blocks`) that has no business inside a dedup-guard's stored value.
+    #[derive(Clone, Copy, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum CaseSubjectKind {
+        LawChallenge,
+        TierConflict,
+    }
+
+    /// Identifies who filed a case (`Cases`' first tuple element). For case types that are
+    /// "citizen vs. institutional power" — `LawChallenge`, `TreasuryDispute`, `TierConflict` —
+    /// this is `Nullifier`, the filer's ZKPassport outer-proof `scoped_nullifier`, never an
+    /// `AccountId`: the filer risks retaliation from the very power they're challenging, so
+    /// their identity is not permanently, publicly bound to the case the way a plain signed
+    /// extrinsic would (see `file_case`'s doc comment for the full writeup, including the
+    /// residual submission-metadata gap this does *not* close). For citizen-vs-citizen/general
+    /// cases — `CitizenConduct`, `General` — this remains `Account`, unchanged from before:
+    /// the accused has a legitimate interest in knowing their accuser.
+    ///
+    /// A case's bond is *always* reserved from (and released back to) the real signing account
+    /// regardless of which variant is stored here — see `CaseBondAccount`, which is deliberately
+    /// decoupled from this field for exactly that reason.
+    #[derive(Clone, Debug, PartialEq, Encode, Decode, DecodeWithMemTracking, MaxEncodedLen, TypeInfo)]
+    pub enum CaseFiler<AccountId> {
+        Account(AccountId),
+        Nullifier([u8; 32]),
     }
 
     /// What a pending Oracle Council proposal for a case will do once approvals reach the
@@ -249,6 +341,30 @@ pub mod pallet {
         /// Block at which this version was approved (i.e. reached supermajority).
         pub approved_at: BlockNumber,
     }
+
+    /// Maximum number of pending oracle-case actions — and, separately, up to that many
+    /// pending admin actions — that `remove_oracle_member` will attempt to re-resolve
+    /// (`try_resolve_oracle_action`/`try_resolve_admin_action`) in a single call, after purging
+    /// the removed member's approvals. See `remove_oracle_member`'s doc comment for the fuller
+    /// weight-pricing rationale; in short: the purge itself (walking every
+    /// `OracleApprovals`/`PendingAdminAction` entry to strip the removed member's vote) must
+    /// stay unbounded regardless of this cap — skipping an entry there would leave a removed
+    /// (e.g. compromised) member's vote silently still counting toward some pending action's
+    /// threshold forever, defeating the whole point of removal — but that purge is cheap,
+    /// bounded per-item work (`BoundedVec` position/remove, capped at `MaxOracleMembers`
+    /// entries). What genuinely needs bounding is the optional *re-resolution* step:
+    /// `try_resolve_oracle_action` can trigger real cross-pallet enforcement
+    /// (`T::LawEnforcer`/`T::TreasuryEnforcer`/`T::CitizenSuspender` via `auto_finalize`), whose
+    /// cost this pallet cannot know statically, so leaving it fully unbounded would make this
+    /// call's real weight scale with however many cases happen to be pending removal-time — an
+    /// admin action a citizen's transaction never even sees, but one that still occupies a
+    /// block's weight budget. Any action left un-resolved past this cap simply stays pending
+    /// exactly as it was before this fix (already purged of the removed member's vote) and
+    /// resolves itself the moment any other Oracle Council member's next
+    /// `approve_ai_ruling`/`approve_admin_action`/`submit_ai_ruling`/`finalize_ruling`/
+    /// `propose_admin_action` call touches it — not stuck, just not resolved *within this
+    /// specific call*.
+    const MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL: usize = 20;
 
     // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -382,14 +498,20 @@ pub mod pallet {
         /// Denominator of the supermajority fraction (e.g. 3 for 2/3).
         #[pallet::constant]
         type AIModelSupermajorityDenominator: Get<u32>;
+
+        /// Verifier for the ZK citizenship proof `file_case`/`file_case_for` require when
+        /// filing an anonymized case (`LawChallenge`/`TreasuryDispute`/`TierConflict`) — see
+        /// `CaseFiler` and `ZkProofVerifier`.
+        type ZkVerifier: ZkProofVerifier;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
 
     /// (filer, status, ruling_ipfs_hash, subject) — the shape of a `Cases` entry, named so
     /// `is_filer_or_oracle`/`is_ruled_against_party` don't need to repeat the tuple type.
+    /// `filer` is `CaseFiler<AccountId>`, not a bare `AccountId` — see that type's doc comment.
     pub type CaseOf<T> =
-        (<T as frame_system::Config>::AccountId, CaseStatus, Option<[u8; 32]>, CaseSubject);
+        (CaseFiler<<T as frame_system::Config>::AccountId>, CaseStatus, Option<[u8; 32]>, CaseSubject);
 
     /// case_id -> (filer, status, ruling_ipfs_hash, subject).
     #[pallet::storage]
@@ -492,6 +614,45 @@ pub mod pallet {
     /// Taken (removed) and unreserved in full by `auto_finalize` once the case resolves.
     #[pallet::storage]
     pub type CaseBonds<T: Config> = StorageMap<_, Blake2_128Concat, u32, BalanceOf<T>>;
+
+    /// law_id -> (the kind of case currently open against it, its case_id). At most one
+    /// law-targeting case (`LawChallenge` or `TierConflict`) may be open per law_id at a time,
+    /// regardless of kind. Keying on law_id ALONE (not `(CaseSubjectKind, law_id)`) is what
+    /// makes a `LawChallenge` and a `TierConflict` against the same law mutually exclusive with
+    /// each other, not just each with itself — replaces the earlier
+    /// `OpenLawChallengeCase`/`OpenTierConflictCase` maps, which only guarded within one
+    /// case-subject type and let the two types coexist, reintroducing the revert-and-strand bug
+    /// they were built to prevent.
+    ///
+    /// Enforced by `do_file_case` and `auto_file_case` (`Error::DuplicateLawChallenge`/
+    /// `Error::DuplicateTierConflict` — selected by the *incoming* subject's own kind — rejects
+    /// a second filing while an entry exists) and cleared by `auto_finalize` once that case
+    /// reaches `FinalRuling`.
+    ///
+    /// Exists to close a griefing/stranding bug: without this, two law-targeting cases (of
+    /// either kind, in any combination) could be pending against the same `law_id`
+    /// simultaneously. If the first resolves Overturned, `auto_finalize` calls
+    /// `T::LawEnforcer::invalidate_law`, which pauses the law (moves it out of `Active`). When
+    /// the second case later also resolves, its own `T::LawEnforcer::invalidate_law` call fails
+    /// because the law is no longer `Active` — and because `auto_finalize` runs inside the same
+    /// transactional extrinsic as its caller (`cast_jury_vote` or `finalize_ruling`), that whole
+    /// call reverts, permanently stranding the second case (and its filing bond, for
+    /// citizen-filed cases) in a state nothing can ever move forward. A side index keyed by
+    /// `law_id` -> open case lets both filing calls reject a duplicate in O(1), rather than an
+    /// unbounded scan of `Cases` for an existing pending challenge against the same law.
+    #[pallet::storage]
+    pub type OpenCaseByLaw<T: Config> = StorageMap<_, Blake2_128Concat, u32, (CaseSubjectKind, u32)>;
+
+    /// case_id -> the account that actually reserved `CaseBonds` via `T::Currency::reserve`,
+    /// for `T::Currency::unreserve` at `auto_finalize` time. Deliberately decoupled from
+    /// `Cases`' filer field (`CaseFiler`): for an anonymized case type
+    /// (`LawChallenge`/`TreasuryDispute`/`TierConflict`) that field stores a ZK nullifier, not
+    /// an `AccountId`, but the bond is always reserved from — and must be returned to — the
+    /// real signing account regardless of case type. Populated (and later taken) alongside
+    /// `CaseBonds`; absent exactly when `CaseBonds` is (never populated for `auto_file_case`'s
+    /// system-initiated filings, which reserve no bond at all).
+    #[pallet::storage]
+    pub type CaseBondAccount<T: Config> = StorageMap<_, Blake2_128Concat, u32, T::AccountId>;
     // ── AI model governance (supermajority vote) ─────────────────────────────────
 
     /// Council authorized to vote on which AI model version `submit_ai_ruling` may cite.
@@ -600,7 +761,10 @@ pub mod pallet {
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
-        CaseFiled { case_id: u32, filer: T::AccountId, subject: CaseSubject },
+        /// `filer` is `CaseFiler::Nullifier` for `LawChallenge`/`TreasuryDispute`/`TierConflict`
+        /// cases and `CaseFiler::Account` for `CitizenConduct`/`General` ones — see `CaseFiler`'s
+        /// doc comment. The event never carries a real `AccountId` for the anonymized types.
+        CaseFiled { case_id: u32, filer: CaseFiler<T::AccountId>, subject: CaseSubject },
         AIRulingIssued { case_id: u32, ruling_hash: [u8; 32], model_version: u32 },
         JurySelected { case_id: u32, jurors: BoundedVec<T::AccountId, ConstU32<21>> },
         AppealFiled { case_id: u32, appellant: T::AccountId },
@@ -707,6 +871,32 @@ pub mod pallet {
         NoApprovedAdminAction,
         /// The `ApprovedAdminAction` token has not yet reached `AdminActionExpiryBlocks`.
         ApprovalNotYetStale,
+        /// A `LawChallenge` case was filed against a `law_id` that already has a law-targeting
+        /// case open (filed but not yet `FinalRuling`/`Enforced`) — which may itself be either
+        /// a `LawChallenge` or a `TierConflict`. See `OpenCaseByLaw`'s doc comment for the
+        /// revert-and-strand bug this prevents.
+        DuplicateLawChallenge,
+        /// A `TierConflict` case was filed against a `law_id` that already has a law-targeting
+        /// case open — which may itself be either a `TierConflict` or a `LawChallenge`. See
+        /// `OpenCaseByLaw`'s doc comment.
+        DuplicateTierConflict,
+        /// `LawChallenge`/`TreasuryDispute`/`TierConflict` filing requires both `zk_proof` and
+        /// `public_inputs` — see `CaseFiler`'s doc comment for why these case types must file
+        /// anonymously.
+        MissingZkProof,
+        /// A `zk_proof`/`public_inputs` pair was supplied for a `CitizenConduct`/`General`
+        /// filing, which files under the filer's plain `AccountId` and has no use for one.
+        UnexpectedZkProof,
+        /// `public_inputs` is shorter than the real ZKPassport outer-circuit layout's 9-element
+        /// floor — too short to contain `service_scope`/`service_subscope`/`scoped_nullifier`
+        /// at their expected fixed offsets. See `MIN_PUBLIC_INPUTS`.
+        MissingNullifierInput,
+        /// The proof's `service_scope`/`service_subscope` don't match this pallet's required
+        /// case-filing domain-separation constants — the proof was generated for a different
+        /// purpose and cannot be replayed here. See `CASE_FILING_SERVICE_SCOPE`.
+        InvalidProofScope,
+        /// The ZK citizenship proof failed verification.
+        InvalidZkProof,
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────
@@ -716,26 +906,40 @@ pub mod pallet {
         /// File a new case. Only active (non-suspended) citizens may file.
         /// subject determines what gets auto-enforced on ruling.
         ///
-        /// Reserves `CaseFilingBond` from the filer as a spam-prevention deposit — instant,
+        /// Reserves `CaseFilingBond` from the signer as a spam-prevention deposit — instant,
         /// free Level-0 AI rulings would otherwise make this call a cheap DoS vector against
         /// a court system meant to carry real judicial weight. The bond is released in full
         /// once the case reaches a final status; see `auto_finalize`.
+        ///
+        /// `zk_proof`/`public_inputs` are required for `LawChallenge`/`TreasuryDispute`/
+        /// `TierConflict` (cases against institutional power — see `CaseFiler`'s doc comment)
+        /// and rejected for `CitizenConduct`/`General` (which still file under the signer's
+        /// plain `AccountId`, unchanged). This is a signed extrinsic regardless of case type —
+        /// **the signer's `AccountId` (used to reserve the bond) is still ordinary public
+        /// transaction data**, the same residual submission-metadata-linkability gap this
+        /// codebase already documents for `commit_vote`/`submit_whistleblower_report`/delegate-
+        /// persona filings (see CLAUDE.md's Voting System section). What this call fixes is that
+        /// the *stored case record and its `CaseFiled` event* no longer name the filer for the
+        /// anonymized types — it does not, and cannot by itself, achieve full transaction-level
+        /// anonymity (that would need a relayer/mixnet or unsigned ZK-gated submission, neither
+        /// of which exists in this codebase — out of scope here, same as everywhere else this
+        /// gap is documented).
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
-        pub fn file_case(origin: OriginFor<T>, subject: CaseSubject) -> DispatchResult {
+        // Worst case (an anonymized filing) performs a real BN254/UltraHonk pairing check via
+        // `T::ZkVerifier::verify`, not just storage writes — priced the same order of magnitude
+        // as `pallet_anticorruption::submit_whistleblower_report`'s identical real ZK-verification
+        // call (see that call's own weight-choice doc comment for the reasoning). A
+        // `CitizenConduct`/`General` filing is much cheaper in practice (no proof to check) but
+        // this flat weight doesn't vary by argument content, so it prices the worst case.
+        #[pallet::weight(Weight::from_parts(20_000_000, 0))]
+        pub fn file_case(
+            origin: OriginFor<T>,
+            subject: CaseSubject,
+            zk_proof: Option<BoundedVec<u8, ConstU32<4096>>>,
+            public_inputs: Option<BoundedVec<[u8; 32], ConstU32<16>>>,
+        ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            ensure!(
-                T::CitizenChecker::is_active_citizen(&who),
-                Error::<T>::NotActiveCitizen
-            );
-            let bond = T::CaseFilingBond::get();
-            T::Currency::reserve(&who, bond).map_err(|_| Error::<T>::InsufficientBalance)?;
-            let id = NextCaseId::<T>::get();
-            Cases::<T>::insert(id, (who.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
-            CaseBonds::<T>::insert(id, bond);
-            NextCaseId::<T>::put(id.saturating_add(1));
-            Self::deposit_event(Event::CaseFiled { case_id: id, filer: who, subject });
-            Ok(())
+            Self::do_file_case(who, subject, zk_proof, public_inputs)
         }
 
         /// Propose an AI ruling. ruling_hash is the IPFS CID of the full reasoning document.
@@ -912,12 +1116,36 @@ pub mod pallet {
             // routing logic (Level 1 vs Level 2) is enforced on-chain rather than
             // relying on the caller to pass the correct value.
             let required_size: u8 = match &case.3 {
-                CaseSubject::LawChallenge { .. } => 21,
+                // Both are Level-2 constitutional-review questions: LawChallenge disputes a
+                // law's validity outright, TierConflict disputes whether it was enacted at the
+                // correct tier — the same weight of question, so the same 21-juror bar.
+                CaseSubject::LawChallenge { .. } | CaseSubject::TierConflict { .. } => 21,
                 _ => 7,
             };
             ensure!(jury_size == required_size, Error::<T>::InvalidJurySize);
+            let defendant_nullifier = match &case.3 {
+                CaseSubject::CitizenConduct { nullifier, .. } => Some(*nullifier),
+                _ => None,
+            };
             let total = T::CitizenSelector::total_citizens();
-            ensure!(total >= required_size as u32, Error::<T>::NotEnoughCitizens);
+            // `pick_random_jurors` below always excludes the case's own filer, and (for
+            // `CaseSubject::CitizenConduct`) also the defendant — see that function's doc
+            // comment. Checking the raw citizen `total` here (as this used to) can pass
+            // eligibility while the pool is too small to actually seat a jury once those
+            // exclusions are applied: at `total == required_size` with an excluded party
+            // inside the pool, `pick_random_jurors` can never fill the last seat, and since
+            // eligibility already passed here, nothing ever rejects the case again — it's
+            // permanently stranded in `InJuryAppeal`. Subtracting the exclusions before
+            // comparing closes that gap.
+            //
+            // `excluded` is a conservative approximation for `CitizenConduct`: if the filer and
+            // defendant happen to be the same citizen, this overcounts by one and could
+            // over-reject a pool that would technically still work. Not worth detecting
+            // precisely for a vanishingly rare case — erring toward over-rejection here is the
+            // safe side.
+            let excluded = 1u32 + defendant_nullifier.is_some() as u32;
+            let eligible = total.saturating_sub(excluded);
+            ensure!(eligible >= required_size as u32, Error::<T>::NotEnoughCitizens);
             // Read the pre-captured delayed-reveal seed rather than recomputing it from live
             // block-hash storage. `CapturedJurySeed` is written by `on_initialize` at exactly
             // the block the seed window closes (see `SeedCaptureDue`), so its mere presence
@@ -926,7 +1154,14 @@ pub mod pallet {
             // is immune to `BlockHashCount`-based pruning no matter how late `select_jury` is
             // actually called.
             let seed = CapturedJurySeed::<T>::get(case_id).ok_or(Error::<T>::JurySeedNotReady)?;
-            let jurors = Self::pick_random_jurors(case_id, required_size, total, seed)?;
+            let jurors = Self::pick_random_jurors(
+                case_id,
+                required_size,
+                total,
+                seed,
+                case.0.clone(),
+                defendant_nullifier,
+            )?;
             Self::deposit_event(Event::JurySelected { case_id, jurors: jurors.clone() });
             JuryPool::<T>::insert(case_id, jurors);
             // Advance status so a second select_jury call is rejected.
@@ -1057,13 +1292,77 @@ pub mod pallet {
         /// size the approval threshold is computed against, so a purge can newly cross the
         /// threshold for an action that was previously still short (e.g. a 2-of-3 proposal with
         /// the removed member as one of the two approvers becomes a 1-of-2 proposal, which the
-        /// remaining approval alone already satisfies). `PendingOracleProposal` has no
-        /// equivalent re-check — a case-based action's resolution has extra preconditions (case
-        /// status) checked at approval time, not just at removal time, and this pallet's
-        /// existing behavior for that map already accepts the member's own next approval call
-        /// as the trigger; not expanded here to stay within this fix's scope.
+        /// remaining approval alone already satisfies). `PendingOracleProposal` gets the same
+        /// re-check, for the same reason (fixed after the fact — see
+        /// `remove_oracle_member_reresolves_case_action_crossing_threshold_after_shrink` in
+        /// tests.rs for the failure this closes: a 2-member council where the non-proposer is
+        /// removed left the proposer's own approval already meeting the shrunk 1-of-1 threshold,
+        /// but nothing re-triggered resolution, permanently stranding the proposal — the
+        /// proposer couldn't re-propose (`OracleActionAlreadyProposed`) and no one else could
+        /// approve it (`AlreadyApprovedOracleAction`, and there was no one else)).
+        ///
+        /// Two things make this re-check different from the admin-action one:
+        ///
+        /// - `try_resolve_oracle_action` returns a `DispatchResult`, not `()` —
+        ///   a case-based action has extra preconditions (case status, appeal window) that can
+        ///   genuinely fail even once the approval threshold is met, and per that function's own
+        ///   doc comment, callers are expected to propagate that error so Substrate's
+        ///   transactional dispatch reverts the whole call. That's the right behavior for
+        ///   `submit_ai_ruling`/`finalize_ruling`/`approve_ai_ruling`, but not here: this call's
+        ///   primary job (removing a compromised member) must succeed regardless of the state of
+        ///   some unrelated in-flight case, so an error from the re-check must not abort the
+        ///   member removal or the purges already performed above it. Each re-check therefore
+        ///   runs inside its own nested `with_transaction`, committed on success and rolled back
+        ///   on error — so a failed attempt (e.g. `auto_finalize` partially mutating before an
+        ///   enforcement hook errors) can't leave partial state behind, while the member-removal
+        ///   and purge writes made earlier in this call are unaffected either way. The
+        ///   proposal simply stays pending on error, exactly the pre-purge status quo, resolvable
+        ///   later via the surviving members' own calls.
+        /// - Unlike `PendingAdminAction`, which stores `(proposer, approvals)` and preserves
+        ///   `proposer` through the purge (it's needed later to gate who may consume
+        ///   `ApprovedAdminAction`), `PendingOracleProposal`/`OracleApprovals` never track a
+        ///   distinct "proposer" role at all — `submit_ai_ruling`/`finalize_ruling` just push the
+        ///   caller into the same `OracleApprovals` list any `approve_ai_ruling` call appends to.
+        ///   So removing the proposer needs no special case: their approval is purged exactly
+        ///   like any other member's, the proposal survives (it's still valid, just down one
+        ///   vote), and it can still resolve immediately in this call if the remaining approvals
+        ///   already meet the shrunk threshold, or later via other members' approvals otherwise.
+        /// - The re-check is run for *every* case_id with an in-flight `OracleApprovals` entry,
+        ///   not only the ones `account` itself had approved (`PendingAdminAction`'s `affected`
+        ///   list is narrower — gated on the removed member having approved that specific
+        ///   action). That narrower gate is actually wrong for the failure this fix targets: in
+        ///   the report's 2-member scenario, the removed member never approved the lone pending
+        ///   proposal at all (only the proposer did) — the council shrinking is what crosses the
+        ///   threshold, independent of whether the removed member happened to have voted on any
+        ///   given case. Gating the oracle re-check the same way `PendingAdminAction` does would
+        ///   silently fail to close this exact bug. Left `PendingAdminAction` itself unchanged
+        ///   (out of scope here) even though the same broader argument likely applies to it too.
         #[pallet::call_index(10)]
-        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        // Was a flat 5_000 (sized for a single write) even after the fix above gave this call
+        // an unbounded loop of `try_resolve_oracle_action`/`try_resolve_admin_action` calls —
+        // each of which can trigger real cross-pallet enforcement via `auto_finalize`. Rather
+        // than leave that loop genuinely unbounded (an admin action whose real cost would then
+        // scale with however many cases happen to be pending at removal time) or build a full
+        // multi-block resumable scan for what's realistically a rare, root-gated,
+        // incident-response action, the loop itself is capped at
+        // `MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL` re-resolutions each for cases and admin
+        // actions (see that constant's doc comment for why a resumable scan — the pattern
+        // `pallet_elections::run_election` uses for its own unbounded-scan fix — is
+        // disproportionate here: a member removal's own purge step must still apply to *every*
+        // pending entry immediately and atomically, for the removal to actually be a complete,
+        // immediate incident response; only the strictly-optional re-resolution step is
+        // deferrable). Priced here as a base cost (member removal + the two unavoidably
+        // full-map `translate` purges, each item's work bounded by `MaxOracleMembers`) plus up
+        // to `MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL * 2` re-resolutions (cases and admin
+        // actions), each costed the same as `finalize_ruling`'s own flat weight (20_000) since
+        // `try_resolve_oracle_action` performs equivalent work to what `finalize_ruling` itself
+        // triggers.
+        #[pallet::weight(
+            Weight::from_parts(5_000, 0).saturating_add(
+                Weight::from_parts(20_000, 0)
+                    .saturating_mul(MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL as u64 * 2)
+            )
+        )]
         pub fn remove_oracle_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             OracleMembers::<T>::try_mutate(|members| {
@@ -1074,14 +1373,39 @@ pub mod pallet {
                 members.remove(pos);
                 Ok::<(), DispatchError>(())
             })?;
+            // Unlike the `PendingAdminAction` purge below (which only re-checks entries the
+            // *removed* member had actually approved), every case_id with an in-flight
+            // `OracleApprovals` entry is collected here, whether or not `account` had approved
+            // it — removing a member shrinks the threshold's denominator for *every* pending
+            // case, not just the ones they personally voted on (that's exactly the bug: in the
+            // report's 2-member scenario the removed member never approved the pending proposal
+            // at all, only the proposer did, yet removing them still crosses the new 1-of-1
+            // threshold and must resolve it).
+            let mut affected_cases: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
             OracleApprovals::<T>::translate(
-                |_case_id, mut approvers: BoundedVec<T::AccountId, T::MaxOracleMembers>| {
+                |case_id, mut approvers: BoundedVec<T::AccountId, T::MaxOracleMembers>| {
                     if let Some(pos) = approvers.iter().position(|m| m == &account) {
                         approvers.remove(pos);
                     }
+                    affected_cases.push(case_id);
                     Some(approvers)
                 },
             );
+            // Bounded to `MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL` — see that constant's doc
+            // comment for why this loop, unlike the purge above, is capped rather than left to
+            // scale with however many cases are pending. Every entry was already purged of the
+            // removed member's vote above regardless of whether it gets re-resolved here.
+            for case_id in affected_cases.into_iter().take(MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL) {
+                // See the doc comment above this function for why errors here are swallowed
+                // (via a nested, independently-rolled-back transaction) rather than propagated:
+                // this call's own success must not depend on the state of an unrelated case.
+                let _ = frame_support::storage::with_transaction(|| {
+                    match Self::try_resolve_oracle_action(case_id) {
+                        Ok(()) => sp_runtime::TransactionOutcome::Commit(Ok(())),
+                        Err(e) => sp_runtime::TransactionOutcome::Rollback(Err(e)),
+                    }
+                });
+            }
             let mut affected: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
             PendingAdminAction::<T>::translate(
                 |call_hash,
@@ -1096,7 +1420,8 @@ pub mod pallet {
                     Some((proposer, approvers))
                 },
             );
-            for call_hash in affected {
+            // Same bound as the case-action loop above, for the same reason.
+            for call_hash in affected.into_iter().take(MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL) {
                 Self::try_resolve_admin_action(call_hash);
             }
             Self::deposit_event(Event::OracleMemberRemoved { account });
@@ -1289,8 +1614,19 @@ pub mod pallet {
         /// move this case along" apply exactly the same rule.
         fn is_filer_or_oracle(who: &T::AccountId, case: &CaseOf<T>) -> bool {
             let oracle_ok = OracleMembers::<T>::get().contains(who);
-            let system_case = case.0 == T::AutoChallengeAccount::get();
-            who == &case.0 || oracle_ok || (system_case && T::CitizenChecker::is_active_citizen(who))
+            // `case.0` is `CaseFiler::Account` for `CitizenConduct`/`General` cases (including
+            // every system-initiated `auto_file_case` filing, which always uses
+            // `CaseFiler::Account(T::AutoChallengeAccount::get())`) and `CaseFiler::Nullifier`
+            // for anonymized `LawChallenge`/`TreasuryDispute`/`TierConflict` cases. For the
+            // latter, "is `who` the filer" is answered the same way `is_ruled_against_party`
+            // answers "is `who` the accused" — by matching `who`'s own registered nullifier
+            // against the stored one — since there's no `AccountId` in the record to compare
+            // against directly.
+            let (is_filer, system_case) = match &case.0 {
+                CaseFiler::Account(acct) => (who == acct, acct == &T::AutoChallengeAccount::get()),
+                CaseFiler::Nullifier(n) => (T::CitizenChecker::citizen_nullifier(who) == Some(*n), false),
+            };
+            is_filer || oracle_ok || (system_case && T::CitizenChecker::is_active_citizen(who))
         }
 
         /// True if `who` is the verified losing party of a `CaseSubject::CitizenConduct` case
@@ -1304,6 +1640,18 @@ pub mod pallet {
                     T::CitizenChecker::citizen_nullifier(who) == Some(*nullifier)
                 }
                 _ => false,
+            }
+        }
+
+        /// Returns the `OpenCaseByLaw` kind + law_id for `subject`, if `subject` is one of the
+        /// law-targeting variants (`LawChallenge`/`TierConflict`) — `None` for every other
+        /// subject. Shared by `do_file_case`, `auto_file_case`, and `auto_finalize` so the
+        /// mapping from subject to dedup-guard key/kind is defined exactly once.
+        fn law_case_kind(subject: &CaseSubject) -> Option<(CaseSubjectKind, u32)> {
+            match subject {
+                CaseSubject::LawChallenge { law_id } => Some((CaseSubjectKind::LawChallenge, *law_id)),
+                CaseSubject::TierConflict { law_id } => Some((CaseSubjectKind::TierConflict, *law_id)),
+                _ => None,
             }
         }
 
@@ -1323,16 +1671,52 @@ pub mod pallet {
                 c.1 = CaseStatus::FinalRuling;
                 Ok::<(), DispatchError>(())
             })?;
+            // This case has now reached a terminal status (FinalRuling, possibly advanced to
+            // Enforced below) — release its `law_id` slot in `OpenCaseByLaw` (if this case is a
+            // law-targeting one) so a fresh LawChallenge or TierConflict against the same law
+            // can be filed. Guarded on the map still pointing at *this* case (matching both
+            // kind and case_id), though in practice it always does: only `do_file_case`/
+            // `auto_file_case` ever insert into this map, and the dedup check they both perform
+            // first prevents a second case from ever overwriting an existing entry for the same
+            // law_id.
+            if let Some((kind, law_id)) = Self::law_case_kind(&case.3) {
+                if OpenCaseByLaw::<T>::get(law_id) == Some((kind, case_id)) {
+                    OpenCaseByLaw::<T>::remove(law_id);
+                }
+            }
             Rulings::<T>::insert(case_id, verdict.clone());
             // Release the filing bond, if any, now that the case has reached a final status.
             // Always released in full regardless of verdict — there's no precedent elsewhere
             // in this pallet for slashing on a "bad-faith" outcome, and inventing one here
             // would be guessing at policy rather than following an established pattern (see
             // the bond-and-release design note on `Config::CaseFilingBond`). Absent for
-            // system-filed cases (`auto_file_case` never inserts a `CaseBonds` entry), so this
-            // is a no-op for those — `take` just returns `None`.
+            // system-filed cases (`auto_file_case` never inserts a `CaseBonds`/`CaseBondAccount`
+            // entry), so this is a no-op for those — `take` just returns `None`.
+            //
+            // Unreserved from `CaseBondAccount` (the real signing account that reserved it),
+            // not `case.0` (the `CaseFiler`, which is a ZK nullifier — not an `AccountId` at
+            // all — for anonymized case types) — see `CaseBondAccount`'s doc comment.
             if let Some(bond) = CaseBonds::<T>::take(case_id) {
-                T::Currency::unreserve(&case.0, bond);
+                if let Some(bond_account) = CaseBondAccount::<T>::take(case_id) {
+                    T::Currency::unreserve(&bond_account, bond);
+                } else {
+                    // Not reachable via any call site today — `do_file_case` always inserts
+                    // both `CaseBonds` and `CaseBondAccount` together in the same call, and
+                    // `auto_file_case` inserts neither — but nothing *structurally* enforces
+                    // that the two maps stay in sync. If they ever did fall out of sync,
+                    // silently doing nothing here would permanently lose the reserved bond
+                    // (never unreserved, and `CaseBonds::take` above has already removed the
+                    // only record of it). A hard error here would be worse: it would abort
+                    // finalization for an otherwise-legitimate case over an unrelated
+                    // bookkeeping bug, reintroducing exactly the kind of permanently-stuck case
+                    // the dedup-guard fix above exists to eliminate. So this stays a debug-only
+                    // trip wire — a no-op in production, not a new runtime error path — to
+                    // catch the invariant violation immediately in any test/dev build.
+                    debug_assert!(
+                        false,
+                        "CaseBonds entry with no matching CaseBondAccount for case {case_id}"
+                    );
+                }
             }
             Self::deposit_event(Event::RulingFinalized { case_id, verdict: verdict.clone() });
             // Auto-enforce only on Overturned verdicts — Upheld means "AI was right, no action".
@@ -1340,6 +1724,14 @@ pub mod pallet {
             if verdict == Verdict::Overturned {
                 let enforced = match &case.3 {
                     CaseSubject::LawChallenge { law_id } => {
+                        T::LawEnforcer::invalidate_law(*law_id)?;
+                        true
+                    }
+                    // Same remedy as LawChallenge — see `CaseSubject::TierConflict`'s doc
+                    // comment for why this is deliberately not a "re-tier and re-run through
+                    // entrenchment" flow: invalidating the wrongly-tiered law is enough, and if
+                    // the legislature wants it back they re-enact it at the correct tier.
+                    CaseSubject::TierConflict { law_id } => {
                         T::LawEnforcer::invalidate_law(*law_id)?;
                         true
                     }
@@ -1386,12 +1778,138 @@ pub mod pallet {
         /// unsignable well-known account, see that Config item) would just be a pointless
         /// balance requirement on an account nobody controls.
         pub fn auto_file_case(subject: CaseSubject) -> DispatchResult {
-            let filer = T::AutoChallengeAccount::get();
+            // Same duplicate law-targeting-case guard as `do_file_case` — see `OpenCaseByLaw`'s
+            // doc comment. System-initiated filings can hit the same revert-and-strand bug in
+            // `auto_finalize` just as citizen-filed ones can, so this path needs the same
+            // check even though it never reserves a bond. Written generically against both
+            // law-targeting kinds (via `law_case_kind`), even though today only `LawChallenge`
+            // subjects are ever actually routed through this system-initiated entry point (the
+            // runtime's `AutoChallengeHook` impl only ever calls this with `LawChallenge`;
+            // `TierConflict` only ever reaches the chain via `file_case_for`) — defense in
+            // depth, so a future caller passing `TierConflict` here doesn't silently bypass the
+            // guard.
+            let law_case = Self::law_case_kind(&subject);
+            if let Some((kind, law_id)) = &law_case {
+                ensure!(
+                    OpenCaseByLaw::<T>::get(law_id).is_none(),
+                    match kind {
+                        CaseSubjectKind::LawChallenge => Error::<T>::DuplicateLawChallenge,
+                        CaseSubjectKind::TierConflict => Error::<T>::DuplicateTierConflict,
+                    }
+                );
+            }
+            let filer = CaseFiler::Account(T::AutoChallengeAccount::get());
             let id = NextCaseId::<T>::get();
+            if let Some((kind, law_id)) = &law_case {
+                OpenCaseByLaw::<T>::insert(law_id, (*kind, id));
+            }
             Cases::<T>::insert(id, (filer.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
             NextCaseId::<T>::put(id.saturating_add(1));
             Self::deposit_event(Event::CaseFiled { case_id: id, filer, subject });
             Ok(())
+        }
+
+        /// Same filing logic as the `file_case` dispatchable, for callers that already have a
+        /// verified signed account in hand — used by `pallet-constitution`'s
+        /// `challenge_law_tier` (via its `TierConflictHook` trait) to open a
+        /// `CaseSubject::TierConflict` case through this pallet's normal citizen-filing
+        /// pipeline (ZK-gated anonymized storage, bond reservation, dedup guard) without
+        /// pallet-constitution needing to duplicate any of it. Mirrors how `auto_file_case`
+        /// above is the existing non-dispatchable entry point `AutoChallengeHook` calls into —
+        /// same cross-pallet-hook pattern, applied to a citizen-initiated (not system-initiated)
+        /// filing this time.
+        pub fn file_case_for(
+            who: T::AccountId,
+            subject: CaseSubject,
+            zk_proof: BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: BoundedVec<[u8; 32], ConstU32<16>>,
+        ) -> DispatchResult {
+            Self::do_file_case(who, subject, Some(zk_proof), Some(public_inputs))
+        }
+
+        /// Shared body for the `file_case` dispatchable and `file_case_for`. See `file_case`'s
+        /// doc comment for the full behavior; this just factors out the logic both entry points
+        /// need so pallet-constitution's `challenge_law_tier` doesn't have to re-implement any
+        /// of it.
+        fn do_file_case(
+            who: T::AccountId,
+            subject: CaseSubject,
+            zk_proof: Option<BoundedVec<u8, ConstU32<4096>>>,
+            public_inputs: Option<BoundedVec<[u8; 32], ConstU32<16>>>,
+        ) -> DispatchResult {
+            ensure!(
+                T::CitizenChecker::is_active_citizen(&who),
+                Error::<T>::NotActiveCitizen
+            );
+            // Reject a second open law-targeting case (of *either* kind) against the same
+            // law_id — see `OpenCaseByLaw`'s doc comment. Checked before verifying any proof or
+            // reserving the bond, matching this file's cheap-checks-first pattern elsewhere.
+            let law_case = Self::law_case_kind(&subject);
+            if let Some((kind, law_id)) = &law_case {
+                ensure!(
+                    OpenCaseByLaw::<T>::get(law_id).is_none(),
+                    match kind {
+                        CaseSubjectKind::LawChallenge => Error::<T>::DuplicateLawChallenge,
+                        CaseSubjectKind::TierConflict => Error::<T>::DuplicateTierConflict,
+                    }
+                );
+            }
+
+            // Determine the filer identity to store — see `CaseFiler`'s doc comment for which
+            // subjects get which treatment.
+            let filer = match &subject {
+                CaseSubject::LawChallenge { .. }
+                | CaseSubject::TreasuryDispute { .. }
+                | CaseSubject::TierConflict { .. } => {
+                    let proof = zk_proof.ok_or(Error::<T>::MissingZkProof)?;
+                    let inputs = public_inputs.ok_or(Error::<T>::MissingZkProof)?;
+                    CaseFiler::Nullifier(Self::verify_and_extract_case_filing_nullifier(
+                        &proof, &inputs,
+                    )?)
+                }
+                CaseSubject::CitizenConduct { .. } | CaseSubject::General => {
+                    ensure!(
+                        zk_proof.is_none() && public_inputs.is_none(),
+                        Error::<T>::UnexpectedZkProof
+                    );
+                    CaseFiler::Account(who.clone())
+                }
+            };
+
+            let bond = T::CaseFilingBond::get();
+            T::Currency::reserve(&who, bond).map_err(|_| Error::<T>::InsufficientBalance)?;
+            let id = NextCaseId::<T>::get();
+            if let Some((kind, law_id)) = &law_case {
+                OpenCaseByLaw::<T>::insert(law_id, (*kind, id));
+            }
+            Cases::<T>::insert(id, (filer.clone(), CaseStatus::Filed, None::<[u8; 32]>, subject.clone()));
+            CaseBonds::<T>::insert(id, bond);
+            CaseBondAccount::<T>::insert(id, who);
+            NextCaseId::<T>::put(id.saturating_add(1));
+            Self::deposit_event(Event::CaseFiled { case_id: id, filer, subject });
+            Ok(())
+        }
+
+        /// Verifies a case-filing ZK proof and returns its `scoped_nullifier`. See
+        /// `pallet_anticorruption::submit_whistleblower_report`'s identical logic for the full
+        /// field-by-field rationale (length check before indexing/before the verifier runs,
+        /// scope/subscope domain separation, `len - 2` for the real per-citizen value rather
+        /// than `[0]`'s shared registry root).
+        fn verify_and_extract_case_filing_nullifier(
+            zk_proof: &BoundedVec<u8, ConstU32<4096>>,
+            public_inputs: &BoundedVec<[u8; 32], ConstU32<16>>,
+        ) -> Result<[u8; 32], DispatchError> {
+            ensure!(public_inputs.len() >= MIN_PUBLIC_INPUTS, Error::<T>::MissingNullifierInput);
+            ensure!(
+                public_inputs[SERVICE_SCOPE_INDEX] == CASE_FILING_SERVICE_SCOPE
+                    && public_inputs[SERVICE_SUBSCOPE_INDEX] == CASE_FILING_SERVICE_SUBSCOPE,
+                Error::<T>::InvalidProofScope
+            );
+            ensure!(
+                T::ZkVerifier::verify(zk_proof.as_slice(), public_inputs.as_slice()),
+                Error::<T>::InvalidZkProof
+            );
+            Ok(public_inputs[public_inputs.len() - 2])
         }
 
         /// Mix the hashes of `window_len` blocks starting at `window_start` into a single
@@ -1427,11 +1945,27 @@ pub mod pallet {
         /// seed (see `CapturedJurySeed`) — this no longer recomputes `anchored_entropy` itself
         /// from live block-hash storage, so it has no dependency on whether the seed window's
         /// block hashes are still live in `frame_system::BlockHash` at call time.
+        ///
+        /// Excludes `filer` (the case's own filer has an obvious stake in the outcome) and,
+        /// when `defendant_nullifier` is `Some` (a `CaseSubject::CitizenConduct` case), any
+        /// candidate whose own registered nullifier matches it — the accused sitting on their
+        /// own jury. `defendant_nullifier` is a nullifier rather than an `AccountId` because
+        /// that's the only identifier `CaseSubject::CitizenConduct` itself carries for the
+        /// accused; comparing via `T::CitizenChecker::citizen_nullifier` avoids needing a
+        /// nullifier -> AccountId reverse lookup, which doesn't exist anywhere in this
+        /// codebase (`CitizenNullifier` in pallet-identity only maps AccountId -> nullifier).
+        ///
+        /// `filer` is `CaseFiler<T::AccountId>`, not a bare `AccountId`: for an anonymized case
+        /// (`LawChallenge`/`TreasuryDispute`/`TierConflict`) the case only carries the filer's
+        /// nullifier, so exclusion for those is done the same nullifier-matching way as the
+        /// `defendant_nullifier` check above, not a direct `AccountId` comparison.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
             total: u32,
             raw: [u8; 32],
+            filer: CaseFiler<T::AccountId>,
+            defendant_nullifier: Option<[u8; 32]>,
         ) -> Result<BoundedVec<T::AccountId, ConstU32<21>>, DispatchError> {
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
@@ -1442,7 +1976,16 @@ pub mod pallet {
                 let bytes = hash.as_ref();
                 let idx = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % total;
                 if let Some(citizen) = T::CitizenSelector::citizen_at(idx) {
-                    if !jurors.contains(&citizen) {
+                    let is_filer = match &filer {
+                        CaseFiler::Account(acct) => citizen == *acct,
+                        CaseFiler::Nullifier(n) => {
+                            T::CitizenChecker::citizen_nullifier(&citizen) == Some(*n)
+                        }
+                    };
+                    let is_defendant = defendant_nullifier.is_some_and(|nullifier| {
+                        T::CitizenChecker::citizen_nullifier(&citizen) == Some(nullifier)
+                    });
+                    if !is_filer && !is_defendant && !jurors.contains(&citizen) {
                         jurors.try_push(citizen).map_err(|_| Error::<T>::InvalidJurySize)?;
                     }
                 }

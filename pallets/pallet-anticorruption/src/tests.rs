@@ -852,6 +852,103 @@ fn clear_report_fails_when_action_already_pending() {
     });
 }
 
+// ─── report workflow: reject_report_action ──────────────────────────────────
+//
+// Regression coverage for the stuck-report griefing fix: previously, once an investigator
+// proposed the wrong action (e.g. `clear_report` when the report should have been referred to
+// courts), nothing short of approving that wrong action could clear `PendingReportAction` —
+// `propose_report_action` rejects any second proposal while one is outstanding
+// (`ReportActionAlreadyPending`), and a proposer can never approve their own proposal
+// (`SameInvestigator`). `reject_report_action` clears the entry without applying it, re-opening
+// the report for a fresh proposal.
+
+#[test]
+fn reject_report_action_clears_pending_action_and_allows_fresh_proposal() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        // 9 proposes the wrong action (Clear); without a reject path this would permanently
+        // block anyone from proposing ReferToCourts instead.
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+        assert!(PendingReportAction::<Test>::get(0).is_some());
+
+        // A different investigator rejects it.
+        assert_ok!(AntiCorruption::reject_report_action(RuntimeOrigin::signed(10), 0));
+        assert!(PendingReportAction::<Test>::get(0).is_none());
+        System::assert_last_event(
+            Event::ReportActionRejected {
+                report_id: 0,
+                action: ReportAction::Clear,
+                proposer: 9,
+                rejecter: 10,
+            }
+            .into(),
+        );
+
+        // Report is still UnderInvestigation (not Cleared) and now open for a fresh, correct
+        // proposal.
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::UnderInvestigation
+        );
+        assert_ok!(AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(9), 0));
+        assert_eq!(PendingReportAction::<Test>::get(0), Some((ReportAction::ReferToCourts, 9)));
+    });
+}
+
+#[test]
+fn reject_report_action_allows_self_rejection_by_the_original_proposer() {
+    // Unlike approve_report_action, reject doesn't apply any transition or grant new power —
+    // it only returns the report to its pre-proposal state — so the proposer may reject their
+    // own mistaken proposal without needing a second investigator.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+
+        assert_ok!(AntiCorruption::reject_report_action(RuntimeOrigin::signed(9), 0));
+        assert!(PendingReportAction::<Test>::get(0).is_none());
+    });
+}
+
+#[test]
+fn reject_report_action_fails_for_non_investigator() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+
+        assert_noop!(
+            AntiCorruption::reject_report_action(RuntimeOrigin::signed(1), 0),
+            Error::<Test>::NotInvestigator
+        );
+        assert!(PendingReportAction::<Test>::get(0).is_some());
+    });
+}
+
+#[test]
+fn reject_report_action_fails_when_no_pending_action() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+
+        assert_noop!(
+            AntiCorruption::reject_report_action(RuntimeOrigin::signed(9), 0),
+            Error::<Test>::NoPendingReportAction
+        );
+    });
+}
+
 // ─── report workflow: refer_report_to_courts ────────────────────────────────
 
 #[test]
@@ -1022,5 +1119,61 @@ fn remove_investigator_is_noop_ok_for_non_investigator() {
         // `retain` is a no-op — but it still emits the event.
         assert_ok!(AntiCorruption::remove_investigator(RuntimeOrigin::root(), 9));
         System::assert_last_event(Event::InvestigatorRemoved { who: 9 }.into());
+    });
+}
+
+// Regression coverage: before this fix, removing an investigator did not clear
+// `PendingReportAction` — if the removed investigator was a proposal's sole proposer, the
+// entry was permanently stuck (no one else can approve their own proposal, and a fresh
+// proposal is rejected while one is outstanding).
+#[test]
+fn remove_investigator_clears_pending_action_where_it_was_sole_proposer() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+        assert!(PendingReportAction::<Test>::get(0).is_some());
+
+        // Eject the bad-faith proposer.
+        assert_ok!(AntiCorruption::remove_investigator(RuntimeOrigin::root(), 9));
+
+        // The stuck pending action must be cleared, not left dangling on a removed
+        // investigator's proposal.
+        assert!(PendingReportAction::<Test>::get(0).is_none());
+        System::assert_has_event(
+            Event::PendingReportActionClearedOnRemoval { report_id: 0, removed_investigator: 9 }
+                .into(),
+        );
+
+        // Report is still UnderInvestigation and now open for a fresh proposal from a
+        // remaining investigator.
+        assert_eq!(
+            WhistleblowerReports::<Test>::get(0).unwrap().status,
+            ReportStatus::UnderInvestigation
+        );
+        assert_ok!(AntiCorruption::refer_report_to_courts(RuntimeOrigin::signed(10), 0));
+        assert_eq!(PendingReportAction::<Test>::get(0), Some((ReportAction::ReferToCourts, 10)));
+    });
+}
+
+#[test]
+fn remove_investigator_does_not_clear_pending_action_proposed_by_someone_else() {
+    // Removing an investigator who was NOT the proposer of a pending action must leave that
+    // action untouched.
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_investigator(9);
+        add_investigator(10);
+        submit_report(1, NULLIFIER_A, CONTENT_A);
+        open_investigation_on(0, 9);
+        assert_ok!(AntiCorruption::clear_report(RuntimeOrigin::signed(9), 0));
+
+        // Remove an unrelated investigator (10), who never proposed anything.
+        assert_ok!(AntiCorruption::remove_investigator(RuntimeOrigin::root(), 10));
+
+        assert_eq!(PendingReportAction::<Test>::get(0), Some((ReportAction::Clear, 9)));
     });
 }

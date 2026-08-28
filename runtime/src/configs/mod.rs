@@ -26,7 +26,7 @@
 // Substrate and Polkadot dependencies
 use frame_support::{
 	derive_impl, parameter_types,
-	traits::{ConstBool, ConstU128, ConstU32, ConstU64, ConstU8, VariantCountOf},
+	traits::{ConstBool, ConstU128, ConstU32, ConstU64, ConstU8, Get, VariantCountOf},
 	weights::{
 		constants::{RocksDbWeight, WEIGHT_REF_TIME_PER_SECOND},
 		IdentityFee, Weight,
@@ -40,10 +40,10 @@ use sp_version::RuntimeVersion;
 
 // Local module imports
 use super::{
-	AccountId, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash, Legislature, Nonce,
-	PalletAntiCorruption, PalletInfo, Runtime, RuntimeCall, RuntimeEvent, RuntimeFreezeReason,
-	RuntimeHoldReason, RuntimeOrigin, RuntimeTask, System, Timestamp, DAYS, EXISTENTIAL_DEPOSIT,
-	MINUTES, SLOT_DURATION, VERSION,
+	AccountId, AccountabilityCouncil, Aura, Balance, Balances, Block, BlockNumber, Cabinet, Hash,
+	Legislature, Nonce, PalletAntiCorruption, PalletInfo, Runtime, RuntimeCall, RuntimeEvent,
+	RuntimeFreezeReason, RuntimeHoldReason, RuntimeOrigin, RuntimeTask, System, Timestamp, DAYS,
+	EXISTENTIAL_DEPOSIT, MINUTES, SLOT_DURATION, VERSION,
 };
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
@@ -233,6 +233,17 @@ impl pallet_elections::ZkProofVerifier for PassthroughZkVerifier {
 
 #[cfg(feature = "dev-mode")]
 impl pallet_elections::BackingProofVerifier for PassthroughZkVerifier {
+	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
+		true
+	}
+}
+
+/// Same passthrough, reused for `pallet_courts::Config::ZkVerifier` (the anonymized
+/// `LawChallenge`/`TreasuryDispute`/`TierConflict` case-filing proof) — identical
+/// `verify(proof_bytes, public_inputs) -> bool` shape, and dev-mode's whole point is "accept
+/// everything", so this struct covers it too rather than adding a fourth near-identical stub.
+#[cfg(feature = "dev-mode")]
+impl pallet_courts::ZkProofVerifier for PassthroughZkVerifier {
 	fn verify(_proof_bytes: &[u8], _public_inputs: &[[u8; 32]]) -> bool {
 		true
 	}
@@ -609,6 +620,15 @@ impl pallet_voting::Config for Runtime {
 	/// many would all have to be created within the same block to overflow it); any overflow
 	/// still finalizes correctly via the permissionless `finalize_referendum` extrinsic.
 	type MaxReferendaPerBlock = ConstU32<500>;
+	/// Bounds `pallet_voting::OpenReferenda`, the flat list of currently-open referendum ids
+	/// `RecoveryStateChecker::has_open_referendum_vote` scans below — see that storage item's
+	/// and `pallet_voting::Config::MaxConcurrentReferenda`'s doc comments. 500 mirrors
+	/// `MaxReferendaPerBlock` above: generous relative to realistic referendum creation rates
+	/// (referendum creation is gated by a legislature motion or a petition threshold, and only
+	/// referenda created within one `ReferendumDurationBlocks` — 14-day — window can be
+	/// concurrently open), while unlike `MaxReferendaPerBlock`, overflowing this one fails
+	/// referendum creation outright rather than silently proceeding untracked.
+	type MaxConcurrentReferenda = ConstU32<500>;
 }
 
 /// Type alias for the audit pallet used in cross-pallet trait wiring.
@@ -714,10 +734,11 @@ impl pallet_courts::CitizenSuspender<BlockNumber> for Runtime {
 }
 
 /// Runtime implements `RecoveryStateChecker` by reading pallet-elections/pallet-legislature/
-/// pallet-executive's own storage directly — see `pallet_identity_zk::RecoveryStateChecker`'s
-/// doc comment for why this lives on `Runtime` rather than as a direct impl on any of those
-/// three pallets' own `Pallet<T>` (a circular crate dependency back onto pallet-identity-zk,
-/// the same reason `CitizenSuspender` above is Runtime-glue rather than a direct impl).
+/// pallet-executive/pallet-voting's own storage directly — see
+/// `pallet_identity_zk::RecoveryStateChecker`'s doc comment for why this lives on `Runtime`
+/// rather than as a direct impl on any of those pallets' own `Pallet<T>` (a circular crate
+/// dependency back onto pallet-identity-zk, the same reason `CitizenSuspender` above is
+/// Runtime-glue rather than a direct impl).
 impl pallet_identity_zk::RecoveryStateChecker<AccountId> for Runtime {
 	fn is_registered_delegate(who: &AccountId) -> bool {
 		pallet_elections::Delegates::<Runtime>::contains_key(who)
@@ -730,6 +751,24 @@ impl pallet_identity_zk::RecoveryStateChecker<AccountId> for Runtime {
 	fn holds_cabinet_role(who: &AccountId) -> bool {
 		pallet_executive::MinisterPortfolio::<Runtime>::contains_key(who)
 			|| pallet_executive::PrimeMinister::<Runtime>::get().as_ref() == Some(who)
+	}
+
+	/// Scans `pallet_voting::OpenReferenda` — a bounded list (see
+	/// `pallet_voting::Config::MaxConcurrentReferenda`) of referendum ids currently in
+	/// `ReferendumState::Voting`, not an unbounded scan over `Referenda` — checking
+	/// `ReferendumHasVoted` for `who` against each. Bounded worst-case cost:
+	/// `MaxConcurrentReferenda` storage reads.
+	fn has_open_referendum_vote(who: &AccountId) -> bool {
+		pallet_voting::OpenReferenda::<Runtime>::get()
+			.iter()
+			.any(|referendum_id| pallet_voting::ReferendumHasVoted::<Runtime>::get((*referendum_id, who.clone())))
+	}
+
+	/// O(1): `true` iff `who` has already claimed the currently active fiscal epoch's budget
+	/// allocation.
+	fn has_unclaimed_current_epoch_budget(who: &AccountId) -> bool {
+		pallet_voting::CitizenClaimedEpoch::<Runtime>::get(who)
+			== Some(pallet_voting::FiscalYearEpoch::<Runtime>::get())
 	}
 }
 
@@ -790,6 +829,17 @@ impl pallet_courts::Config for Runtime {
 	/// and pallet-executive's identical cabinet-emergency threshold below.
 	type AIModelSupermajorityNumerator = ConstU32<2>;
 	type AIModelSupermajorityDenominator = ConstU32<3>;
+	/// Dev builds accept every anonymized case-filing proof unconditionally
+	/// (`PassthroughZkVerifier`); non-dev builds run the real bb 5.0.0 UltraHonk pairing check —
+	/// the same verifier `pallet_identity_zk`/`pallet_elections::Config::ZkVerifier` use, since
+	/// this is cryptographically just another outer ZKPassport proof (see
+	/// `crate::verifier::ZkPassportUltraHonkVerifier`'s `pallet_courts::ZkProofVerifier` impl).
+	/// Mirrors `pallet_elections::Config::ZkVerifier`'s identical per-field cfg-gating pattern
+	/// elsewhere in this file, rather than duplicating this whole `impl` for one differing line.
+	#[cfg(feature = "dev-mode")]
+	type ZkVerifier = PassthroughZkVerifier;
+	#[cfg(not(feature = "dev-mode"))]
+	type ZkVerifier = crate::verifier::ZkPassportUltraHonkVerifier;
 }
 
 /// Runtime implements CitizenChecker for pallet-constitution (petition/sign gating).
@@ -824,6 +874,25 @@ impl pallet_constitution::AutoChallengeHook for Runtime {
 	fn auto_challenge_law(law_id: u32) -> sp_runtime::DispatchResult {
 		pallet_courts::Pallet::<Runtime>::auto_file_case(
 			pallet_courts::CaseSubject::LawChallenge { law_id },
+		)
+	}
+}
+
+/// Runtime implements TierConflictHook by calling pallet-courts::file_case_for with
+/// `CaseSubject::TierConflict` — the citizen-initiated, anonymized counterpart to
+/// `AutoChallengeHook` above. See `pallet_constitution::TierConflictHook`'s doc comment.
+impl pallet_constitution::TierConflictHook<AccountId> for Runtime {
+	fn file_tier_conflict_case(
+		filer: AccountId,
+		law_id: u32,
+		zk_proof: frame_support::BoundedVec<u8, ConstU32<4096>>,
+		public_inputs: frame_support::BoundedVec<[u8; 32], ConstU32<16>>,
+	) -> sp_runtime::DispatchResult {
+		pallet_courts::Pallet::<Runtime>::file_case_for(
+			filer,
+			pallet_courts::CaseSubject::TierConflict { law_id },
+			zk_proof,
+			public_inputs,
 		)
 	}
 }
@@ -867,6 +936,9 @@ impl pallet_constitution::Config for Runtime {
 	type CitizenChecker = Runtime;
 	/// Structural/Foundational laws auto-open a court case on enactment for AI review.
 	type AutoChallengeHook = Runtime;
+	/// Citizen-initiated, permissionless `challenge_law_tier` — see
+	/// `pallet_constitution::TierConflictHook`'s doc comment.
+	type TierConflictHook = Runtime;
 	/// Courts origin for invalidate_law (manual override). The auto-enforcement path
 	/// uses invalidate_law_internal via the LawEnforcer trait. Wired to
 	/// `EnsureOracleCouncilApproved`, not the bare `EnsureOracle` membership check: this
@@ -944,6 +1016,13 @@ impl pallet_executive::Config for Runtime {
 	/// without it, the same supermajority could chain back-to-back emergencies into de-facto
 	/// indefinite emergency powers.
 	type EmergencyCooldownBlocks = ConstU32<{ 7 * DAYS }>;
+	/// Cross-pallet coordination with pallet-emergency-council's own, independent cooldown —
+	/// see `pallet_executive::SiblingEmergencyCooldown`'s doc comment. Implemented on `Runtime`
+	/// itself, just below (a "Runtime-level delegating impl", the same escape hatch
+	/// `CitizenChecker`/`LegislatureMembership` above use, needed here — unlike
+	/// `DisclosureChecker` elsewhere in this file — because the relationship is symmetric and a
+	/// direct pallet-to-pallet crate dependency in both directions would cycle).
+	type SiblingEmergencyCooldown = Runtime;
 	/// 2/3 cabinet supermajority required to declare or end an emergency.
 	type SupermajorityNumerator = ConstU32<2>;
 	type SupermajorityDenominator = ConstU32<3>;
@@ -954,6 +1033,12 @@ impl pallet_executive::Config for Runtime {
 	/// The PM/successor/nominee/voter must currently hold a legislature seat.
 	/// Implemented on `Runtime` itself, just below.
 	type LegislatureMembership = Runtime;
+	/// Gates PM/minister appointment on the reverse-direction executive/Accountability-Council
+	/// overlap bar (see `pallet_executive::AccountabilityCouncilChecker`'s doc comment) —
+	/// `pallet_accountability_council::add_member` only blocks the other direction (a current
+	/// minister/PM joining the Council) at join time; this closes the gap where a sitting
+	/// Council member could later be nominated/invested PM or appointed a minister.
+	type AccountabilityCouncilChecker = AccountabilityCouncil;
 	/// 7 days to nominate PM candidates once an investiture round opens, matching
 	/// pallet-legislature's own motion-duration convention.
 	type PmNominationWindowBlocks = ConstU32<{ 7 * DAYS }>;
@@ -998,6 +1083,43 @@ impl pallet_executive::LegislatureMembership<AccountId> for Runtime {
 impl pallet_executive::BenchmarkHelper<AccountId> for RuntimeBenchmarkHelper {
 	fn make_active_citizen(_who: &AccountId) {}
 	fn make_legislature_member(_who: &AccountId) {}
+}
+
+/// Runtime-level delegating impl of `pallet_executive::SiblingEmergencyCooldown` — see that
+/// trait's doc comment for the full rationale (mutual coordination between pallet-executive's
+/// and pallet-emergency-council's independently-cooled-down emergency mechanisms; a
+/// `Runtime`-level impl rather than a direct one on either pallet's `Pallet<T>` because the
+/// relationship is symmetric and a direct crate dependency in both directions would cycle).
+/// Reuses pallet-emergency-council's own `CooldownUntil` storage item directly rather than
+/// adding a new "cooldown imposed by the sibling" item — see the trait's doc comment for why
+/// that's safe (neither pallet's internal logic distinguishes *why* `CooldownUntil` was set).
+impl pallet_executive::SiblingEmergencyCooldown<BlockNumber> for Runtime {
+	fn is_in_cooldown(now: BlockNumber) -> bool {
+		now < pallet_emergency_council::CooldownUntil::<Runtime>::get()
+	}
+	fn notify_emergency_ended(now: BlockNumber) {
+		pallet_emergency_council::CooldownUntil::<Runtime>::put(
+			now.saturating_add(
+				<Runtime as pallet_emergency_council::Config>::EmergencyCooldownBlocks::get(),
+			),
+		);
+	}
+}
+
+/// Mirror-image of the impl above: lets pallet-emergency-council also honor, and also start,
+/// pallet-executive's own cooldown. See `pallet_executive::SiblingEmergencyCooldown`'s doc
+/// comment just above for the shared rationale.
+impl pallet_emergency_council::SiblingEmergencyCooldown<BlockNumber> for Runtime {
+	fn is_in_cooldown(now: BlockNumber) -> bool {
+		now < pallet_executive::CooldownUntil::<Runtime>::get()
+	}
+	fn notify_emergency_ended(now: BlockNumber) {
+		pallet_executive::CooldownUntil::<Runtime>::put(
+			now.saturating_add(
+				<Runtime as pallet_executive::Config>::EmergencyCooldownBlocks::get(),
+			),
+		);
+	}
 }
 
 // ── Liquid Democracy Delegates / Legislature Elections ──────────────────────
@@ -1061,6 +1183,17 @@ impl pallet_elections::Config for Runtime {
 	/// `MaxDelegates / MaxDelegateSweepPerBlock` = 100 blocks (~10-20 min at this chain's
 	/// block time) in the worst case.
 	type MaxDelegateSweepPerBlock = ConstU32<100>;
+	/// Bounds `run_election`'s per-block ranking scan the same way — a full scan-and-seat
+	/// cycle completes within `MaxDelegates / MaxElectionScanPerBlock` = 100 blocks in the
+	/// worst case, instead of doing an unbounded `Delegates::iter()` + sort in one block.
+	type MaxElectionScanPerBlock = ConstU32<100>;
+	/// Flash-backing defense (see `pallet_elections::Config::MinBackingDurationBlocks`'s doc
+	/// comment): a `BackingCount` checkpoint must be at least 30 days old before `run_election`
+	/// will use it for seating. Matches `pallet_voting::Config::MinDelegationDurationBlocks`
+	/// (same 30-day figure, same "stop a flash-style manipulation of a governance-weight
+	/// signal" rationale), and stays comfortably below `DefaultElectionCycleBlocks` (2 years)
+	/// so a checkpoint always has an opportunity to mature within a single election cycle.
+	type MinBackingDurationBlocks = ConstU32<{ 30 * DAYS }>;
 	type CitizenChecker = Runtime;
 	/// Ordinary supermajority legislature motion can adjust BackingThreshold within bounds.
 	type GovernanceOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
@@ -1074,6 +1207,13 @@ impl pallet_elections::Config for Runtime {
 	/// `pallet_elections::DisclosureChecker`'s doc comment for the full rationale). Points at
 	/// the real pallet-anticorruption implementation, not a no-op.
 	type DisclosureChecker = PalletAntiCorruption;
+	/// Gates seating on the reverse-direction legislature/Accountability-Council overlap bar —
+	/// an account currently sitting on the Council is skipped in favor of the next-highest-
+	/// backed eligible delegate (see `pallet_elections::AccountabilityCouncilChecker`'s doc
+	/// comment). `pallet_accountability_council::add_member` only blocks the other direction
+	/// (a current legislature member joining the Council) at join time; this closes the gap
+	/// where a sitting Council member could later be automatically seated here.
+	type AccountabilityCouncilChecker = AccountabilityCouncil;
 	/// Real byte-identity `AccountId` conversion — see `AccountIdToBytes`'s impl comment above.
 	/// Not dev-mode-gated: it performs no cryptographic verification, just a structural
 	/// conversion, so there is nothing for dev-mode to stub out.
@@ -1150,6 +1290,13 @@ impl pallet_emergency_council::Config for Runtime {
 	/// ends, chaining into de-facto indefinite emergency powers despite `MaxEmergencyBlocks`
 	/// capping each individual window.
 	type EmergencyCooldownBlocks = ConstU32<{ 7 * DAYS }>;
+	/// Cross-pallet coordination with pallet-executive's own, independent cooldown — see
+	/// `pallet_emergency_council::SiblingEmergencyCooldown`'s doc comment. Implemented on
+	/// `Runtime` itself, just below, for the same reason `pallet_executive::Config::
+	/// SiblingEmergencyCooldown` above is (a "Runtime-level delegating impl", needed because
+	/// this relationship is symmetric and a direct pallet-to-pallet crate dependency in both
+	/// directions would cycle).
+	type SiblingEmergencyCooldown = Runtime;
 	/// Council capped at 15 members (docs/project/pallets/emergency-council.md).
 	type MaxCouncilSize = ConstU32<15>;
 	/// 2/3 supermajority required to declare or end an emergency.
