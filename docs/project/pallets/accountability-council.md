@@ -79,6 +79,31 @@ whose consumption fails this check is *not* consumed (the whole call reverts, to
 FRAME wraps dispatch in a storage transaction), so the Council can retry once the account becomes
 eligible without re-proposing from scratch.
 
+**The legislature/executive-overlap bar is now a maintained invariant, not just a join-time
+gate.** `add_member` above only ever blocked one direction — a current legislature member or
+executive minister/PM joining the Council. Until now nothing stopped the reverse: a sitting
+Council member could later be automatically seated into the legislature by `pallet-elections`'
+top-N-by-backing seating, or appointed a minister/invested PM by `pallet-executive`, with no
+on-chain check in either direction. Both are now closed, mirroring `pallet_elections::
+DisclosureChecker`'s existing shape:
+- `pallet_elections::AccountabilityCouncilChecker<AccountId>` (defined in pallet-elections, the
+  consumer) is checked in `run_election` alongside `DisclosureChecker` — a would-be-seated
+  delegate who currently sits on the Council is skipped rather than seated, the next-highest-
+  backed eligible delegate fills the seat instead, and `Event::
+  SeatingSkippedAccountabilityCouncilMember` is emitted per skip.
+- `pallet_executive::AccountabilityCouncilChecker<AccountId>` (defined in pallet-executive, the
+  consumer) is checked at the three points that actually install someone into executive power —
+  `nominate_pm` (candidate), `remove_and_replace_prime_minister` (successor), and
+  `appoint_minister` (who) — rejecting the call outright with `Error::AccountabilityCouncilMember`
+  (no ranked fallback exists there the way seating has, so this is a hard rejection rather than a
+  skip-and-fall-through).
+
+Both traits are implemented directly on this pallet's own `Pallet<T>` (reading `Members`), the
+same consumer-defines/provider-implements idiom `DisclosureChecker` already uses, and wired in
+`runtime/src/configs/mod.rs` as `pallet_elections::Config::AccountabilityCouncilChecker =
+AccountabilityCouncil` / `pallet_executive::Config::AccountabilityCouncilChecker =
+AccountabilityCouncil`.
+
 Self-perpetuating membership: unlike every other council in this codebase (Oracle Council, AI
 Model Governance Council, Emergency Council, the legislature itself), which stay permanently
 `Root`-managed, this Council's `Root` access is deliberately one-time.
@@ -113,6 +138,16 @@ Calls:
   token nobody consumed once `ApprovalExpiryBlocks` have passed
 
 TODOs:
-- `pallet-anticorruption` still needs a per-report recusal/multi-sign-off mechanism independent
+- ~~`pallet-anticorruption` still needs a per-report recusal/multi-sign-off mechanism independent
   of the appointment-origin fix above: today any current investigator can unilaterally clear or
-  refer *any* report, including one filed about themselves.
+  refer *any* report, including one filed about themselves.~~ **Fixed (commit `0529508`).**
+  `clear_report`/`refer_report_to_courts` now only *propose* a transition (recorded in new
+  `PendingReportAction` storage, keyed by `report_id`) and leave the report at
+  `UnderInvestigation`; a second, different investigator must call the new
+  `approve_report_action` to actually apply it — the proposer is rejected from approving their
+  own proposal (`Error::SameInvestigator`). This is a per-report 2-of-N peer sign-off, not a
+  supermajority vote, mirroring the propose/approve pattern this pallet and pallet-courts'
+  Oracle Council already use elsewhere. Report content is still deliberately encrypted to the
+  investigator's key, so the chain still can't check on-chain whether a report concerns the
+  caller specifically — the fix is structural (a second investigator's sign-off) rather than
+  content-based.

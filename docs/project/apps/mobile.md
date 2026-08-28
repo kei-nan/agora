@@ -7,10 +7,12 @@ anywhere in the repo).
 
 ### Current status (see `docs/project/changelog/080.md` for the full verification)
 
-- `cd mobile && npm install` then `npm test`: **11 suites / 140 tests, all passing** — grown
-  well past the 4 suites / 77 tests changelog #080 originally verified (`sodParser`,
-  `zkProving`, `proofEncoding`, `certificateTree` plus, since then, governance-screen fixes,
-  chain-call argument tests, and Keystore-backed signing coverage).
+- `cd mobile && npm install` then `npm test`: **21 suites / 300 tests, all passing** (re-verified
+  2026-08-25 via `npx jest`) — grown well past the 4 suites / 77 tests changelog #080 originally
+  verified (`sodParser`, `zkProving`, `proofEncoding`, `certificateTree` plus, since then,
+  governance-screen fixes, chain-call argument tests, Keystore-backed signing coverage, and — most
+  recently — recover-account, delegate-persona/backing-privacy, and IPFS content-fetching
+  coverage).
 - `mobile/android/` has real Gradle config (Gradle 8.6 via `gradle-wrapper.properties`,
   `compileSdkVersion`/`buildToolsVersion` 34, `ndkVersion 26.1.10909125` in `build.gradle`), a
   checked-in `app/debug.keystore`, generated app resources, and a hand-written native module:

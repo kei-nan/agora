@@ -217,7 +217,7 @@ with a small council where quicker/majority-model-agreement rulings naturally co
 real (a) — a mode where an instance polls `PendingOracleProposal` for cases *other* accounts
 already proposed and independently decides whether to add its approval — is genuine future work,
 not attempted in this pass; this README flags it rather than silently assuming it exists. The
-single-instance path (all existing code, all 47 tests) is exactly what a 1-member council, or the
+single-instance path (all existing code, all 52 tests) is exactly what a 1-member council, or the
 proposer's own call reaching threshold in a small council, already exercises correctly.
 
 ## Configuration

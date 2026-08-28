@@ -253,8 +253,15 @@
     new `neutralize_tag_markers` HTML-entity-escapes literal open/close delimiter markers before
     wrapping untrusted IPFS text, so a law author can no longer forge a fake closing tag followed
     by fake trusted-looking directives; the same mitigation was ported into desktop's `agent_ask`
-    in commit `bbacd04`), a narrow delegation-cap staleness gap in `pallet-voting`
-    (Low/informational, still open), and a long list of citizen-UX gaps (mobile shows raw hex
+    in commit `bbacd04`) — a delegation-cap staleness gap in `pallet-voting` originally listed
+    here as "Low/informational, still open" turned out, on closer reading of the code, to be a
+    real bypass rather than a benign staleness window, and is now fixed (**commit `22ca2f6`**):
+    an intermediate delegate's stored `resolved_weight` was only snapshotted at edge-creation
+    time and never updated when an upstream delegator joined afterward, letting `DelegationCap`
+    be exceeded via three ordinary `delegate_vote` calls; `propagate_weight_along_chain` now
+    keeps every intermediate hop's weight live on every add/unwind, not just the terminal's — see
+    `docs/project/pallets/voting.md`'s "Delegation guards" section for the full detail — and a
+    long list of citizen-UX gaps (mobile shows raw hex
     instead of proposal/law content since it never fetches IPFS — **fixed 2026-08-21, commit
     `c4aa1a9`**: `mobile/src/chain/ipfs.ts` fetches and SHA-256-verifies IPFS content the same way
     desktop does, wired into `IpfsContentBox.tsx`/`ProposalsScreen.tsx`/`LawsScreen.tsx`;
@@ -317,20 +324,47 @@
     own scoping): the actual cross-pallet migration, and any notification/dispute-window
     mechanism for the coercion risk — see items 14 and 15.
 
-14. [ ] **Cross-pallet `AccountMigrator` for `recover_account`** — found 2026-08-22 (review
-    finding, see item 13 part 3). `recover_account` only rebinds pallet-identity's own storage;
-    a recovering citizen's AGR balance, pallet-voting budget/delegation state, pallet-elections
-    delegate registration/backing, a legislature seat, a cabinet role, and pallet-anticorruption
-    disclosures/conflict-registry entries all stay silently bound to the abandoned old account.
-    Real, separate design/implementation work: needs a genuine cross-pallet `AccountMigrator`
-    trait (mirroring the existing `CitizenSuspender` runtime-trait pattern) spanning
-    pallet-voting/elections/legislature/executive/anticorruption, each implementing its own
-    "move this account's state to a new AccountId" logic and being called from
-    `recover_account` in a single atomic transaction. Non-trivial questions of its own: what
-    happens to an in-flight vote/delegation/motion the old account was mid-way through, whether
-    a legislature seat or cabinet role can even be "moved" mid-term without its own governance
-    implications, and how to keep the whole rebind atomic across that many pallets. Not
-    attempted in the 2026-08-22 pass — deliberately scoped out as too large for that session.
+14. [x] **Cross-pallet `AccountMigrator` for `recover_account`** — found 2026-08-22 (review
+    finding, see item 13 part 3), originally understated as passive data loss ("stay silently
+    bound to the abandoned old account"). **Update, 2026-08-25: two of the previously-orphaned
+    pieces of pallet-voting state turned out to be an active double-vote/double-claim
+    vulnerability, not just orphaning, and are now fixed.** `ReferendumHasVoted`/
+    `ReferendumVoteChoice` (keyed by raw `AccountId`, set by `vote_referendum`) and
+    `CitizenClaimedEpoch`/`BudgetBalance`/`CategoryVotes` (set by `claim_fiscal_year_tokens`/
+    `vote_category`) were never checked by `recover_account`. Since `MaxEpochDurationBlocks`
+    (30 days) exceeds `MinBlocksBetweenRecoveries` (7 days) and only one `ActiveEpoch` can be
+    open network-wide at a time, a citizen could vote (or claim+spend a fiscal-epoch budget)
+    under `old_account`, drain its balance to zero (already required for recovery), wait out the
+    cooldown, and recover to a fresh account with no record of having voted/claimed — voting
+    again on the same still-open referendum, or claiming a second full budget allocation for the
+    same epoch. Fixed by extending `pallet_identity_zk::RecoveryStateChecker` with two new
+    divest-first guards — `has_open_referendum_vote`/`has_unclaimed_current_epoch_budget`,
+    `Error::RecoveryBlockedOpenReferendumVote`/`RecoveryBlockedUnclaimedEpochBudget` — checked in
+    `recover_account` alongside the existing three (AGR balance, pallet-elections delegate
+    persona, legislature seat, cabinet role — already guarded, not orphaned, since the earlier
+    2026-08-22 pass; this item's original text was already stale on those three). The
+    open-referendum check reads a new bounded `pallet_voting::OpenReferenda` list (capped by a
+    new `Config::MaxConcurrentReferenda`, maintained by all three referendum-creation call sites
+    and cleared on finalization) rather than scanning the unbounded `Referenda` map — referendum
+    creation itself now fails outright (`Error::TooManyOpenReferenda`) if that bound would be
+    exceeded, since (unlike `MaxReferendaPerBlock`/`PendingFinalization`) there's no
+    permissionless fallback path that could otherwise pick up an untracked entry. The
+    epoch-budget check is a plain O(1) storage read. New tests: `pallet-identity-zk`
+    (`recover_account_fails_when_old_account_has_open_referendum_vote`,
+    `..._has_unclaimed_current_epoch_budget`) and `pallet-voting`
+    (`open_referenda_tracks_creation_and_finalization`,
+    `create_referendum_fails_when_open_referenda_at_capacity`).
+
+    **What's still genuinely unguarded/orphaned, real separate future work**: pallet-voting's
+    liquid-democracy *delegation* relationships (a citizen's own `Delegations` entry as a
+    delegator) — distinct from the direct-vote/budget-claim state just fixed, and passive rather
+    than exploitable: an inert delegation from `old_account` stops counting for anything once
+    `old_account`'s citizen status is removed by `recover_account`, it doesn't let anyone
+    double-delegate. Also still open: pallet-anticorruption's conflict-registry entries. A full
+    cross-pallet `AccountMigrator` trait (mirroring `CitizenSuspender`) that actually *moves*
+    rather than merely *guards* this remaining state — plus the harder open questions it would
+    raise (an in-flight delegation/motion mid-move, whether a legislature seat/cabinet role can
+    even be moved mid-term) — remains real, separate, unattempted design/implementation work.
 
 15. [ ] **Open safety/product question: `recover_account` has no notification or dispute window**
     — found 2026-08-22 (review finding, see item 13 part 3), needs a human product decision, not
@@ -419,10 +453,12 @@
     mobile app to all of it (new `backingNullifierEncoding.ts`/`backingTree.ts`/`backingState.ts`,
     `zkProving.ts`'s `proveDelegatePersona`/`proveBackingNullifier`, updated
     `governance.ts`/delegate screens). Verified per-commit: `cargo test -p pallet-elections`
-    59/59 (66/66 with `runtime-benchmarks`); `cargo test -p pallet-identity-zk` 141/141
-    (`bae1cbd`'s Merkle-tree work, including 14 new tests checked against an independently-written
-    recursive reference implementation); `nargo test --workspace` 50/50 for the circuits; `npx
-    tsc --noEmit` clean and `npx jest` 297/297 in `mobile/` (see item 2 in Current State above).
+    59/59 (66/66 with `runtime-benchmarks`); `cargo test -p pallet-identity-zk` 141/141 as of
+    `bae1cbd`'s Merkle-tree work (including 14 new tests checked against an independently-written
+    recursive reference implementation) — re-verified 2026-08-25, now 148/148 after further
+    fixes landed since (see item 14 below); `nargo test --workspace` 50/50 for the circuits; `npx
+    tsc --noEmit` clean and `npx jest` 297/297 in `mobile/` as of this commit — re-verified
+    2026-08-25, now 300/300 (see item 2 in Current State above).
     **Still not real end-to-end**: like every other proof-submitting call in this codebase, both
     schemes remain gated on the standing OPRF committee blocker (item 1) — no genuine on-device
     proof can be produced without it — and the submission-metadata-linkability gap `CLAUDE.md`'s

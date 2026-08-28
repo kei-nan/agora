@@ -30,12 +30,19 @@ Delegation guards:
   `delegate_vote`, `revoke_delegation`, and the lazy expired-delegation cleanup inside
   `has_delegation_cycle` — but it is only used for this cap check; `apply_delegated_weight`
   always re-resolves the real `Delegations` graph fresh, so tally correctness never depends on
-  it. Known gap: if an *intermediate* delegate later re-delegates to a different target without
-  the delegator whose chain runs through them ever touching their own edge, the weight that was
-  upstream of that intermediate isn't re-walked onto the new terminal — this can only make a
-  later check on that stale terminal too permissive, never let the cap-violating edge itself go
-  undetected. See `DelegatedWeight`'s doc comment in `pallets/pallet-voting/src/lib.rs` for the
-  full reasoning.
+  it. **Fixed, was a real bypass (commit `22ca2f6`):** an intermediate delegate's stored
+  `resolved_weight` used to be snapshotted only at edge-creation time and never updated when an
+  upstream delegator joined afterward through that intermediate. Re-targeting away from that
+  stale hub then unwound the stale snapshot instead of the real transitive weight, permanently
+  undercounting the new target — this let `DelegationCap` be exceeded outright via three
+  ordinary, unprivileged `delegate_vote` calls, not merely a theoretical staleness window. Now
+  closed: every weight change (a new upstream join, a departure, a re-target) is propagated by
+  `propagate_weight_along_chain`, which walks the *whole* affected chain and updates every
+  intermediate hop's own stored `DelegationRecord::resolved_weight` along the way, not just the
+  terminal's `DelegatedWeight` bucket — so an intermediate delegate that later re-targets to a
+  different delegate always re-targets off a live, accurate snapshot. See `DelegatedWeight`'s and
+  `propagate_weight_along_chain`'s doc comments in `pallets/pallet-voting/src/lib.rs` for the full
+  reasoning.
   - Re-targeting an existing delegation (`who` already has an outgoing `Delegations` record for
     the topic, to a *different* delegate than before) uses the old record's own snapshotted
     `resolved_weight` — not `1 + DelegatedWeight[who]` — as `who`'s real contribution: per
