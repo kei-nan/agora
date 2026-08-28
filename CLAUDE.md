@@ -18,9 +18,9 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `mobile/android/` is a real, committed native project (Gradle 8.6, hand-written
   `NfcPassportModule.kt`/`com.agora.facematch` native modules) with the JS/TS test suite passing
-  (297 tests across 21 suites, confirmed by running `npx jest` in `mobile/` 2026-08-23 — up from
-  the 77 changelog #80 originally verified, most recently 228→297 per commit `4a628d1`'s own
-  message); no JDK/Android
+  (337 tests across 26 suites, confirmed by running `npx jest` in `mobile/` 2026-08-28 — up from
+  the 77 changelog #80 originally verified, 228→297 per commit `4a628d1`'s own message, 297→300→337
+  since); no JDK/Android
   SDK in this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
   exist (see `docs/project/apps/mobile.md`, changelog #80)
 
