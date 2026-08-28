@@ -1,0 +1,15 @@
+{
+  "title": "Treasury Ledger",
+  "departmentBudgets": "Department Budgets",
+  "tableDept": "Dept",
+  "tableBudget": "Budget",
+  "tableSpent": "Spent",
+  "tableRemaining": "Remaining",
+  "expenditures": "Expenditures",
+  "loading": "Loading...",
+  "empty": "No transactions yet.",
+  "detailMeta": "{{department}} · {{amount}} {{currency}}",
+  "fetchingAuditRecord": "Fetching audit record from IPFS…",
+  "auditMetadataAvailable": "Audit metadata available on IPFS.",
+  "auditRecordLink": "Audit record on IPFS"
+}

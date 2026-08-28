@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "../lib/invoke";
 import { useAgent } from "../context/AgentContext";
 import AgentPanel from "../components/AgentPanel";
@@ -15,6 +16,7 @@ interface Law {
 }
 
 export default function LawsPage() {
+  const { t } = useTranslation("laws");
   const [laws, setLaws] = useState<Law[]>([]);
   const [selected, setSelected] = useState<Law | null>(null);
   const [loading, setLoading] = useState(true);
@@ -54,9 +56,9 @@ export default function LawsPage() {
   return (
     <div className="page-layout">
       <div className="list-panel">
-        <h1 className="page-title">Laws</h1>
-        {loading && <p className="loading">Loading...</p>}
-        {!loading && laws.length === 0 && <p className="empty">No laws enacted yet.</p>}
+        <h1 className="page-title">{t("title")}</h1>
+        {loading && <p className="loading">{t("loading")}</p>}
+        {!loading && laws.length === 0 && <p className="empty">{t("empty")}</p>}
         <ul className="item-list">
           {laws.map((law) => (
             <li
@@ -76,9 +78,9 @@ export default function LawsPage() {
         <div className="detail-panel">
           <h2 className="detail-title">{selected.title}</h2>
           <p className="detail-meta">
-            {selected.tier} law · version {selected.version}
+            {t("detailMeta", { tier: selected.tier, version: selected.version })}
           </p>
-          {ipfsLoading && <p className="loading">Fetching law text from IPFS…</p>}
+          {ipfsLoading && <p className="loading">{t("fetchingContent")}</p>}
           {ipfsContent ? (
             <pre className="ipfs-content">{ipfsContent}</pre>
           ) : (
@@ -90,7 +92,7 @@ export default function LawsPage() {
             target="_blank"
             rel="noreferrer"
           >
-            View raw on IPFS
+            {t("viewRawOnIpfs")}
           </a>
           <AgentPanel itemTitle="law" />
         </div>

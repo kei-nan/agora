@@ -1,0 +1,21 @@
+{
+  "title": "Elections",
+  "subtitle_one": "{{count}} registered delegate · legislature seats fill automatically by backing count each election cycle",
+  "subtitle_other": "{{count}} registered delegates · legislature seats fill automatically by backing count each election cycle",
+  "loading": "Loading…",
+  "empty": "No delegates registered yet.",
+  "delegatesHeading": "Delegates",
+  "statusLabel": {
+    "pending": "Pending",
+    "active": "Active",
+    "on_break": "On break"
+  },
+  "accountLabel": "Account",
+  "backingLabel": "Backing",
+  "consecutiveTermsLabel": "Consecutive terms",
+  "profileLabel": "Profile",
+  "citizenCount_one": "{{count}} citizen",
+  "citizenCount_other": "{{count}} citizens",
+  "viewOnIpfs": "View on IPFS",
+  "selectPrompt": "Select a delegate to view their profile."
+}

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "../lib/invoke";
 import { useAgent } from "../context/AgentContext";
 import AgentPanel from "../components/AgentPanel";
@@ -24,6 +25,7 @@ interface DepartmentBudget {
 const ZERO_HASH = "0x" + "0".repeat(64);
 
 export default function TreasuryPage() {
+  const { t } = useTranslation("treasury");
   const [entries, setEntries] = useState<TreasuryEntry[]>([]);
   const [budgets, setBudgets] = useState<DepartmentBudget[]>([]);
   const [selected, setSelected] = useState<TreasuryEntry | null>(null);
@@ -67,18 +69,18 @@ export default function TreasuryPage() {
   return (
     <div className="page-layout">
       <div className="list-panel">
-        <h1 className="page-title">Treasury Ledger</h1>
+        <h1 className="page-title">{t("title")}</h1>
 
         {budgets.length > 0 && (
           <div className="budget-summary">
-            <h3 className="budget-heading">Department Budgets</h3>
+            <h3 className="budget-heading">{t("departmentBudgets")}</h3>
             <table className="budget-table">
               <thead>
                 <tr>
-                  <th>Dept</th>
-                  <th>Budget</th>
-                  <th>Spent</th>
-                  <th>Remaining</th>
+                  <th>{t("tableDept")}</th>
+                  <th>{t("tableBudget")}</th>
+                  <th>{t("tableSpent")}</th>
+                  <th>{t("tableRemaining")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -95,9 +97,9 @@ export default function TreasuryPage() {
           </div>
         )}
 
-        <h3 className="budget-heading">Expenditures</h3>
-        {loading && <p className="loading">Loading...</p>}
-        {!loading && entries.length === 0 && <p className="empty">No transactions yet.</p>}
+        <h3 className="budget-heading">{t("expenditures")}</h3>
+        {loading && <p className="loading">{t("loading")}</p>}
+        {!loading && entries.length === 0 && <p className="empty">{t("empty")}</p>}
         <ul className="item-list">
           {entries.map((e) => (
             <li
@@ -119,14 +121,14 @@ export default function TreasuryPage() {
         <div className="detail-panel">
           <h2 className="detail-title">{selected.description}</h2>
           <p className="detail-meta">
-            {selected.department} · {selected.amount} {selected.currency}
+            {t("detailMeta", { department: selected.department, amount: selected.amount, currency: selected.currency })}
           </p>
-          {ipfsLoading && <p className="loading">Fetching audit record from IPFS…</p>}
+          {ipfsLoading && <p className="loading">{t("fetchingAuditRecord")}</p>}
           {ipfsContent ? (
             <pre className="ipfs-content">{ipfsContent}</pre>
           ) : (
             !ipfsLoading && selected.ipfsHash && selected.ipfsHash !== ZERO_HASH && (
-              <p className="detail-summary">Audit metadata available on IPFS.</p>
+              <p className="detail-summary">{t("auditMetadataAvailable")}</p>
             )
           )}
           {selected.ipfsHash && selected.ipfsHash !== ZERO_HASH && (
@@ -136,7 +138,7 @@ export default function TreasuryPage() {
               target="_blank"
               rel="noreferrer"
             >
-              Audit record on IPFS
+              {t("auditRecordLink")}
             </a>
           )}
           <AgentPanel itemTitle="transaction" />

@@ -45,7 +45,7 @@ export default function AuthPage() {
             Session valid until {new Date(session.expiresAt * 1000).toLocaleTimeString()}
           </p>
           <p className="auth-nullifier">
-            Identity: {session.nullifierHash.slice(0, 8)}…{session.nullifierHash.slice(-6)}
+            Session ID: {session.nullifierHash.slice(0, 6)}…{session.nullifierHash.slice(-4)}
           </p>
           <button className="auth-logout-btn" onClick={logout}>
             Sign out

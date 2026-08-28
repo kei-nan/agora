@@ -50,7 +50,7 @@
 }
 
 .auth-meta { font-size: 13px; color: var(--text-muted); }
-.auth-nullifier { font-size: 12px; color: var(--text-muted); font-family: monospace; }
+.auth-nullifier { font-size: 11px; color: var(--text-muted); font-family: monospace; opacity: 0.7; }
 
 .auth-logout-btn {
   background: var(--bg-hover);

@@ -1,0 +1,8 @@
+{
+  "title": "Laws",
+  "loading": "Loading...",
+  "empty": "No laws enacted yet.",
+  "fetchingContent": "Fetching law text from IPFS…",
+  "detailMeta": "{{tier}} law · version {{version}}",
+  "viewRawOnIpfs": "View raw on IPFS"
+}

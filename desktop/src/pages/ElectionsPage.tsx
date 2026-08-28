@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "../lib/invoke";
 import { useAgent } from "../context/AgentContext";
 import AgentPanel from "../components/AgentPanel";
@@ -22,13 +23,13 @@ function shortAddr(hex: string): string {
   return `${hex.slice(0, 8)}…${hex.slice(-6)}`;
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  pending: "Pending",
-  active: "Active",
-  on_break: "On break",
-};
-
 export default function ElectionsPage() {
+  const { t } = useTranslation("elections");
+  const STATUS_LABEL: Record<string, string> = {
+    pending: t("statusLabel.pending"),
+    active: t("statusLabel.active"),
+    on_break: t("statusLabel.on_break"),
+  };
   const [data, setData] = useState<ElectionsData>({ delegates: [] });
   const [selectedDelegate, setSelectedDelegate] = useState<Delegate | null>(null);
   const [loading, setLoading] = useState(true);
@@ -52,20 +53,19 @@ export default function ElectionsPage() {
   return (
     <div className="page-layout">
       <div className="list-panel">
-        <h1 className="page-title">Elections</h1>
+        <h1 className="page-title">{t("title")}</h1>
         <p className="page-subtitle">
-          {data.delegates.length} registered delegate{data.delegates.length !== 1 ? "s" : ""} ·
-          legislature seats fill automatically by backing count each election cycle
+          {t("subtitle", { count: data.delegates.length })}
         </p>
-        {loading && <p className="loading">Loading…</p>}
+        {loading && <p className="loading">{t("loading")}</p>}
 
         {!loading && data.delegates.length === 0 && (
-          <p className="empty">No delegates registered yet.</p>
+          <p className="empty">{t("empty")}</p>
         )}
 
         {data.delegates.length > 0 && (
           <>
-            <h2 className="section-heading">Delegates</h2>
+            <h2 className="section-heading">{t("delegatesHeading")}</h2>
             <ul className="item-list">
               {data.delegates.map((d) => (
                 <li
@@ -96,15 +96,15 @@ export default function ElectionsPage() {
             </span>
           </p>
           <dl className="detail-fields">
-            <dt>Account</dt>
+            <dt>{t("accountLabel")}</dt>
             <dd className="mono">{shortAddr(selectedDelegate.account)}</dd>
-            <dt>Backing</dt>
-            <dd>{selectedDelegate.backingCount} citizen{selectedDelegate.backingCount !== 1 ? "s" : ""}</dd>
-            <dt>Consecutive terms</dt>
+            <dt>{t("backingLabel")}</dt>
+            <dd>{t("citizenCount", { count: selectedDelegate.backingCount })}</dd>
+            <dt>{t("consecutiveTermsLabel")}</dt>
             <dd>{selectedDelegate.consecutiveTerms}</dd>
             {selectedDelegate.profileIpfsHash && selectedDelegate.profileIpfsHash !== "0x" + "0".repeat(64) && (
               <>
-                <dt>Profile</dt>
+                <dt>{t("profileLabel")}</dt>
                 <dd>
                   <a
                     className="ipfs-link"
@@ -112,7 +112,7 @@ export default function ElectionsPage() {
                     target="_blank"
                     rel="noreferrer"
                   >
-                    View on IPFS
+                    {t("viewOnIpfs")}
                   </a>
                 </dd>
               </>
@@ -122,7 +122,7 @@ export default function ElectionsPage() {
         </div>
       ) : (
         <div className="detail-panel detail-empty">
-          <p>Select a delegate to view their profile.</p>
+          <p>{t("selectPrompt")}</p>
         </div>
       )}
     </div>

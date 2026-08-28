@@ -83,6 +83,14 @@ export default function ProposalsPage() {
         <div className="detail-panel">
           <h2 className="detail-title">{selected.title}</h2>
           <p className="detail-meta">Proposed by {selected.proposer}</p>
+          <div className="detail-vote-row">
+            <span className="detail-vote aye">{selected.votesFor} for</span>
+            <span className="detail-vote nay">{selected.votesAgainst} against</span>
+          </div>
+          <p className="mobile-vote-note">
+            🗳️ Voting happens in the Agora mobile app, using your phone's secure key. This desktop
+            view is read-only.
+          </p>
           {ipfsLoading && <p className="loading">Fetching proposal text from IPFS…</p>}
           {ipfsContent ? (
             <pre className="ipfs-content">{ipfsContent}</pre>
