@@ -31,8 +31,6 @@ pub fn run() {
             app.manage(AccountPinStore::load(base_dir.join("account_pins.json")));
             Ok(())
         })
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
