@@ -27,6 +27,7 @@ import {
   isRuledAgainstParty,
   CaseSubject,
   CaseDetail,
+  CaseFilingProof,
 } from './courts';
 
 interface RecordedCall {
@@ -98,7 +99,7 @@ describe('castJuryVote', () => {
 });
 
 describe('fileCase', () => {
-  it('accepts every CaseSubject variant, including CitizenConduct', async () => {
+  it('defaults to a null proof for every CaseSubject variant, including CitizenConduct', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
 
@@ -107,13 +108,30 @@ describe('fileCase', () => {
       { LawChallenge: { law_id: 3 } },
       { TreasuryDispute: { department_id: 2 } },
       { CitizenConduct: { nullifier: new Uint8Array(32).fill(1), suspension_blocks: 100 } },
+      { TierConflict: { law_id: 3 } },
     ];
 
     for (const subject of subjects) {
       await fileCase(fakePair, subject);
     }
 
-    expect(calls.map((c) => c.args[0])).toEqual(subjects);
+    expect(calls.map((c) => c.args)).toEqual(subjects.map((subject) => [subject, null, null]));
+  });
+
+  it('passes zkProof/publicInputs through as the 2nd/3rd args when a proof is supplied', async () => {
+    const { api, calls } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+
+    const proof: CaseFilingProof = {
+      zkProof: new Uint8Array([1, 2, 3]),
+      publicInputs: [new Uint8Array(32).fill(9), new Uint8Array(32).fill(8)],
+    };
+
+    await fileCase(fakePair, { LawChallenge: { law_id: 3 } }, proof);
+
+    expect(calls).toEqual([
+      { name: 'fileCase', args: [{ LawChallenge: { law_id: 3 } }, proof.zkProof, proof.publicInputs] },
+    ]);
   });
 });
 
@@ -182,14 +200,26 @@ function citizenConductSubject(nullifier: Uint8Array, suspensionBlocks: number |
     },
   };
 }
+function tierConflictSubject(lawId: number) {
+  return { type: 'TierConflict', value: { law_id: num(lawId) } };
+}
+
+/** Fake `CaseFiler::Account(AccountId)` codec value, as stored in `Cases`' filer field. */
+function accountFiler(address: string) {
+  return { type: 'Account', value: accountId(address) };
+}
+/** Fake `CaseFiler::Nullifier([u8; 32])` codec value, as stored in `Cases`' filer field. */
+function nullifierFiler(nullifier: Uint8Array) {
+  return { type: 'Nullifier', value: { toU8a: () => nullifier } };
+}
 
 function caseTuple(
-  filer: string,
+  filer: ReturnType<typeof accountFiler> | ReturnType<typeof nullifierFiler>,
   status: string,
   rulingHash: ReturnType<typeof none> | ReturnType<typeof some>,
   subject: unknown,
 ) {
-  return [accountId(filer), statusCodec(status), rulingHash, subject];
+  return [filer, statusCodec(status), rulingHash, subject];
 }
 
 function entryKey(id: number) {
@@ -199,13 +229,13 @@ function entryKey(id: number) {
 describe('fetchAllCases', () => {
   it('decodes multiple entries across different CaseStatus/CaseSubject variants, sorted by caseId', async () => {
     const entries = [
-      [entryKey(2), some(caseTuple('Bob', 'InJuryAppeal', none(), treasuryDisputeSubject(7)))],
-      [entryKey(0), some(caseTuple('Alice', 'Filed', none(), generalSubject()))],
+      [entryKey(2), some(caseTuple(accountFiler('Bob'), 'InJuryAppeal', none(), treasuryDisputeSubject(7)))],
+      [entryKey(0), some(caseTuple(accountFiler('Alice'), 'Filed', none(), generalSubject()))],
       [
         entryKey(1),
         some(
           caseTuple(
-            'Carol',
+            accountFiler('Carol'),
             'AIRulingIssued',
             some(hexHash('0xaa')),
             lawChallengeSubject(3),
@@ -221,17 +251,23 @@ describe('fetchAllCases', () => {
     const result = await fetchAllCases();
 
     expect(result).toEqual([
-      { caseId: 0, filer: 'Alice', status: 'Filed', rulingIpfsHash: null, subject: { General: null } },
+      {
+        caseId: 0,
+        filer: { kind: 'account', address: 'Alice' },
+        status: 'Filed',
+        rulingIpfsHash: null,
+        subject: { General: null },
+      },
       {
         caseId: 1,
-        filer: 'Carol',
+        filer: { kind: 'account', address: 'Carol' },
         status: 'AIRulingIssued',
         rulingIpfsHash: '0xaa',
         subject: { LawChallenge: { law_id: 3 } },
       },
       {
         caseId: 2,
-        filer: 'Bob',
+        filer: { kind: 'account', address: 'Bob' },
         status: 'InJuryAppeal',
         rulingIpfsHash: null,
         subject: { TreasuryDispute: { department_id: 7 } },
@@ -244,7 +280,7 @@ describe('fetchAllCases', () => {
     const entries = [
       [
         entryKey(5),
-        some(caseTuple('Dave', 'Filed', none(), citizenConductSubject(nullifier, null))),
+        some(caseTuple(accountFiler('Dave'), 'Filed', none(), citizenConductSubject(nullifier, null))),
       ],
     ];
     const api = {
@@ -257,10 +293,36 @@ describe('fetchAllCases', () => {
     expect(result).toEqual([
       {
         caseId: 5,
-        filer: 'Dave',
+        filer: { kind: 'account', address: 'Dave' },
         status: 'Filed',
         rulingIpfsHash: null,
         subject: { CitizenConduct: { nullifier, suspension_blocks: null } },
+      },
+    ]);
+  });
+
+  it('decodes an anonymized TierConflict case filed under a nullifier, not an account', async () => {
+    const filerNullifier = new Uint8Array(32).fill(7);
+    const entries = [
+      [
+        entryKey(6),
+        some(caseTuple(nullifierFiler(filerNullifier), 'Filed', none(), tierConflictSubject(3))),
+      ],
+    ];
+    const api = {
+      query: { courts: { cases: { entries: jest.fn(async () => entries) } } },
+    };
+    mockedGetApi.mockResolvedValue(api as any);
+
+    const result = await fetchAllCases();
+
+    expect(result).toEqual([
+      {
+        caseId: 6,
+        filer: { kind: 'nullifier', value: filerNullifier },
+        status: 'Filed',
+        rulingIpfsHash: null,
+        subject: { TierConflict: { law_id: 3 } },
       },
     ]);
   });
@@ -308,7 +370,7 @@ describe('fetchCaseDetail', () => {
 
   it('composes every sub-read, including the appealDeadlineBlock computation', async () => {
     const api = fakeDetailApi({
-      caseOpt: some(caseTuple('Alice', 'JurySeated', none(), generalSubject())),
+      caseOpt: some(caseTuple(accountFiler('Alice'), 'JurySeated', none(), generalSubject())),
       juryPoolOpt: some([accountId('Juror1'), accountId('Juror2')]),
       tally: [4, 1],
       aiRulingBlockOpt: some(num(50)),
@@ -321,7 +383,7 @@ describe('fetchCaseDetail', () => {
 
     expect(result).toEqual<CaseDetail>({
       caseId: 3,
-      filer: 'Alice',
+      filer: { kind: 'account', address: 'Alice' },
       status: 'JurySeated',
       rulingIpfsHash: null,
       subject: { General: null },
@@ -335,7 +397,7 @@ describe('fetchCaseDetail', () => {
 
   it('reports a null appealDeadlineBlock when there is no aiRulingBlock yet', async () => {
     const api = fakeDetailApi({
-      caseOpt: some(caseTuple('Alice', 'Filed', none(), generalSubject())),
+      caseOpt: some(caseTuple(accountFiler('Alice'), 'Filed', none(), generalSubject())),
     });
     mockedGetApi.mockResolvedValue(api as any);
 
@@ -347,7 +409,7 @@ describe('fetchCaseDetail', () => {
 
   it('decodes a final Upheld ruling', async () => {
     const api = fakeDetailApi({
-      caseOpt: some(caseTuple('Alice', 'FinalRuling', some(hexHash('0xbb')), generalSubject())),
+      caseOpt: some(caseTuple(accountFiler('Alice'), 'FinalRuling', some(hexHash('0xbb')), generalSubject())),
       rulingOpt: some(verdictCodec('Upheld')),
       aiRulingBlockOpt: some(num(10)),
     });
@@ -357,6 +419,20 @@ describe('fetchCaseDetail', () => {
 
     expect(result?.ruling).toBe('Upheld');
     expect(result?.rulingIpfsHash).toBe('0xbb');
+  });
+
+  it('decodes a case filed anonymously under a nullifier (e.g. LawChallenge)', async () => {
+    const filerNullifier = new Uint8Array(32).fill(5);
+    const api = fakeDetailApi({
+      caseOpt: some(
+        caseTuple(nullifierFiler(filerNullifier), 'Filed', none(), lawChallengeSubject(9)),
+      ),
+    });
+    mockedGetApi.mockResolvedValue(api as any);
+
+    const result = await fetchCaseDetail(3);
+
+    expect(result?.filer).toEqual({ kind: 'nullifier', value: filerNullifier });
   });
 });
 
@@ -396,7 +472,7 @@ describe('getOracleMembers', () => {
 describe('isFilerOrOracle', () => {
   const baseDetail: CaseDetail = {
     caseId: 1,
-    filer: 'Alice',
+    filer: { kind: 'account', address: 'Alice' },
     status: 'Filed',
     rulingIpfsHash: null,
     subject: { General: null },
@@ -407,20 +483,46 @@ describe('isFilerOrOracle', () => {
     appealDeadlineBlock: null,
   };
 
-  it('is true when the caller is the filer', () => {
-    expect(isFilerOrOracle(baseDetail, 'Alice', ['Oracle1'])).toBe(true);
+  it('is true when the caller is the account filer', () => {
+    expect(isFilerOrOracle(baseDetail, 'Alice', null, ['Oracle1'])).toBe(true);
   });
 
   it('is true when the caller is a member of the oracle council', () => {
-    expect(isFilerOrOracle(baseDetail, 'Oracle1', ['Oracle1', 'Oracle2'])).toBe(true);
+    expect(isFilerOrOracle(baseDetail, 'Oracle1', null, ['Oracle1', 'Oracle2'])).toBe(true);
   });
 
   it('is false when the caller is neither the filer nor an oracle member', () => {
-    expect(isFilerOrOracle(baseDetail, 'Random', ['Oracle1'])).toBe(false);
+    expect(isFilerOrOracle(baseDetail, 'Random', null, ['Oracle1'])).toBe(false);
   });
 
   it('is false when there are no oracle members and the caller is not the filer', () => {
-    expect(isFilerOrOracle(baseDetail, 'Random', [])).toBe(false);
+    expect(isFilerOrOracle(baseDetail, 'Random', null, [])).toBe(false);
+  });
+
+  describe('with a nullifier-kind (anonymized) filer', () => {
+    const nullifier = new Uint8Array(32).fill(6);
+    const otherNullifier = new Uint8Array(32).fill(7);
+    const anonDetail: CaseDetail = {
+      ...baseDetail,
+      filer: { kind: 'nullifier', value: nullifier },
+      subject: { LawChallenge: { law_id: 3 } },
+    };
+
+    it('is true when callerCitizenNullifier matches the stored filer nullifier', () => {
+      expect(isFilerOrOracle(anonDetail, 'SomeAddress', nullifier, [])).toBe(true);
+    });
+
+    it('is false when callerCitizenNullifier does not match', () => {
+      expect(isFilerOrOracle(anonDetail, 'SomeAddress', otherNullifier, [])).toBe(false);
+    });
+
+    it('is false when callerCitizenNullifier is null', () => {
+      expect(isFilerOrOracle(anonDetail, 'SomeAddress', null, [])).toBe(false);
+    });
+
+    it('is still true for a nullifier filer when the caller is an oracle member', () => {
+      expect(isFilerOrOracle(anonDetail, 'Oracle1', null, ['Oracle1'])).toBe(true);
+    });
   });
 });
 
@@ -430,7 +532,7 @@ describe('isRuledAgainstParty', () => {
 
   const conductDetail: CaseDetail = {
     caseId: 1,
-    filer: 'Alice',
+    filer: { kind: 'account', address: 'Alice' },
     status: 'Filed',
     rulingIpfsHash: null,
     subject: { CitizenConduct: { nullifier, suspension_blocks: null } },
@@ -457,6 +559,7 @@ describe('isRuledAgainstParty', () => {
     ['General', { General: null }],
     ['LawChallenge', { LawChallenge: { law_id: 1 } }],
     ['TreasuryDispute', { TreasuryDispute: { department_id: 1 } }],
+    ['TierConflict', { TierConflict: { law_id: 1 } }],
   ] as const)('is false for a %s subject even with a matching-looking nullifier', (_label, subject) => {
     const detail: CaseDetail = { ...conductDetail, subject: subject as CaseSubject };
     expect(isRuledAgainstParty(detail, nullifier)).toBe(false);

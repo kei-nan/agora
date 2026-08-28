@@ -108,6 +108,10 @@ function subjectDescription(subject: CaseSubject): string {
   if ('TreasuryDispute' in subject) {
     return `Treasury dispute (dept #${subject.TreasuryDispute.department_id})`;
   }
+  // Distinct copy from "Law challenge" even though the on-chain remedy is identical
+  // (T::LawEnforcer::invalidate_law) — this is a claim that the law was enacted at the
+  // wrong constitutional tier, not a substantive challenge to its content.
+  if ('TierConflict' in subject) return `Tier conflict (law #${subject.TierConflict.law_id})`;
   return 'Citizen conduct case';
 }
 
@@ -290,7 +294,8 @@ export default function CasesScreen() {
         const isPending = pending[item.caseId];
 
         const eligibleParty =
-          isFilerOrOracle(item, myAddress ?? '', oracleMembers) || isRuledAgainstParty(item, myNullifier);
+          isFilerOrOracle(item, myAddress ?? '', myNullifier, oracleMembers) ||
+          isRuledAgainstParty(item, myNullifier);
         const appealWindowOpen =
           item.appealDeadlineBlock !== null && currentBlock !== null && currentBlock <= item.appealDeadlineBlock;
         const canAppeal = item.status === 'AIRulingIssued' && eligibleParty && appealWindowOpen;

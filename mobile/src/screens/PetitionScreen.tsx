@@ -9,6 +9,7 @@ import {
   View,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
+import { useTranslation } from 'react-i18next';
 import { Petition, fetchPetitions, fetchReferendumIdForPetition, signPetition } from '../chain/governance';
 import { getSigningKeypair } from '../chain/identity';
 import { getRegistered } from '../chain/citizenState';
@@ -21,6 +22,7 @@ export default function PetitionScreen() {
   // cross-tab navigation to Proposals goes through `navigation as any`
   // rather than a typed TabParamList prop.
   const navigation = useNavigation();
+  const { t } = useTranslation('petitions');
   const [petitions, setPetitions] = useState<Petition[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -72,7 +74,7 @@ export default function PetitionScreen() {
 
   async function handleSign(petitionId: number) {
     if (!getRegistered()) {
-      showInfo('Not registered', 'You must be a registered citizen to sign petitions.');
+      showInfo(t('notRegisteredTitle'), t('notRegisteredMessage'));
       return;
     }
     setSigning(petitionId);
@@ -81,7 +83,7 @@ export default function PetitionScreen() {
       await signPetition(keypair, petitionId);
       setSigned(prev => new Set(prev).add(petitionId));
     } catch (e: any) {
-      showError('Failed to sign', e, 'Your signature could not be submitted. Please try again.');
+      showError(t('signFailedTitle'), e, t('signFailedMessage'));
     } finally {
       setSigning(null);
     }
@@ -103,7 +105,7 @@ export default function PetitionScreen() {
           tintColor={colors.accent}
         />
       }
-      ListEmptyComponent={<Text style={s.empty}>No active petitions.</Text>}
+      ListEmptyComponent={<Text style={s.empty}>{t('empty')}</Text>}
       renderItem={({ item }) => {
         const pct = Math.min(100, Math.round((item.sigCount / item.threshold) * 100));
         const reached = item.sigCount >= item.threshold;
@@ -112,20 +114,20 @@ export default function PetitionScreen() {
         return (
           <View style={s.card}>
             <View style={s.cardHeader}>
-              <Text style={s.id}>Petition #{item.id}</Text>
+              <Text style={s.id}>{t('petitionId', { id: item.id })}</Text>
               {reached && (
                 referendumId !== undefined ? (
                   <TouchableOpacity
                     style={s.reachedBadge}
                     onPress={() => (navigation as any).navigate('Proposals')}
                     accessibilityRole="link"
-                    accessibilityLabel={`Petition ${item.id} is now up for a vote as proposal ${referendumId}. View it in Proposals.`}
+                    accessibilityLabel={t('reachedVoteAccessibilityLabel', { id: item.id, referendumId })}
                   >
-                    <Text style={s.reachedText}>Now up for a vote → #{referendumId}</Text>
+                    <Text style={s.reachedText}>{t('reachedVote', { referendumId })}</Text>
                   </TouchableOpacity>
                 ) : (
                   <View style={s.reachedBadge}>
-                    <Text style={s.reachedText}>Referendum pending</Text>
+                    <Text style={s.reachedText}>{t('referendumPending')}</Text>
                   </View>
                 )
               )}
@@ -133,13 +135,19 @@ export default function PetitionScreen() {
 
             <View
               accessible
-              accessibilityLabel={`${item.title}. ${item.description ? item.description + '. ' : ''}${item.sigCount.toLocaleString()} of ${item.threshold.toLocaleString()} signatures, ${pct}%.`}
+              accessibilityLabel={t('cardAccessibilityLabel', {
+                title: item.title,
+                descriptionPart: item.description ? `${item.description}. ` : '',
+                count: item.sigCount.toLocaleString(),
+                threshold: item.threshold.toLocaleString(),
+                pct,
+              })}
             >
               <Text style={s.title}>{item.title}</Text>
               <Text style={s.description}>{item.description}</Text>
 
               <View style={s.sigRow}>
-                <Text style={s.sigCount}>{item.sigCount.toLocaleString()} / {item.threshold.toLocaleString()} signatures</Text>
+                <Text style={s.sigCount}>{t('sigCountLabel', { count: item.sigCount.toLocaleString(), threshold: item.threshold.toLocaleString() })}</Text>
                 <Text style={s.pct}>{pct}%</Text>
               </View>
               <View style={s.barBg}>
@@ -154,14 +162,14 @@ export default function PetitionScreen() {
               disabled={signing === item.id || hasSigned || reached}
               accessibilityRole="button"
               accessibilityLabel={
-                hasSigned ? `Petition ${item.id} signed` : `Sign petition ${item.id}`
+                hasSigned ? t('signedAccessibilityLabel', { id: item.id }) : t('signAccessibilityLabel', { id: item.id })
               }
               accessibilityState={{ disabled: signing === item.id || hasSigned || reached }}
             >
               {signing === item.id
                 ? <ActivityIndicator color={colors.textPrimary} size="small" />
                 : <Text style={s.signBtnText}>
-                    {hasSigned ? '✓ Signed' : reached ? 'Threshold reached' : 'Sign this petition'}
+                    {hasSigned ? t('signed') : reached ? t('thresholdReached') : t('signThisPetition')}
                   </Text>}
             </TouchableOpacity>
           </View>

@@ -8,9 +8,10 @@
  * `react-native.js` mock's empty `NativeModules` — mocking 'react-native'
  * alone isn't enough to make 'react-native-fs' importable under Jest.
  *
- * Backs `DocumentDirectoryPath` with a plain in-memory `Map`, keyed by path
- * — enough to exercise `keystoreWallet.ts`'s exists/readFile/writeFile
- * round-trip. The `Map` lives on `globalThis`, not a module-local variable,
+ * Backs `DocumentDirectoryPath` and `CachesDirectoryPath` with a single plain
+ * in-memory `Map`, keyed by path — enough to exercise `keystoreWallet.ts`'s
+ * and `registrationState.ts`'s exists/readFile/writeFile round-trips. The
+ * `Map` lives on `globalThis`, not a module-local variable,
  * specifically so it survives `jest.resetModules()` — tests that simulate
  * an app restart (`keystoreWallet.test.ts`) reset the module registry to
  * clear `keystoreWallet.ts`'s in-memory keypair cache while expecting its
@@ -27,6 +28,7 @@ function backingStore() {
 
 module.exports = {
   DocumentDirectoryPath: '/mock-documents',
+  CachesDirectoryPath: '/mock-caches',
   exists: jest.fn((path) => Promise.resolve(backingStore().has(path))),
   readFile: jest.fn((path) => {
     const files = backingStore();

@@ -13,11 +13,17 @@ import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.modules.core.PermissionAwareActivity
 import com.facebook.react.modules.core.PermissionListener
 import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import android.graphics.BitmapFactory
 import java.io.File
+import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -63,6 +69,40 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
       .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
       .build()
 
+    /** QR-decode half of [captureFaceAndQr] below — same options [QrChallengeModule] uses for its own standalone decode. */
+    private val barcodeScannerOptions = BarcodeScannerOptions.Builder()
+      .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+      .build()
+
+    /**
+     * Shared background executor for every CameraX `takePicture` callback in
+     * this package (this module's own [capturePhoto]/[captureFaceAndQr], and
+     * [QrChallengeModule]'s `captureAndDecodeQrCode` via [captureExecutor]).
+     *
+     * **Fixes a real bug, not a hardening measure**: `takePicture`'s second
+     * argument is the `Executor` its `OnImageSavedCallback` runs on. This
+     * code previously passed `ContextCompat.getMainExecutor(reactContext)`,
+     * so `onImageSaved` ran on the main/UI thread — and then called the
+     * blocking `Tasks.await(...)` from inside it. Play Services' `Tasks.await`
+     * explicitly forbids being called from the main thread and throws
+     * unconditionally when it is (this is documented and enforced, not just
+     * discouraged) — so every one of these captures was guaranteed to reject
+     * before this fix, regardless of what was actually in frame. (The
+     * `capturePhoto` doc comment used to justify the `Tasks.await` call by
+     * saying "this native-module method already runs off the JS thread" —
+     * true of the `@ReactMethod` entry point itself, but irrelevant: the
+     * `Tasks.await` call happens later, inside the `takePicture` callback,
+     * on whatever thread *that* executor provides, which was main.) A
+     * single-thread executor is enough — captures are inherently sequential
+     * (one `<FaceCameraView>` preview, one capture in flight at a time from
+     * the JS side) — this just needs to not be the main thread.
+     */
+    private val backgroundExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    /** Exposes [backgroundExecutor] to [QrChallengeModule] so its own `takePicture` callback runs off the main thread too — see that property's doc comment. */
+    @JvmStatic
+    fun captureExecutor(): Executor = backgroundExecutor
+
     /** The live `ImageCapture` use case `FaceCameraViewManager` currently has bound, if any. */
     @Volatile
     private var activeImageCapture: ImageCapture? = null
@@ -72,6 +112,15 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
     fun bindImageCapture(imageCapture: ImageCapture?) {
       activeImageCapture = imageCapture
     }
+
+    /**
+     * Read-only access to the currently bound `ImageCapture` use case, for
+     * [QrChallengeModule] (same package) to capture a frame from the same
+     * live preview this module drives, without duplicating the CameraX
+     * binding logic `FaceCameraViewManager` already owns.
+     */
+    @JvmStatic
+    fun currentImageCapture(): ImageCapture? = activeImageCapture
 
     /**
      * Deletes every registration-selfie JPEG this module has ever written into
@@ -180,9 +229,11 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
 
   /**
    * Takes one still frame from the already-bound live preview and runs ML
-   * Kit face detection against it synchronously — this native-module method
-   * already runs off the JS thread (RN dispatches `@ReactMethod` calls to
-   * their own handler thread), so blocking on `Tasks.await` here is safe.
+   * Kit face detection against it. Runs on [backgroundExecutor], not the
+   * main thread — see that property's doc comment for why the blocking
+   * `Tasks.await` call below requires this (this method used to pass
+   * `ContextCompat.getMainExecutor(reactContext)` here instead, which made
+   * every capture reject unconditionally).
    * `challenge` is opaque to this method — purely an identifier folded into
    * the saved filename so a caller juggling multiple shots (a frontal
    * baseline plus a randomized liveness challenge, see `RegisterScreen.tsx`)
@@ -201,7 +252,7 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
     val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
     imageCapture.takePicture(
       outputOptions,
-      ContextCompat.getMainExecutor(reactContext),
+      backgroundExecutor,
       object : ImageCapture.OnImageSavedCallback {
         override fun onImageSaved(output: ImageCapture.OutputFileResults) {
           try {
@@ -242,6 +293,94 @@ class FaceCaptureModule(private val reactContext: ReactApplicationContext) :
         override fun onError(exception: ImageCaptureException) {
           // CameraX may or may not have written a partial file before failing —
           // best-effort delete either way, same reasoning as above.
+          runCatching { outputFile.delete() }
+          promise.reject("CAMERA_CAPTURE_ERROR", exception.message ?: "Photo capture failed", exception)
+        }
+      },
+    )
+  }
+
+  /**
+   * Combined capture backing the QR-liveness-challenge's two-shot redesign
+   * (see `mobile/src/screens/qrLivenessChallenge.ts` and `RegisterScreen.tsx`'s
+   * `qrCapture1`/`qrCapture2` substeps): takes one still frame and runs BOTH
+   * ML Kit face detection and ML Kit barcode scanning against the very same
+   * [InputImage], so a single captured frame is the only thing that can ever
+   * satisfy both checks together — not two independently-satisfiable steps.
+   *
+   * This replaces the old flaw directly: the QR challenge substep used to
+   * call [QrChallengeModule.captureAndDecodeQrCode], which decodes a barcode
+   * and does *no* face check at all, while the *separate*, earlier baseline
+   * shot (a plain [capturePhoto] call, satisfiable by a static photo held up
+   * once) was what got reused for the eventual passport face-match. Nothing
+   * ever required a face and a fresh QR nonce to be present in front of the
+   * camera at the same moment. Calling this method twice, with a freshly
+   * regenerated QR session between calls (`RegisterScreen.tsx`'s
+   * `toggleLivenessMethod`/retry logic), is what the JS side now does
+   * instead — see that file for the residual-risk note on what this still
+   * doesn't defend against (an attacker who can hold up the same static
+   * photo *and* a validly-refreshed QR code twice in a row).
+   *
+   * Deliberately never rejects for "no face"/"no code" the way
+   * [capturePhoto]/[QrChallengeModule.captureAndDecodeQrCode] do
+   * individually — absence comes back as `-1` eye-open probabilities
+   * (mirroring [capturePhoto]'s existing "-1 = uncomputed" convention) and
+   * `qrText: null`. The caller evaluates both signals itself (the same
+   * thresholds `RegisterScreen.tsx` already applies to [capturePhoto]'s
+   * output, plus `isQrChallengeValid` from `qrLivenessChallenge.ts`) and
+   * decides whether to advance, retry, or clean up the file — this method
+   * only reports what it saw. Runs on [backgroundExecutor] for the same
+   * `Tasks.await`-off-the-main-thread reason as [capturePhoto].
+   */
+  @ReactMethod
+  fun captureFaceAndQr(promise: Promise) {
+    val imageCapture = activeImageCapture
+    if (imageCapture == null) {
+      promise.reject("CAMERA_NOT_READY", "No live camera preview is bound yet — is <FaceCameraView> mounted?")
+      return
+    }
+    val outputFile = File(reactContext.cacheDir, "${CAPTURE_FILE_PREFIX}qrcombined-${System.currentTimeMillis()}$CAPTURE_FILE_SUFFIX")
+    val outputOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
+    imageCapture.takePicture(
+      outputOptions,
+      backgroundExecutor,
+      object : ImageCapture.OnImageSavedCallback {
+        override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+          try {
+            val bitmap = BitmapFactory.decodeFile(outputFile.absolutePath)
+              ?: throw IllegalStateException("Captured frame could not be decoded")
+            val inputImage = InputImage.fromBitmap(bitmap, 0)
+            val faces = Tasks.await(
+              FaceDetection.getClient(faceDetectorOptions).process(inputImage),
+              10, TimeUnit.SECONDS,
+            )
+            val barcodes = Tasks.await(
+              BarcodeScanning.getClient(barcodeScannerOptions).process(inputImage),
+              10, TimeUnit.SECONDS,
+            )
+            val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() }
+            val qrText = barcodes.firstNotNullOfOrNull { it.rawValue }
+            val result = Arguments.createMap().apply {
+              putString("uri", Uri.fromFile(outputFile).toString())
+              putDouble("leftEyeOpenProbability", (face?.leftEyeOpenProbability ?: -1f).toDouble())
+              putDouble("rightEyeOpenProbability", (face?.rightEyeOpenProbability ?: -1f).toDouble())
+              putDouble("headEulerAngleY", (face?.headEulerAngleY ?: 0f).toDouble())
+              putString("qrText", qrText)
+            }
+            // Deliberately not deleted here even when face/qrText came back empty — unlike
+            // capturePhoto's NO_FACE_DETECTED path, this isn't a dead end the caller can't
+            // act on: the JS side (RegisterScreen.tsx) decides pass/fail from the returned
+            // signals and, on failure, calls deleteCaptureFile itself (same pattern already
+            // used for a failed baseline/challenge shot). On success this file is passed to
+            // matchAgainstPassport, whose own finally-block sweep cleans it up either way.
+            promise.resolve(result)
+          } catch (e: Exception) {
+            runCatching { outputFile.delete() }
+            promise.reject("FACE_QR_CAPTURE_ERROR", e.message ?: "Combined face/QR capture failed", e)
+          }
+        }
+
+        override fun onError(exception: ImageCaptureException) {
           runCatching { outputFile.delete() }
           promise.reject("CAMERA_CAPTURE_ERROR", exception.message ?: "Photo capture failed", exception)
         }

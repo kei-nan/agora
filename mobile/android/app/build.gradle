@@ -163,6 +163,22 @@ dependencies {
     // (mobile/android/app/src/main/assets/mobilefacenet.tflite — see
     // FaceMatchModule.kt's doc comment for the asset's provenance).
     implementation("org.tensorflow:tensorflow-lite:2.17.0")
+
+    // ML Kit Barcode Scanning — QrChallengeModule.kt's decode step for the
+    // QR-code alternate liveness challenge (mobile/src/screens/
+    // qrLivenessChallenge.ts). Bundled model variant (com.google.mlkit:
+    // barcode-scanning), same reasoning as the face-detection dependency
+    // above: fully on-device, no Play-Services download, ~2.4MB APK cost
+    // accepted the same way.
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+
+    // Play Integrity API — PlayIntegrityModule.kt's device/app-integrity
+    // attestation (mobile/src/chain/deviceIntegrity.ts). The standalone
+    // "integrity" artifact, not the older/deprecated "com.google.android.
+    // play:core" bundle that used to include this alongside unrelated Play
+    // Core features (in-app review, app updates, asset delivery) — Google's
+    // current recommended dependency for this API specifically.
+    implementation("com.google.android.play:integrity:1.6.0")
 }
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle"); applyNativeModulesAppBuildGradle(project)

@@ -14,7 +14,21 @@ export type CaseSubject =
   | { General: null }
   | { LawChallenge: { law_id: number } }
   | { TreasuryDispute: { department_id: number } }
-  | { CitizenConduct: { nullifier: Uint8Array; suspension_blocks: number | null } };
+  | { CitizenConduct: { nullifier: Uint8Array; suspension_blocks: number | null } }
+  | { TierConflict: { law_id: number } };
+
+/**
+ * `pallet_courts::file_case`'s ZK citizenship proof, required for anonymized filings
+ * (`LawChallenge`/`TreasuryDispute`/`TierConflict` — see `CaseFiler`'s doc comment on the
+ * Rust side for why those case types file under a nullifier instead of a plain `AccountId`)
+ * and rejected for `CitizenConduct`/`General`. Mirrors `identity.ts`'s `OuterProofPayload`
+ * convention, minus `outerCount`: unlike `identity.ts`'s callers, nothing here needs to
+ * validate `publicInputs`'s shape client-side before submission.
+ */
+export interface CaseFilingProof {
+  zkProof: Uint8Array;
+  publicInputs: Uint8Array[];
+}
 
 /** Mirrors `pallet_courts::Verdict` (`pallets/pallet-courts/src/lib.rs`) — a fieldless enum. */
 export type Verdict = 'Upheld' | 'Overturned';
@@ -45,6 +59,8 @@ function decodeCaseSubject(raw: any): CaseSubject {
       return { LawChallenge: { law_id: raw.value.law_id.toNumber() } };
     case 'TreasuryDispute':
       return { TreasuryDispute: { department_id: raw.value.department_id.toNumber() } };
+    case 'TierConflict':
+      return { TierConflict: { law_id: raw.value.law_id.toNumber() } };
     case 'CitizenConduct': {
       const inner = raw.value;
       return {
@@ -61,10 +77,43 @@ function decodeCaseSubject(raw: any): CaseSubject {
   }
 }
 
+/**
+ * Mirrors `pallet_courts::CaseFiler<AccountId>` (`pallets/pallet-courts/src/lib.rs`) — who
+ * filed a case. `LawChallenge`/`TreasuryDispute`/`TierConflict` cases are filed under the
+ * filer's ZKPassport `scoped_nullifier` rather than their `AccountId` (see that type's Rust
+ * doc comment for why: the filer risks retaliation from the institutional power they're
+ * challenging); `CitizenConduct`/`General` cases still file under the plain signing account,
+ * since the accused has a legitimate interest in knowing their accuser.
+ */
+export type CaseFiler =
+  | { kind: 'account'; address: string }
+  | { kind: 'nullifier'; value: Uint8Array };
+
+function decodeCaseFiler(raw: any): CaseFiler {
+  switch (raw.type as string) {
+    case 'Account':
+      return { kind: 'account', address: raw.value.toString() };
+    case 'Nullifier':
+      return { kind: 'nullifier', value: raw.value.toU8a() };
+    default:
+      throw new Error(`decodeCaseFiler: unrecognized CaseFiler variant '${raw.type}'`);
+  }
+}
+
+/** Byte-for-byte equality check for two 32-byte identity nullifiers. */
+function nullifiersEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((byte, i) => byte === b[i]);
+}
+
 export interface CaseSummary {
   caseId: number;
-  /** SS58 address of the filer — `T::AutoChallengeAccount` for system-initiated cases. */
-  filer: string;
+  /**
+   * Who filed the case — an `AccountId` for `CitizenConduct`/`General`, or an anonymizing
+   * ZK nullifier for `LawChallenge`/`TreasuryDispute`/`TierConflict`. See `CaseFiler`.
+   * `T::AutoChallengeAccount` (as `{ kind: 'account' }`) for system-initiated cases.
+   */
+  filer: CaseFiler;
   status: CaseStatus;
   /** Hex-encoded IPFS CID of the AI ruling's reasoning document, once issued; else null. */
   rulingIpfsHash: string | null;
@@ -88,7 +137,7 @@ export async function fetchAllCases(): Promise<CaseSummary[]> {
     const [filer, status, rulingHashOpt, subject] = (value as any).unwrap();
     cases.push({
       caseId,
-      filer: filer.toString(),
+      filer: decodeCaseFiler(filer),
       status: status.type,
       rulingIpfsHash: (rulingHashOpt as any).isSome ? (rulingHashOpt as any).unwrap().toHex() : null,
       subject: decodeCaseSubject(subject),
@@ -131,7 +180,7 @@ export async function fetchCaseDetail(caseId: number): Promise<CaseDetail | null
 
   return {
     caseId,
-    filer: filer.toString(),
+    filer: decodeCaseFiler(filer),
     status: status.type,
     rulingIpfsHash: (rulingHashOpt as any).isSome ? (rulingHashOpt as any).unwrap().toHex() : null,
     subject: decodeCaseSubject(subject),
@@ -173,8 +222,17 @@ export async function getOracleMembers(): Promise<string[]> {
 
 /**
  * Pure client-side port of `pallet_courts::Pallet::is_filer_or_oracle`
- * (`pallets/pallet-courts/src/lib.rs`) — true if `callerAddress` is the case's own filer or
+ * (`pallets/pallet-courts/src/lib.rs`) — true if the caller is the case's own filer or
  * a current member of the Oracle Council (`OracleMembers`).
+ *
+ * `caseDetail.filer` is now a `CaseFiler` (see that type's doc comment), not a plain
+ * address: for a `{ kind: 'account' }` filer this compares `callerAddress` the same way
+ * the old string comparison did; for a `{ kind: 'nullifier' }` filer (an anonymized
+ * `LawChallenge`/`TreasuryDispute`/`TierConflict` filing) it instead compares
+ * `callerCitizenNullifier` — the caller's own registered identity nullifier, e.g. from
+ * `identity.ts`'s `api.query.identity.citizenNullifier(address)` — against the stored
+ * nullifier byte-for-byte via `nullifiersEqual`, mirroring how `isRuledAgainstParty` already
+ * identifies a caller by nullifier rather than address.
  *
  * Deliberately omits the Rust helper's third branch — `system_case && CitizenChecker::
  * is_active_citizen(who)`, which additionally allows ANY active citizen to act on a
@@ -191,9 +249,15 @@ export async function getOracleMembers(): Promise<string[]> {
 export function isFilerOrOracle(
   caseDetail: CaseDetail,
   callerAddress: string,
+  callerCitizenNullifier: Uint8Array | null,
   oracleMembers: string[],
 ): boolean {
-  return callerAddress === caseDetail.filer || oracleMembers.includes(callerAddress);
+  const filer = caseDetail.filer;
+  const isFiler =
+    filer.kind === 'account'
+      ? callerAddress === filer.address
+      : callerCitizenNullifier !== null && nullifiersEqual(filer.value, callerCitizenNullifier);
+  return isFiler || oracleMembers.includes(callerAddress);
 }
 
 /**
@@ -208,17 +272,29 @@ export function isRuledAgainstParty(
   callerCitizenNullifier: Uint8Array | null,
 ): boolean {
   if (callerCitizenNullifier === null || !('CitizenConduct' in caseDetail.subject)) return false;
-  const caseNullifier = caseDetail.subject.CitizenConduct.nullifier;
-  if (caseNullifier.length !== callerCitizenNullifier.length) return false;
-  return caseNullifier.every((byte, i) => byte === callerCitizenNullifier[i]);
+  return nullifiersEqual(caseDetail.subject.CitizenConduct.nullifier, callerCitizenNullifier);
 }
 
+/**
+ * `pallet_courts::file_case(subject, zk_proof, public_inputs)` requires both `zk_proof` and
+ * `public_inputs` for `LawChallenge`/`TreasuryDispute`/`TierConflict` (else
+ * `Error::MissingZkProof`) and rejects both for `CitizenConduct`/`General` (else
+ * `Error::UnexpectedZkProof`) — see `CaseFilingProof`'s doc comment. `proof` defaults to
+ * `null`, which is correct for `CitizenConduct`/`General` filings and is the only case this
+ * mobile app can produce today — no Noir prover native module is registered in this project
+ * yet (see `zkProving.ts`'s documented blocker), so nothing here can actually build a
+ * `CaseFilingProof` for the anonymized case types.
+ */
 export async function fileCase(
   pair: KeyringPair,
   subject: CaseSubject,
+  proof: CaseFilingProof | null = null,
 ): Promise<void> {
   const api = await getApi();
-  return submitExtrinsic(api.tx.courts.fileCase(subject), pair);
+  return submitExtrinsic(
+    api.tx.courts.fileCase(subject, proof ? proof.zkProof : null, proof ? proof.publicInputs : null),
+    pair,
+  );
 }
 
 export async function appealRuling(

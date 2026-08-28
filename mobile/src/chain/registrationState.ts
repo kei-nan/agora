@@ -3,11 +3,27 @@
  * (passport scan -> proof assembly -> OPRF committee round-trip -> chain
  * submission) across app restarts, so `RegisterScreen.tsx` (or whatever UI
  * eventually drives it) can resume mid-pipeline instead of starting over
- * every time the app is killed. Same on-disk approach as `keystoreWallet.ts`
- * — a JSON file under `RNFS.DocumentDirectoryPath`, a `version` field, and an
- * "unrecognized shape -> treat as absent" defensive read — see that module's
- * doc comment for why that location/library combination was already chosen
- * for this app.
+ * every time the app is killed. Same on-disk *library* as `keystoreWallet.ts`
+ * (`react-native-fs`) and the same "JSON file, `version` field, unrecognized
+ * shape -> treat as absent" defensive-read shape — see that module's doc
+ * comment for why that library was already chosen for this app — but a
+ * deliberately different *directory*. Unlike the signing key material in
+ * `keystoreWallet.ts`, this file can reveal that its owner is mid-registration,
+ * or that a face-match/liveness check specifically failed for them
+ * (`LivenessVerified`'s `faceMatched`/`matchSkippedReason`) — sensitive on its
+ * own to anyone with casual access to the device (e.g. an abusive partner),
+ * even before registration finishes. So this lives under
+ * `RNFS.CachesDirectoryPath`, not `DocumentDirectoryPath`: OS-evictable,
+ * cache-tier storage rather than treated as durable user data — the same
+ * tier `FaceCaptureModule.kt`'s `sweepCaptureFiles` already uses for the raw
+ * liveness/face-match capture photos themselves (`reactContext.cacheDir`).
+ * Losing this file early just means the pipeline-progress UI falls back to
+ * re-deriving what it can from chain state (see `registrationReconciler.ts`)
+ * instead of resuming exactly where it left off — never data loss for
+ * anything the chain itself would consider authoritative. Users can also
+ * clear it explicitly and immediately via `clearRegistrationStatus` from
+ * `RegistrationStatusScreen.tsx`'s "Clear saved status" action, rather than
+ * waiting on the OS to evict it.
  *
  * Deliberately has NO `@polkadot/api` import and no notion of "chain state":
  * this is a dumb, address-scoped key-value store. `registrationReconciler.ts`
@@ -37,7 +53,7 @@ import RNFS from 'react-native-fs';
 /** Bumped if the on-disk shape ever changes; unrecognized versions are treated as "no file on disk". */
 const REGISTRATION_STATE_FILE_VERSION = 1;
 
-const REGISTRATION_STATE_FILE_PATH = `${RNFS.DocumentDirectoryPath}/agora-registration-status.json`;
+const REGISTRATION_STATE_FILE_PATH = `${RNFS.CachesDirectoryPath}/agora-registration-status.json`;
 
 /**
  * `committeeSlots` (on the four OPRF-tracking stages below) holds the
@@ -57,10 +73,27 @@ export type RegistrationStatus =
    * passed. `faceMatched` is `false` whenever the match itself was `skipped`
    * (e.g. an undecodable DG2 photo — see `FaceMatchModule.kt`) as well as
    * whenever it genuinely didn't match; `matchSkippedReason` disambiguates.
-   * Liveness (blink/turn) is required either way — this stage is never
-   * reached at all if the liveness challenges themselves failed.
+   * Liveness — blink/turn, or the QR-code alternate challenge (see
+   * `../screens/qrLivenessChallenge.ts`) — is required either way; this
+   * stage is never reached at all if the liveness challenge itself failed.
+   *
+   * `deviceIntegrityCaptured`/`deviceIntegrityReason` record whether the
+   * best-effort Play Integrity attestation (`../chain/deviceIntegrity.ts`)
+   * was obtained for this attempt — never gates registration, purely a
+   * defense-in-depth signal, see that module's doc comment for the full
+   * accounting of what it does and doesn't prove. The raw token itself is
+   * deliberately NOT persisted here (nothing downstream consumes it yet, so
+   * there's no reason to keep a second copy of security-sensitive material
+   * in this already cache-tier-but-sensitive file — see this module's own
+   * doc comment above).
    */
-  | { stage: 'LivenessVerified'; faceMatched: boolean; matchSkippedReason?: string }
+  | {
+      stage: 'LivenessVerified';
+      faceMatched: boolean;
+      matchSkippedReason?: string;
+      deviceIntegrityCaptured?: boolean;
+      deviceIntegrityReason?: string;
+    }
   | { stage: 'ProofMaterialAssembled' }
   | {
       stage: 'OprfQuerySubmitted';
@@ -189,7 +222,14 @@ export async function writeRegistrationStatus(address: string, status: Persistab
   });
 }
 
-/** Removes `address`'s entry entirely (used once the chain confirms `Active`, see `registrationReconciler.ts`). Serialized — see `serialize`. */
+/**
+ * Removes `address`'s entry entirely. Two call sites: automatically once the
+ * chain confirms `Active` (see `registrationReconciler.ts`), and on-demand
+ * from the user's own explicit "Clear saved status" action
+ * (`RegistrationStatusScreen.tsx`) so they don't have to wait on
+ * `RegistrationStatus`'s cache-tier storage (see this module's doc comment)
+ * to eventually be evicted by the OS. Serialized — see `serialize`.
+ */
 export async function clearRegistrationStatus(address: string): Promise<void> {
   return serialize(async () => {
     const file = await readFile();

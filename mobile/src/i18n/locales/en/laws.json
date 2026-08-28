@@ -1,0 +1,7 @@
+{
+  "loadError": "Couldn't load laws",
+  "empty": "No laws enacted yet.",
+  "constitutionalChip": "Constitutional",
+  "meta": "Law #{{id}} · v{{version}}",
+  "accessibilityLabel": "Law {{id}}, version {{version}}, {{status}}{{constitutionalSuffix}}. {{title}}."
+}

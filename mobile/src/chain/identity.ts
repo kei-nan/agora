@@ -227,6 +227,18 @@ export interface RegisterCitizenParams extends OuterProofPayload {
 }
 
 /**
+ * A device-integrity attestation (`../chain/deviceIntegrity.ts`) is
+ * deliberately NOT a field on `RegisterCitizenParams` above and is never
+ * passed to `api.tx.identity.registerCitizen` below — the real pallet
+ * extrinsic has no argument for it yet (see `proofEncoding.ts`'s
+ * `DeviceIntegritySubmissionExtras` doc comment for the full accounting of
+ * what adding one would take, and what a future verifier service consuming
+ * it would need to do). This is a documented gap, not an omission: the
+ * capture mechanism exists and is real, it just isn't threaded through this
+ * function.
+ */
+
+/**
  * Submits `register_citizen` (call index 0). See `RegisterCitizenParams` for
  * the shape and `pallets/pallet-identity/src/lib.rs` for the extrinsic
  * itself. Validates `publicInputs` against `outerCount` and the anchor

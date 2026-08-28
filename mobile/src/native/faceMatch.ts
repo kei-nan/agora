@@ -48,6 +48,25 @@ export interface MatchResult {
   reason?: string;
 }
 
+/**
+ * Result of {@link captureFaceAndQr} — the same per-shot liveness signals
+ * {@link CapturedPhoto} carries, plus whatever QR code (if any) was decoded
+ * from the very same frame. See that function's doc comment for why this
+ * exists: a single frame proving both signals at once is the whole point of
+ * the QR-liveness-challenge's two-shot redesign — see
+ * `../screens/qrLivenessChallenge.ts`.
+ */
+export interface CapturedFaceAndQr {
+  /** file:// URI of the captured JPEG on-device — never uploaded anywhere. */
+  uri: string;
+  /** `-1` if ML Kit found no face in the frame at all (uncomputed probability), not a real 0-1 value — same convention as `CapturedPhoto`. */
+  leftEyeOpenProbability: number;
+  rightEyeOpenProbability: number;
+  headEulerAngleY: number;
+  /** Raw decoded text of the first QR code found in the frame, or `null` if none was found. */
+  qrText: string | null;
+}
+
 interface FaceCaptureModuleNative {
   hasCameraPermission(): Promise<boolean>;
   requestCameraPermission(): Promise<boolean>;
@@ -56,6 +75,13 @@ interface FaceCaptureModuleNative {
     leftEyeOpenProbability: number;
     rightEyeOpenProbability: number;
     headEulerAngleY: number;
+  }>;
+  captureFaceAndQr(): Promise<{
+    uri: string;
+    leftEyeOpenProbability: number;
+    rightEyeOpenProbability: number;
+    headEulerAngleY: number;
+    qrText: string | null;
   }>;
   deleteCaptureFile(uri: string): Promise<void>;
 }
@@ -121,6 +147,25 @@ export async function requestCameraPermission(): Promise<boolean> {
  */
 export async function capturePhoto(challenge: LivenessChallenge): Promise<CapturedPhoto> {
   return requireCaptureModule().capturePhoto(challenge);
+}
+
+/**
+ * Takes one still frame from the already-mounted `<FaceCameraView>` preview
+ * and runs BOTH ML Kit face detection and ML Kit barcode scanning against
+ * it, returning the face signals {@link capturePhoto} would (or `-1`
+ * probabilities if no face was found — never rejects for that, unlike
+ * {@link capturePhoto}'s `NO_FACE_DETECTED`) plus whatever QR text was
+ * decoded from that same frame (`null` if none). Backs the QR-liveness-
+ * challenge's two-shot redesign in `RegisterScreen.tsx`: calling this twice,
+ * with a freshly-regenerated QR session
+ * (`../screens/qrLivenessChallenge.ts#createQrChallengeSession`) between
+ * calls, is what proves a face and a live, freshly-issued nonce were both
+ * presented together, at two distinct challenged moments — not two
+ * separately-satisfiable checks. See `FaceCaptureModule.captureFaceAndQr`'s
+ * doc comment for the full redesign and its residual-risk scope.
+ */
+export async function captureFaceAndQr(): Promise<CapturedFaceAndQr> {
+  return requireCaptureModule().captureFaceAndQr();
 }
 
 /**

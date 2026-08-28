@@ -7,12 +7,14 @@ import {
   Text,
   View,
 } from 'react-native';
+import { useTranslation } from 'react-i18next';
 import { Law, fetchLaws } from '../chain/governance';
 import { useAppModal } from '../components/AppModal';
 import IpfsContentBox from '../components/IpfsContentBox';
 import { colors } from '../theme';
 
 export default function LawsScreen() {
+  const { t } = useTranslation('laws');
   const [laws, setLaws] = useState<Law[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -25,12 +27,12 @@ export default function LawsScreen() {
       // Without this, a chain-unreachable error left `laws` at its previous
       // value (empty on first load) with no indication anything went wrong —
       // indistinguishable from "no laws enacted yet."
-      showError("Couldn't load laws", e);
+      showError(t('loadError'), e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [showError]);
+  }, [showError, t]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -50,14 +52,20 @@ export default function LawsScreen() {
           tintColor={colors.accent}
         />
       }
-      ListEmptyComponent={<Text style={s.empty}>No laws enacted yet.</Text>}
+      ListEmptyComponent={<Text style={s.empty}>{t('empty')}</Text>}
       renderItem={({ item }) => (
         <View
           style={s.card}
           accessible
           accessibilityRole="summary"
           accessibilityLabel={
-            `Law ${item.id}, version ${item.version}, ${item.status}${item.tier === 'Constitutional' ? ', Constitutional' : ''}. ${item.title}.`
+            t('accessibilityLabel', {
+              id: item.id,
+              version: item.version,
+              status: item.status,
+              constitutionalSuffix: item.tier === 'Constitutional' ? `, ${t('constitutionalChip')}` : '',
+              title: item.title,
+            })
           }
         >
           <View style={s.chips}>
@@ -74,10 +82,10 @@ export default function LawsScreen() {
             </View>
             {item.tier === 'Constitutional' && (
               <View style={[s.chip, s.chipConstitutional]}>
-                <Text style={[s.chipText, s.chipTextConstitutional]}>Constitutional</Text>
+                <Text style={[s.chipText, s.chipTextConstitutional]}>{t('constitutionalChip')}</Text>
               </View>
             )}
-            <Text style={s.meta}>Law #{item.id} · v{item.version}</Text>
+            <Text style={s.meta}>{t('meta', { id: item.id, version: item.version })}</Text>
           </View>
           <Text style={s.title}>{item.title}</Text>
           <IpfsContentBox hashHex={item.contentHash} />

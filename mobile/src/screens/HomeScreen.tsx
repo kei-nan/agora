@@ -42,7 +42,7 @@ function stageLabel(stage: RegistrationStatus['stage']): string {
     case 'AwaitingCommitteeRound1':
     case 'AwaitingCommitteeRound2':
     case 'ProofCombining':
-      return 'Waiting on OPRF committee';
+      return 'Waiting for the identity verification network';
     case 'Failed':
       return 'Registration failed';
     case 'ReverificationDue':

@@ -5,9 +5,11 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { enableScreens } from 'react-native-screens';
+import { I18nextProvider } from 'react-i18next';
 
 enableScreens();
 
+import i18n from './i18n';
 import { AppModalProvider } from './components/AppModal';
 import { colors } from './theme';
 import RegisterScreen from './screens/RegisterScreen';
@@ -92,6 +94,7 @@ export default function App() {
   }, []);
 
   return (
+    <I18nextProvider i18n={i18n}>
     <SafeAreaProvider>
     <AppModalProvider>
     <NavigationContainer ref={navRef}>
@@ -142,5 +145,6 @@ export default function App() {
     </NavigationContainer>
     </AppModalProvider>
     </SafeAreaProvider>
+    </I18nextProvider>
   );
 }

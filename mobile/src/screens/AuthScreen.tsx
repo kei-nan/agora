@@ -165,11 +165,14 @@ export default function AuthScreen({ route, navigation }: Props) {
 
       {status === "awaitingConfirmation" && pendingRequest && (
         <View style={styles.flowBox}>
-          <Text style={styles.confirmLabel}>You are about to sign in to a desktop app requesting:</Text>
+          <Text style={styles.confirmExplainer}>
+            Confirm this matches the code shown on your desktop screen to finish signing in.
+          </Text>
+          <Text style={styles.confirmLabel}>Code shown on desktop:</Text>
           <Text style={styles.confirmChallenge} selectable>
             {pendingRequest.challenge}
           </Text>
-          <Text style={styles.confirmLabel}>Sending the signature to:</Text>
+          <Text style={styles.confirmLabel}>Signing in to the desktop app at:</Text>
           <Text style={styles.confirmChallenge} selectable>
             {pendingRequest.callback}
           </Text>
@@ -287,6 +290,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
+  confirmExplainer: {
+    color: colors.textBody,
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
   confirmLabel: {
     color: colors.textSecondary,
     fontSize: 13,
@@ -295,6 +304,7 @@ const styles = StyleSheet.create({
   confirmChallenge: {
     color: colors.textPrimary,
     fontSize: 14,
+    fontWeight: "600",
     fontFamily: Platform.OS === "android" ? "monospace" : "Menlo",
     backgroundColor: colors.bg,
     borderRadius: 8,

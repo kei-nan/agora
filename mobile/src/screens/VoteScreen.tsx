@@ -232,6 +232,10 @@ export default function VoteScreen() {
                   ? ` (refunds ${(oldVotes * oldVotes) - cost})`
                   : ''}
             </Text>
+            <Text style={styles.costExplainer}>
+              Casting more votes on the same category costs more per vote — this keeps any one
+              voice from dominating.
+            </Text>
             {overBudget && (
               <Text style={styles.warningText} accessibilityRole="alert">
                 Exceeds your balance of {balance} tokens.
@@ -285,6 +289,7 @@ const styles = StyleSheet.create({
   },
   costText: { fontSize: 12, color: colors.textSecondary },
   costTextWarning: { color: colors.warning, fontWeight: '600' },
+  costExplainer: { fontSize: 11, color: colors.textDim, lineHeight: 15 },
   warningText: { fontSize: 12, color: colors.danger, fontWeight: '600' },
   btn: {
     backgroundColor: colors.accent,

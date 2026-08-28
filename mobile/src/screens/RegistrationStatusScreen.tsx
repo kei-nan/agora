@@ -112,6 +112,29 @@ async function estimateTimeRemaining(status: RegistrationStatus): Promise<string
   }
 }
 
+/**
+ * Best-effort estimated wall-clock date for a target block number, using the
+ * same `minimumPeriod * 2` block-time approximation `estimateTimeRemaining`
+ * above uses. Returns `null` (never throws) on any chain-read failure, or if
+ * the target block is already in the past — an estimate is only meaningful
+ * for a still-future block, and a stale/past estimate would be misleading.
+ */
+async function estimateBlockDate(targetBlock: number): Promise<string | null> {
+  try {
+    const api = await getApi();
+    const header = await api.rpc.chain.getHeader();
+    const currentBlock = header.number.toNumber();
+    const blocksRemaining = targetBlock - currentBlock;
+    if (blocksRemaining <= 0) return null;
+
+    const blockTimeMs = (api.consts.timestamp.minimumPeriod as any).toNumber() * 2;
+    const estimatedDate = new Date(Date.now() + blocksRemaining * blockTimeMs);
+    return estimatedDate.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' });
+  } catch {
+    return null;
+  }
+}
+
 /** Short, human-readable label per stage for the Suspended/ReverificationDue-adjacent card headers. */
 function citizenCardTitle(stage: 'Active' | 'ReverificationDue' | 'Suspended'): string {
   switch (stage) {
@@ -129,9 +152,10 @@ export default function RegistrationStatusScreen({ navigation }: Props) {
   const [status, setStatus] = useState<RegistrationStatus | null>(null);
   const [oprfProgress, setOprfProgress] = useState<OprfProgress>(undefined);
   const [timeRemaining, setTimeRemaining] = useState<string | null>(null);
+  const [suspendedUntilDate, setSuspendedUntilDate] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const { showError } = useAppModal();
+  const { showError, showConfirm } = useAppModal();
 
   const refresh = useCallback(
     async (addr: string, opts: { manual: boolean; isCancelled?: () => boolean }) => {
@@ -145,6 +169,12 @@ export default function RegistrationStatusScreen({ navigation }: Props) {
         const timeText = await estimateTimeRemaining(result.status);
         if (isCancelled()) return;
         setTimeRemaining(timeText);
+        const suspendedDateText =
+          result.status.stage === 'Suspended' && result.status.until !== null
+            ? await estimateBlockDate(result.status.until)
+            : null;
+        if (isCancelled()) return;
+        setSuspendedUntilDate(suspendedDateText);
       } catch (e) {
         if (isCancelled()) return;
         // Initial focus-driven reconciles degrade gracefully offline, same
@@ -193,6 +223,38 @@ export default function RegistrationStatusScreen({ navigation }: Props) {
   async function handleManualRefresh() {
     if (!address) return;
     await refresh(address, { manual: true });
+  }
+
+  /**
+   * User-triggered privacy control: deletes this device's locally-saved
+   * registration progress (which stage was reached, whether face match
+   * passed or failed) right now, rather than relying on the OS to evict it
+   * from cache storage eventually (see registrationState.ts's doc comment).
+   * Purely local — never touches chain state, so a genuinely registered
+   * citizen just sees their status re-derive from the chain on next check.
+   */
+  function handleClearStatus() {
+    if (!address) return;
+    showConfirm({
+      title: 'Clear saved status?',
+      message:
+        "This deletes the registration progress saved on this device — including which step " +
+        "you'd reached and whether your face match passed or failed — right away, instead of " +
+        "waiting for it to eventually age out on its own. It doesn't touch anything on the " +
+        "chain: if you're actually a registered citizen, checking again will still show that.",
+      confirmLabel: 'Clear',
+      destructive: true,
+      onConfirm: () => {
+        void (async () => {
+          try {
+            await clearRegistrationStatus(address);
+            await refresh(address, { manual: false });
+          } catch (e: any) {
+            showError('Could not clear status', e, 'Your saved registration status could not be cleared. Please try again.');
+          }
+        })();
+      },
+    });
   }
 
   if (loading && !status) {
@@ -318,11 +380,20 @@ export default function RegistrationStatusScreen({ navigation }: Props) {
                 </Text>
               )}
               {status.stage === 'Suspended' && (
-                <Text style={s.citizenSub}>
-                  {status.until !== null
-                    ? `Suspended until block #${status.until.toLocaleString()}.`
-                    : 'Suspended indefinitely.'}
-                </Text>
+                <>
+                  <Text style={s.citizenSub}>
+                    {status.until === null
+                      ? 'Suspended indefinitely — check back later.'
+                      : suspendedUntilDate
+                        ? `Suspended — expected to lift around ${suspendedUntilDate}. Check back then.`
+                        : 'Suspended — check back later.'}
+                  </Text>
+                  {status.until !== null && (
+                    <Text style={s.citizenDebug}>
+                      Technical reference: block #{status.until.toLocaleString()}
+                    </Text>
+                  )}
+                </>
               )}
             </View>
           )}
@@ -341,6 +412,17 @@ export default function RegistrationStatusScreen({ navigation }: Props) {
           <Text style={s.refreshBtnText}>Refresh status</Text>
         )}
       </TouchableOpacity>
+
+      {!isCitizenStage && (
+        <TouchableOpacity
+          style={s.clearBtn}
+          onPress={handleClearStatus}
+          accessibilityRole="button"
+          accessibilityLabel="Clear saved status"
+        >
+          <Text style={s.clearBtnText}>Clear saved status</Text>
+        </TouchableOpacity>
+      )}
     </ScrollView>
   );
 }
@@ -382,6 +464,7 @@ const s = StyleSheet.create({
   citizenTitleWarning: { color: colors.warningTextStrong },
   citizenTitleDanger: { color: colors.danger },
   citizenSub: { fontSize: 13, color: colors.textBody, lineHeight: 18 },
+  citizenDebug: { fontSize: 11, color: colors.textFaint, marginTop: 6 },
   failedCard: {
     backgroundColor: colors.card,
     borderRadius: 16,
@@ -407,4 +490,10 @@ const s = StyleSheet.create({
     alignItems: 'center',
   },
   refreshBtnText: { color: colors.textSecondary, fontWeight: '600', fontSize: 14 },
+  clearBtn: {
+    marginTop: 12,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  clearBtnText: { color: colors.textMuted, fontWeight: '600', fontSize: 13, textDecorationLine: 'underline' },
 });

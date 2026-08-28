@@ -1,0 +1,18 @@
+{
+  "notRegisteredTitle": "Not registered",
+  "notRegisteredMessage": "You must be a registered citizen to sign petitions.",
+  "signFailedTitle": "Failed to sign",
+  "signFailedMessage": "Your signature could not be submitted. Please try again.",
+  "empty": "No active petitions.",
+  "petitionId": "Petition #{{id}}",
+  "reachedVote": "Now up for a vote → #{{referendumId}}",
+  "reachedVoteAccessibilityLabel": "Petition {{id}} is now up for a vote as proposal {{referendumId}}. View it in Proposals.",
+  "referendumPending": "Referendum pending",
+  "cardAccessibilityLabel": "{{title}}. {{descriptionPart}}{{count}} of {{threshold}} signatures, {{pct}}%.",
+  "sigCountLabel": "{{count}} / {{threshold}} signatures",
+  "signed": "✓ Signed",
+  "thresholdReached": "Threshold reached",
+  "signThisPetition": "Sign this petition",
+  "signedAccessibilityLabel": "Petition {{id}} signed",
+  "signAccessibilityLabel": "Sign petition {{id}}"
+}

@@ -12,13 +12,23 @@ import {
   hasCameraPermission,
   requestCameraPermission,
   capturePhoto,
+  captureFaceAndQr,
   deleteCaptureFile,
   matchAgainstPassport,
   CapturedPhoto,
+  CapturedFaceAndQr,
   LivenessChallenge,
 } from '../native/faceMatch';
 import { buildCircuitInputs } from '../chain/sodParser';
 import { shouldBlockOnFaceMismatch } from './faceMatchGating';
+import {
+  createQrChallengeSession,
+  encodeQrPayload,
+  combinedCapturePassed,
+  QrChallengeSession,
+} from './qrLivenessChallenge';
+import { isQrChallengeScanAvailable } from '../native/qrChallenge';
+import QrCode from '../components/QrCode';
 import {
   TEST_PASSPORT_DG1_BASE64,
   TEST_PASSPORT_DG15_BASE64,
@@ -27,6 +37,7 @@ import {
 import { useAppModal } from '../components/AppModal';
 import { getSigningKeypair } from '../chain/identity';
 import { writeRegistrationStatus } from '../chain/registrationState';
+import { captureDeviceIntegritySignal } from '../chain/deviceIntegrity';
 import { colors } from '../theme';
 
 // setRegistered/setPassportName (../chain/citizenState) intentionally not
@@ -92,12 +103,48 @@ function getTestPassportData(): RawPassportData {
   };
 }
 
-type LivenessSubstep = 'baseline' | 'challenge';
+/**
+ * `'baseline'`/`'challenge'` are the facial (blink/turn) method's two steps
+ * — a plain frontal photo, then the randomized blink/turn shot, both via
+ * `capturePhoto`. `'qrCapture1'`/`'qrCapture2'` are the QR method's two
+ * steps instead — see `./qrLivenessChallenge.ts`'s doc comment for why the
+ * QR method needs its own two combined-capture substeps rather than reusing
+ * `'baseline'`/`'challenge'`'s shape: each one independently proves a face
+ * *and* a freshly-issued QR nonce were presented together, unlike the old
+ * single-shot QR decode this replaced. `RegisterScreen`'s invariant: `method
+ * === 'qr'` iff `substep` is one of the `qrCapture*` values — see
+ * `toggleLivenessMethod`, the only place `method` changes.
+ */
+type LivenessSubstep = 'baseline' | 'challenge' | 'qrCapture1' | 'qrCapture2';
+
+/**
+ * `'facial'` is the default blink/turn challenge (`challengePassed` below).
+ * `'qr'` is the accessible alternative for citizens who can't perform facial
+ * articulation (paralysis, certain facial differences) or are otherwise
+ * having trouble with the camera-based blink/turn detection — see
+ * `./qrLivenessChallenge.ts`'s doc comment for the full design. Selectable
+ * either way at any point during the liveness step — see `toggleLivenessMethod`,
+ * which resets `substep` (and discards any in-flight capture for the method
+ * being left) rather than trying to carry progress across methods, since
+ * the two methods' substeps aren't compatible with each other (see
+ * `LivenessSubstep`'s doc comment).
+ */
+type LivenessMethod = 'facial' | 'qr';
 
 interface LivenessUiState {
   substep: LivenessSubstep;
-  /** Only meaningful once `substep === 'challenge'` — chosen once per attempt so a static photo/video can't be pre-prepared for a known challenge. */
+  /** Only meaningful while `method === 'facial'` && `substep === 'challenge'` — chosen once per attempt so a static photo/video can't be pre-prepared for a known challenge. */
   challenge: LivenessChallenge;
+  method: LivenessMethod;
+  /**
+   * Only set while `method === 'qr'` — the current combined-capture
+   * substep's (`qrCapture1` or `qrCapture2`) nonce/expiry. Regenerated on
+   * every switch to QR, on every failed/expired attempt, and again between
+   * `qrCapture1` and `qrCapture2` themselves (each substep gets its own
+   * fresh nonce — see `./qrLivenessChallenge.ts`'s doc comment for why that
+   * matters).
+   */
+  qrSession: QrChallengeSession | null;
   error: string | null;
   capturing: boolean;
 }
@@ -173,7 +220,14 @@ export default function RegisterScreen({ navigation }: Props) {
       throw new Error('Camera permission is required to verify your face and liveness.');
     }
     baselineUriRef.current = null;
-    setLivenessUi({ substep: 'baseline', challenge: pickRandomChallenge(), error: null, capturing: false });
+    setLivenessUi({
+      substep: 'baseline',
+      challenge: pickRandomChallenge(),
+      method: 'facial',
+      qrSession: null,
+      error: null,
+      capturing: false,
+    });
     try {
       return await new Promise<{ faceMatched: boolean; matchSkippedReason?: string }>((resolve, reject) => {
         livenessResolveRef.current = resolve;
@@ -187,11 +241,61 @@ export default function RegisterScreen({ navigation }: Props) {
   }
 
   /**
-   * The baseline shot only gates on eyes-open/frontal-angle; the challenge
-   * shot's face-match comparison against the passport's DG2 photo happens
-   * here too (using the baseline capture, not the challenge one — a
-   * frontal, eyes-open frame is what the embedding model expects, see
-   * `FaceMatchModule.kt`), once liveness itself has already passed.
+   * Switches the liveness method between the default blink/turn check and
+   * the QR-code alternative — see `LivenessMethod`'s doc comment. Selectable
+   * at any point during the liveness step. Unlike before this fix, the two
+   * methods no longer share a substep shape (`LivenessSubstep`'s doc
+   * comment), so switching always resets `substep` to that method's first
+   * step rather than trying to carry progress across — a mid-flight
+   * `baseline` capture becomes meaningless once the QR method's own
+   * combined-capture requirement replaces it, and vice versa. Any capture
+   * already sitting in `baselineUriRef` (a passed facial baseline, waiting
+   * on the challenge substep) is discarded when leaving the facial method,
+   * since nothing will ever consume it now — see `handleLivenessCapture`'s
+   * mismatch-retry cleanup for the same reasoning applied elsewhere.
+   */
+  function toggleLivenessMethod() {
+    if (!livenessUi) return;
+    if (livenessUi.method === 'facial') {
+      if (baselineUriRef.current) {
+        deleteCaptureFile(baselineUriRef.current);
+        baselineUriRef.current = null;
+      }
+      setLivenessUi({
+        ...livenessUi,
+        method: 'qr',
+        substep: 'qrCapture1',
+        qrSession: createQrChallengeSession(),
+        error: null,
+      });
+    } else {
+      setLivenessUi({
+        ...livenessUi,
+        method: 'facial',
+        substep: 'baseline',
+        qrSession: null,
+        challenge: pickRandomChallenge(),
+        error: null,
+      });
+    }
+  }
+
+  /**
+   * Facial method: the baseline shot gates on eyes-open/frontal-angle, then
+   * the challenge shot proves temporal freshness via blink/turn — the
+   * face-match comparison against the passport's DG2 photo then uses the
+   * *baseline* capture (a frontal, eyes-open frame is what the embedding
+   * model expects, see `FaceMatchModule.kt`), once the challenge has passed.
+   *
+   * QR method: two sequential combined face+QR captures
+   * (`captureFaceAndQr`/`combinedCapturePassed`), each against its own
+   * freshly-issued `qrSession` — see `./qrLivenessChallenge.ts`'s doc
+   * comment for why both a face and a fresh nonce must appear together, in
+   * each of two challenged moments, rather than reusing a single earlier
+   * baseline shot the way the facial method's `matchAgainstPassport` call
+   * does. Unlike the facial method, the face-match comparison here uses the
+   * *second* combined capture, not a separate baseline — see the
+   * `qrCapture2` branch below.
    */
   async function handleLivenessCapture() {
     if (!livenessUi || livenessUi.capturing) return;
@@ -209,34 +313,91 @@ export default function RegisterScreen({ navigation }: Props) {
           return;
         }
         baselineUriRef.current = photo.uri;
-        setLivenessUi({ substep: 'challenge', challenge: livenessUi.challenge, error: null, capturing: false });
+        setLivenessUi({ ...livenessUi, substep: 'challenge', error: null, capturing: false });
         return;
       }
-      const photo = await capturePhoto(livenessUi.challenge);
-      if (!challengePassed(livenessUi.challenge, photo)) {
-        // Same reasoning as the baseline branch above — this failed challenge shot
-        // is never reused, so clean it up now rather than leaving it for the next
-        // app-launch sweep. Note: only this challenge shot, not baselineUriRef.current
-        // — the passed baseline is still needed for the eventual matchAgainstPassport call.
-        await deleteCaptureFile(photo.uri);
-        setLivenessUi({ ...livenessUi, capturing: false, error: "That didn't register — try again." });
-        return;
+      if (livenessUi.substep === 'qrCapture1' || livenessUi.substep === 'qrCapture2') {
+        if (!livenessUi.qrSession) {
+          // Shouldn't happen — toggleLivenessMethod and the qrCapture1 branch below
+          // always set one before this substep can be reached — but stay defensive
+          // rather than calling captureFaceAndQr with nothing to validate against.
+          setLivenessUi({ ...livenessUi, capturing: false, error: 'No active code — switch methods again to get a new one.' });
+          return;
+        }
+        let captured: CapturedFaceAndQr;
+        try {
+          captured = await captureFaceAndQr();
+        } catch {
+          setLivenessUi({
+            ...livenessUi,
+            capturing: false,
+            error: "Couldn't capture — make sure your face and the code are both fully in view, then try again.",
+          });
+          return;
+        }
+        const passed = combinedCapturePassed(livenessUi.qrSession, captured.qrText, baselinePassed(captured));
+        if (!passed) {
+          // Same reasoning as the facial branches: a failed shot is never reused, so
+          // clean it up now. A fresh nonce is issued regardless of which half failed
+          // (face or code) — see qrLivenessChallenge.ts's doc comment on why sessions
+          // are never reused across attempts.
+          await deleteCaptureFile(captured.uri);
+          setLivenessUi({
+            ...livenessUi,
+            qrSession: createQrChallengeSession(),
+            capturing: false,
+            error: 'Make sure your face is clearly visible with both eyes open while showing the code, then try again.',
+          });
+          return;
+        }
+        if (livenessUi.substep === 'qrCapture1') {
+          // First combined capture passed both checks — it's never the frame that
+          // gets matched against the passport (that's qrCapture2's job below), so
+          // discard it and move on with a brand-new nonce for the second capture.
+          await deleteCaptureFile(captured.uri);
+          setLivenessUi({
+            ...livenessUi,
+            substep: 'qrCapture2',
+            qrSession: createQrChallengeSession(),
+            capturing: false,
+            error: null,
+          });
+          return;
+        }
+        // qrCapture2 passed — this is the frame matchAgainstPassport compares against
+        // the passport's DG2 photo, replacing the old (disconnected) baseline reuse.
+        baselineUriRef.current = captured.uri;
+        // Fall through to the shared face-match step below, same as the facial method.
+      } else {
+        // substep === 'challenge' (facial method only — see LivenessSubstep's doc comment).
+        const photo = await capturePhoto(livenessUi.challenge);
+        if (!challengePassed(livenessUi.challenge, photo)) {
+          // Same reasoning as the baseline branch above — this failed challenge shot
+          // is never reused, so clean it up now rather than leaving it for the next
+          // app-launch sweep. Note: only this challenge shot, not baselineUriRef.current
+          // — the passed baseline is still needed for the eventual matchAgainstPassport call.
+          await deleteCaptureFile(photo.uri);
+          setLivenessUi({ ...livenessUi, capturing: false, error: "That didn't register — try again." });
+          return;
+        }
       }
       const dg2 = rawPassport?.dg2 ?? new Uint8Array(0);
       const dg2MimeType = rawPassport?.dg2MimeType ?? '';
       const match = await matchAgainstPassport(dg2, dg2MimeType, baselineUriRef.current!);
       // A real mismatch must not silently let registration continue. Mirror
-      // the challenge-failure branch above: reset back to the baseline
-      // substep with an error and don't resolve runLivenessGate()'s promise,
-      // so `start()` simply never proceeds past `await runLivenessGate()`
-      // until this passes (or is legitimately skipped) — no separate gate
-      // needed in `start()` itself. See faceMatchGating.ts for what counts
-      // as a block vs. a legitimate skip.
+      // the challenge-failure branch above: reset back to the first substep
+      // with an error and don't resolve runLivenessGate()'s promise, so
+      // `start()` simply never proceeds past `await runLivenessGate()` until
+      // this passes (or is legitimately skipped) — no separate gate needed
+      // in `start()` itself. See faceMatchGating.ts for what counts as a
+      // block vs. a legitimate skip.
       if (shouldBlockOnFaceMismatch(match)) {
         baselineUriRef.current = null;
         setLivenessUi({
-          substep: 'baseline',
+          substep: livenessUi.method === 'qr' ? 'qrCapture1' : 'baseline',
           challenge: pickRandomChallenge(),
+          method: livenessUi.method,
+          qrSession: livenessUi.method === 'qr' ? createQrChallengeSession() : null,
           error: "That doesn't look like a match for your passport photo. Please try again.",
           capturing: false,
         });
@@ -262,15 +423,18 @@ export default function RegisterScreen({ navigation }: Props) {
   }, []);
 
   // Mirrors the cleanup above for the liveness step: if the user abandons
-  // registration after the baseline shot has passed (so it's held in
-  // baselineUriRef, see handleLivenessCapture) but before finishing the
-  // challenge substep, that file would otherwise never reach
-  // matchAgainstPassport's sweep and would sit on disk until the next app
-  // launch's startup sweep. `baselineUriRef.current` is read at unmount
-  // time (not captured by this closure), so it reflects whatever the flow
-  // last set it to. deleteCaptureFile is a no-op if the ref is already
-  // null (never captured, or already consumed by a completed match) or
-  // points to a file already swept by matchAgainstPassport's own finally.
+  // registration after the frame that will eventually be matched against
+  // the passport has already been captured and passed its own checks (the
+  // facial method's baseline shot, or the QR method's second combined
+  // capture — either way it's held in baselineUriRef, see
+  // handleLivenessCapture) but before the flow reaches matchAgainstPassport,
+  // that file would otherwise never reach matchAgainstPassport's sweep and
+  // would sit on disk until the next app launch's startup sweep.
+  // `baselineUriRef.current` is read at unmount time (not captured by this
+  // closure), so it reflects whatever the flow last set it to.
+  // deleteCaptureFile is a no-op if the ref is already null (never
+  // captured, or already consumed by a completed match) or points to a
+  // file already swept by matchAgainstPassport's own finally.
   useEffect(() => {
     return () => {
       if (baselineUriRef.current) {
@@ -320,17 +484,35 @@ export default function RegisterScreen({ navigation }: Props) {
       setRawPassport(raw);
       setStep('liveness');
       await writeRegistrationStatus(keypair.address, { stage: 'PassportScanned' });
+      // Device/app-integrity attestation (defense-in-depth signal alongside
+      // the eventual ZK proof submission — see ../chain/deviceIntegrity.ts's
+      // doc comment for the full design note, including why nothing verifies
+      // this yet). Best-effort and never throws, so it's safe to kick off
+      // here without awaiting it: the only place its result is actually
+      // consumed is the `LivenessVerified` write below, so starting it now
+      // and awaiting it later (after the liveness capture UI has already
+      // rendered and the citizen has finished it) means a slow/hung network
+      // call here can never leave the liveness screen looking frozen with no
+      // feedback — it was previously `await`ed right here, blocking
+      // `runLivenessGate()` (and therefore the capture UI itself) from ever
+      // showing until this resolved.
+      const integrityPromise = captureDeviceIntegritySignal();
       // Real as of this session (../native/faceMatch.ts + the capture UI
       // rendered below, gated on `step === 'liveness' && livenessUi`) — a
       // 2-shot randomized challenge-response (frontal-eyes-open baseline,
-      // then blink or turn) read via ML Kit, plus a MobileFaceNet embedding
-      // comparison against `raw.dg2`. See runLivenessGate()'s doc comment
-      // and docs/project/changelog/087.md for the full design/limitations.
+      // then blink/turn or, if the citizen switches methods, the QR-code
+      // alternate challenge — see ./qrLivenessChallenge.ts) read via ML Kit,
+      // plus a MobileFaceNet embedding comparison against `raw.dg2`. See
+      // runLivenessGate()'s doc comment and docs/project/changelog/087.md
+      // for the full design/limitations.
       const { faceMatched, matchSkippedReason } = await runLivenessGate();
+      const integrityResult = await integrityPromise;
       await writeRegistrationStatus(keypair.address, {
         stage: 'LivenessVerified',
         faceMatched,
         ...(matchSkippedReason ? { matchSkippedReason } : {}),
+        deviceIntegrityCaptured: integrityResult.captured,
+        ...(!integrityResult.captured ? { deviceIntegrityReason: integrityResult.reason } : {}),
       });
       setStep('proving');
       // Real as of this session (../chain/sodParser.ts) — parses the SOD's
@@ -438,6 +620,25 @@ export default function RegisterScreen({ navigation }: Props) {
 
       {step === 'idle' && (
         <>
+          <View style={s.noticeBox}>
+            <Text style={s.noticeTitle}>Registration can't finish yet</Text>
+            <Text style={s.noticeText}>
+              You can scan your passport and complete face verification below, but the last
+              step — turning that into a proof the chain accepts — isn't built yet, so
+              registration won't actually complete in this version. If you'd rather not spend the
+              few minutes that takes right now, check back in a future update.
+            </Text>
+          </View>
+          <View style={s.noticeBox}>
+            <Text style={s.noticeTitle}>What you'll need</Text>
+            <Text style={s.noticeText}>
+              You'll need a valid, unexpired passport with an electronic chip (look for this
+              symbol on the cover: 📔) from a supported country to register — a smaller allowlist
+              of countries works today, not every country yet. If you don't hold a passport like
+              this, you won't be able to register right now. We're working to expand this over
+              time.
+            </Text>
+          </View>
           <View style={s.mrzForm}>
             <Text style={s.mrzLabel}>Passport number</Text>
             <TextInput
@@ -472,13 +673,22 @@ export default function RegisterScreen({ navigation }: Props) {
                 {dateOfExpiry ? formatDate(dateOfExpiry) : 'Select date of expiry'}
               </Text>
             </TouchableOpacity>
+            <Text style={s.expiryNote}>
+              Your passport must not be expired to register. Enter its real expiry date here even
+              if that date has already passed — we'll tell you if it's a problem.
+            </Text>
 
             {activePicker && (
               <DateTimePicker
                 value={(activePicker === 'dob' ? dateOfBirth : dateOfExpiry) ?? TODAY}
                 mode="date"
                 display="default"
-                minimumDate={activePicker === 'dob' ? MIN_BIRTH_DATE : TODAY}
+                // Deliberately no minimumDate on the expiry picker: a citizen whose
+                // passport already expired still needs to be able to scroll to and
+                // enter their real (past) expiry date. Chain-side proof/registration
+                // logic is what actually determines validity, not this picker — see
+                // the expiryNote text above.
+                minimumDate={activePicker === 'dob' ? MIN_BIRTH_DATE : undefined}
                 maximumDate={activePicker === 'dob' ? TODAY : MAX_EXPIRY_DATE}
                 onChange={(_event: DateTimePickerEvent, selected?: Date) => {
                   const picker = activePicker;
@@ -530,13 +740,24 @@ export default function RegisterScreen({ navigation }: Props) {
           <View style={s.cameraFrame}>
             <FaceCameraView style={s.cameraPreview} />
           </View>
-          <Text style={s.livenessInstruction}>
-            {livenessUi.substep === 'baseline'
-              ? 'Look straight at the camera with both eyes open.'
-              : livenessUi.challenge === 'blink'
-                ? 'Now blink.'
-                : 'Now turn your head to the side.'}
-          </Text>
+          {(livenessUi.substep === 'qrCapture1' || livenessUi.substep === 'qrCapture2') && livenessUi.qrSession ? (
+            <>
+              <Text style={s.livenessInstruction}>
+                {livenessUi.substep === 'qrCapture1'
+                  ? "Keep your face in view and display this code — on another device's screen, or printed — held up to the camera above."
+                  : 'Almost there — a fresh code is shown below. Keep your face in view and hold it up again.'}
+              </Text>
+              <QrCode value={encodeQrPayload(livenessUi.qrSession)} />
+            </>
+          ) : (
+            <Text style={s.livenessInstruction}>
+              {livenessUi.substep === 'baseline'
+                ? 'Look straight at the camera with both eyes open.'
+                : livenessUi.challenge === 'blink'
+                  ? 'Now blink.'
+                  : 'Now turn your head to the side.'}
+            </Text>
+          )}
           {livenessUi.error && <Text style={s.livenessError}>{livenessUi.error}</Text>}
           <TouchableOpacity
             style={[s.btn, livenessUi.capturing && s.btnDisabled]}
@@ -551,6 +772,23 @@ export default function RegisterScreen({ navigation }: Props) {
               <Text style={s.btnText}>Capture</Text>
             )}
           </TouchableOpacity>
+          {isQrChallengeScanAvailable() && (
+            <TouchableOpacity
+              style={s.altMethodLink}
+              onPress={toggleLivenessMethod}
+              disabled={livenessUi.capturing}
+              accessibilityRole="button"
+              accessibilityLabel={
+                livenessUi.method === 'facial' ? 'Switch to the QR code check' : 'Switch to the face check'
+              }
+            >
+              <Text style={s.altMethodLinkText}>
+                {livenessUi.method === 'facial'
+                  ? "Having trouble with the blink/turn check? Try this instead"
+                  : 'Use the face check instead'}
+              </Text>
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
@@ -591,6 +829,16 @@ const s = StyleSheet.create({
   stepLabel: { fontSize: 15, fontWeight: '600', color: colors.textMuted, marginBottom: 2 },
   stepLabelActive: { color: colors.textPrimary },
   stepDetail: { fontSize: 12, color: colors.textDim, lineHeight: 17 },
+  noticeBox: {
+    backgroundColor: colors.warningBg,
+    borderWidth: 1,
+    borderColor: colors.warningBorder,
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 20,
+  },
+  noticeTitle: { fontSize: 14, fontWeight: '700', color: colors.warningTextStrong, marginBottom: 6 },
+  noticeText: { fontSize: 13, color: colors.warningTextStrong, lineHeight: 18 },
   btn: {
     backgroundColor: colors.accent,
     paddingVertical: 16,
@@ -626,6 +874,7 @@ const s = StyleSheet.create({
   dateValue: { fontSize: 15, color: colors.textPrimary },
   datePlaceholder: { fontSize: 15, color: colors.textDim },
   mrzHint: { fontSize: 11, color: colors.textDim, lineHeight: 15, marginTop: 10 },
+  expiryNote: { fontSize: 12, color: colors.warning, lineHeight: 16, marginTop: 6 },
   scanResult: { fontSize: 12, color: colors.success, textAlign: 'center', marginBottom: 12 },
   btnDisabled: { backgroundColor: colors.textFaint },
   livenessBox: { alignItems: 'center', gap: 16 },
@@ -641,4 +890,6 @@ const s = StyleSheet.create({
   cameraPreview: { width: '100%', height: '100%' },
   livenessInstruction: { fontSize: 16, fontWeight: '600', color: colors.textPrimary, textAlign: 'center' },
   livenessError: { fontSize: 13, color: colors.danger, textAlign: 'center' },
+  altMethodLink: { marginTop: 4, padding: 4 },
+  altMethodLinkText: { fontSize: 13, color: colors.accent, textAlign: 'center', textDecorationLine: 'underline' },
 });

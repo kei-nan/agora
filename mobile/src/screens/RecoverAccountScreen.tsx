@@ -43,6 +43,7 @@ import {
   hasCameraPermission,
   requestCameraPermission,
   capturePhoto,
+  deleteCaptureFile,
   matchAgainstPassport,
   CapturedPhoto,
   LivenessChallenge,
@@ -183,6 +184,23 @@ export default function RecoverAccountScreen({ navigation }: Props) {
     };
   }, []);
 
+  // Mirrors RegisterScreen.tsx's identical cleanup effect: if the user abandons
+  // recovery after the baseline shot has passed (so it's held in baselineUriRef,
+  // see handleLivenessCapture) but before finishing the challenge substep, that
+  // file would otherwise never reach matchAgainstPassport's sweep and would sit
+  // on disk until the next app launch's startup sweep. `baselineUriRef.current`
+  // is read at unmount time (not captured by this closure), so it reflects
+  // whatever the flow last set it to. deleteCaptureFile is a no-op if the ref is
+  // already null (never captured, or already consumed by a completed match) or
+  // points to a file already swept by matchAgainstPassport's own finally.
+  useEffect(() => {
+    return () => {
+      if (baselineUriRef.current) {
+        deleteCaptureFile(baselineUriRef.current);
+      }
+    };
+  }, []);
+
   async function handleLivenessCapture() {
     if (!livenessUi || livenessUi.capturing) return;
     setLivenessUi({ ...livenessUi, capturing: true, error: null });
@@ -190,6 +208,12 @@ export default function RecoverAccountScreen({ navigation }: Props) {
       if (livenessUi.substep === 'baseline') {
         const photo = await capturePhoto('baseline');
         if (!baselinePassed(photo)) {
+          // This shot failed the liveness heuristic and will never be passed to
+          // matchAgainstPassport (whose own finally-block sweep is the only other
+          // thing that ever cleans these up) — the retry below captures a brand-new
+          // file, so this one is now permanently orphaned unless deleted here.
+          // Mirrors RegisterScreen.tsx's identical branch.
+          await deleteCaptureFile(photo.uri);
           setLivenessUi({ ...livenessUi, capturing: false, error: 'Look straight at the camera with both eyes open, then try again.' });
           return;
         }
@@ -199,6 +223,12 @@ export default function RecoverAccountScreen({ navigation }: Props) {
       }
       const photo = await capturePhoto(livenessUi.challenge);
       if (!challengePassed(livenessUi.challenge, photo)) {
+        // Same reasoning as the baseline branch above — this failed challenge shot
+        // is never reused, so clean it up now rather than leaving it for the next
+        // app-launch sweep. Note: only this challenge shot, not baselineUriRef.current
+        // — the passed baseline is still needed for the eventual matchAgainstPassport call.
+        // Mirrors RegisterScreen.tsx's identical branch.
+        await deleteCaptureFile(photo.uri);
         setLivenessUi({ ...livenessUi, capturing: false, error: "That didn't register — try again." });
         return;
       }
@@ -401,6 +431,16 @@ export default function RecoverAccountScreen({ navigation }: Props) {
 
       {step === 'form' && (
         <>
+          <View style={s.noticeBox}>
+            <Text style={s.noticeTitle}>Recovery can't finish yet</Text>
+            <Text style={s.noticeText}>
+              You can scan your passport and complete face verification below, but the last
+              step — turning that into a proof the chain accepts — isn't built yet, so recovery
+              won't actually complete in this version. If you'd rather not spend the few minutes
+              that takes right now, check back in a future update. Either way, your old account
+              will not be touched.
+            </Text>
+          </View>
           <View style={s.mrzForm}>
             <Text style={s.mrzLabel}>Passport number</Text>
             <TextInput
@@ -435,13 +475,22 @@ export default function RecoverAccountScreen({ navigation }: Props) {
                 {dateOfExpiry ? formatDate(dateOfExpiry) : 'Select date of expiry'}
               </Text>
             </TouchableOpacity>
+            <Text style={s.expiryNote}>
+              Your passport must not be expired to recover your account. Enter its real expiry
+              date here even if that date has already passed — we'll tell you if it's a problem.
+            </Text>
 
             {activePicker && (
               <DateTimePicker
                 value={(activePicker === 'dob' ? dateOfBirth : dateOfExpiry) ?? TODAY}
                 mode="date"
                 display="default"
-                minimumDate={activePicker === 'dob' ? MIN_BIRTH_DATE : TODAY}
+                // Deliberately no minimumDate on the expiry picker: a citizen whose
+                // passport already expired still needs to be able to scroll to and
+                // enter their real (past) expiry date. Chain-side proof/registration
+                // logic is what actually determines validity, not this picker — see
+                // the expiryNote text above.
+                minimumDate={activePicker === 'dob' ? MIN_BIRTH_DATE : undefined}
                 maximumDate={activePicker === 'dob' ? TODAY : MAX_EXPIRY_DATE}
                 onChange={(_event: DateTimePickerEvent, selected?: Date) => {
                   const picker = activePicker;
@@ -544,6 +593,16 @@ const s = StyleSheet.create({
   },
   warnTitle: { fontSize: 15, fontWeight: '700', color: colors.warningTextStrong, marginBottom: 10 },
   warnItem: { fontSize: 13, color: colors.warningTextStrong, lineHeight: 19, marginBottom: 8 },
+  noticeBox: {
+    backgroundColor: colors.warningBg,
+    borderWidth: 1,
+    borderColor: colors.warningBorder,
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 20,
+  },
+  noticeTitle: { fontSize: 14, fontWeight: '700', color: colors.warningTextStrong, marginBottom: 6 },
+  noticeText: { fontSize: 13, color: colors.warningTextStrong, lineHeight: 18 },
   stepList: { gap: 20, marginBottom: 40 },
   stepRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 14 },
   stepNum: {
@@ -593,6 +652,7 @@ const s = StyleSheet.create({
   dateValue: { fontSize: 15, color: colors.textPrimary },
   datePlaceholder: { fontSize: 15, color: colors.textDim },
   mrzHint: { fontSize: 11, color: colors.textDim, lineHeight: 15, marginTop: 10 },
+  expiryNote: { fontSize: 12, color: colors.warning, lineHeight: 16, marginTop: 6 },
   btnDisabled: { backgroundColor: colors.textFaint },
   livenessBox: { alignItems: 'center', gap: 16 },
   cameraFrame: {

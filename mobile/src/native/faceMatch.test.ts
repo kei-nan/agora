@@ -31,6 +31,13 @@ function fakeCaptureModule() {
       rightEyeOpenProbability: 0.9,
       headEulerAngleY: 2.5,
     })),
+    captureFaceAndQr: jest.fn(async () => ({
+      uri: 'file:///fake/qrcombined.jpg',
+      leftEyeOpenProbability: 0.9,
+      rightEyeOpenProbability: 0.9,
+      headEulerAngleY: 2.5,
+      qrText: 'agora-liveness-v1:0123456789abcdef0123456789abcdef',
+    })),
     deleteCaptureFile: jest.fn(async (_uri: string) => undefined),
   };
 }
@@ -110,6 +117,49 @@ describe('capturePhoto', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const native = require('react-native').NativeModules.FaceCaptureModule;
     expect(native.capturePhoto).toHaveBeenCalledWith('blink');
+  });
+});
+
+describe('captureFaceAndQr', () => {
+  it('throws instead of calling the native module when unavailable', async () => {
+    const mod = loadModule({ captureLinked: false, matchLinked: false });
+    await expect(mod.captureFaceAndQr()).rejects.toThrow(/not available/);
+  });
+
+  it('returns the native result verbatim, including the decoded QR text', async () => {
+    const mod = loadModule({ captureLinked: true, matchLinked: true });
+    const result = await mod.captureFaceAndQr();
+    expect(result).toEqual({
+      uri: 'file:///fake/qrcombined.jpg',
+      leftEyeOpenProbability: 0.9,
+      rightEyeOpenProbability: 0.9,
+      headEulerAngleY: 2.5,
+      qrText: 'agora-liveness-v1:0123456789abcdef0123456789abcdef',
+    });
+  });
+
+  it('surfaces a null qrText when the native side found no code, without throwing', async () => {
+    const mod = loadModule({ captureLinked: true, matchLinked: true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const native = require('react-native').NativeModules.FaceCaptureModule;
+    native.captureFaceAndQr.mockResolvedValueOnce({
+      uri: 'file:///fake/qrcombined-2.jpg',
+      leftEyeOpenProbability: -1,
+      rightEyeOpenProbability: -1,
+      headEulerAngleY: 0,
+      qrText: null,
+    });
+    const result = await mod.captureFaceAndQr();
+    expect(result.qrText).toBeNull();
+    expect(result.leftEyeOpenProbability).toBe(-1);
+  });
+
+  it('propagates a native rejection (e.g. camera not bound yet)', async () => {
+    const mod = loadModule({ captureLinked: true, matchLinked: true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const native = require('react-native').NativeModules.FaceCaptureModule;
+    native.captureFaceAndQr.mockRejectedValueOnce(new Error('CAMERA_NOT_READY'));
+    await expect(mod.captureFaceAndQr()).rejects.toThrow('CAMERA_NOT_READY');
   });
 });
 

@@ -17,7 +17,9 @@
  */
 import type * as RegistrationStateModule from './registrationState';
 
-const STATE_FILE_PATH = '/mock-documents/agora-registration-status.json';
+// Cache-tier, not documents-tier — see registrationState.ts's doc comment on
+// why this file deliberately moved off DocumentDirectoryPath.
+const STATE_FILE_PATH = '/mock-caches/agora-registration-status.json';
 
 function loadModule(): typeof RegistrationStateModule {
   jest.resetModules();

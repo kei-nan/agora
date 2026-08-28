@@ -293,6 +293,41 @@ export function publicInputsFromHex(hex: readonly string[]): Uint8Array[] {
   });
 }
 
+/**
+ * The device/app-integrity attestation captured alongside a registration
+ * submission (`../chain/deviceIntegrity.ts` — see that module's doc comment
+ * for the full design note on what it is, why it can't be self-verified, and
+ * exactly what a future verifier service would need to do with it).
+ *
+ * This is a **sibling** field, not a public input: unlike everything else in
+ * this file, it is never folded into the ZK proof's own public-input array
+ * or the proof bytes themselves — a modified client could fabricate any
+ * public input it likes, so cryptographically binding an integrity token
+ * into the circuit would not add real assurance without upstream ZKPassport
+ * circuit support this project does not control (a separate, likely-
+ * infeasible-without-upstream-support problem, already scoped elsewhere and
+ * out of scope here). Instead it's meant to travel *alongside*
+ * `RegisterCitizenParams` (`./identity.ts`) as ordinary extra call data, the
+ * same way `backing_commitment` sits next to `anchor` in the real
+ * `register_citizen` extrinsic today without being part of the proof.
+ *
+ * **Not wired into any live extrinsic call.** `pallet-identity`'s actual
+ * `register_citizen` (`pallets/pallet-identity/src/lib.rs`) has no matching
+ * argument yet — adding one is a pallet change (a new bounded-bytes field)
+ * that hasn't been made. This type exists so the mobile-side shape is
+ * defined and ready the moment that pallet change lands, without requiring
+ * another mobile-side change at that point — the same "mechanism built ahead
+ * of what makes it exercisable" staging this codebase already uses for
+ * `runtime/src/verifier.rs` verifying real proofs well ahead of any OPRF
+ * committee that could produce one.
+ */
+export interface DeviceIntegritySubmissionExtras {
+  /** Opaque token from Google's Play Integrity client library — see `../chain/deviceIntegrity.ts`. */
+  deviceIntegrityToken: string;
+  /** The base64url nonce the token was bound to; a verifier must check this against the token's own decoded nonce. */
+  deviceIntegrityNonceBase64: string;
+}
+
 /** Reads a 32-byte big-endian field element as a bigint. */
 export function fieldToBigInt(value: Uint8Array): bigint {
   if (value.length !== FIELD_ELEMENT_BYTES) {

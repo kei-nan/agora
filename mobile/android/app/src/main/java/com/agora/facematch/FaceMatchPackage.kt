@@ -11,13 +11,20 @@ import com.facebook.react.uimanager.ViewManager
  * (mobile/android/gradle.properties) — see `NfcPassportModule.kt`'s module
  * doc comment for why that matters here.
  *
+ * `QrChallengeModule` lives here too, alongside `FaceCaptureModule`/
+ * `FaceMatchModule`, even though it's a distinct feature (the QR-code
+ * alternate liveness challenge, see that module's doc comment) — it shares
+ * this package's live `<FaceCameraView>` camera preview
+ * (`FaceCaptureModule.currentImageCapture()`), so it belongs alongside the
+ * modules that actually own that preview rather than in a new package.
+ *
  * Registered manually in `MainApplication.kt` (autolinking doesn't apply to
  * modules that live inside this app's own source tree), mirroring
  * `NfcPassportPackage.kt`.
  */
 class FaceMatchPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
-    listOf(FaceCaptureModule(reactContext), FaceMatchModule(reactContext))
+    listOf(FaceCaptureModule(reactContext), FaceMatchModule(reactContext), QrChallengeModule(reactContext))
 
   override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
     listOf(FaceCameraViewManager())
