@@ -55,7 +55,9 @@ mod benchmarks {
 	) -> (BoundedVec<u8, ConstU32<4096>>, BoundedVec<[u8; 32], ConstU32<18>>) {
 		let persona_bytes = T::AccountIdToBytes::to_bytes(persona_account);
 		let public_inputs: BoundedVec<[u8; 32], ConstU32<18>> = BoundedVec::try_from(alloc::vec![
-			[0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],
+			[0u8; 32], [0u8; 32], [0u8; 32],
+			AGORA_ELECTIONS_SERVICE_SCOPE,
+			AGORA_ELECTIONS_DELEGATE_REG_SUBSCOPE,
 			delegate_persona_id,
 			persona_bytes,
 			[0u8; 32], [0u8; 32],

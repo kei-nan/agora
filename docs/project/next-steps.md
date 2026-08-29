@@ -453,12 +453,15 @@
     mobile app to all of it (new `backingNullifierEncoding.ts`/`backingTree.ts`/`backingState.ts`,
     `zkProving.ts`'s `proveDelegatePersona`/`proveBackingNullifier`, updated
     `governance.ts`/delegate screens). Verified per-commit: `cargo test -p pallet-elections`
-    59/59 (66/66 with `runtime-benchmarks`); `cargo test -p pallet-identity-zk` 141/141 as of
+    59/59 (66/66 with `runtime-benchmarks`) — re-verified 2026-08-29, now 67/67 (74/74 with
+    `runtime-benchmarks`, after fixing a benchmark-fixture scope-check bug the delegate-persona
+    wiring itself introduced without updating; see changelog #097); `cargo test -p
+    pallet-identity-zk` 141/141 as of
     `bae1cbd`'s Merkle-tree work (including 14 new tests checked against an independently-written
-    recursive reference implementation) — re-verified 2026-08-25, now 148/148 after further
+    recursive reference implementation) — re-verified 2026-08-29, now 152/152 after further
     fixes landed since (see item 14 below); `nargo test --workspace` 50/50 for the circuits; `npx
     tsc --noEmit` clean and `npx jest` 297/297 in `mobile/` as of this commit — re-verified
-    2026-08-25, now 300/300 (see item 2 in Current State above).
+    2026-08-29, now 356/356 (see item 2 in Current State above).
     **Still not real end-to-end**: like every other proof-submitting call in this codebase, both
     schemes remain gated on the standing OPRF committee blocker (item 1) — no genuine on-device
     proof can be produced without it — and the submission-metadata-linkability gap `CLAUDE.md`'s

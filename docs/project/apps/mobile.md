@@ -7,8 +7,8 @@ anywhere in the repo).
 
 ### Current status (see `docs/project/changelog/080.md` for the full verification)
 
-- `cd mobile && npm install` then `npm test`: **21 suites / 300 tests, all passing** (re-verified
-  2026-08-25 via `npx jest`) — grown well past the 4 suites / 77 tests changelog #080 originally
+- `cd mobile && npm install` then `npm test`: **26 suites / 356 tests, all passing** (re-verified
+  2026-08-29 via `npx jest`) — grown well past the 4 suites / 77 tests changelog #080 originally
   verified (`sodParser`, `zkProving`, `proofEncoding`, `certificateTree` plus, since then,
   governance-screen fixes, chain-call argument tests, Keystore-backed signing coverage, and — most
   recently — recover-account, delegate-persona/backing-privacy, and IPFS content-fetching
