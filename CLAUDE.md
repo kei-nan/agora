@@ -150,7 +150,11 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   relayer/mixnet, or unsigned extrinsics validated by ZK group-membership instead of a signature)
   is a genuine standalone-infrastructure project, not a local fix to any one pallet.
 - Liquid democracy: direct vote OR delegate (transitive, revocable, per-topic)
-- Delegation caps: no single delegate can hold >X% of votes
+- Delegation caps: no single delegate can hold >X% of votes — enforced per `topic_id`
+  (`pallet-voting`'s `DelegationCap`), and `topic_id_of` derives that id from a referendum's own
+  content hash, not a durable category, so the cap is effectively per-bill/per-referendum, not an
+  aggregate system-wide ceiling: a delegate can legally sit at the cap on every open referendum
+  simultaneously (see `topic_id_of`'s own doc comment in `pallets/pallet-voting/src/lib.rs`)
 - Petitions: citizen signatures → threshold → votable referendum
 - Batched voting epochs (Switzerland model) — not continuous voting
 
@@ -200,7 +204,10 @@ All enforced by smart contract boundaries:
   minority collective (30–40%) for mainnet") and `pallet_elections::Config::ConstitutionalOrigin`
   ("Production should wire this to a dedicated constitutional collective with a 2/3 supermajority
   threshold") are both honestly commented as dev-only `EnsureRoot<AccountId>` stand-ins pending
-  that mainnet wiring.
+  that mainnet wiring. This isn't an abstract future concern today: `runtime/src/
+  genesis_config_presets.rs:47` seeds a real `SudoConfig { key: Some(root) }`, and `pallet_sudo`
+  is wired at `pallet_index(6)` in `runtime/src/lib.rs` — so "Root" currently resolves to whoever
+  holds that one genesis key, a literal single private key, not a collective.
 
 ## Court System (AI-First)
 - Level 0: AI judge (instant, cites specific laws, reasoning stored on IPFS hash on-chain)
@@ -385,7 +392,12 @@ authoritative version of this list; treat this section as a summary, not the sou
    double-approval and non-members. Membership is root-gated via
    `add_oracle_member`/`remove_oracle_member`. Call indices and argument shapes are unchanged, so
    `court-oracle` needed no code changes beyond updated doc comments describing the new
-   one-instance-per-council-member deployment model. See `docs/project/pallets/courts.md` and
+   one-instance-per-council-member deployment model. The same fix also closed an identical
+   single-point-of-failure gap on manual admin overrides: `invalidate_law`/`suspend_citizen`/
+   `restore_citizen_rights` now go through a parallel `PendingAdminAction`/
+   `EnsureOracleCouncilApproved` propose-then-co-sign mechanism in `pallets/pallet-courts/src/
+   lib.rs`, mirroring the ruling-approval flow rather than being gated by a single account. See
+   `docs/project/pallets/courts.md` and
    `court-oracle/README.md` and `docs/project/next-steps.md` item 10 for the full accounting.
 3. **Mobile app native build** — `mobile/android/` and its NFC module already exist and are committed;
    blocked on (a) no JDK/Android SDK in this environment to run `./gradlew assembleDebug`, and

@@ -53,7 +53,8 @@ Chain reads:
 - `src/chain/governance.ts` — `fetchProposals`, `fetchLaws`, `fetchPetitions`, `voteOnReferendum`, `signPetition`, `getDelegation`, `delegateVote`, `revokeDelegation`
 - `src/chain/voting.ts` — MACI proposal submission, budget allocation
 - `src/chain/constitution.ts` — petition submission and amendment
-- `src/chain/courts.ts` — case filing, appeal, jury vote
+- `src/chain/courts.ts` — case filing (including the `TierConflict` case type and anonymized,
+  nullifier-based filers for `LawChallenge`/`TreasuryDispute`/`TierConflict`), appeal, jury vote
 
 Screens:
 - `src/screens/HomeScreen.tsx` — citizen status, chain stats, quick nav
@@ -66,6 +67,22 @@ Screens:
   `src/native/nfcPassportReader`) and real SOD/DG1/DG15 parsing (`buildCircuitInputs` in
   `chain/sodParser.ts`); "stub" understates it — it only stops short at proof generation,
   throwing `NotImplementedError` once it reaches that step
+- `src/screens/qrLivenessChallenge.ts` — session/payload logic for the accessible QR-code
+  liveness alternative to the blink/turn challenge, for citizens who can't perform facial
+  articulation (commit `261941e`); RN-free, unit-tested directly
+- `src/screens/qrCodeMatrix.ts` — turns text into a QR module matrix (`qrcode-generator`), no
+  Canvas/DOM/SVG needed, rendered by `components/QrCode.tsx`; RN-free, unit-tested directly
+- `src/screens/faceMatchGating.ts` — pure eligibility logic (match/liveness gate a capture
+  result against) pulled out of `RegisterScreen.tsx` so it's unit-testable without RN
+
+Native module bridges (`src/native/`):
+- `faceMatch.ts` — bridge to `com.agora.facematch`'s MobileFaceNet embedding comparison + 2-shot
+  blink/turn liveness capture
+- `qrChallenge.ts` — bridge to `com.agora.facematch.QrChallengeModule`, the decode half of the
+  QR-code liveness challenge (feeds `screens/qrLivenessChallenge.ts`'s session logic)
+- `playIntegrity.ts` — bridge to `com.agora.integrity.PlayIntegrityModule` (commit `261941e`):
+  requests a Play Integrity attestation token as a defense-in-depth signal alongside
+  registration; client-side capture only, nothing verifies the token server-side yet
 
 `src/App.tsx`:
 - Bottom tab navigator (Home / Proposals / Laws / Petitions / Delegate)

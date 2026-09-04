@@ -234,7 +234,21 @@
     thresholds are unvalidated placeholders (no real calibration corpus). The liveness check is
     2-shot-still, not continuous video — a prepared attacker with video of the real person could
     plausibly defeat it, a documented residual risk, not an oversight. iOS has no equivalent
-    since `ios/` itself doesn't exist. See `docs/project/changelog/087.md` for the full record.
+    since `ios/` itself doesn't exist. **Update, 2026-08-28 (commit `261941e`)**: a second,
+    accessible liveness path was added for citizens who can't perform facial articulation
+    (blink/turn) — a QR-code challenge (`qrLivenessChallenge.ts`/`qrCodeMatrix.ts`, native
+    `QrChallengeModule.kt`) captures the face-match photo and a freshly-displayed QR nonce in
+    the same frame, twice in sequence with a fresh nonce each time
+    (`combinedCapturePassed`), so a static photo alone can't pass either path. The same commit
+    fixed the native capture callbacks' main-thread-blocking `Tasks.await()` call, which had
+    made QR decoding fail unconditionally, and added best-effort Android Play Integrity
+    attestation capture alongside registration (`playIntegrity.ts`/`PlayIntegrityModule.kt`,
+    via `deviceIntegrity.ts`) — a client-side signal only; nothing in this codebase verifies
+    the token server-side yet, matching how this project already stages other proving
+    infrastructure. Neither addition has been compiled or run — same standing no-JDK/no-SDK
+    limitation as the rest of the native code. See `docs/project/changelog/098.md` for the
+    full record. `npm test`: 356/356 passing across 26 suites (confirmed 2026-09-04 via
+    `npx jest` in `mobile/`, up from the 210/210 this item previously cited).
 13. [PARTIAL] **Persona-based review (security researcher / citizen / product manager) + two
     fixes, 2026-08-20** — user-requested, not `/project-review`. Two concrete security fixes
     landed: (a) **post-emergency cooldown** in both `pallet-emergency-council` and
