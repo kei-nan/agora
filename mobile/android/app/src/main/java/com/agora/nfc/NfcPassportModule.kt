@@ -210,12 +210,21 @@ class NfcPassportModule(reactContext: ReactApplicationContext) : ReactContextBas
         // constructor from PassportService.java source; it delegates to the
         // 6-arg overload using NORMAL_MAX_TRANCEIVE_LENGTH as the PACE
         // tranceive length, which is irrelevant here since PACE isn't used.
+        //
+        // shouldCheckMAC = true (security-review fix): BAC's secure-messaging
+        // channel MACs every response APDU; verifying that MAC is one of BAC's
+        // actual integrity protections against a tampering/relaying reader
+        // sitting between this phone and the chip. This was previously `false`
+        // with no justification anywhere in this file, this repo's docs, or
+        // (checked externally) JMRTD's own docs/issue history — no known
+        // chip-compatibility reason turned up for disabling it, so there is no
+        // reason to accept a weaker read than BAC already provides.
         val passportService = PassportService(
           cardService,
           PassportService.NORMAL_MAX_TRANCEIVE_LENGTH,
           PassportService.DEFAULT_MAX_BLOCKSIZE,
           /* isSFIEnabled = */ false,
-          /* shouldCheckMAC = */ false,
+          /* shouldCheckMAC = */ true,
         )
         passportService.open()
         // As of JMRTD 0.4.10+, open() no longer auto-selects the passport

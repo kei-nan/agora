@@ -137,17 +137,21 @@ describe('getOrCreateKeystoreKeypair', () => {
     expect(keypairB.address).toBe(addressA);
   });
 
-  it('caches within a process — a second call in the same load does not touch the native module again', async () => {
+  it('does NOT cache the decrypted keypair across calls — a second call re-decrypts (finding-1 fix)', async () => {
+    // Security-review finding 1: an earlier version cached the decrypted `KeyringPair` (i.e. the
+    // plaintext seed) for the life of the process. The fix decrypts fresh on every call instead,
+    // so the plaintext secret is never held alive longer than a single call's scope — this test
+    // pins that behavior down so it can't silently regress back to the old caching.
     const mod = loadModule();
     await mod.getOrCreateKeystoreKeypair();
     await mod.getOrCreateKeystoreKeypair();
 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const native = require('react-native').NativeModules.KeystoreSigningModule;
-    // One encrypt (first-use generation) and zero further decrypts, since
-    // the second call should hit the in-memory cache, not disk again.
+    // One encrypt (first-use generation persists the seed), and one decrypt per call thereafter —
+    // the second call must hit the native module again rather than reusing an in-memory pair.
     expect(native.encryptSecret).toHaveBeenCalledTimes(1);
-    expect(native.decryptSecret).not.toHaveBeenCalled();
+    expect(native.decryptSecret).toHaveBeenCalledTimes(1);
   });
 
   it('treats a corrupt on-disk file as "no wallet on file" and generates a fresh one instead of throwing', async () => {

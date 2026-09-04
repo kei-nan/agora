@@ -159,13 +159,42 @@ async function loadOrCreateSeed(filePath: string): Promise<Uint8Array> {
 }
 
 /**
- * Builds an independent, cached "load or create a Keystore-backed keypair at this file path"
- * getter. Each of {@link getOrCreateKeystoreKeypair}/{@link getOrCreateDelegatePersonaKeypair}
- * is one call to this, closed over its own file path and its own in-memory promise cache — the
- * two never share state.
+ * Builds an independent "load or create a Keystore-backed keypair at this file path" getter.
+ * Each of {@link getOrCreateKeystoreKeypair}/{@link getOrCreateDelegatePersonaKeypair} is one
+ * call to this, closed over its own file path and its own in-flight-request de-duplication —
+ * the two never share state.
+ *
+ * ## Deliberately does NOT cache the decrypted `KeyringPair` across calls
+ *
+ * An earlier version of this function cached the resolved `KeyringPair` (which holds the
+ * decrypted sr25519 secret internally) for the life of the process, on the theory that repeated
+ * signing shouldn't re-hit disk/Keystore each time. A security review flagged that as holding
+ * plaintext key material alive far longer than the native module's own doc comment promises
+ * (`KeystoreSigningModule.kt`: "decrypted into JS memory for the lifetime of a signing
+ * operation") — in practice, a single successful call kept the decrypted secret reachable from
+ * this closure for as long as the app process ran, not just for one signature.
+ *
+ * The fix: every call to {@link getOrCreate} decrypts fresh (reads the file, calls
+ * `decryptSecret`, rebuilds the `KeyringPair`) and this function keeps no reference to the
+ * result once it hands it back to the caller — the returned `KeyringPair` is reachable only from
+ * the caller's own local variable, so it becomes eligible for GC as soon as the caller is done
+ * signing with it (in practice: immediately, since every call site here awaits exactly one
+ * `tx.signAndSend(pair, ...)` and doesn't hold onto `pair` afterward — see `identity.ts`'s
+ * `getSigningKeypair` call sites and `RegisterDelegateScreen.tsx`). This is only ever called from
+ * a signing flow that already requires the Keystore wrapping key to be available (see
+ * `KeystoreSigningModule.kt`'s `getOrCreateWrappingKey`, which currently sets
+ * `setUserAuthenticationRequired(false)` — so re-decrypting per call costs a cheap AES-GCM
+ * operation, not a repeated biometric/lock-screen prompt; if that ever changes to
+ * `true`, this per-call re-decrypt would need to change too), so the latency cost of not caching
+ * is negligible and the security win (no indefinitely-cached plaintext key material) is real.
+ *
+ * The one thing still cached is an **in-flight promise**, purely to de-duplicate genuinely
+ * concurrent calls (e.g. two UI actions racing to sign at once) into a single decrypt rather than
+ * two — and even that is cleared the instant it settles, so the very next call always decrypts
+ * fresh again.
  */
 function createKeystoreBackedKeypairGetter(filePath: string, keyringName: string) {
-  let cached: Promise<KeyringPair> | null = null;
+  let inFlight: Promise<KeyringPair> | null = null;
 
   async function getOrCreate(): Promise<KeyringPair> {
     if (!isKeystoreSigningAvailable()) {
@@ -173,23 +202,34 @@ function createKeystoreBackedKeypairGetter(filePath: string, keyringName: string
         'getOrCreateKeystoreKeypair: Android Keystore signing module is not available on this platform/build.',
       );
     }
-    if (!cached) {
-      cached = (async () => {
+    if (!inFlight) {
+      inFlight = (async () => {
         await cryptoWaitReady();
         const seed = await loadOrCreateSeed(filePath);
-        const keyring = new Keyring({ type: 'sr25519', ss58Format: 42 });
-        return keyring.addFromSeed(seed, { name: keyringName }, 'sr25519');
+        try {
+          const keyring = new Keyring({ type: 'sr25519', ss58Format: 42 });
+          return keyring.addFromSeed(seed, { name: keyringName }, 'sr25519');
+        } finally {
+          // Best-effort: `@polkadot/keyring` copies these bytes into its own (Wasm) memory when
+          // building the pair, so this doesn't reach the copy embedded in the returned
+          // `KeyringPair` — JS has no way to guarantee that's cleared. This at least stops *this*
+          // module's own local reference from keeping the plaintext seed reachable any longer
+          // than the single call that needed it.
+          seed.fill(0);
+        }
       })();
     }
     try {
-      return await cached;
-    } catch (e) {
-      cached = null; // Don't cache a failed attempt — the next call should retry fresh.
-      throw e;
+      return await inFlight;
+    } finally {
+      // Always clear — success or failure — so the next call (even a call that arrives one
+      // microtask later) decrypts fresh rather than reusing anything. This is what keeps the
+      // decrypted `KeyringPair` from being cached beyond a single signing operation's scope.
+      inFlight = null;
     }
   }
 
-  return { getOrCreate, reset: () => { cached = null; } };
+  return { getOrCreate, reset: () => { inFlight = null; } };
 }
 
 const _citizenKeypair = createKeystoreBackedKeypairGetter(WALLET_FILE_PATH, 'agora-keystore');
@@ -198,7 +238,14 @@ const _delegatePersonaKeypair = createKeystoreBackedKeypairGetter(
   'agora-delegate-persona',
 );
 
-/** Test-only escape hatch — production code never needs to reset this within a process lifetime. */
+/**
+ * Test-only escape hatch. Since {@link getOrCreateKeystoreKeypair}/
+ * {@link getOrCreateDelegatePersonaKeypair} no longer cache the decrypted `KeyringPair` beyond a
+ * single in-flight call (see `createKeystoreBackedKeypairGetter`'s doc comment — this changed as
+ * part of the finding-1 fix that used to hold the decrypted secret alive for the process
+ * lifetime), this only clears a transient in-flight-request marker. Kept for API stability with
+ * existing tests; production code never needed it even before this change.
+ */
 export function _resetCachedKeystoreKeypairForTests(): void {
   _citizenKeypair.reset();
   _delegatePersonaKeypair.reset();
@@ -212,8 +259,12 @@ export function _resetCachedKeystoreKeypairForTests(): void {
  * this app that decides what to do when it isn't (currently: a `__DEV__`-
  * gated fallback to the legacy dev mnemonic, or a hard error).
  *
- * Cached for the life of the process, same as the old `devKeyringPair()` —
- * repeated calls don't re-hit disk/Keystore.
+ * NOT cached across calls. Every call decrypts the seed fresh (file read + Keystore decrypt +
+ * `Keyring.addFromSeed`) and this module keeps no reference to the result afterward — see
+ * `createKeystoreBackedKeypairGetter`'s doc comment for why (a prior version cached the decrypted
+ * `KeyringPair`, i.e. the plaintext secret, for the life of the process; that was the bug this
+ * now fixes). Concurrent calls that race are de-duplicated onto a single decrypt, but even that
+ * dedup is cleared as soon as it settles — the next call always decrypts fresh again.
  */
 export async function getOrCreateKeystoreKeypair(): Promise<KeyringPair> {
   return _citizenKeypair.getOrCreate();
@@ -222,9 +273,9 @@ export async function getOrCreateKeystoreKeypair(): Promise<KeyringPair> {
 /**
  * Returns the citizen's second, independent delegate-persona `KeyringPair` (generating one on
  * first call) — see this module's doc comment for why it is a separate random seed rather than
- * derived from the citizen wallet's. Same availability/caching contract as
+ * derived from the citizen wallet's. Same availability/no-persistent-caching contract as
  * {@link getOrCreateKeystoreKeypair}: throws if {@link isKeystoreSigningAvailable} is `false`,
- * and is cached for the life of the process.
+ * and decrypts fresh on every call rather than holding the decrypted secret alive across calls.
  */
 export async function getOrCreateDelegatePersonaKeypair(): Promise<KeyringPair> {
   return _delegatePersonaKeypair.getOrCreate();
