@@ -961,6 +961,25 @@ pub mod pallet {
     pub type LastRecoveryBlock<T: Config> =
         StorageMap<_, Blake2_128Concat, [u8; 32], BlockNumberFor<T>>;
 
+    /// Tombstone left behind on `old_account` by a completed `recover_account` call, recording
+    /// the citizen nullifier that was just moved off of it. Unlike `CitizenNullifier` (removed
+    /// from `old_account` as part of that same rebind, live-registration lookup only), this
+    /// entry is never removed, so cross-pallet code that recorded `old_account` at some earlier
+    /// point in time — e.g. `pallet_elections::UsedBackingNullifier`, which stores the
+    /// `AccountId` that originally called `back_delegate` — can still resolve which citizen
+    /// `old_account` used to belong to, and from there (via `NullifierRegistry`, which always
+    /// holds the *current* owner) find that citizen's present-day `AccountId` even after one or
+    /// more further recoveries. See `same_citizen`'s doc comment, which is what actually
+    /// consumes this.
+    ///
+    /// Overwritten, not appended, if `old_account` is ever recovered away from a second time
+    /// (only possible if it first became a live citizen again in between, e.g. by being the
+    /// `who` of some other, unrelated `recover_account` call) — the tombstone always reflects
+    /// whichever citizen most recently vacated this account, which is what `same_citizen` needs.
+    #[pallet::storage]
+    pub type RecoveredAccountNullifier<T: Config> =
+        StorageMap<_, Blake2_128Concat, T::AccountId, [u8; 32]>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -2120,6 +2139,10 @@ pub mod pallet {
             NullifierRegistry::<T>::insert(nullifier, &who);
             CitizenNullifier::<T>::remove(&old_account);
             CitizenNullifier::<T>::insert(&who, nullifier);
+            // Tombstone: leave a permanent trace of which citizen just vacated old_account, so
+            // `same_citizen` can still resolve it later — see `RecoveredAccountNullifier`'s doc
+            // comment.
+            RecoveredAccountNullifier::<T>::insert(&old_account, nullifier);
 
             IdentityAnchorRegistry::<T>::insert((scheme_version, anchor), &who);
             CitizenAnchor::<T>::remove(&old_account);
@@ -2229,6 +2252,38 @@ pub mod pallet {
         /// True if the account is registered (regardless of suspension status).
         pub fn is_citizen(who: &T::AccountId) -> bool {
             CitizenNullifier::<T>::contains_key(who)
+        }
+
+        /// Resolves `who` to the citizen nullifier it is, or once was, associated with: a live
+        /// `CitizenNullifier` entry if `who` is presently a registered citizen, else whatever
+        /// `RecoveredAccountNullifier` tombstone was left behind if `who` was ever the
+        /// `old_account` of a completed `recover_account` call. `None` if `who` has never been
+        /// either.
+        fn nullifier_of_current_or_recovered(who: &T::AccountId) -> Option<[u8; 32]> {
+            CitizenNullifier::<T>::get(who).or_else(|| RecoveredAccountNullifier::<T>::get(who))
+        }
+
+        /// True if `former` and `current` are, or were, the same citizen — either the same
+        /// account, or `former` is an account whose citizen identity has since been moved (via
+        /// one or more `recover_account` calls) onto `current`. Consumed cross-pallet by
+        /// `pallet_elections::CitizenChecker::same_citizen` (wired in
+        /// `runtime/src/configs/mod.rs`) so `remove_backing` can accept a backing nullifier
+        /// originally submitted by an account that has since been recovered away from — a
+        /// citizen's `backing_nullifier` is derived purely from their `backing_root_secret` and
+        /// slot index, not their `AccountId`, so it still recomputes identically after recovery,
+        /// but the raw `UsedBackingNullifier::submitter == who` check that used to gate
+        /// `remove_backing` could never match the citizen's new account. Resolving through
+        /// `NullifierRegistry` (always the *current* owner of a nullifier, however many
+        /// recoveries it has been through) makes this correct across any number of hops, not
+        /// just one.
+        pub fn same_citizen(former: &T::AccountId, current: &T::AccountId) -> bool {
+            if former == current {
+                return true;
+            }
+            let Some(nullifier) = Self::nullifier_of_current_or_recovered(former) else {
+                return false;
+            };
+            NullifierRegistry::<T>::get(nullifier).as_ref() == Some(current)
         }
 
         /// True only if the account is *currently* suspended (not expired — same lazy-expiry

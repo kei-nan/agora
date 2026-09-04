@@ -20,6 +20,22 @@ thread_local! {
     static SEAT_CALLS: RefCell<Vec<Vec<u64>>> = RefCell::new(Vec::new());
     static CURRENT_DISCLOSURES: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
     static ACCOUNTABILITY_COUNCIL_MEMBERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    // Simulates pallet-identity's recovery tombstone chain (`RecoveredAccountNullifier` +
+    // `NullifierRegistry`) for `TestCitizenChecker::same_citizen`: maps an account that was
+    // "recovered away from" to whatever account it was recovered *into*. Empty by default, so
+    // `same_citizen` behaves exactly like the old bare `==` check unless a test opts in via
+    // `set_recovered_to`.
+    static RECOVERED_TO: RefCell<std::collections::BTreeMap<u64, u64>> =
+        RefCell::new(std::collections::BTreeMap::new());
+}
+
+/// Records that `old` has been recovered into `new` (mirrors a `pallet_identity_zk::
+/// recover_account` call moving `old`'s citizen identity onto `new`), for
+/// `TestCitizenChecker::same_citizen` to resolve. Supports chained recoveries: if `old` is
+/// later itself recovered into some `newer` account, calling this again with `(new, newer)`
+/// keeps the whole chain resolvable from `old`.
+pub fn set_recovered_to(old: u64, new: u64) {
+    RECOVERED_TO.with(|r| { r.borrow_mut().insert(old, new); });
 }
 
 /// Marks `who` as an active (non-suspended) registered citizen, or removes them.
@@ -55,6 +71,28 @@ pub struct TestCitizenChecker;
 impl pallet_elections::CitizenChecker<u64> for TestCitizenChecker {
     fn is_active_citizen(who: &u64) -> bool {
         ACTIVE_CITIZENS.with(|c| c.borrow().contains(who))
+    }
+    fn same_citizen(former: &u64, current: &u64) -> bool {
+        if former == current {
+            return true;
+        }
+        // Follow the `RECOVERED_TO` chain from `former`, the same way
+        // `pallet_identity_zk::same_citizen` follows `RecoveredAccountNullifier` +
+        // `NullifierRegistry` -- handles any number of chained recoveries, not just one hop.
+        RECOVERED_TO.with(|r| {
+            let map = r.borrow();
+            let mut cursor = *former;
+            // Bounded by the map's size so a (deliberately impossible, self-referential) cycle
+            // can't loop forever.
+            for _ in 0..map.len() {
+                match map.get(&cursor) {
+                    Some(next) if next == current => return true,
+                    Some(next) => cursor = *next,
+                    None => return false,
+                }
+            }
+            false
+        })
     }
 }
 

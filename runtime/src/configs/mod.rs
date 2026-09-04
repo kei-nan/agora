@@ -799,6 +799,11 @@ impl pallet_courts::Config for Runtime {
 	/// 14 days, matching `pallet_legislature::Config::PendingApprovalExpiryBlocks` — the same
 	/// stuck-proposer deadlock this closes (see `EnsureOracleCouncilApproved`'s doc comment).
 	type AdminActionExpiryBlocks = ConstU32<{ 14 * DAYS }>;
+	/// 14 days, same as `AdminActionExpiryBlocks` — the case-based counterpart, closing the
+	/// analogous deadlock for `submit_ai_ruling`/`finalize_ruling` proposals that never reach
+	/// quorum (see `pallet_courts::Config::OracleProposalExpiryBlocks`'s doc comment and
+	/// `clear_stale_oracle_proposal`).
+	type OracleProposalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	type CitizenSuspender = Runtime;
 	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`
@@ -1137,6 +1142,12 @@ impl pallet_emergency_council::SiblingEmergencyCooldown<BlockNumber> for Runtime
 impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 	fn is_active_citizen(who: &AccountId) -> bool {
 		pallet_identity_zk::Pallet::<Runtime>::is_active_citizen(who)
+	}
+	/// Delegates to `pallet_identity_zk::Pallet::same_citizen` -- see that fn's and
+	/// `pallet_elections::CitizenChecker::same_citizen`'s doc comments for why `remove_backing`
+	/// needs this rather than a bare `AccountId` equality check.
+	fn same_citizen(former: &AccountId, current: &AccountId) -> bool {
+		pallet_identity_zk::Pallet::<Runtime>::same_citizen(former, current)
 	}
 }
 

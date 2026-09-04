@@ -130,6 +130,19 @@ pub mod pallet {
 
     pub trait CitizenChecker<AccountId> {
         fn is_active_citizen(who: &AccountId) -> bool;
+        /// True if `former` and `current` are, or were, the same citizen -- either literally
+        /// the same account, or `former` is an account whose citizen identity has since been
+        /// moved onto `current` via `pallet_identity_zk::recover_account` (possibly more than
+        /// once). Backed by `pallet_identity_zk::Pallet::same_citizen`, which resolves this
+        /// through that pallet's `NullifierRegistry`/`RecoveredAccountNullifier` bookkeeping --
+        /// see its doc comment for the full mechanism. Consumed by `remove_backing`: a
+        /// `backing_nullifier` recomputes identically after its owner recovers to a new account
+        /// (it depends only on `backing_root_secret`/slot index, never `AccountId`), but
+        /// `UsedBackingNullifier` still records the *original* submitting account, so a bare
+        /// `submitter == who` check would permanently reject the recovered citizen's own
+        /// attempt to remove their own backing. This lets that check accept `who` when it is
+        /// `submitter`'s current, post-recovery identity.
+        fn same_citizen(former: &AccountId, current: &AccountId) -> bool;
     }
 
     /// Converts a `T::AccountId` to its raw 32-byte representation, for binding
@@ -1117,8 +1130,10 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Remove backing from `delegate`, freeing the slot for reuse. Requires the *same*
-        /// account that originally called `back_delegate` to resubmit the *same*
+        /// Remove backing from `delegate`, freeing the slot for reuse. Requires the account that
+        /// originally called `back_delegate` -- or that account's current identity, if it has
+        /// since recovered to a new `AccountId` via `pallet_identity_zk::recover_account`, see
+        /// `T::CitizenChecker::same_citizen`'s doc comment -- to resubmit the *same*
         /// `backing-nullifier` proof (recomputing the same `backing_nullifier`, since it depends
         /// only on the citizen's fixed secret and slot index, not on `delegate_persona_id`) --
         /// see `UsedBackingNullifier`'s doc comment for why.
@@ -1137,7 +1152,10 @@ pub mod pallet {
 
             let (submitter, recorded_persona_id) =
                 UsedBackingNullifier::<T>::get(nullifier).ok_or(Error::<T>::NotBacking)?;
-            ensure!(submitter == who, Error::<T>::NotBacking);
+            // Accepts the original submitter's account as well as its current identity if it
+            // has since recovered to a new account -- see `T::CitizenChecker::same_citizen`'s
+            // doc comment.
+            ensure!(T::CitizenChecker::same_citizen(&submitter, &who), Error::<T>::NotBacking);
             ensure!(recorded_persona_id == delegate_persona_id, Error::<T>::NotBacking);
 
             UsedBackingNullifier::<T>::remove(nullifier);
@@ -1486,6 +1504,16 @@ pub mod pallet {
                 let candidate_count = candidates.len() as u64;
                 weight = weight
                     .saturating_add(T::DbWeight::get().reads_writes(candidate_count, candidate_count));
+
+                // Zero-backing candidates (never backed at all, or ranked on an immature
+                // flash-backing checkpoint that hasn't matured -- see the `backing` computation
+                // above) must never be seated merely to fill an otherwise-undersized candidate
+                // pool: a seat filled this way would be indistinguishable from one won on
+                // genuine backing. If the eligible pool is smaller than `LegislatureSeats`
+                // (plausible early in the chain's life, e.g. while `MinBackingDurationBlocks`
+                // maturity lag keeps every new delegate's checkpoint at 0), the remaining seats
+                // are simply left empty rather than filled this way.
+                candidates.retain(|(_, backing)| *backing > 0);
 
                 // Stable sort by backing count descending — ties broken by drain order.
                 candidates.sort_by(|a, b| b.1.cmp(&a.1));

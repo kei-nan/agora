@@ -720,6 +720,84 @@ fn remove_backing_fails_when_submitted_by_a_different_account_than_the_original_
     });
 }
 
+/// A citizen who backed a delegate as account 2, then lost that account and recovered (via
+/// pallet-identity's `recover_account`) into a fresh account 20, must still be able to remove
+/// their own backing -- the `backing_nullifier` recomputes identically regardless of which
+/// account submits it (it depends only on the citizen's fixed `backing_root_secret`/slot
+/// index), but `UsedBackingNullifier` still records account 2 as the original submitter. Before
+/// the `same_citizen` fix, a bare `submitter == who` check would reject this forever, since
+/// account 2 no longer belongs to the citizen. `set_recovered_to` here simulates what
+/// `pallet_identity_zk::same_citizen` reports for real once `recover_account` has rebound the
+/// citizen's identity onto account 20.
+#[test]
+fn remove_backing_succeeds_for_backer_recovered_to_a_new_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 1);
+
+        set_recovered_to(2, 20);
+        set_active_citizen(20, true);
+        let (proof, inputs) = backing_proof(2, 1); // the same proof account 2 originally used
+
+        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(20), 1, proof, inputs));
+
+        assert_eq!(BackingCount::<Test>::get(1), 0);
+        assert!(!UsedBackingNullifier::<Test>::contains_key(backing_nullifier_for(2, 1)));
+        System::assert_last_event(
+            Event::DelegateBackingRemoved {
+                delegate: 1,
+                backing_nullifier: backing_nullifier_for(2, 1),
+            }
+            .into(),
+        );
+    });
+}
+
+/// `same_citizen` must follow a chain of recoveries, not just one hop: account 2 backs, recovers
+/// to account 20, which itself later recovers to account 200 -- the citizen's *second* new
+/// account must still be able to remove the original backing.
+#[test]
+fn remove_backing_succeeds_after_a_chain_of_two_recoveries() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+
+        set_recovered_to(2, 20);
+        set_recovered_to(20, 200);
+        set_active_citizen(200, true);
+        let (proof, inputs) = backing_proof(2, 1);
+
+        assert_ok!(Elections::remove_backing(RuntimeOrigin::signed(200), 1, proof, inputs));
+        assert_eq!(BackingCount::<Test>::get(1), 0);
+    });
+}
+
+/// An account that merely shares a recovery chain with the wrong citizen (i.e. an unrelated
+/// citizen, or a citizen who never backed this delegate) still cannot strip someone else's
+/// backing -- `same_citizen` returning true for the genuine recovered account must not be
+/// mistaken for it accepting *any* account.
+#[test]
+fn remove_backing_still_fails_for_an_unrelated_account_when_a_recovery_is_recorded() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        register_delegate(1);
+        back(2, 1);
+        // Some *other*, unrelated recovery is on record (e.g. a different citizen entirely).
+        set_recovered_to(3, 30);
+        set_active_citizen(30, true);
+        let (proof, inputs) = backing_proof(2, 1); // account 2's proof, not account 3's
+
+        assert_noop!(
+            Elections::remove_backing(RuntimeOrigin::signed(30), 1, proof, inputs),
+            Error::<Test>::NotBacking
+        );
+        assert_eq!(BackingCount::<Test>::get(1), 1);
+    });
+}
+
 /// `remove_backing` frees the slot for reuse: after removal, the exact same (deterministic)
 /// nullifier can back again.
 #[test]
@@ -1647,11 +1725,14 @@ fn run_election_flash_backing_does_not_win_a_seat() {
         back(4, 1);
         assert_eq!(BackingCount::<Test>::get(1), 3);
 
-        // Election 1: delegate 1 is the only candidate, so it wins the single seat regardless
-        // of its ranking value -- this just seeds its checkpoint at (block 20, count 3).
+        // Election 1: delegate 1 is the only candidate, but it has no matured checkpoint yet
+        // (this is the very scan that seeds it), so it ranks 0 and the zero-backing filter
+        // excludes it -- the single seat is left empty rather than filled with a candidate
+        // nobody has confirmed durable backing for. This also just seeds its checkpoint at
+        // (block 20, count 3).
         System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
-        assert_eq!(seat_calls(), vec![vec![1]]);
+        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
         assert_eq!(LastBackingCheckpoint::<Test>::get(1), Some((DEFAULT_ELECTION_CYCLE_BLOCKS as u64, 3)));
 
         // Delegate 2 ("attacker"): registered only now, in the run-up to election 2's
@@ -1666,11 +1747,12 @@ fn run_election_flash_backing_does_not_win_a_seat() {
 
         // Election 2: delegate 1's checkpoint has matured (20 blocks since it was set, well
         // past the 5-block minimum) and is used for ranking (3); delegate 2 has no matured
-        // checkpoint at all (registered after election 1 already ran), so it contributes 0.
-        // Delegate 1 wins the single seat despite delegate 2's more-than-3x live lead.
+        // checkpoint at all (registered after election 1 already ran), so it contributes 0 and
+        // is excluded by the zero-backing filter. Delegate 1 wins the single seat despite
+        // delegate 2's more-than-3x live lead.
         System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
-        assert_eq!(seat_calls(), vec![vec![1], vec![1]]);
+        assert_eq!(seat_calls(), vec![Vec::<u64>::new(), vec![1]]);
 
         // The rent-and-withdraw pattern this closes: having already lost the election, the
         // attacker's later withdrawal changes nothing -- the attack already failed regardless
@@ -1716,6 +1798,84 @@ fn run_election_backing_counts_once_it_has_genuinely_matured() {
         System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
         assert_eq!(seat_calls().last(), Some(&vec![2]));
+    });
+}
+
+// ── Zero-backing seating floor (no candidate seated purely to fill an undersized pool) ──
+
+/// The single candidate in this election has no matured checkpoint yet (it ranks 0), so even
+/// though `LegislatureSeats` (default 3) is nowhere near filled, the seat must be left empty --
+/// not filled with a delegate nobody has confirmed durable backing for.
+#[test]
+fn run_election_seats_nobody_when_the_only_candidate_has_zero_backing() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_min_backing_duration_blocks(5);
+
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1); // crosses the threshold -> Active, but the checkpoint is brand new
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
+        System::assert_last_event(
+            Event::LegislatureElectionRun {
+                at_block: DEFAULT_ELECTION_CYCLE_BLOCKS as u64,
+                seated: 0,
+            }
+            .into(),
+        );
+    });
+}
+
+/// `LegislatureSeats` stays at its default of 3 for this whole test -- only ever one candidate
+/// has a matured (non-zero) backing count by the election being checked. Before the
+/// zero-backing filter, `sort_by(...).take(seats)` would still have padded the result up with
+/// the second, zero-backing delegate purely to fill seats; after the fix, that delegate is
+/// excluded and the other two seats are simply left empty.
+#[test]
+fn run_election_leaves_extra_seats_empty_instead_of_padding_with_zero_backing_candidates() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_min_backing_duration_blocks(5);
+
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+        assert_eq!(BackingCount::<Test>::get(1), 3);
+
+        // Election 1: seeds delegate 1's checkpoint. It ranks 0 (immature), so nothing is
+        // seated despite 3 seats being available.
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
+
+        // Delegate 2 registers and is backed only after election 1 -- its checkpoint has no
+        // chance to mature before election 2.
+        register_delegate(2);
+        back(10, 2);
+        back(11, 2);
+        back(12, 2);
+        assert_eq!(BackingCount::<Test>::get(2), 3);
+
+        // Election 2: delegate 1's checkpoint has matured (backing 3, well past the 5-block
+        // minimum); delegate 2's has not (contributes 0, filtered out). Only delegate 1 is
+        // seated -- the other 2 of the 3 available seats stay empty rather than being padded
+        // with delegate 2.
+        System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+        assert_eq!(seat_calls().last(), Some(&vec![1]));
+        System::assert_last_event(
+            Event::LegislatureElectionRun {
+                at_block: 2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64,
+                seated: 1,
+            }
+            .into(),
+        );
     });
 }
 
