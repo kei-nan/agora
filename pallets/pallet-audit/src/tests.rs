@@ -502,13 +502,15 @@ fn resolve_entry_clears_a_flagged_entry() {
     new_test_ext().execute_with(|| {
         System::set_block_number(1);
         add_auditor(1);
+        add_auditor(2);
         flagged_entry(1, 0);
 
-        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(1), 0));
+        // A *different* auditor than the one who flagged it resolves the entry.
+        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(2), 0));
 
         let entry = AuditLog::<Test>::get(0).unwrap();
         assert!(entry.status == AuditStatus::Cleared);
-        System::assert_last_event(Event::EntryResolved { index: 0, by: 1 }.into());
+        System::assert_last_event(Event::EntryResolved { index: 0, by: 2 }.into());
     });
 }
 
@@ -516,12 +518,47 @@ fn resolve_entry_clears_a_flagged_entry() {
 fn resolve_entry_clears_a_disputed_entry() {
     new_test_ext().execute_with(|| {
         add_auditor(1);
+        add_auditor(2);
         disputed_entry(1, 0);
 
-        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(1), 0));
+        // A *different* auditor than the one who flagged (and disputed) it resolves it.
+        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(2), 0));
 
         let entry = AuditLog::<Test>::get(0).unwrap();
         assert!(entry.status == AuditStatus::Cleared);
+    });
+}
+
+#[test]
+fn resolve_entry_fails_when_same_auditor_who_flagged_it_tries_to_resolve() {
+    new_test_ext().execute_with(|| {
+        add_auditor(1);
+        flagged_entry(1, 0);
+
+        assert_noop!(
+            Audit::resolve_entry(RuntimeOrigin::signed(1), 0),
+            Error::<Test>::CannotResolveOwnFlag
+        );
+
+        // Entry remains Flagged — the failed resolve attempt made no state change.
+        let entry = AuditLog::<Test>::get(0).unwrap();
+        assert!(entry.status == AuditStatus::Flagged);
+    });
+}
+
+#[test]
+fn resolve_entry_fails_when_same_auditor_who_flagged_a_disputed_entry_tries_to_resolve() {
+    new_test_ext().execute_with(|| {
+        add_auditor(1);
+        disputed_entry(1, 0);
+
+        assert_noop!(
+            Audit::resolve_entry(RuntimeOrigin::signed(1), 0),
+            Error::<Test>::CannotResolveOwnFlag
+        );
+
+        let entry = AuditLog::<Test>::get(0).unwrap();
+        assert!(entry.status == AuditStatus::Disputed);
     });
 }
 
@@ -592,10 +629,12 @@ fn flag_entry_freezes_the_department() {
 fn resolving_the_only_open_flag_unfreezes_the_department() {
     new_test_ext().execute_with(|| {
         add_auditor(1);
+        add_auditor(2);
         flagged_entry(1, 0);
         assert_eq!(frozen_calls(), vec![DEPT]);
 
-        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(1), 0));
+        // Resolved by a different auditor than the one who flagged it.
+        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(2), 0));
 
         assert_eq!(unfrozen_calls(), vec![DEPT]);
         assert_eq!(OpenFlags::<Test>::get(DEPT), 0);
@@ -606,6 +645,7 @@ fn resolving_the_only_open_flag_unfreezes_the_department() {
 fn resolving_one_of_two_open_flags_does_not_unfreeze() {
     new_test_ext().execute_with(|| {
         add_auditor(1);
+        add_auditor(2);
         // Two separate expenditures, same department, both flagged.
         flagged_entry(1, 0);
         record_expenditure(1);
@@ -615,15 +655,15 @@ fn resolving_one_of_two_open_flags_does_not_unfreeze() {
         // department doesn't re-trigger it.
         assert_eq!(frozen_calls(), vec![DEPT]);
 
-        // Resolve just the first entry.
-        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(1), 0));
+        // Resolve just the first entry — by a different auditor than the one who flagged it.
+        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(2), 0));
 
         // Department still has one open flag (index 1), so it must stay frozen.
         assert_eq!(OpenFlags::<Test>::get(DEPT), 1);
         assert!(unfrozen_calls().is_empty());
 
         // Resolving the second (last) open flag finally unfreezes it.
-        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(1), 1));
+        assert_ok!(Audit::resolve_entry(RuntimeOrigin::signed(2), 1));
         assert_eq!(OpenFlags::<Test>::get(DEPT), 0);
         assert_eq!(unfrozen_calls(), vec![DEPT]);
     });

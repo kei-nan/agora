@@ -183,6 +183,9 @@ pub mod pallet {
         EntryAlreadyDisputed,
         /// resolve_entry requires the entry to currently be Flagged or Disputed.
         EntryNotOpen,
+        /// resolve_entry cannot be called by the same auditor who flagged the entry —
+        /// resolution requires a second, different auditor.
+        CannotResolveOwnFlag,
     }
 
     // ── Calls ──────────────────────────────────────────────────────────────────
@@ -313,6 +316,11 @@ pub mod pallet {
         /// count reaches zero (no other open flags/disputes remain against the department),
         /// the department is unfrozen in pallet-treasury-ledger. If other flags/disputes
         /// are still open against the same department, it stays frozen.
+        ///
+        /// The resolving auditor must differ from the auditor who flagged the entry
+        /// (`flagged_by`) — otherwise a single auditor could flag then immediately clear
+        /// their own flag, defeating the point of the check. Mirrors the
+        /// `SameInvestigator` check in `pallet_anticorruption::approve_report_action`.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(12_000, 0))]
         pub fn resolve_entry(origin: OriginFor<T>, expenditure_index: u64) -> DispatchResult {
@@ -323,6 +331,9 @@ pub mod pallet {
                     entry.status == AuditStatus::Flagged || entry.status == AuditStatus::Disputed,
                     Error::<T>::EntryNotOpen
                 );
+                if let Some(flagged_by) = entry.flagged_by.as_ref() {
+                    ensure!(flagged_by != &who, Error::<T>::CannotResolveOwnFlag);
+                }
                 entry.status = AuditStatus::Cleared;
                 Ok::<_, DispatchError>(entry.dept_id)
             })?;
