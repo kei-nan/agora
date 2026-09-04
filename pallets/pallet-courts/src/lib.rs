@@ -424,6 +424,21 @@ pub mod pallet {
         /// `EnsureOracleCouncilApproved`'s doc comment for the deadlock this closes.
         #[pallet::constant]
         type AdminActionExpiryBlocks: Get<u32>;
+        /// How many blocks a `PendingOracleProposal` may sit without reaching its
+        /// `OracleApprovalNumerator`/`Denominator` threshold before any current Oracle Council
+        /// member can discard it via `clear_stale_oracle_proposal`. The case-based counterpart
+        /// of `AdminActionExpiryBlocks`: unlike an admin action (which has a distinct
+        /// post-threshold "approved but unconsumed" state, `ApprovedAdminAction`, that's what
+        /// actually goes stale), a case-based action applies itself the instant it crosses
+        /// threshold (see `try_resolve_oracle_action`) — so what can go stale here is the
+        /// *pre-threshold* proposal itself, if Oracle Council members never cast enough
+        /// approvals (e.g. because they're offline). Without this, a case whose proposer's
+        /// lone approval never reaches quorum is stuck forever: `submit_ai_ruling`/
+        /// `finalize_ruling` both refuse to re-propose while a `PendingOracleProposal` already
+        /// exists for that `case_id` (`Error::OracleActionAlreadyProposed`), and there is no
+        /// other way to withdraw one. See `clear_stale_oracle_proposal`.
+        #[pallet::constant]
+        type OracleProposalExpiryBlocks: Get<u32>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// Number of blocks, starting the block *after* a case enters jury appeal, whose
@@ -576,6 +591,17 @@ pub mod pallet {
     #[pallet::storage]
     pub type OracleApprovals<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, BoundedVec<T::AccountId, T::MaxOracleMembers>>;
+
+    /// case_id -> the block `PendingOracleProposal` was first inserted for it (by
+    /// `submit_ai_ruling` or `finalize_ruling`). Used by `clear_stale_oracle_proposal` to
+    /// discard a proposal that has sat for `OracleProposalExpiryBlocks` without reaching the
+    /// approval threshold — the case-based counterpart of `ApprovedAdminAction`'s stored
+    /// approval block (see `clear_stale_admin_action`). Cleared alongside
+    /// `PendingOracleProposal`/`OracleApprovals` whenever the action resolves, expires, or is
+    /// cleared, so a later, unrelated proposal for the same `case_id` never inherits a stale
+    /// timestamp.
+    #[pallet::storage]
+    pub type OracleProposalProposedAt<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
 
     /// call_hash -> (proposer, Oracle Council members who have approved) for an in-flight
     /// "administrative action" proposal — the case-less counterpart of `PendingOracleProposal`/
@@ -801,6 +827,10 @@ pub mod pallet {
         /// An `ApprovedAdminAction` token expired unconsumed and was discarded via
         /// `clear_stale_admin_action`, freeing the call_hash for a new proposal.
         AdminActionExpired { call_hash: [u8; 32] },
+        /// A `PendingOracleProposal` sat for `OracleProposalExpiryBlocks` without reaching its
+        /// approval threshold and was discarded via `clear_stale_oracle_proposal`, freeing the
+        /// case_id for a fresh `submit_ai_ruling`/`finalize_ruling` proposal.
+        OracleProposalCleared { case_id: u32 },
         /// A new member was added to the AI Model Governance Council.
         AIGovernanceMemberAdded { who: T::AccountId },
         /// A member was removed from the AI Model Governance Council.
@@ -871,6 +901,9 @@ pub mod pallet {
         NoApprovedAdminAction,
         /// The `ApprovedAdminAction` token has not yet reached `AdminActionExpiryBlocks`.
         ApprovalNotYetStale,
+        /// The `PendingOracleProposal` for this case_id has not yet reached
+        /// `OracleProposalExpiryBlocks`, so `clear_stale_oracle_proposal` refuses to discard it.
+        OracleProposalNotYetStale,
         /// A `LawChallenge` case was filed against a `law_id` that already has a law-targeting
         /// case open (filed but not yet `FinalRuling`/`Enforced`) — which may itself be either
         /// a `LawChallenge` or a `TierConflict`. See `OpenCaseByLaw`'s doc comment for the
@@ -992,6 +1025,7 @@ pub mod pallet {
                 case_id,
                 PendingOracleAction::Submission { ruling_hash, model_version, verdict },
             );
+            OracleProposalProposedAt::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
             let mut approvals: BoundedVec<T::AccountId, T::MaxOracleMembers> = BoundedVec::default();
             approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)?;
             OracleApprovals::<T>::insert(case_id, approvals);
@@ -1206,6 +1240,7 @@ pub mod pallet {
                 Error::<T>::OracleActionAlreadyProposed
             );
             PendingOracleProposal::<T>::insert(case_id, PendingOracleAction::Finalization);
+            OracleProposalProposedAt::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
             let mut approvals: BoundedVec<T::AccountId, T::MaxOracleMembers> = BoundedVec::default();
             approvals.try_push(who.clone()).map_err(|_| Error::<T>::OracleCouncilAtCapacity)?;
             OracleApprovals::<T>::insert(case_id, approvals);
@@ -1600,6 +1635,44 @@ pub mod pallet {
             );
             ApprovedAdminAction::<T>::remove(call_hash);
             Self::deposit_event(Event::AdminActionExpired { call_hash });
+            Ok(())
+        }
+
+        /// Discard a `PendingOracleProposal` that has sat for `OracleProposalExpiryBlocks`
+        /// without reaching the Oracle Council's M-of-N approval threshold. Open to any
+        /// *current* Oracle Council member — the case-based counterpart of
+        /// `clear_stale_admin_action`, recovering the court system from a `submit_ai_ruling`/
+        /// `finalize_ruling` proposal that nobody ever pushes past quorum because members are
+        /// offline, non-participating, or were removed. Without this, `case_id` is stuck
+        /// forever: neither `submit_ai_ruling` nor `finalize_ruling` will re-propose while a
+        /// `PendingOracleProposal` already exists (`Error::OracleActionAlreadyProposed`), and
+        /// `approve_ai_ruling` only accepts approvals, never withdrawals. See
+        /// `OracleProposalProposedAt` and `Config::OracleProposalExpiryBlocks`.
+        ///
+        /// Clears `PendingOracleProposal`, `OracleApprovals`, and `OracleProposalProposedAt`
+        /// for `case_id`, exactly like a normal resolution or expiry via
+        /// `try_resolve_oracle_action` — so a fresh `submit_ai_ruling`/`finalize_ruling` call
+        /// afterward starts a clean proposal with no leftover approvals.
+        #[pallet::call_index(15)]
+        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        pub fn clear_stale_oracle_proposal(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(
+                OracleMembers::<T>::get().contains(&who),
+                Error::<T>::OracleMemberNotFound
+            );
+            let proposed_at = OracleProposalProposedAt::<T>::get(case_id)
+                .ok_or(Error::<T>::NoPendingOracleAction)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            let expiry = BlockNumberFor::<T>::from(T::OracleProposalExpiryBlocks::get());
+            ensure!(
+                now >= proposed_at.saturating_add(expiry),
+                Error::<T>::OracleProposalNotYetStale
+            );
+            PendingOracleProposal::<T>::remove(case_id);
+            OracleApprovals::<T>::remove(case_id);
+            OracleProposalProposedAt::<T>::remove(case_id);
+            Self::deposit_event(Event::OracleProposalCleared { case_id });
             Ok(())
         }
     }
@@ -2091,6 +2164,7 @@ pub mod pallet {
             }
             PendingOracleProposal::<T>::remove(case_id);
             OracleApprovals::<T>::remove(case_id);
+            OracleProposalProposedAt::<T>::remove(case_id);
             Ok(())
         }
 

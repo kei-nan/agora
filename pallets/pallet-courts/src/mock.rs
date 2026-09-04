@@ -21,6 +21,11 @@ pub const CASE_FILING_BOND: Balance = 100;
 /// `APPROVAL_EXPIRY` constant. Small so tests don't need to advance hundreds of blocks.
 pub const ADMIN_ACTION_EXPIRY: u32 = 20;
 
+/// How many blocks a `PendingOracleProposal` may sit short of its approval threshold before
+/// `clear_stale_oracle_proposal` can discard it. Small so tests don't need to advance hundreds
+/// of blocks.
+pub const ORACLE_PROPOSAL_EXPIRY: u32 = 20;
+
 #[frame_support::runtime]
 mod runtime {
 	// The main runtime
@@ -206,6 +211,7 @@ impl pallet_courts::Config for Test {
 	type OracleApprovalNumerator = ConstU32<1>;
 	type OracleApprovalDenominator = ConstU32<2>;
 	type AdminActionExpiryBlocks = ConstU32<ADMIN_ACTION_EXPIRY>;
+	type OracleProposalExpiryBlocks = ConstU32<ORACLE_PROPOSAL_EXPIRY>;
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;

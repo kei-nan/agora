@@ -1723,6 +1723,137 @@ fn clear_stale_admin_action_unblocks_a_new_proposal_after_expiry() {
 	});
 }
 
+// ─── clear_stale_oracle_proposal ─────────────────────────────────────────────
+//
+// Case-based counterpart of the `clear_stale_admin_action` coverage above: closes the gap
+// where a `submit_ai_ruling`/`finalize_ruling` proposal that never reaches the Oracle
+// Council's M-of-N threshold (e.g. because members are offline/non-participating) would
+// otherwise strand `case_id` forever behind `Error::OracleActionAlreadyProposed`, with no
+// recovery path.
+
+#[test]
+fn clear_stale_oracle_proposal_fails_when_not_yet_expired() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// Only 1 of 3 approvals -- proposal stays pending, not yet stale.
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+
+		System::set_block_number(System::block_number() + ORACLE_PROPOSAL_EXPIRY as u64 - 1);
+		assert_noop!(
+			Courts::clear_stale_oracle_proposal(RuntimeOrigin::signed(m1), case_id),
+			Error::<Test>::OracleProposalNotYetStale
+		);
+		assert!(crate::pallet::PendingOracleProposal::<Test>::get(case_id).is_some());
+	});
+}
+
+#[test]
+fn clear_stale_oracle_proposal_fails_when_none_pending() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		assert_noop!(
+			Courts::clear_stale_oracle_proposal(RuntimeOrigin::signed(m1), 0),
+			Error::<Test>::NoPendingOracleAction
+		);
+	});
+}
+
+#[test]
+fn clear_stale_oracle_proposal_fails_for_non_member() {
+	new_test_ext().execute_with(|| {
+		let (m1, _m2, _m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		System::set_block_number(System::block_number() + ORACLE_PROPOSAL_EXPIRY as u64);
+
+		assert_noop!(
+			Courts::clear_stale_oracle_proposal(RuntimeOrigin::signed(999), case_id),
+			Error::<Test>::OracleMemberNotFound
+		);
+	});
+}
+
+/// The deadlock recovery this fix adds: once a pending oracle proposal sits without reaching
+/// threshold past `OracleProposalExpiryBlocks`, *any* current Oracle Council member (not
+/// necessarily the stuck proposer) can clear it, and a fresh proposal for the same case_id can
+/// then be raised and successfully resolved -- proving the court system is no longer
+/// permanently stuck. Mirrors `clear_stale_admin_action_unblocks_a_new_proposal_after_expiry`.
+#[test]
+fn clear_stale_oracle_proposal_unblocks_a_new_proposal_after_expiry() {
+	new_test_ext().execute_with(|| {
+		let (m1, m2, m3) = setup_three_member_oracle_council();
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+
+		// m1 proposes; only 1 of 3 approvals ever lands (m2/m3 never approve -- offline).
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		let proposed_at = System::block_number();
+
+		// Before expiry, the case cannot be re-proposed.
+		assert_noop!(
+			Courts::submit_ai_ruling(
+				RuntimeOrigin::signed(m3),
+				case_id,
+				[8u8; 32],
+				model_version,
+				Verdict::Upheld
+			),
+			Error::<Test>::OracleActionAlreadyProposed
+		);
+
+		// Move past the expiry window and clear the stale proposal -- called by m3, who never
+		// approved the original proposal.
+		System::set_block_number(proposed_at + ORACLE_PROPOSAL_EXPIRY as u64);
+		assert_ok!(Courts::clear_stale_oracle_proposal(RuntimeOrigin::signed(m3), case_id));
+		System::assert_last_event(Event::OracleProposalCleared { case_id }.into());
+		assert!(crate::pallet::PendingOracleProposal::<Test>::get(case_id).is_none());
+		assert!(crate::pallet::OracleApprovals::<Test>::get(case_id).is_none());
+
+		// The case is still Filed (the stale proposal was never applied), so a fresh
+		// submission can be proposed and this time driven to threshold.
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::Filed);
+		assert_eq!(ruling_hash, None);
+
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(m1),
+			case_id,
+			[9u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::approve_ai_ruling(RuntimeOrigin::signed(m2), case_id));
+		let (_, status, ruling_hash, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::AIRulingIssued);
+		assert_eq!(ruling_hash, Some([9u8; 32]));
+	});
+}
+
 /// The second half of the finding: a removed/compromised member's still-pending admin-action
 /// approval must no longer count toward the M-of-N threshold, exactly like the existing
 /// `remove_oracle_member_purges_stale_approval_from_in_flight_proposal` coverage for case-based
