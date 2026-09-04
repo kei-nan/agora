@@ -1,6 +1,6 @@
 use crate::{
-    mock::*, EnsureLegislatureMotion, Error, Event, Members, Motions, MotionVotes, NextMotionId,
-    PendingLegislatureApproval,
+    mock::*, Bootstrapped, EnsureLegislatureMotion, Error, Event, Members, Motions, MotionVotes,
+    NextMotionId, PendingLegislatureApproval,
 };
 use frame_support::{assert_noop, assert_ok, traits::EnsureOriginWithArg};
 use sp_runtime::DispatchError;
@@ -876,5 +876,95 @@ fn clear_stale_approval_unblocks_a_new_motion_after_expiry() {
         assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 2));
 
         assert!(PendingLegislatureApproval::<Test>::get().is_some());
+    });
+}
+
+// ─── Bootstrap lock: Root can seed initial members, but not forever ────────────────────────
+
+#[test]
+fn root_can_add_and_remove_members_pre_bootstrap() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+        assert_ok!(Legislature::remove_member(RuntimeOrigin::root(), 2));
+        assert_eq!(Members::<Test>::get().to_vec(), vec![1]);
+        assert!(!Bootstrapped::<Test>::get());
+    });
+}
+
+#[test]
+fn close_bootstrap_requires_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_noop!(
+            Legislature::close_bootstrap(RuntimeOrigin::signed(1)),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn close_bootstrap_requires_at_least_one_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            Legislature::close_bootstrap(RuntimeOrigin::root()),
+            Error::<Test>::NoMembersToBootstrap
+        );
+    });
+}
+
+#[test]
+fn close_bootstrap_cannot_be_called_twice() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+        assert!(Bootstrapped::<Test>::get());
+        System::assert_last_event(Event::BootstrapClosed.into());
+        assert_noop!(
+            Legislature::close_bootstrap(RuntimeOrigin::root()),
+            Error::<Test>::BootstrapClosed
+        );
+    });
+}
+
+/// The core fix this pallet gained: once bootstrapped, `Root` can never again unilaterally
+/// add or remove a legislature member — closing the gap where a compromised sudo key could
+/// pack or purge the legislature forever.
+#[test]
+fn root_cannot_add_or_remove_members_after_bootstrap_closed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+
+        assert_noop!(
+            Legislature::add_member(RuntimeOrigin::root(), 2),
+            Error::<Test>::BootstrapClosed
+        );
+        assert_noop!(
+            Legislature::remove_member(RuntimeOrigin::root(), 1),
+            Error::<Test>::BootstrapClosed
+        );
+        assert_eq!(Members::<Test>::get().to_vec(), vec![1]);
+    });
+}
+
+/// `pallet_elections`'s election-driven seating path must keep working after bootstrap
+/// closes -- it does not go through `add_member`/`remove_member` at all.
+#[test]
+fn election_seating_path_unaffected_by_closed_bootstrap() {
+    use pallet_elections::pallet::SeatLegislature;
+
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+
+        assert_ok!(<Legislature as SeatLegislature<u64>>::replace_members(vec![9, 10]));
+        assert_eq!(Members::<Test>::get().to_vec(), vec![9, 10]);
     });
 }

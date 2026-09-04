@@ -36,6 +36,7 @@ pub trait WeightInfo {
 	fn remove_council_member() -> Weight;
 	fn vote_declare_emergency() -> Weight;
 	fn vote_end_emergency() -> Weight;
+	fn close_bootstrap() -> Weight;
 }
 
 /// Weights for pallet_emergency_council.
@@ -77,6 +78,12 @@ impl<T: crate::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(3_u64.saturating_add(council_reads)))
 			.saturating_add(T::DbWeight::get().writes(3_u64))
 	}
+	/// 2 reads (`Bootstrapped`, `Council`) + 1 write (`Bootstrapped`).
+	fn close_bootstrap() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
 }
 
 // For backwards compatibility and tests. Uses a fixed generous council-size assumption (35,
@@ -102,5 +109,10 @@ impl WeightInfo for () {
 		Weight::from_parts(16_000_000, 3_600)
 			.saturating_add(RocksDbWeight::get().reads(38_u64))
 			.saturating_add(RocksDbWeight::get().writes(3_u64))
+	}
+	fn close_bootstrap() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}
 }

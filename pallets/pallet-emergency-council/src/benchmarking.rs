@@ -110,5 +110,16 @@ mod benchmarks {
 		assert!(ActiveEmergency::<T>::get().is_none());
 	}
 
+	#[benchmark]
+	fn close_bootstrap() {
+		let member: T::AccountId = account("member", 0, 0);
+		Council::<T>::put(BoundedVec::<T::AccountId, T::MaxCouncilSize>::try_from(alloc::vec![member]).unwrap());
+
+		#[extrinsic_call]
+		close_bootstrap(RawOrigin::Root);
+
+		assert!(Bootstrapped::<T>::get());
+	}
+
 	impl_benchmark_test_suite!(EmergencyCouncil, crate::mock::new_test_ext(), crate::mock::Test);
 }

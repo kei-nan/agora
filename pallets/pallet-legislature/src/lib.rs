@@ -262,6 +262,21 @@ pub mod pallet {
     pub type MotionVotes<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), bool>;
 
+    /// Whether the legislature's bootstrap phase has been closed (see `close_bootstrap`). While
+    /// `false`, `Root` may freely call `add_member`/`remove_member` — the bootstrapping path
+    /// used to seed the initial legislature. Once `true`, both calls are refused unconditionally
+    /// (`Error::BootstrapClosed`), including for `Root`: this closes a gap where a compromised
+    /// sudo key could otherwise unilaterally pack or purge the legislature forever, not just
+    /// during genesis bootstrap. Unlike `pallet_accountability_council::Bootstrapped` (which
+    /// hands post-bootstrap membership control to the Council's own supermajority vote), there
+    /// is deliberately no alternate `Root`-free path wired up here: the legislature's real
+    /// ongoing membership mechanism is `pallet_elections`'s automatic, backing-driven seating via
+    /// `SeatLegislature::replace_members` (see the impl at the bottom of this file), which does
+    /// not read this flag at all and keeps working unaffected after bootstrap closes. `Root` can
+    /// never flip this back to `false`; there is no call that does so.
+    #[pallet::storage]
+    pub type Bootstrapped<T: Config> = StorageValue<_, bool, ValueQuery>;
+
     /// Set by `close_motion` when a motion passes; consumed by `EnsureLegislatureMotion`.
     /// Stores `(call_hash, proposer, ayes, total_members, planted_at)` — any current
     /// legislature member may consume the token (see `EnsureLegislatureMotion`'s doc comment
@@ -300,6 +315,9 @@ pub mod pallet {
         /// A `PendingLegislatureApproval` token expired unconsumed and was discarded via
         /// `clear_stale_approval`, freeing the legislature to pass a new motion.
         PendingApprovalExpired { call_hash: [u8; 32] },
+        /// `Root` closed the bootstrap phase; `add_member`/`remove_member` can never be called
+        /// successfully again (see `Bootstrapped`'s doc comment).
+        BootstrapClosed,
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────────
@@ -333,17 +351,26 @@ pub mod pallet {
         NoPendingApproval,
         /// The pending approval token has not yet reached `PendingApprovalExpiryBlocks`.
         ApprovalNotYetStale,
+        /// `add_member`/`remove_member` was called after `close_bootstrap` — or `close_bootstrap`
+        /// itself was called a second time. Once closed, the bootstrap phase can never reopen;
+        /// see `Bootstrapped`'s doc comment.
+        BootstrapClosed,
+        /// `close_bootstrap` was called with no members yet seated.
+        NoMembersToBootstrap,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Add a member to the legislature. Root-only (bootstrapping; replaced by elections later).
+        /// Add a member to the legislature. Root-only, and only while the bootstrap phase is
+        /// still open (`Bootstrapped == false`) — see `Bootstrapped`'s doc comment and
+        /// `close_bootstrap`. Once bootstrap is closed this call always fails, even for `Root`.
         #[pallet::call_index(0)]
         #[pallet::weight(T::WeightInfo::add_member())]
         pub fn add_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
             Members::<T>::try_mutate(|members| {
                 ensure!(!members.contains(&who), Error::<T>::AlreadyMember);
                 members.try_push(who.clone()).map_err(|_| Error::<T>::MembersAtCapacity)
@@ -352,11 +379,12 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Remove a member from the legislature. Root-only.
+        /// Remove a member from the legislature. Root-only, same bootstrap gate as `add_member`.
         #[pallet::call_index(1)]
         #[pallet::weight(T::WeightInfo::remove_member())]
         pub fn remove_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
             Members::<T>::try_mutate(|members| {
                 let pos = members.iter().position(|m| m == &who)
                     .ok_or(Error::<T>::MemberNotFound)?;
@@ -516,6 +544,23 @@ pub mod pallet {
 
             PendingLegislatureApproval::<T>::kill();
             Self::deposit_event(Event::PendingApprovalExpired { call_hash });
+            Ok(())
+        }
+
+        /// `Root`-only, one-time: closes the legislature's bootstrap phase. Requires at least
+        /// one member already seated. After this, `add_member`/`remove_member` can never be
+        /// called successfully again by anyone, including `Root` — see `Bootstrapped`'s doc
+        /// comment. `pallet_elections`'s automatic seating (`SeatLegislature::replace_members`,
+        /// implemented at the bottom of this file) is unaffected and remains the ongoing
+        /// membership mechanism after this point.
+        #[pallet::call_index(6)]
+        #[pallet::weight(T::WeightInfo::close_bootstrap())]
+        pub fn close_bootstrap(origin: OriginFor<T>) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
+            ensure!(!Members::<T>::get().is_empty(), Error::<T>::NoMembersToBootstrap);
+            Bootstrapped::<T>::put(true);
+            Self::deposit_event(Event::BootstrapClosed);
             Ok(())
         }
     }

@@ -56,6 +56,7 @@ pub trait WeightInfo {
 	fn vote_motion() -> Weight;
 	fn close_motion() -> Weight;
 	fn clear_stale_approval() -> Weight;
+	fn close_bootstrap() -> Weight;
 }
 
 /// Weights for pallet_legislature.
@@ -108,6 +109,12 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
+	/// 2 reads (`Bootstrapped`, `Members`) + 1 write (`Bootstrapped`).
+	fn close_bootstrap() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -139,6 +146,11 @@ impl WeightInfo for () {
 	}
 	fn clear_stale_approval() -> Weight {
 		Weight::from_parts(13_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn close_bootstrap() -> Weight {
+		Weight::from_parts(11_000_000, 1_957)
 			.saturating_add(RocksDbWeight::get().reads(2_u64))
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}

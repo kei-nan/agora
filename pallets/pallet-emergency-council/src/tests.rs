@@ -1,5 +1,5 @@
 use crate::{
-    mock::*, ActiveEmergency, Council, CooldownUntil, DeclareVotes, EndVotes,
+    mock::*, ActiveEmergency, Bootstrapped, Council, CooldownUntil, DeclareVotes, EndVotes,
     EnsureActiveEmergency, Error, Event, PendingEmergencyProposal,
 };
 use frame_support::{assert_noop, assert_ok, traits::{EnsureOrigin, Hooks}};
@@ -777,5 +777,78 @@ fn vote_declare_emergency_fails_while_sibling_in_cooldown_even_with_own_cooldown
             REASON_A,
             10
         ));
+    });
+}
+
+// ─── Bootstrap lock: Root can seed initial members, but not forever ────────────────────────
+
+#[test]
+fn root_can_add_and_remove_members_pre_bootstrap() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1, 2]);
+        assert_ok!(EmergencyCouncil::remove_council_member(RuntimeOrigin::root(), 2));
+        assert_eq!(Council::<Test>::get().into_inner(), vec![1]);
+        assert!(!Bootstrapped::<Test>::get());
+    });
+}
+
+#[test]
+fn close_bootstrap_requires_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1]);
+        assert_noop!(
+            EmergencyCouncil::close_bootstrap(RuntimeOrigin::signed(1)),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn close_bootstrap_requires_at_least_one_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_noop!(
+            EmergencyCouncil::close_bootstrap(RuntimeOrigin::root()),
+            Error::<Test>::NoMembersToBootstrap
+        );
+    });
+}
+
+#[test]
+fn close_bootstrap_cannot_be_called_twice() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1]);
+        assert_ok!(EmergencyCouncil::close_bootstrap(RuntimeOrigin::root()));
+        assert!(Bootstrapped::<Test>::get());
+        System::assert_last_event(Event::BootstrapClosed.into());
+        assert_noop!(
+            EmergencyCouncil::close_bootstrap(RuntimeOrigin::root()),
+            Error::<Test>::BootstrapClosed
+        );
+    });
+}
+
+/// The core fix this pallet gained: once bootstrapped, `Root` can never again unilaterally
+/// add or remove an Emergency Council member — closing the gap where a compromised sudo key
+/// could pack or purge the council forever.
+#[test]
+fn root_cannot_add_or_remove_members_after_bootstrap_closed() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add_members(&[1]);
+        assert_ok!(EmergencyCouncil::close_bootstrap(RuntimeOrigin::root()));
+
+        assert_noop!(
+            EmergencyCouncil::add_council_member(RuntimeOrigin::root(), 2),
+            Error::<Test>::BootstrapClosed
+        );
+        assert_noop!(
+            EmergencyCouncil::remove_council_member(RuntimeOrigin::root(), 1),
+            Error::<Test>::BootstrapClosed
+        );
+        assert_eq!(Council::<Test>::get().into_inner(), vec![1]);
     });
 }

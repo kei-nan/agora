@@ -232,6 +232,20 @@ pub mod pallet {
     #[pallet::storage]
     pub type PendingEmergencyProposal<T: Config> = StorageValue<_, ([u8; 32], u32), OptionQuery>;
 
+    /// Whether the Emergency Council's bootstrap phase has been closed (see `close_bootstrap`).
+    /// While `false`, `Root` may freely call `add_council_member`/`remove_council_member` — the
+    /// bootstrapping path used to seed the initial council. Once `true`, both calls are refused
+    /// unconditionally (`Error::BootstrapClosed`), including for `Root`: this closes a gap where
+    /// a compromised sudo key could otherwise unilaterally pack or purge the Emergency Council
+    /// forever, not just during genesis bootstrap. Unlike
+    /// `pallet_accountability_council::Bootstrapped`, there is deliberately no alternate
+    /// `Root`-free path to change membership after this point — this pallet has no self-
+    /// governance mechanism of its own (its supermajority votes govern declaring/ending an
+    /// emergency, not council composition), so once closed, this council's membership is frozen
+    /// for good. `Root` can never flip this back to `false`; there is no call that does so.
+    #[pallet::storage]
+    pub type Bootstrapped<T: Config> = StorageValue<_, bool, ValueQuery>;
+
     /// Block number before which a new emergency cannot be declared. Set to
     /// `now + EmergencyCooldownBlocks` whenever an emergency ends, by any path (sunset
     /// expiry in `on_initialize`, or early `vote_end_emergency`). Defaults to zero, so the
@@ -285,6 +299,9 @@ pub mod pallet {
         CouncilMemberAdded { who: T::AccountId },
         /// A member was removed from the Emergency Council.
         CouncilMemberRemoved { who: T::AccountId },
+        /// `Root` closed the bootstrap phase; `add_council_member`/`remove_council_member` can
+        /// never be called successfully again (see `Bootstrapped`'s doc comment).
+        BootstrapClosed,
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────
@@ -315,17 +332,26 @@ pub mod pallet {
         MemberNotFound,
         /// The account is already a council member.
         AlreadyCouncilMember,
+        /// `add_council_member`/`remove_council_member` was called after `close_bootstrap` — or
+        /// `close_bootstrap` itself was called a second time. Once closed, the bootstrap phase
+        /// can never reopen; see `Bootstrapped`'s doc comment.
+        BootstrapClosed,
+        /// `close_bootstrap` was called with no members yet seated.
+        NoMembersToBootstrap,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────
 
     #[pallet::call]
     impl<T: Config> Pallet<T> {
-        /// Add a member to the Emergency Council. Root only.
+        /// Add a member to the Emergency Council. Root only, and only while the bootstrap phase
+        /// is still open (`Bootstrapped == false`) — see `Bootstrapped`'s doc comment and
+        /// `close_bootstrap`. Once bootstrap is closed this call always fails, even for `Root`.
         #[pallet::call_index(0)]
         #[pallet::weight(T::WeightInfo::add_council_member())]
         pub fn add_council_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
             Council::<T>::try_mutate(|members| {
                 ensure!(!members.contains(&account), Error::<T>::AlreadyCouncilMember);
                 members.try_push(account.clone()).map_err(|_| Error::<T>::CouncilAtCapacity)
@@ -334,11 +360,13 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Remove a member from the Emergency Council. Root only.
+        /// Remove a member from the Emergency Council. Root only, same bootstrap gate as
+        /// `add_council_member`.
         #[pallet::call_index(1)]
         #[pallet::weight(T::WeightInfo::remove_council_member())]
         pub fn remove_council_member(origin: OriginFor<T>, account: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
             Council::<T>::try_mutate(|members| {
                 let pos = members
                     .iter()
@@ -462,6 +490,23 @@ pub mod pallet {
                 T::SiblingEmergencyCooldown::notify_emergency_ended(now);
                 Self::deposit_event(Event::EmergencyLifted);
             }
+            Ok(())
+        }
+
+        /// `Root`-only, one-time: closes the Emergency Council's bootstrap phase. Requires at
+        /// least one member already seated. After this, `add_council_member`/
+        /// `remove_council_member` can never be called successfully again by anyone, including
+        /// `Root` — see `Bootstrapped`'s doc comment. This pallet has no post-bootstrap
+        /// self-governance path for its own membership (unlike
+        /// `pallet_accountability_council`): the Council's composition is frozen once closed.
+        #[pallet::call_index(4)]
+        #[pallet::weight(T::WeightInfo::close_bootstrap())]
+        pub fn close_bootstrap(origin: OriginFor<T>) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
+            ensure!(!Council::<T>::get().is_empty(), Error::<T>::NoMembersToBootstrap);
+            Bootstrapped::<T>::put(true);
+            Self::deposit_event(Event::BootstrapClosed);
             Ok(())
         }
     }
