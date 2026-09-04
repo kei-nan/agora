@@ -5,18 +5,29 @@
 // two are easy to diff against each other if a pallet's storage layout changes.
 import type { ApiPromise } from "@polkadot/api";
 import { xxhashAsHex } from "@polkadot/util-crypto";
-import { getApi } from "./client";
+import { getApi, withTimeout } from "./client";
 import { decodeCompact, extractU32KeySuffix, formatAgr, hexToBytes, u128LE, u32LE } from "./scale";
 
 function storagePrefix(pallet: string, item: string): string {
   return "0x" + xxhashAsHex(pallet, 128).slice(2) + xxhashAsHex(item, 128).slice(2);
 }
 
+// Every direct `api.rpc.*` call in this file goes through `withTimeout` (see `./client`): with
+// no wrapping, a stalled smoldot `jsonRpcResponses` iterator (see client.ts's `ScShim`) would
+// leave the awaiting call hung forever with nothing user-facing to show for it. The three
+// helpers below (`getKeysPaged`, `queryStorageAt`, `getStorage`) are the only places that make
+// raw `api.rpc.state.*` calls anywhere in this file — every `fetch*` function above builds on
+// them — so wrapping just these three (plus `chainStatus`'s own direct calls) covers every RPC
+// call site in this module.
+
 async function getKeysPaged(api: ApiPromise, prefixHex: string): Promise<string[]> {
   const all: string[] = [];
   let startKey = "";
   for (;;) {
-    const page = await api.rpc.state.getKeysPaged(prefixHex, 1000, startKey);
+    const page = await withTimeout(
+      api.rpc.state.getKeysPaged(prefixHex, 1000, startKey),
+      "state_getKeysPaged",
+    );
     const keys = page.map((k) => k.toHex());
     all.push(...keys);
     if (keys.length < 1000) break;
@@ -30,12 +41,18 @@ type OptionLike = { isSome: boolean; unwrap(): { toHex(): string } };
 /** Returns values aligned 1:1 with `keys`; `null` where the key has no value. */
 async function queryStorageAt(api: ApiPromise, keys: string[]): Promise<(string | null)[]> {
   if (keys.length === 0) return [];
-  const values = (await api.rpc.state.queryStorageAt(keys)) as unknown as OptionLike[];
+  const values = (await withTimeout(
+    api.rpc.state.queryStorageAt(keys),
+    "state_queryStorageAt",
+  )) as unknown as OptionLike[];
   return values.map((v) => (v && v.isSome ? v.unwrap().toHex() : null));
 }
 
 async function getStorage(api: ApiPromise, keyHex: string): Promise<string | null> {
-  const v = (await api.rpc.state.getStorage(keyHex)) as unknown as OptionLike;
+  const v = (await withTimeout(
+    api.rpc.state.getStorage(keyHex),
+    "state_getStorage",
+  )) as unknown as OptionLike;
   return v.isSome ? v.unwrap().toHex() : null;
 }
 
@@ -43,9 +60,12 @@ async function getStorage(api: ApiPromise, keyHex: string): Promise<string | nul
 
 export async function chainStatus(): Promise<{ best: number; finalized: number }> {
   const api = await getApi();
-  const header = await api.rpc.chain.getHeader();
-  const finalizedHash = await api.rpc.chain.getFinalizedHead();
-  const finalizedHeader = await api.rpc.chain.getHeader(finalizedHash);
+  const header = await withTimeout(api.rpc.chain.getHeader(), "chain_getHeader");
+  const finalizedHash = await withTimeout(api.rpc.chain.getFinalizedHead(), "chain_getFinalizedHead");
+  const finalizedHeader = await withTimeout(
+    api.rpc.chain.getHeader(finalizedHash),
+    "chain_getHeader(finalized)",
+  );
   return { best: header.number.toNumber(), finalized: finalizedHeader.number.toNumber() };
 }
 

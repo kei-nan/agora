@@ -3,8 +3,15 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // queries.ts's only real dependency is the shared light-client `getApi()` from ./client — mock
 // that boundary so these tests exercise the byte-decoding logic this codebase actually wrote
 // (storage key/value parsing) without touching the network or a real smoldot connection.
+// `withTimeout` is mocked as a pass-through (just awaits the wrapped promise, ignoring the
+// timeout) — these tests don't exercise Finding 2's timeout behavior itself (see
+// `client.test.ts` for that), they just need `queries.ts`'s calls to `withTimeout(...)` to keep
+// working now that it wraps every `api.rpc.*` call site.
 const { getApiMock } = vi.hoisted(() => ({ getApiMock: vi.fn() }));
-vi.mock("./client", () => ({ getApi: getApiMock }));
+vi.mock("./client", () => ({
+  getApi: getApiMock,
+  withTimeout: (promise: Promise<unknown>) => promise,
+}));
 
 import { chainStatus, fetchLaws, fetchProposals } from "./queries";
 

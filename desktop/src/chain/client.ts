@@ -23,6 +23,65 @@ const CHAINSPEC_URL = "/chainspecs/dev-chainspec-raw.json";
 export type ChainConnState = "connecting" | "syncing" | "ready" | "error";
 type StateListener = (state: ChainConnState, error?: string) => void;
 
+/** Default timeout for a single light-client RPC round trip. Matches the existing 30s
+ * convention already used on the Rust `reqwest` path (`desktop/src-tauri/src/commands/chain.rs`,
+ * `Client::builder().timeout(Duration::from_secs(30))` around line 756) — no reason for the two
+ * transports to disagree on how long "hung" means. */
+export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/** Raised by `withTimeout` when the wrapped promise doesn't settle in time. A distinct class
+ * (rather than a plain `Error`) so callers that want to special-case a stall (e.g. show a
+ * "chain connection stalled, retry?" UI instead of a generic error) can `instanceof` it. */
+export class RpcTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RpcTimeoutError";
+  }
+}
+
+/**
+ * Wraps a promise — in practice, almost always a single `api.rpc.*` call — so that if it never
+ * settles, the caller gets a rejected promise after `timeoutMs` instead of an `await` that hangs
+ * forever.
+ *
+ * Why this exists: smoldot surfaces RPC responses via an async iterator
+ * (`chain.jsonRpcResponses`, see `ScShim` below) that `ScProvider` pumps into `@polkadot/api`'s
+ * normal promise-based `api.rpc.*` calls. If that iterator ever stalls — a wedged smoldot
+ * internal state, a peer that stops responding mid-sync, etc. — nothing on the `@polkadot/api`
+ * side has its own timeout, so the awaiting call just hangs indefinitely with no user-facing
+ * failure. This is the one place that risk is closed off; every `api.rpc.*` call site in
+ * `queries.ts` and the connection-establishment calls below route through this.
+ *
+ * Deliberately does NOT cancel or otherwise touch the original `promise` on timeout — there's no
+ * `AbortController`-equivalent for a `@polkadot/api` RPC call, so a timed-out call's eventual
+ * result (if it ever arrives) is just ignored; this only changes what the *caller* sees.
+ */
+export function withTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs: number = DEFAULT_RPC_TIMEOUT_MS,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new RpcTimeoutError(
+          `${label} timed out after ${timeoutMs}ms — the chain connection may be stalled`,
+        ),
+      );
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 const listeners = new Set<StateListener>();
 let currentState: ChainConnState = "connecting";
 let currentError: string | undefined;
@@ -94,6 +153,17 @@ export const ScShim = {
  * hardcode a peer ID — which changes every time the node restarts with a fresh `--node-key`
  * (a plain `--dev --tmp` run generates a random one each time).
  *
+ * This is also why `desktop/src-tauri/tauri.conf.json`'s CSP `connect-src` has to include
+ * `ws://127.0.0.1:*` with a wildcard port rather than a specific one: the port comes from
+ * whatever `system_localListenAddresses` reports here, at connect time — CLAUDE.md documents
+ * `--listen-addr /ip4/0.0.0.0/tcp/30333/ws` as the flag to pass the node, but nothing in this
+ * function (or anywhere else) assumes or enforces that exact port, so a node started with a
+ * different `/ws` port would still be discovered and dialed correctly. CSP is static/build-time
+ * and can't be narrowed per-connection to match, so the wildcard stays until the port is
+ * actually pinned somewhere real (not just documented as the example flag) — `tauri.conf.json`
+ * itself can't carry this explanation inline: it's parsed with `deny_unknown_fields` and no
+ * comment support, confirmed by `cargo check` rejecting an attempted comment field.
+ *
  * NOT a re-introduction of the trust boundary flagged on `lookup_registered_account` in
  * `commands/chain.rs`: this call discovers *where to dial*, not *what to believe*. Every
  * subsequent state read is independently verified by smoldot against finalized GRANDPA
@@ -152,9 +222,12 @@ async function connect(): Promise<ApiPromise> {
 
     const provider = new ScProvider(ScShim as never, JSON.stringify(rawSpec));
     setState("syncing");
-    await provider.connect();
-    const api = await ApiPromise.create({ provider, throwOnConnect: true });
-    await api.isReady;
+    await withTimeout(provider.connect(), "smoldot provider.connect()");
+    const api = await withTimeout(
+      ApiPromise.create({ provider, throwOnConnect: true }),
+      "ApiPromise.create()",
+    );
+    await withTimeout(api.isReady, "api.isReady");
     setState("ready");
     api.on("disconnected", () => setState("error", "light client disconnected"));
     api.on("error", (e: unknown) => setState("error", e instanceof Error ? e.message : String(e)));

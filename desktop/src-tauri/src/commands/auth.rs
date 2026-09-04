@@ -56,6 +56,24 @@ impl PendingSessions {
     }
 }
 
+/// What a bearer token is permitted to do. Every session minted by the QR-auth flow today is
+/// `Read` — no phone-side flow exists yet that produces an already-signed extrinsic for
+/// `chain_submit_extrinsic` to relay (see that command's doc comment in `commands/chain.rs`), so
+/// there is currently no code path that should ever mint `ReadSubmit`. The variant exists so
+/// that whenever such a flow is designed and wired up, granting submit capability is an explicit
+/// choice made at the session-minting call site, not an accident of `SessionRecord` having no
+/// scope field at all — and so `chain_submit_extrinsic` fails closed against every session that
+/// exists today (all `Read`) instead of relying on whoever adds that future caller to remember
+/// to add a scope check themselves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum SessionScope {
+    /// Can call read-only chain-query commands gated by `require_valid_session`.
+    Read,
+    /// Can additionally call submit commands gated by `require_submit_session`
+    /// (`chain_submit_extrinsic`). Nothing mints this today.
+    ReadSubmit,
+}
+
 /// A validated session, keyed by bearer token. This — not any frontend state — is the source of
 /// truth for "is this caller authenticated," and it is only ever populated after a signature
 /// verified against the identity's on-chain-registered public key (see `verify_challenge_signature`
@@ -64,6 +82,7 @@ impl PendingSessions {
 pub struct SessionRecord {
     pub nullifier_hash: String,
     pub expires_at: u64,
+    pub scope: SessionScope,
 }
 
 #[derive(Clone)]
@@ -75,21 +94,49 @@ impl SessionStore {
     }
 }
 
-/// Validates a bearer token against the server-held `SessionStore`. This is the check every
-/// privileged command (e.g. a submit-transaction passthrough) must call before acting — an
-/// expired or unknown token is rejected here, not merely flagged in the UI. Returns the
-/// session's nullifier hash on success.
-pub fn require_valid_session(store: &SessionStore, token: &str) -> Result<String, String> {
+/// Shared lookup used by both `require_valid_session` and `require_submit_session`: validates
+/// the token against the server-held `SessionStore` and returns the full record (including
+/// scope) on success. An expired or unknown token is rejected here, not merely flagged in the UI.
+fn lookup_valid_session(store: &SessionStore, token: &str) -> Result<SessionRecord, String> {
     let mut map = store.0.lock().map_err(|e| e.to_string())?;
     let now = unix_now();
     // Opportunistic prune: bearer-token sessions past expiry are dropped on every check,
     // rather than accumulating for the process lifetime the way PendingSessions used to.
     map.retain(|_, record| record.expires_at > now);
     match map.get(token) {
-        Some(record) if record.expires_at > now => Ok(record.nullifier_hash.clone()),
+        Some(record) if record.expires_at > now => Ok(record.clone()),
         Some(_) => Err("session expired".into()),
         None => Err("invalid or unknown session token".into()),
     }
+}
+
+/// Validates a bearer token against the server-held `SessionStore`, with no scope requirement
+/// beyond plain validity. This is the check every read-only command should call before acting.
+/// Returns the session's nullifier hash on success.
+///
+/// This does NOT authorize submit actions — see `require_submit_session` for the additional
+/// scope check `chain_submit_extrinsic` requires.
+///
+/// `#[allow(dead_code)]`: `chain_submit_extrinsic` (the only privileged command that exists
+/// today) now goes through `require_submit_session` instead, so nothing calls this outside its
+/// own tests yet — there simply are no other privileged commands in the codebase today. Kept
+/// (not deleted) as the intended gate for the next one, per its own doc comment above.
+#[allow(dead_code)]
+pub fn require_valid_session(store: &SessionStore, token: &str) -> Result<String, String> {
+    lookup_valid_session(store, token).map(|record| record.nullifier_hash)
+}
+
+/// Same validity checks as `require_valid_session`, plus a `SessionScope::ReadSubmit`
+/// requirement. This is the gate `chain_submit_extrinsic` must pass before relaying anything to
+/// the chain — see `SessionScope`'s doc comment for why every session minted today is `Read` and
+/// will therefore be rejected here until a real submit flow exists and deliberately mints
+/// `ReadSubmit`. Returns the session's nullifier hash on success.
+pub fn require_submit_session(store: &SessionStore, token: &str) -> Result<String, String> {
+    let record = lookup_valid_session(store, token)?;
+    if record.scope != SessionScope::ReadSubmit {
+        return Err("session lacks submit scope: this bearer token is read-only".into());
+    }
+    Ok(record.nullifier_hash)
 }
 
 /// Posted by the mobile app to the local callback server once the QR is scanned.
@@ -404,6 +451,9 @@ fn finalize_callback(
                         SessionRecord {
                             nullifier_hash: cb.nullifier_hash.clone(),
                             expires_at,
+                            // QR-auth-issued sessions are read-only today — see `SessionScope`'s
+                            // doc comment for why.
+                            scope: SessionScope::Read,
                         },
                     );
                     ("200 OK", "{\"ok\":true}".into())
@@ -541,6 +591,7 @@ mod signature_tests {
             SessionRecord {
                 nullifier_hash: "0xabc".into(),
                 expires_at: 1, // way in the past
+                scope: SessionScope::Read,
             },
         );
         assert!(require_valid_session(&store, "expired-token").is_err());
@@ -550,11 +601,58 @@ mod signature_tests {
             SessionRecord {
                 nullifier_hash: "0xabc".into(),
                 expires_at: unix_now() + 3600,
+                scope: SessionScope::Read,
             },
         );
         assert_eq!(
             require_valid_session(&store, "live-token").unwrap(),
             "0xabc"
+        );
+    }
+
+    /// Finding 1 regression test: a session lacking submit scope (i.e. every session the QR-auth
+    /// flow mints today) must be rejected by `require_submit_session`, even though it's perfectly
+    /// valid for `require_valid_session`/read commands.
+    #[test]
+    fn require_submit_session_rejects_read_only_session() {
+        let store = SessionStore::new();
+        store.0.lock().unwrap().insert(
+            "read-only-token".into(),
+            SessionRecord {
+                nullifier_hash: "0xabc".into(),
+                expires_at: unix_now() + 3600,
+                scope: SessionScope::Read,
+            },
+        );
+
+        // Still fine for a read command...
+        assert!(require_valid_session(&store, "read-only-token").is_ok());
+        // ...but rejected for a submit command.
+        let err = require_submit_session(&store, "read-only-token").unwrap_err();
+        assert!(
+            err.contains("submit scope"),
+            "expected a submit-scope error, got: {err}"
+        );
+    }
+
+    /// A session that was actually minted with submit scope must pass `require_submit_session`.
+    /// Nothing mints `ReadSubmit` today, but the check itself must work correctly once something
+    /// does.
+    #[test]
+    fn require_submit_session_accepts_read_submit_session() {
+        let store = SessionStore::new();
+        store.0.lock().unwrap().insert(
+            "submit-token".into(),
+            SessionRecord {
+                nullifier_hash: "0xdef".into(),
+                expires_at: unix_now() + 3600,
+                scope: SessionScope::ReadSubmit,
+            },
+        );
+
+        assert_eq!(
+            require_submit_session(&store, "submit-token").unwrap(),
+            "0xdef"
         );
     }
 }

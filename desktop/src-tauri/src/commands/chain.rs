@@ -515,13 +515,20 @@ pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Op
 /// transport), plus nonce/mortality negotiation so the phone knows what to sign. That's real
 /// protocol design work beyond this auth fix, and is intentionally left undone here; this
 /// command is only the chain-facing half, ready for whichever phone-side flow is designed next.
+///
+/// Scoped to `SessionScope::ReadSubmit` (see `commands/auth.rs`), not just plain session
+/// validity: since every session the QR-auth flow mints today is `Read`-only, this command is
+/// currently unreachable by any session that exists, by construction — not merely by the
+/// absence of a caller. Whoever eventually wires up a phone-side signing flow must deliberately
+/// mint a `ReadSubmit` session for that flow to work at all, rather than this command silently
+/// accepting whatever read-only token happens to be lying around.
 #[tauri::command]
 pub async fn chain_submit_extrinsic(
     token: String,
     extrinsic_hex: String,
     sessions: State<'_, crate::commands::auth::SessionStore>,
 ) -> Result<String, String> {
-    crate::commands::auth::require_valid_session(&sessions, &token)?;
+    crate::commands::auth::require_submit_session(&sessions, &token)?;
 
     let client = RpcClient::new(NODE_URL);
     let result = client
