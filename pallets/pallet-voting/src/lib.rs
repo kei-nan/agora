@@ -960,12 +960,12 @@ pub mod pallet {
             let new_cost = (vote_count as u64).saturating_mul(vote_count as u64);
 
             if new_cost > old_cost {
-                let extra = new_cost - old_cost;
+                let extra = new_cost.saturating_sub(old_cost);
                 let balance = BudgetBalance::<T>::get(&who);
                 ensure!(balance >= extra, Error::<T>::InsufficientBudgetTokens);
-                BudgetBalance::<T>::insert(&who, balance - extra);
+                BudgetBalance::<T>::insert(&who, balance.saturating_sub(extra));
             } else {
-                let refund = old_cost - new_cost;
+                let refund = old_cost.saturating_sub(new_cost);
                 BudgetBalance::<T>::mutate(&who, |b| *b = b.saturating_add(refund));
             }
 
