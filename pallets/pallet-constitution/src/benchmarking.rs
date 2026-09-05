@@ -17,7 +17,7 @@
 use super::*;
 use codec::Encode;
 use frame_benchmarking::v2::*;
-use frame_support::traits::{EnsureOrigin, EnsureOriginWithArg, Get};
+use frame_support::traits::{EnsureOriginWithArg, Get};
 use frame_system::pallet_prelude::BlockNumberFor;
 use frame_system::RawOrigin;
 use sp_runtime::traits::Saturating;
@@ -231,7 +231,10 @@ mod benchmarks {
 			stage: MaturityStage::Provisional,
 			legislature_reaffirmed: false,
 		});
-		let origin = T::RevocationOrigin::try_successful_origin().unwrap();
+		let origin = T::RevocationOrigin::try_successful_origin(&crate::pallet::revocation_threshold_for_stage(
+			&MaturityStage::Provisional,
+		))
+		.unwrap();
 
 		#[extrinsic_call]
 		revoke_amendment(origin, 0u32);

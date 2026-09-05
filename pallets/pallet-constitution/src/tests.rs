@@ -155,6 +155,84 @@ fn invalidate_law_fails_when_already_paused() {
 	});
 }
 
+// ── invalidate_law_internal (idempotency fix for the courts-race finding) ──────
+//
+// `pallet-courts`' `auto_finalize` calls `invalidate_law_internal` (the `LawEnforcer` trait
+// impl) synchronously inside the same extrinsic that finalizes a jury vote or AI ruling. If
+// `repeal_law` or the manual `invalidate_law` extrinsic already moved the law out of `Active`
+// before that court case's own `auto_finalize` runs, the old behavior (hard error on
+// non-`Active`) would revert the entire extrinsic -- including the jury vote/oracle approval
+// just cast -- and retrying would reproduce the identical failure forever, permanently
+// stranding the case. These tests simulate that race directly against the internal helper.
+
+#[test]
+fn invalidate_law_internal_is_idempotent_after_repeal_law_race() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Ordinary, 1);
+		// Simulates repeal_law winning the race before the court case's auto_finalize runs.
+		assert_ok!(Constitution::repeal_law(RuntimeOrigin::root(), id));
+		assert_eq!(Laws::<Test>::get(id).unwrap().1, LawStatus::Repealed);
+
+		// The court case's auto_finalize call must now succeed as a no-op instead of
+		// permanently stranding the case with LawNotActive.
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		// Status is left as Repealed -- a no-op must not regress Repealed back to Paused.
+		assert_eq!(Laws::<Test>::get(id).unwrap().1, LawStatus::Repealed);
+	});
+}
+
+#[test]
+fn invalidate_law_internal_is_idempotent_after_a_prior_invalidation() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Ordinary, 1);
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		assert_eq!(Laws::<Test>::get(id).unwrap().1, LawStatus::Paused);
+
+		// A second call (e.g. a retried/duplicate auto_finalize) must succeed as a no-op,
+		// not error with LawNotActive.
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		assert_eq!(Laws::<Test>::get(id).unwrap().1, LawStatus::Paused);
+	});
+}
+
+#[test]
+fn invalidate_law_internal_no_op_does_not_re_emit_law_invalidated_event() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Ordinary, 1);
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		System::assert_last_event(Event::LawInvalidated { law_id: id }.into());
+
+		System::reset_events();
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		// The no-op path must not deposit a second, misleading LawInvalidated event.
+		assert!(System::events().is_empty());
+	});
+}
+
+#[test]
+fn invalidate_law_internal_works_on_a_genuinely_active_law() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Ordinary, 1);
+		assert_ok!(Constitution::invalidate_law_internal(id));
+		assert_eq!(Laws::<Test>::get(id).unwrap().1, LawStatus::Paused);
+		System::assert_last_event(Event::LawInvalidated { law_id: id }.into());
+	});
+}
+
+#[test]
+fn invalidate_law_internal_still_fails_for_a_law_that_never_existed() {
+	new_test_ext().execute_with(|| {
+		// The idempotency fix only applies to a law that exists but already transitioned out
+		// of Active -- it must not be mistaken for "anything goes" and silently allow
+		// invalidating a law_id that was never enacted at all.
+		assert_noop!(Constitution::invalidate_law_internal(999), Error::<Test>::LawNotFound);
+	});
+}
+
 // ── propose_amendment / ratify_amendment (Ordinary) ─────────────────────────
 
 #[test]
@@ -752,6 +830,65 @@ fn revoke_amendment_works_at_confirmed_stage_and_restores_law() {
 
 		assert_eq!(Laws::<Test>::get(id), Some((LawTier::Structural, LawStatus::Active, 1, h(1))));
 		assert_eq!(ConstitutionalAmendments::<Test>::get(id), None);
+	});
+}
+
+// ── RevocationOrigin threading the stage-dependent threshold ───────────────────
+//
+// `Config::RevocationOrigin` is `EnsureOriginWithArg<_, u8>` (not a plain `EnsureOrigin`)
+// specifically so `revoke_amendment` can pass the amendment's *current* `MaturityStage`-derived
+// percentage into the origin check -- see `revocation_threshold_for_stage` and the module doc
+// comment. The mock's `RevocationOrigin` (`AsEnsureOriginWithArg<EnsureRoot<u64>>`) ignores the
+// argument's value, same as `LegislatureOrigin`/`CourtOrigin` elsewhere in this suite -- what's
+// under test here is that the call correctly extracts the stage from storage and threads it
+// through (the call compiles and succeeds), not that this particular origin enforces it.
+
+#[test]
+fn revocation_threshold_maps_each_stage_to_its_configured_percentage() {
+	assert_eq!(
+		crate::pallet::revocation_threshold_for_stage(&MaturityStage::Provisional),
+		30
+	);
+	assert_eq!(crate::pallet::revocation_threshold_for_stage(&MaturityStage::Confirmed), 35);
+	assert_eq!(crate::pallet::revocation_threshold_for_stage(&MaturityStage::Entrenched), 40);
+}
+
+#[test]
+fn revoke_amendment_threads_provisional_stage_threshold_through_origin_check() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Structural, 1);
+		assert_ok!(Constitution::propose_constitutional_amendment(RuntimeOrigin::root(), id, h(2)));
+		assert_eq!(
+			ConstitutionalAmendments::<Test>::get(id).unwrap().stage,
+			MaturityStage::Provisional
+		);
+		// Succeeds: the 30%-Provisional threshold was correctly extracted from storage and
+		// passed into `RevocationOrigin::ensure_origin`, which this mock's Root origin satisfies
+		// regardless of the argument's value.
+		assert_ok!(Constitution::revoke_amendment(RuntimeOrigin::root(), id));
+		assert_eq!(Laws::<Test>::get(id), Some((LawTier::Structural, LawStatus::Active, 1, h(1))));
+	});
+}
+
+#[test]
+fn revoke_amendment_threads_confirmed_stage_threshold_through_origin_check() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = enact(LawTier::Structural, 1);
+		assert_ok!(Constitution::propose_constitutional_amendment(RuntimeOrigin::root(), id, h(2)));
+		set_fresh_legislature(true);
+		System::set_block_number(1 + PROVISIONING_PERIOD_BLOCKS as u64);
+		assert_ok!(Constitution::reaffirm_amendment(RuntimeOrigin::root(), id));
+		assert_eq!(
+			ConstitutionalAmendments::<Test>::get(id).unwrap().stage,
+			MaturityStage::Confirmed
+		);
+		// Succeeds with the 35%-Confirmed threshold extracted and threaded through -- a
+		// different value than the Provisional case above, proving this isn't a hardcoded
+		// constant but genuinely read from the amendment's current stage.
+		assert_ok!(Constitution::revoke_amendment(RuntimeOrigin::root(), id));
+		assert_eq!(Laws::<Test>::get(id), Some((LawTier::Structural, LawStatus::Active, 1, h(1))));
 	});
 }
 

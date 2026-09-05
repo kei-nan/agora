@@ -192,7 +192,11 @@ impl pallet_constitution::Config for Test {
 	// is covered by pallet-legislature's own test suite (the real
 	// `EnsureLegislatureMotion` origin wired in the runtime enforces it for real).
 	type LegislatureOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
-	type RevocationOrigin = EnsureRoot<u64>;
+	// Same `AsEnsureOriginWithArg` adaptation as `LegislatureOrigin`/`CourtOrigin` below, now
+	// that `RevocationOrigin` requires `EnsureOriginWithArg<_, u8>` (the stage-dependent
+	// threshold argument is exercised by this pallet's own `revocation_threshold_for_stage`
+	// unit tests, not by this mock, which stays Root-authorized regardless of the argument).
+	type RevocationOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<u64>>;
 	// Same `AsEnsureOriginWithArg` adaptation as `LegislatureOrigin` above, now that
 	// `CourtOrigin` requires `EnsureOriginWithArg<_, [u8; 32]>` too (the call-hash binding
 	// itself is exercised by pallet-courts' own `EnsureOracleCouncilApproved` test suite).

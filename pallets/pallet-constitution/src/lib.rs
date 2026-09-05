@@ -41,8 +41,15 @@
 //!   3. advance_to_entrenched: permissionless once ProvisioningPeriodBlocks + ConfirmationPeriodBlocks
 //!      have elapsed — advances to Entrenched.
 //!   4. revoke_amendment: RevocationOrigin may revert the amendment at any stage.
-//!      The required revocation threshold (30 / 35 / 40 %) grows by stage and is
-//!      enforced externally by the RevocationOrigin collective configuration.
+//!      The required revocation threshold (30 / 35 / 40 %) grows by stage; unlike the
+//!      Provisional-era plain `EnsureOrigin`, `RevocationOrigin` is now `EnsureOriginWithArg<_,
+//!      u8>`, so `revoke_amendment` passes that stage-derived percentage into the origin check
+//!      itself (`revocation_threshold_for_stage`, read from the amendment's on-chain
+//!      `MaturityStage` — never a caller-supplied value) — the same "origin type carries what it
+//!      needs to enforce" pattern `LegislatureOrigin`/`CourtOrigin` use above. Still a bare
+//!      `EnsureRoot` placeholder pending a real minority-collective origin in production (see
+//!      `Config::RevocationOrigin`'s doc comment), but the type can now actually carry the
+//!      stage-dependent bar once that collective is wired in.
 //!
 //! Courts may pause any Active law via CourtOrigin (M-of-N Oracle Council approval, not a
 //! single member — see `Config::CourtOrigin`'s doc comment).
@@ -208,6 +215,19 @@ pub mod pallet {
         }
     }
 
+    /// Required revocation threshold percentage for `stage`, per the escalating 30/35/40 bar
+    /// documented on `MaturityStage` and `revoke_amendment`. Passed as `RevocationOrigin`'s
+    /// `Argument` so a future real minority-collective origin can actually enforce the
+    /// stage-dependent bar — see `Config::RevocationOrigin`'s doc comment for why the origin's
+    /// type has to carry this rather than the check being a single fixed constant.
+    pub(crate) fn revocation_threshold_for_stage(stage: &MaturityStage) -> u8 {
+        match stage {
+            MaturityStage::Provisional => 30,
+            MaturityStage::Confirmed => 35,
+            MaturityStage::Entrenched => 40,
+        }
+    }
+
     // ── Pallet ───────────────────────────────────────────────────────────────────
 
     #[pallet::pallet]
@@ -265,7 +285,14 @@ pub mod pallet {
         type FreshLegislatureChecker: FreshLegislatureChecker<BlockNumberFor<Self>>;
         /// Origin permitted to revoke a constitutional amendment.
         /// Wire to a minority collective (30–40% of legislature, stage-dependent) in production.
-        type RevocationOrigin: frame_support::traits::EnsureOrigin<Self::RuntimeOrigin>;
+        /// `EnsureOriginWithArg<_, u8>` — mirrors `LegislatureOrigin`/`CourtOrigin` above: the
+        /// call site is *required* to pass the revocation threshold the amendment's *current*
+        /// `MaturityStage` actually demands (`revocation_threshold_for_stage`), so the origin
+        /// type itself is capable of enforcing the documented escalating 30/35/40% bar once a
+        /// real collective replaces the bare `EnsureRoot` placeholder — a plain `EnsureOrigin`
+        /// with no argument could never carry that stage-dependent distinction no matter what
+        /// concrete origin it was ever bound to.
+        type RevocationOrigin: frame_support::traits::EnsureOriginWithArg<Self::RuntimeOrigin, u8>;
 
         // ── Petitions ────────────────────────────────────────────────────────────
         /// Minimum citizen signatures required for a petition to trigger a referendum.
@@ -775,14 +802,23 @@ pub mod pallet {
 
         /// Revoke a constitutional amendment at any stage, restoring the previous law hash.
         ///
-        /// Requires RevocationOrigin. The threshold enforced by that collective should be:
+        /// Requires RevocationOrigin at the revocation percentage the amendment's *current*
+        /// `MaturityStage` demands (`revocation_threshold_for_stage`, read from
+        /// `ConstitutionalAmendments` storage — not a caller-supplied value):
         ///   Provisional → 30% of legislature
         ///   Confirmed   → 35% of legislature
         ///   Entrenched  → 40% of legislature + citizen referendum
+        /// Fallback if `law_id` has no pending amendment is the highest (Entrenched, 40%)
+        /// threshold — fail closed, same pattern as `repeal_law`/`propose_constitutional_amendment`
+        /// /`reaffirm_amendment` above; the call rejects with `ConstitutionalAmendmentNotFound`
+        /// right after regardless of what threshold authorized the origin.
         #[pallet::call_index(10)]
         #[pallet::weight(T::WeightInfo::revoke_amendment())]
         pub fn revoke_amendment(origin: OriginFor<T>, law_id: u32) -> DispatchResult {
-            T::RevocationOrigin::ensure_origin(origin)?;
+            let stage = ConstitutionalAmendments::<T>::get(law_id)
+                .map(|record| record.stage)
+                .unwrap_or(MaturityStage::Entrenched);
+            T::RevocationOrigin::ensure_origin(origin, &revocation_threshold_for_stage(&stage))?;
             let record = ConstitutionalAmendments::<T>::take(law_id)
                 .ok_or(Error::<T>::ConstitutionalAmendmentNotFound)?;
 
@@ -845,15 +881,38 @@ pub mod pallet {
             Ok(())
         }
 
-        /// Pause a law on a court ruling. Called by pallet-courts via LawEnforcer trait.
+        /// Pause a law on a court ruling. Called by pallet-courts via LawEnforcer trait,
+        /// synchronously inside the same extrinsic that finalizes a jury vote or AI ruling
+        /// (`auto_finalize`) — see the module-level race this guards against below.
+        ///
+        /// Idempotent by design: if the law is already non-`Active` (already `Paused` by a
+        /// prior call, or `Repealed` via `repeal_law`), this is a successful no-op rather than
+        /// an error. The caller's actual intent — "this law should end up non-Active" — is
+        /// already satisfied in that case. This matters because `pallet-courts`' `auto_finalize`
+        /// calls this function synchronously inside the same extrinsic that finalizes a jury
+        /// vote or AI ruling; if `repeal_law` or the manual `CourtOrigin`-gated `invalidate_law`
+        /// extrinsic already moved the law out of `Active` before that court case's own
+        /// `auto_finalize` runs, a hard error here would revert the *entire* extrinsic —
+        /// including the jury vote or oracle approval just being cast — and retrying would
+        /// reproduce the identical failure forever, permanently stranding the case (bond locked,
+        /// ruling never finalized). A law_id that never existed at all still errors with
+        /// `LawNotFound`: only an already-*transitioned* law is treated as a no-op.
+        ///
+        /// Only the status mutation and its associated event are guarded — there is no other
+        /// side-effecting work in this function to skip or repeat.
         pub fn invalidate_law_internal(law_id: u32) -> DispatchResult {
-            Laws::<T>::try_mutate(law_id, |maybe_law| {
+            let newly_paused = Laws::<T>::try_mutate(law_id, |maybe_law| {
                 let law = maybe_law.as_mut().ok_or(Error::<T>::LawNotFound)?;
-                ensure!(law.1 == LawStatus::Active, Error::<T>::LawNotActive);
+                if law.1 != LawStatus::Active {
+                    // Already Paused or Repealed — no-op, not an error (see doc comment above).
+                    return Ok::<bool, DispatchError>(false);
+                }
                 law.1 = LawStatus::Paused;
-                Ok::<(), DispatchError>(())
+                Ok(true)
             })?;
-            Self::deposit_event(Event::LawInvalidated { law_id });
+            if newly_paused {
+                Self::deposit_event(Event::LawInvalidated { law_id });
+            }
             Ok(())
         }
     }
