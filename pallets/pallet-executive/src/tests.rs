@@ -479,6 +479,63 @@ fn finalize_pm_investiture_fails_before_voting_window_closes() {
     });
 }
 
+// Regression test for the race this fix closes: `nominate_pm` checked eligibility at
+// nomination time, but `finalize_pm_investiture` used to call `install_pm` on the IRV
+// winner with no recheck at all -- so a winner who lost their legislature seat somewhere
+// between nomination and finalization (many blocks later) would still get installed.
+#[test]
+fn finalize_pm_investiture_rejects_winner_who_lost_legislature_membership_before_install() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+
+        // The winner loses their legislature seat in the gap between voting and
+        // finalization -- e.g. pallet-elections' automatic per-epoch reseating.
+        set_legislature_member(1, false);
+
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        assert!(InvestitureRound::<Test>::get().is_none());
+        System::assert_last_event(
+            Event::PmInvestitureFailedWinnerIneligible { winner: 1 }.into(),
+        );
+    });
+}
+
+// Same race, via the other half of the recheck: the winner joins the Accountability
+// Council (rather than losing their seat) before finalization.
+#[test]
+fn finalize_pm_investiture_rejects_winner_who_joined_accountability_council_before_install() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_legislature_member(1, true);
+        assert_ok!(Executive::open_pm_investiture(RuntimeOrigin::signed(1)));
+        assert_ok!(Executive::nominate_pm(RuntimeOrigin::signed(1), 1));
+        System::set_block_number(6);
+        assert_ok!(Executive::cast_pm_ballot(RuntimeOrigin::signed(1), ballot(&[1])));
+
+        // The winner joins the Accountability Council in the gap between voting and
+        // finalization. Still a legislature member throughout -- isolates this check
+        // from the membership-loss case above.
+        set_accountability_council_member(1, true);
+
+        System::set_block_number(11);
+        assert_ok!(Executive::finalize_pm_investiture(RuntimeOrigin::signed(1)));
+
+        assert!(PrimeMinister::<Test>::get().is_none());
+        assert!(InvestitureRound::<Test>::get().is_none());
+        System::assert_last_event(
+            Event::PmInvestitureFailedWinnerIneligible { winner: 1 }.into(),
+        );
+    });
+}
+
 // ─── remove_and_replace_prime_minister (constructive no confidence) ───────────
 
 #[test]

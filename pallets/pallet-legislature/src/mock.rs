@@ -11,6 +11,9 @@ thread_local! {
     /// `thread_local!` keeps this isolated per test thread since `cargo test` runs
     /// tests in parallel.
     static MINISTERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
+    /// Settable set of accounts currently treated as sitting Accountability Council
+    /// members, same thread-local idiom as `MINISTERS`.
+    static ACCOUNTABILITY_COUNCIL_MEMBERS: RefCell<BTreeSet<u64>> = RefCell::new(BTreeSet::new());
 }
 
 /// Test double for `MinisterChecker`: consults the thread-local `MINISTERS` set.
@@ -31,6 +34,27 @@ pub fn set_minister(who: u64) {
 #[allow(dead_code)]
 pub fn unset_minister(who: u64) {
     MINISTERS.with(|m| m.borrow_mut().remove(&who));
+}
+
+/// Test double for `AccountabilityCouncilChecker`: consults the thread-local
+/// `ACCOUNTABILITY_COUNCIL_MEMBERS` set.
+pub struct TestAccountabilityCouncilChecker;
+
+impl pallet_legislature::AccountabilityCouncilChecker<u64> for TestAccountabilityCouncilChecker {
+    fn is_current_member(who: &u64) -> bool {
+        ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| c.borrow().contains(who))
+    }
+}
+
+/// Marks `who` as a sitting Accountability Council member, or removes them.
+pub fn set_accountability_council_member(who: u64, member: bool) {
+    ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| {
+        if member {
+            c.borrow_mut().insert(who);
+        } else {
+            c.borrow_mut().remove(&who);
+        }
+    });
 }
 
 pub const MAX_MEMBERS: u32 = 5;
@@ -76,11 +100,13 @@ impl pallet_legislature::Config for Test {
     type PassageThreshold = frame_support::traits::ConstU8<PASSAGE_THRESHOLD>;
     type PendingApprovalExpiryBlocks = frame_support::traits::ConstU32<APPROVAL_EXPIRY>;
     type MinisterChecker = TestMinisterChecker;
+    type AccountabilityCouncilChecker = TestAccountabilityCouncilChecker;
     type WeightInfo = ();
 }
 
 // Build genesis storage according to the mock runtime.
 pub fn new_test_ext() -> sp_io::TestExternalities {
     MINISTERS.with(|m| m.borrow_mut().clear());
+    ACCOUNTABILITY_COUNCIL_MEMBERS.with(|c| c.borrow_mut().clear());
     frame_system::GenesisConfig::<Test>::default().build_storage().unwrap().into()
 }

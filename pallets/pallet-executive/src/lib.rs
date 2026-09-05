@@ -523,6 +523,11 @@ pub mod pallet {
         /// The investiture round closed with no winner (no candidates were nominated, or
         /// no ballots were cast) — the seat remains vacant; a new round must be opened.
         PmInvestitureFailedNoWinner,
+        /// The instant-runoff tally produced a winner, but by the time the round was
+        /// finalized they no longer held a legislature seat or had since joined the
+        /// Accountability Council — installation was refused and the seat remains vacant.
+        /// A new round must be opened. See `finalize_pm_investiture`'s doc comment.
+        PmInvestitureFailedWinnerIneligible { winner: T::AccountId },
         /// The daily vacancy sweep removed a PM/minister a court has suspended.
         OfficeVacatedForConviction { who: T::AccountId, role: VacatedRole },
     }
@@ -812,6 +817,19 @@ pub mod pallet {
         /// ranked ballots by instant-runoff, and install the winner. Anyone may call
         /// this. Emits `PmInvestitureFailedNoWinner` (seat stays vacant, a fresh round
         /// must be opened) if no candidates were nominated or no ballots were cast.
+        ///
+        /// Nomination and voting can span many blocks, so the tallied winner's eligibility
+        /// is re-checked here at the actual moment of installation — the same
+        /// `LegislatureMembership`/`AccountabilityCouncilChecker` pair `nominate_pm` checked
+        /// at nomination time — rather than trusting that a check performed blocks ago still
+        /// holds. A winner could have lost their legislature seat (e.g. via pallet-elections'
+        /// automatic per-epoch reseating) or joined the Accountability Council in the
+        /// interval. If the recheck fails, installation is refused and
+        /// `PmInvestitureFailedWinnerIneligible` is emitted instead — the seat stays vacant
+        /// and a fresh round must be opened, the same simple "no installable winner" outcome
+        /// already used when no candidates/ballots exist, rather than falling back to the
+        /// next-ranked IRV candidate (this pallet has no existing pattern for resuming a
+        /// tally mid-way, and inventing one here isn't warranted for a low-likelihood race).
         #[pallet::call_index(15)]
         #[pallet::weight(T::WeightInfo::finalize_pm_investiture())]
         pub fn finalize_pm_investiture(origin: OriginFor<T>) -> DispatchResult {
@@ -828,8 +846,16 @@ pub mod pallet {
 
             match winner {
                 Some(w) => {
-                    Self::install_pm(w.clone());
-                    Self::deposit_event(Event::PmInvestitureFinalized { winner: w });
+                    if T::LegislatureMembership::is_member(&w)
+                        && !T::AccountabilityCouncilChecker::is_current_member(&w)
+                    {
+                        Self::install_pm(w.clone());
+                        Self::deposit_event(Event::PmInvestitureFinalized { winner: w });
+                    } else {
+                        Self::deposit_event(Event::PmInvestitureFailedWinnerIneligible {
+                            winner: w,
+                        });
+                    }
                 }
                 None => {
                     Self::deposit_event(Event::PmInvestitureFailedNoWinner);

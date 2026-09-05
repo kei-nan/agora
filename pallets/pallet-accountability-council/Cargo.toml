@@ -20,6 +20,7 @@ scale-info = { features = ["derive"], workspace = true }
 sp-runtime.workspace = true
 pallet-elections = { path = "../pallet-elections", default-features = false }
 pallet-executive = { path = "../pallet-executive", default-features = false }
+pallet-legislature = { path = "../pallet-legislature", default-features = false }
 
 [dev-dependencies]
 sp-core = { default-features = true, workspace = true }
@@ -36,6 +37,7 @@ std = [
     "sp-runtime/std",
     "pallet-elections/std",
     "pallet-executive/std",
+    "pallet-legislature/std",
 ]
 try-runtime = [
     "frame-support/try-runtime",
@@ -43,4 +45,5 @@ try-runtime = [
     "sp-runtime/try-runtime",
     "pallet-elections/try-runtime",
     "pallet-executive/try-runtime",
+    "pallet-legislature/try-runtime",
 ]

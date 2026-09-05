@@ -210,6 +210,18 @@ pub mod pallet {
         fn is_active_minister(who: &AccountId) -> bool;
     }
 
+    /// Checks whether an account currently sits on the Accountability Council.
+    /// Implemented by pallet-accountability-council; called by pallet-legislature's
+    /// bootstrap-phase `add_member` to enforce the same legislature/Council overlap bar
+    /// that `pallet_elections::AccountabilityCouncilChecker` already enforces for
+    /// post-bootstrap automatic seating (see `pallet_elections::SeatLegislature` and
+    /// `add_member`'s doc comment). Same consumer-defines/provider-implements idiom as
+    /// `MinisterChecker` above and `pallet_elections`/`pallet_executive`'s own
+    /// `AccountabilityCouncilChecker` traits.
+    pub trait AccountabilityCouncilChecker<AccountId> {
+        fn is_current_member(who: &AccountId) -> bool;
+    }
+
     // ── Config ───────────────────────────────────────────────────────────────────
 
     #[pallet::config]
@@ -238,6 +250,11 @@ pub mod pallet {
         /// Checks whether a member is an active executive minister.
         /// Ministers are blocked from voting on motions (incompatibility rule).
         type MinisterChecker: MinisterChecker<Self::AccountId>;
+        /// Checks whether an account currently sits on the Accountability Council. Consulted
+        /// by bootstrap-phase `add_member` so Root can't seat a sitting Council member into
+        /// the legislature during the one-time bootstrap window — see
+        /// `AccountabilityCouncilChecker`'s doc comment.
+        type AccountabilityCouncilChecker: AccountabilityCouncilChecker<Self::AccountId>;
         /// Weight functions needed for this pallet's extrinsics.
         type WeightInfo: crate::weights::WeightInfo;
     }
@@ -357,6 +374,12 @@ pub mod pallet {
         BootstrapClosed,
         /// `close_bootstrap` was called with no members yet seated.
         NoMembersToBootstrap,
+        /// The account currently sits on the Accountability Council — barred from bootstrap-
+        /// phase legislature membership (the reverse of the join-time check
+        /// `pallet_accountability_council::add_member` already performs). Mirrors
+        /// `pallet_elections`'s `AccountabilityCouncilMember` skip at post-bootstrap automatic
+        /// seating. See `AccountabilityCouncilChecker`'s doc comment.
+        AccountabilityCouncilMember,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -366,11 +389,18 @@ pub mod pallet {
         /// Add a member to the legislature. Root-only, and only while the bootstrap phase is
         /// still open (`Bootstrapped == false`) — see `Bootstrapped`'s doc comment and
         /// `close_bootstrap`. Once bootstrap is closed this call always fails, even for `Root`.
+        /// Also refuses a sitting Accountability Council member, matching the overlap bar
+        /// `pallet_elections`'s post-bootstrap automatic seating already enforces — see
+        /// `AccountabilityCouncilChecker`'s doc comment.
         #[pallet::call_index(0)]
         #[pallet::weight(T::WeightInfo::add_member())]
         pub fn add_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             ensure_root(origin)?;
             ensure!(!Bootstrapped::<T>::get(), Error::<T>::BootstrapClosed);
+            ensure!(
+                !T::AccountabilityCouncilChecker::is_current_member(&who),
+                Error::<T>::AccountabilityCouncilMember
+            );
             Members::<T>::try_mutate(|members| {
                 ensure!(!members.contains(&who), Error::<T>::AlreadyMember);
                 members.try_push(who.clone()).map_err(|_| Error::<T>::MembersAtCapacity)

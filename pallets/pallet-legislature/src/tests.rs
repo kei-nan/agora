@@ -66,6 +66,24 @@ fn add_member_fails_at_max_capacity() {
     });
 }
 
+// Regression test: bootstrap-phase `add_member` used to have no Accountability Council
+// overlap check at all, unlike post-bootstrap automatic seating via
+// `pallet_elections::SeatLegislature`, which already checks this. A sitting Council member
+// must be refused here too.
+#[test]
+fn add_member_fails_for_sitting_accountability_council_member() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_accountability_council_member(1, true);
+
+        assert_noop!(
+            Legislature::add_member(RuntimeOrigin::root(), 1),
+            Error::<Test>::AccountabilityCouncilMember
+        );
+        assert!(Members::<Test>::get().is_empty());
+    });
+}
+
 // ─── remove_member ──────────────────────────────────────────────────────────
 
 #[test]

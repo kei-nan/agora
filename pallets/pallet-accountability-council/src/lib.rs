@@ -472,9 +472,10 @@ pub mod pallet {
 //
 // `add_member` (above) already blocks the "current legislature/executive member joins the
 // Council" direction. These implement the other direction: `pallet-elections`' automatic
-// legislature seating and `pallet-executive`'s minister/PM appointment path both need to ask
-// "is this account currently a Council member?" before installing them into legislature or
-// executive power. Following the same consumer-defines/provider-implements idiom this codebase
+// legislature seating, `pallet-executive`'s minister/PM appointment path, and
+// `pallet-legislature`'s own bootstrap-phase `add_member` all need to ask "is this account
+// currently a Council member?" before installing them into legislature or executive power.
+// Following the same consumer-defines/provider-implements idiom this codebase
 // already uses for `DisclosureChecker` (defined in pallet-elections, implemented directly on
 // `pallet_anticorruption::Pallet<T>`): each consuming pallet defines its own local
 // `AccountabilityCouncilChecker<AccountId>` trait, and this pallet (the provider, reading its
@@ -488,6 +489,12 @@ impl<T: Config> pallet_elections::AccountabilityCouncilChecker<T::AccountId> for
 }
 
 impl<T: Config> pallet_executive::AccountabilityCouncilChecker<T::AccountId> for Pallet<T> {
+    fn is_current_member(who: &T::AccountId) -> bool {
+        Members::<T>::get().contains(who)
+    }
+}
+
+impl<T: Config> pallet_legislature::AccountabilityCouncilChecker<T::AccountId> for Pallet<T> {
     fn is_current_member(who: &T::AccountId) -> bool {
         Members::<T>::get().contains(who)
     }

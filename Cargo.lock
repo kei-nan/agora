@@ -6018,6 +6018,7 @@ dependencies = [
  "frame-system",
  "pallet-elections",
  "pallet-executive",
+ "pallet-legislature",
  "parity-scale-codec",
  "scale-info",
  "sp-core",
