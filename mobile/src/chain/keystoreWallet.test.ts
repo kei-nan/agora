@@ -7,16 +7,28 @@
  * plain-'node' Jest environment at all).
  *
  * Like `native/keystoreSigner.test.ts`, this module caches state in
- * module-scope (`_keypairPromise`, plus the underlying native module refs
- * one level down) at import time, so each test re-requires it fresh via
- * `jest.resetModules()` after wiring up the fake native Keystore module and
- * clearing the fake filesystem — see `loadModule()`.
+ * module-scope (the underlying native module refs) at import time, so each
+ * test re-requires it fresh via `jest.resetModules()` after wiring up the
+ * fake native Keystore module and clearing the fake filesystem — see
+ * `loadModule()`. Note that `keystoreWallet.ts` itself does NOT cache the
+ * decrypted `KeyringPair` across calls (that was a prior version's behavior,
+ * fixed as a security-review finding — see `createKeystoreBackedKeypairGetter`'s
+ * doc comment in the source module): each call to
+ * `getOrCreateKeystoreKeypair`/`getOrCreateDelegatePersonaKeypair` decrypts
+ * the persisted seed fresh. The only thing held in module scope is a
+ * short-lived `inFlight` promise per keypair, used solely to de-duplicate
+ * genuinely concurrent calls into a single decrypt — it's cleared the
+ * instant that decrypt settles, so the very next call always re-decrypts.
  *
  * What's covered: a fresh install generates a random seed, encrypts it, and
- * persists it; a second call reuses the same persisted (and re-decrypted)
- * seed rather than generating a new one, so the derived address is stable
- * across "restarts" (fresh `loadModule()` calls simulate that); the
- * generated seed is never written to the fake filesystem in plaintext; a
+ * persists it; a second call reuses the same *persisted* seed (re-decrypting
+ * it, not reusing an in-memory `KeyringPair`) rather than generating a new
+ * one, so the derived address is stable across "restarts" (fresh
+ * `loadModule()` calls simulate that); a second call within the same module
+ * load re-decrypts rather than returning a cached `KeyringPair` (native
+ * `decryptSecret` is called once per call, not once per process — see the
+ * "does NOT cache the decrypted keypair across calls" test); the generated
+ * seed is never written to the fake filesystem in plaintext; a
  * corrupt/unrecognized on-disk file is treated as "no wallet on file" rather
  * than crashing; calling this when the Keystore module isn't linked throws
  * rather than silently doing something insecure.
@@ -125,9 +137,10 @@ describe('getOrCreateKeystoreKeypair', () => {
     const addressA = keypairA.address;
 
     // Simulate an app restart: reset the module registry (clears
-    // keystoreWallet.ts's in-memory `_keypairPromise` cache) but do NOT
-    // reset the fake filesystem or re-install a fresh fake Keystore module
-    // with different behavior — the persisted file should still be there.
+    // keystoreWallet.ts's in-memory `inFlight` de-dup promise, which is
+    // module-scoped) but do NOT reset the fake filesystem or re-install a
+    // fresh fake Keystore module with different behavior — the persisted
+    // file should still be there.
     jest.resetModules();
     installFakeKeystoreModule();
     // eslint-disable-next-line @typescript-eslint/no-var-requires

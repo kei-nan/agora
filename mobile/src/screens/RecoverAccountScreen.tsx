@@ -32,6 +32,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Platform, StyleSheet, Text, TextInput, TouchableOpacity, View, ActivityIndicator, ScrollView } from 'react-native';
 import { Buffer } from 'buffer';
+import { randomAsU8a } from '@polkadot/util-crypto';
 import DateTimePicker, { DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { KeyringPair } from '@polkadot/keyring/types';
@@ -134,8 +135,17 @@ function challengePassed(challenge: LivenessChallenge, photo: CapturedPhoto): bo
   return Math.abs(photo.headEulerAngleY) >= TURN_ANGLE_MIN_DEGREES;
 }
 
+/**
+ * Picks 'blink' or 'turn' for the liveness challenge. Uses `@polkadot/util-crypto`'s
+ * `randomAsU8a` — the same RNG this codebase already uses for other security-relevant
+ * randomness (`../chain/keystoreWallet.ts`'s seed generation, `./qrLivenessChallenge.ts`'s
+ * session nonce, and `RegisterScreen.tsx`'s identical fix) — rather than `Math.random()`,
+ * which is not a CSPRNG and is predictable enough that an attacker could in principle
+ * pre-stage a match for whichever challenge is coming next. A single random byte's low
+ * bit is plenty of entropy for a binary choice.
+ */
 function pickRandomChallenge(): LivenessChallenge {
-  return Math.random() < 0.5 ? 'blink' : 'turn';
+  return (randomAsU8a(1)[0] & 1) === 0 ? 'blink' : 'turn';
 }
 
 export default function RecoverAccountScreen({ navigation }: Props) {
