@@ -439,6 +439,17 @@ pub mod pallet {
         /// other way to withdraw one. See `clear_stale_oracle_proposal`.
         #[pallet::constant]
         type OracleProposalExpiryBlocks: Get<u32>;
+        /// How many blocks a jury may sit in `CaseStatus::JurySeated` without a strict majority
+        /// ever being reached (no-shows, or votes split in a way that never crosses the
+        /// threshold for either side) before `clear_stale_jury_deadlock` may discard it and
+        /// re-schedule a fresh jury selection. The jury-voting counterpart of
+        /// `OracleProposalExpiryBlocks` — mirrors its naming/wiring pattern exactly, just keyed
+        /// off `JurySeatedBlock` instead of `OracleProposalProposedAt`. Without this, a
+        /// deadlocked jury has no deadline, no re-selection mechanism, and no admin override:
+        /// `cast_jury_vote` only ever moves the case forward on a majority, and nothing else
+        /// touches `CaseStatus::JurySeated`. See `clear_stale_jury_deadlock`.
+        #[pallet::constant]
+        type JuryVotingExpiryBlocks: Get<u32>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// Number of blocks, starting the block *after* a case enters jury appeal, whose
@@ -564,6 +575,19 @@ pub mod pallet {
     #[pallet::storage]
     pub type JuryTally<T: Config> =
         StorageMap<_, Blake2_128Concat, u32, (u32, u32), ValueQuery>;
+
+    /// Block at which `select_jury` most recently seated a jury for a case (i.e. the block
+    /// `CaseStatus` moved to `JurySeated`). The jury-voting counterpart of
+    /// `OracleProposalProposedAt`: used by `clear_stale_jury_deadlock` to detect a jury that has
+    /// sat in `JurySeated` for `JuryVotingExpiryBlocks` without a strict majority ever being
+    /// reached — no-shows, or votes split in a way that can never cross the threshold for either
+    /// side (see `cast_jury_vote`'s majority check). Without this, such a case has no deadline,
+    /// no re-selection path, and no admin override — it sits in `JurySeated` forever. Cleared
+    /// whenever the case leaves `JurySeated`, whether by `auto_finalize` reaching a majority or
+    /// by `clear_stale_jury_deadlock` re-scheduling a fresh jury, and re-populated the next time
+    /// `select_jury` seats a jury for the case.
+    #[pallet::storage]
+    pub type JurySeatedBlock<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
 
     /// The Oracle Council — the M-of-N body whose members may propose/approve AI ruling
     /// submission (`submit_ai_ruling`) and finalization (`finalize_ruling`). Replaces the
@@ -837,6 +861,12 @@ pub mod pallet {
         AIGovernanceMemberRemoved { who: T::AccountId },
         /// A new AI model version was approved by supermajority vote.
         AIModelApproved { version: u32, model_hash: [u8; 32] },
+        /// A jury sat in `JurySeated` for `JuryVotingExpiryBlocks` without ever reaching a
+        /// strict majority and was cleared via `clear_stale_jury_deadlock`. The case is moved
+        /// back to `InJuryAppeal` and a fresh delayed-reveal jury-selection window is scheduled
+        /// (the same mechanism `appeal_ruling` uses) — `select_jury` may be called again for
+        /// `case_id` once that window elapses.
+        JuryDeadlockCleared { case_id: u32 },
     }
 
     // ── Errors ──────────────────────────────────────────────────────────────────
@@ -904,6 +934,9 @@ pub mod pallet {
         /// The `PendingOracleProposal` for this case_id has not yet reached
         /// `OracleProposalExpiryBlocks`, so `clear_stale_oracle_proposal` refuses to discard it.
         OracleProposalNotYetStale,
+        /// The jury for this case_id has not yet sat in `JurySeated` for
+        /// `JuryVotingExpiryBlocks`, so `clear_stale_jury_deadlock` refuses to discard it.
+        JuryNotYetStale,
         /// A `LawChallenge` case was filed against a `law_id` that already has a law-targeting
         /// case open (filed but not yet `FinalRuling`/`Enforced`) — which may itself be either
         /// a `LawChallenge` or a `TierConflict`. See `OpenCaseByLaw`'s doc comment for the
@@ -1204,6 +1237,9 @@ pub mod pallet {
                 c.1 = CaseStatus::JurySeated;
                 Ok::<(), DispatchError>(())
             })?;
+            // Timestamp the seating so `clear_stale_jury_deadlock` can detect a jury that never
+            // reaches a majority — see `JurySeatedBlock`'s doc comment.
+            JurySeatedBlock::<T>::insert(case_id, frame_system::Pallet::<T>::block_number());
             Ok(())
         }
 
@@ -1675,6 +1711,89 @@ pub mod pallet {
             Self::deposit_event(Event::OracleProposalCleared { case_id });
             Ok(())
         }
+
+        /// Recover a jury that has sat in `CaseStatus::JurySeated` for
+        /// `JuryVotingExpiryBlocks` without a strict majority ever being reached — no-shows,
+        /// or votes split in a way that never crosses the threshold for either side (see
+        /// `cast_jury_vote`'s majority check). Without this, such a case has no deadline, no
+        /// re-selection mechanism, and no admin override: nothing but a majority vote ever
+        /// moves a case out of `JurySeated`, so a jury that never reaches one leaves the case
+        /// stuck there forever.
+        ///
+        /// Rather than merely clearing the stuck jury with no path forward, this re-schedules
+        /// a fresh jury selection through exactly the same delayed-reveal commit-then-reveal
+        /// pipeline `appeal_ruling` uses (see `Config::JurySeedDelayBlocks`): the case moves
+        /// back to `CaseStatus::InJuryAppeal`, the deadlocked jury's pool/votes/tally are
+        /// discarded, and a new `JuryRequestBlock`/`SeedCaptureDue` entry is scheduled from the
+        /// current block — a follow-up `select_jury` call (same as the original flow) draws the
+        /// new jury once that window elapses. This deliberately reuses the existing, already-
+        /// audited randomness pipeline instead of drawing a replacement jury inline from some
+        /// ad-hoc immediately-available randomness source: the latter would reopen exactly the
+        /// grinding hole `JurySeedDelayBlocks` was built to close, since whoever is authorized
+        /// to call this could otherwise pick their submission moment once a favorable outcome
+        /// was already computable. A bare "clear with no next step" was considered and rejected
+        /// as strictly less useful for the same implementation cost, since the re-seed above
+        /// needs nothing beyond storage this pallet already has.
+        ///
+        /// Also clears any `CapturedJurySeed` left over from the deadlocked jury's own window —
+        /// without this, `select_jury` would see a stale, already fully-computable seed from
+        /// the old window still present and could be called immediately, bypassing the new
+        /// delayed-reveal window entirely.
+        ///
+        /// Authorization mirrors `select_jury`/`appeal_ruling`'s own gate
+        /// (`is_filer_or_oracle`): the case's filer, any Oracle Council member, or — for a
+        /// system-initiated case with no natural filer — any active citizen. A jury deadlock
+        /// isn't specifically an Oracle Council concern the way `clear_stale_admin_action`/
+        /// `clear_stale_oracle_proposal` are (those recover a stuck *council approval* flow);
+        /// the parties already entitled to drive this case through the rest of the appeal
+        /// pipeline are the closer fit for recovering a stuck jury on it too.
+        #[pallet::call_index(16)]
+        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        pub fn clear_stale_jury_deadlock(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+            ensure!(case.1 == CaseStatus::JurySeated, Error::<T>::InvalidStatus);
+            ensure!(Self::is_filer_or_oracle(&who, &case), Error::<T>::NotAuthorized);
+            let seated_at =
+                JurySeatedBlock::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
+            let now = frame_system::Pallet::<T>::block_number();
+            let expiry = BlockNumberFor::<T>::from(T::JuryVotingExpiryBlocks::get());
+            ensure!(now >= seated_at.saturating_add(expiry), Error::<T>::JuryNotYetStale);
+
+            // Discard the deadlocked jury's pool, votes, and tally.
+            if let Some(old_jury) = JuryPool::<T>::take(case_id) {
+                for juror in old_jury.iter() {
+                    JuryVotes::<T>::remove((case_id, juror.clone()));
+                }
+            }
+            JuryTally::<T>::remove(case_id);
+            JurySeatedBlock::<T>::remove(case_id);
+            // Stale leftover from the deadlocked jury's own window — must not let a fresh
+            // select_jury call reuse it before the new window scheduled below actually closes.
+            CapturedJurySeed::<T>::remove(case_id);
+
+            Cases::<T>::try_mutate(case_id, |maybe_case| {
+                let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
+                c.1 = CaseStatus::InJuryAppeal;
+                Ok::<(), DispatchError>(())
+            })?;
+
+            // Re-run the same delayed-reveal scheduling `appeal_ruling` performs.
+            let delay = T::JurySeedDelayBlocks::get();
+            let capture_block = now
+                .saturating_add(BlockNumberFor::<T>::from(delay))
+                .saturating_add(BlockNumberFor::<T>::from(1u32));
+            SeedCaptureDue::<T>::try_mutate(capture_block, |maybe_due| {
+                maybe_due
+                    .get_or_insert_with(BoundedVec::default)
+                    .try_push(case_id)
+                    .map_err(|_| Error::<T>::TooManyCasesInBlock)
+            })?;
+            JuryRequestBlock::<T>::insert(case_id, now);
+
+            Self::deposit_event(Event::JuryDeadlockCleared { case_id });
+            Ok(())
+        }
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1739,6 +1858,11 @@ pub mod pallet {
             // ever involved); `cast_jury_vote` only proceeds from `JurySeated` (a jury actually
             // reviewed it). Captured now, before the mutation below overwrites it.
             let jury_reviewed = case.1 == CaseStatus::JurySeated;
+            if jury_reviewed {
+                // The case is leaving JurySeated for good (majority reached) — clear the
+                // staleness timestamp so it can't be mistaken for a still-pending deadlock.
+                JurySeatedBlock::<T>::remove(case_id);
+            }
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;
                 c.1 = CaseStatus::FinalRuling;
@@ -2032,6 +2156,21 @@ pub mod pallet {
         /// (`LawChallenge`/`TreasuryDispute`/`TierConflict`) the case only carries the filer's
         /// nullifier, so exclusion for those is done the same nullifier-matching way as the
         /// `defendant_nullifier` check above, not a direct `AccountId` comparison.
+        ///
+        /// Also excludes any current `OracleMembers`/`AIGovernanceCouncil` member from the
+        /// eligible pool. Every case that ever reaches jury selection got here via
+        /// `appeal_ruling`, which only fires from `CaseStatus::AIRulingIssued` — i.e. every
+        /// jury this function ever seats is reviewing a Level-0 AI ruling, so this exclusion is
+        /// unconditional rather than gated on case type or history (there is no jury-eligible
+        /// case that *didn't* go through an AI ruling first). `OracleMembers` is the direct
+        /// conflict: that council is exactly who proposes/approves the `submit_ai_ruling`/
+        /// `finalize_ruling` action for the very ruling under appeal (see `submit_ai_ruling`,
+        /// `approve_ai_ruling`). `AIGovernanceCouncil` is included too, as a narrower but still
+        /// real institutional stake: that body approves which AI model version produces every
+        /// Level-0 ruling system-wide (see `vote_approve_ai_model`), so its members have a
+        /// standing interest in AI rulings holding up on appeal even though they didn't approve
+        /// this specific ruling. Both memberships are small, root-managed councils, so checking
+        /// both costs little and closes the conflict named by both bodies rather than only one.
         fn pick_random_jurors(
             case_id: u32,
             jury_size: u8,
@@ -2043,6 +2182,8 @@ pub mod pallet {
             let mut jurors: BoundedVec<T::AccountId, ConstU32<21>> = BoundedVec::new();
             let mut nonce: u32 = 0;
             let max_attempts = total.saturating_add(jury_size as u32).saturating_mul(3);
+            let oracle_members = OracleMembers::<T>::get();
+            let ai_governance_members = AIGovernanceCouncil::<T>::get();
             while (jurors.len() as u8) < jury_size && nonce < max_attempts {
                 let seed_input = (raw, case_id, nonce).encode();
                 let hash = T::Hashing::hash(&seed_input);
@@ -2058,7 +2199,9 @@ pub mod pallet {
                     let is_defendant = defendant_nullifier.is_some_and(|nullifier| {
                         T::CitizenChecker::citizen_nullifier(&citizen) == Some(nullifier)
                     });
-                    if !is_filer && !is_defendant && !jurors.contains(&citizen) {
+                    let is_conflicted = oracle_members.contains(&citizen)
+                        || ai_governance_members.contains(&citizen);
+                    if !is_filer && !is_defendant && !is_conflicted && !jurors.contains(&citizen) {
                         jurors.try_push(citizen).map_err(|_| Error::<T>::InvalidJurySize)?;
                     }
                 }

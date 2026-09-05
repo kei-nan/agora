@@ -26,6 +26,11 @@ pub const ADMIN_ACTION_EXPIRY: u32 = 20;
 /// of blocks.
 pub const ORACLE_PROPOSAL_EXPIRY: u32 = 20;
 
+/// How many blocks a jury may sit in `JurySeated` without reaching a majority before
+/// `clear_stale_jury_deadlock` can discard it. Small so tests don't need to advance hundreds of
+/// blocks.
+pub const JURY_VOTING_EXPIRY: u32 = 20;
+
 #[frame_support::runtime]
 mod runtime {
 	// The main runtime
@@ -212,6 +217,7 @@ impl pallet_courts::Config for Test {
 	type OracleApprovalDenominator = ConstU32<2>;
 	type AdminActionExpiryBlocks = ConstU32<ADMIN_ACTION_EXPIRY>;
 	type OracleProposalExpiryBlocks = ConstU32<ORACLE_PROPOSAL_EXPIRY>;
+	type JuryVotingExpiryBlocks = ConstU32<JURY_VOTING_EXPIRY>;
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;

@@ -2263,3 +2263,212 @@ fn select_jury_excludes_the_anonymized_law_challenge_filer_via_nullifier() {
 		assert_eq!(sorted, vec![2, 3, 4, 5, 6, 7, 8]);
 	});
 }
+
+// ─── pick_random_jurors excludes Oracle Council / AI Governance Council members ────────────
+//
+// Regression coverage for the fix closing a conflict-of-interest gap: `pick_random_jurors`
+// previously excluded only the case's own filer and (for CitizenConduct) the defendant, so a
+// member of the Oracle Council that proposed/approved the very Level-0 AI ruling under appeal
+// -- or a member of the separate AI Model Governance Council that approved the model version
+// behind it -- could be randomly seated onto the jury reviewing that ruling. This exclusion is
+// unconditional (not scoped to a case-type subset): every case that ever reaches jury selection
+// got here via `appeal_ruling`, which only fires from `CaseStatus::AIRulingIssued`, so there is
+// no jury-eligible case that didn't go through an AI ruling first.
+
+#[test]
+fn select_jury_excludes_oracle_council_members() {
+	new_test_ext().execute_with(|| {
+		// 9 citizens; account 2 is both a citizen and the Oracle Council member who submits
+		// the AI ruling under appeal. Excluding the filer (1) and the conflicted oracle member
+		// (2) leaves exactly {3..=9} as the only possible jury for a 7-person Level-1 case.
+		set_citizen_count(9);
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		let model_version = approve_first_ai_model([7u8; 32]);
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 2));
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(2),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(1), case_id));
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_eq!(jury.len(), 7);
+		assert!(
+			!jury.contains(&2),
+			"an Oracle Council member who proposed/approved the ruling under appeal must never \
+			 sit on the jury reviewing it"
+		);
+		let mut sorted = jury.into_inner();
+		sorted.sort();
+		assert_eq!(sorted, vec![3, 4, 5, 6, 7, 8, 9]);
+	});
+}
+
+#[test]
+fn select_jury_excludes_ai_governance_council_members() {
+	new_test_ext().execute_with(|| {
+		// 9 citizens; account 2 is both a citizen and an AI Model Governance Council member
+		// who approved the model version behind the ruling under appeal. Excluding the filer
+		// (1) and account 2 leaves exactly {3..=9}. Uses `DEFAULT_ORACLE` (account 50, outside
+		// the citizen pool) to submit the ruling itself, so this test isolates the AI
+		// Governance Council exclusion from the (separately tested) Oracle Council one.
+		set_citizen_count(9);
+		let case_id = crate::NextCaseId::<Test>::get();
+		assert_ok!(file_case_as(1, CaseSubject::General));
+		assert_ok!(Courts::add_ai_governance_member(RuntimeOrigin::root(), 2));
+		assert_ok!(Courts::vote_approve_ai_model(RuntimeOrigin::signed(2), [7u8; 32]));
+		let model_version = crate::CurrentAIModelVersion::<Test>::get();
+		let oracle = setup_oracle_member();
+		assert_ok!(Courts::submit_ai_ruling(
+			RuntimeOrigin::signed(oracle),
+			case_id,
+			[7u8; 32],
+			model_version,
+			Verdict::Upheld
+		));
+		assert_ok!(Courts::appeal_ruling(RuntimeOrigin::signed(1), case_id));
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_eq!(jury.len(), 7);
+		assert!(
+			!jury.contains(&2),
+			"an AI Model Governance Council member must never sit on a jury reviewing an AI \
+			 ruling produced by a model version they approved"
+		);
+		let mut sorted = jury.into_inner();
+		sorted.sort();
+		assert_eq!(sorted, vec![3, 4, 5, 6, 7, 8, 9]);
+	});
+}
+
+// ─── clear_stale_jury_deadlock ──────────────────────────────────────────────────────────────
+//
+// Regression coverage for the fix closing the missing jury-voting liveness mechanism:
+// previously, a case whose jury never reached a strict majority (no-shows, or a split that
+// never crosses the threshold for either side) sat in `CaseStatus::JurySeated` forever, with
+// no deadline, no re-selection mechanism, and no admin override.
+
+#[test]
+fn clear_stale_jury_deadlock_fails_before_expiry() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		// Only 3 of 7 vote -- short of the 4-vote strict majority either way, so the case stays
+		// stuck in JurySeated.
+		for juror in jury.iter().take(3) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Upheld));
+		}
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::JurySeated);
+
+		// Right at seating (well within JURY_VOTING_EXPIRY blocks): must be refused.
+		assert_noop!(
+			Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id),
+			Error::<Test>::JuryNotYetStale
+		);
+	});
+}
+
+#[test]
+fn clear_stale_jury_deadlock_rejects_unauthorized_account() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+
+		// Account 2 is neither the filer nor an Oracle Council member, and this isn't a system
+		// case -- rejected regardless of staleness.
+		assert_noop!(
+			Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(2), case_id),
+			Error::<Test>::NotAuthorized
+		);
+	});
+}
+
+#[test]
+fn clear_stale_jury_deadlock_requires_jury_seated_status() {
+	new_test_ext().execute_with(|| {
+		// Case is still InJuryAppeal -- no jury has been seated yet.
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		assert_noop!(
+			Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id),
+			Error::<Test>::InvalidStatus
+		);
+	});
+}
+
+/// The core property: a jury that never reaches majority can be discarded and the case
+/// re-seeded with a fresh jury selection once `JuryVotingExpiryBlocks` has elapsed -- and that
+/// fresh selection is a real path forward (it can actually reach a majority and finalize the
+/// case), not merely a dead end.
+#[test]
+fn clear_stale_jury_deadlock_succeeds_after_expiry_and_reseeds_a_working_jury() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		let seated_block = capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let old_jury = JuryPool::<Test>::get(case_id).unwrap().into_inner();
+
+		// A 3-1 split that can never cross the 4-of-7 strict majority for either side --
+		// deadlocked for good, not just "not yet decided".
+		for juror in old_jury.iter().take(3) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Upheld));
+		}
+		assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(old_jury[3]), case_id, Verdict::Overturned));
+
+		// One block short of the expiry window: still refused.
+		System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64 - 1);
+		assert_noop!(
+			Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id),
+			Error::<Test>::JuryNotYetStale
+		);
+
+		// Exactly at the expiry window: the filer (authorized the same way select_jury/
+		// appeal_ruling gate authorization) may clear the deadlock.
+		System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64);
+		assert_ok!(Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id));
+
+		// Case is back in InJuryAppeal; the old jury's pool/votes/tally are gone.
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::InJuryAppeal);
+		assert!(JuryPool::<Test>::get(case_id).is_none());
+		assert_eq!(crate::JuryTally::<Test>::get(case_id), (0, 0));
+		for juror in old_jury.iter() {
+			assert!(!crate::JuryVotes::<Test>::contains_key((case_id, *juror)));
+		}
+
+		// A fresh delayed-reveal window was scheduled, not an immediately-drawable jury --
+		// select_jury isn't callable until it elapses, same as any other appeal.
+		assert_noop!(
+			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
+			Error::<Test>::JurySeedNotReady
+		);
+
+		// Once the new window elapses, a fresh jury can be seated and can actually reach a
+		// majority -- proving this re-seed is a real path forward, not a dead end.
+		set_window_hashes(case_id, &[H256::repeat_byte(0x22); 3]);
+		capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let new_jury = JuryPool::<Test>::get(case_id).unwrap();
+		for juror in new_jury.iter().take(4) {
+			assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(*juror), case_id, Verdict::Upheld));
+		}
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::FinalRuling);
+	});
+}
