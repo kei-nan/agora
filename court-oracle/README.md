@@ -82,6 +82,66 @@ against a live chain in this sandboxed environment, only unit-tested at the call
 - **Key file decryption** (`src/keystore.rs`): the same real `age` (age-encryption.org/v1)
   passphrase-decryption pattern this codebase uses elsewhere for a service-held signing key —
   see that module's own honest tamper-resistance caveat.
+- **Per-case retry backoff with a give-up circuit breaker** (`src/retry.rs`) and **on-disk
+  case-tracking persistence** (`src/state.rs`) — see "Operational robustness" below.
+
+## Operational robustness
+
+Three fixes for how this service behaves under real, sustained operation (as opposed to the
+happy-path single ruling this crate's original build focused on) — none of them change what a
+successful ruling/finalize looks like, only how failures and restarts are handled.
+
+- **Exponential backoff + give-up per case_id** (`src/retry.rs`). Before this, a case that failed
+  for a fixed, unrecoverable reason (malformed context content, a Claude call that will never
+  succeed for this input, etc.) would re-trigger a fresh, billed Claude API call every single
+  `POLL_INTERVAL_SECS` forever — no backoff, no cap. `RetryTracker` now tracks attempts per
+  case_id in memory: attempt `n`'s failure schedules the next attempt no sooner than
+  `RETRY_BASE_DELAY_SECS * 2^(n-1)`, capped at `RETRY_MAX_DELAY_SECS`, and after
+  `RETRY_MAX_ATTEMPTS` consecutive failures the case is marked given-up and logged once,
+  prominently, as needing manual attention — it will not be retried again until this process
+  restarts (which resets all in-memory retry state; this was a deliberate "don't over-engineer a
+  job-queue system" simplification, not an oversight — see `Config::retry_max_attempts`'s doc
+  comment for why losing this particular counter on restart is an acceptable, non-harmful
+  outcome). Applies to both the rule-and-submit path (`submit_ai_ruling`, where Claude budget is
+  actually at stake) and the finalize path (`finalize_ruling`, which doesn't call Claude but was
+  equally capable of spamming retries/logs forever without this). See `retry.rs`'s unit tests for
+  the exact backoff-doubling and give-up behavior.
+- **Persisted processed/finalized case-tracking** (`src/state.rs`). `already_processed`/
+  `finalize_processed` used to be in-memory-only `HashSet`s, so a crash-restart in the narrow
+  window between "submitted the extrinsic" and "recorded it locally as done" caused a redundant
+  (billed) Claude call and a redundant submission attempt on the next run. **This was never a
+  correctness/fund-safety bug** — `pallet-courts`'s own status checks (`Filed`/`AIRulingIssued`/
+  etc.) already reject a call that no longer applies to a case's current on-chain state, so a
+  resubmission just fails harmlessly — only a wasted API call. `PersistedState` now writes both
+  sets to `STATE_FILE` (a plain JSON file, write-to-temp-then-rename for crash safety) after every
+  new entry, and loads it back on startup. No existing "local state directory" convention was
+  found elsewhere in this service or its siblings (`committee-node`, `oprf-committee-dev`) to
+  follow, so this is a new, minimal one (a single file path, same "explicit path, overridable via
+  env" shape as `KEYS_FILE`). See `state.rs`'s unit tests for the save/load round trip and the
+  "corrupt file is a load error, not a silent reset" behavior.
+- **A specific diagnostic for oracle-membership removal** (in `poll_once`, `main.rs`). Key
+  rotation still requires a full restart (see below for why hot-reload wasn't attempted), but the
+  narrower "was this account removed via `remove_oracle_member`?" case now gets a clear,
+  early, specific log line instead of a generic RPC/dispatch failure. `submit_ai_ruling`/
+  `finalize_ruling` are both gated by `T::OracleOrigin` (`EnsureOracle` in
+  `pallets/pallet-courts/src/lib.rs`), which rejects a non-member signer with `BadOrigin` **at
+  dispatch time** — critically, `author_submitExtrinsic` itself still returns a tx hash in that
+  case, since origin checks run during block execution, not transaction-pool validation, so a
+  removed oracle account would otherwise show up only as a mysteriously-inert ruling with no
+  error logged at all. `poll_once` now reads `Courts::OracleMembers` fresh at the start of every
+  poll cycle and, if the configured account isn't in it, logs an unambiguous error naming
+  `remove_oracle_member`/`add_oracle_member` as the likely cause and skips the cycle — which also
+  avoids burning a Claude call on a ruling that can't be accepted anyway.
+  **Full hot-reload of the signing key itself was not attempted** — deliberately out of scope for
+  this pass, not an oversight. It's a materially bigger change: the seed is threaded by reference
+  through the whole submission call chain (`poll_once` → `extrinsic::build_signed`), so hot-reload
+  would need either re-reading+re-decrypting `KEYS_FILE` on some trigger (a filesystem watch or a
+  signal handler) and swapping the in-memory seed/`account_id` pair atomically mid-loop, or
+  restructuring the call chain to fetch the current key on every submission. Both are real,
+  buildable changes, but they add a new failure mode of their own (a rotation landing mid-poll-
+  cycle, a corrupt/partial re-read of the key file while the old key is still the one in use) that
+  didn't feel like a "clean, low-risk addition" for a pass scoped to operational hardening — a
+  full restart on key rotation remains the supported path.
 
 ## What's assumed / never executed
 
@@ -238,6 +298,10 @@ All environment variables, see `src/config.rs` for defaults and full doc comment
 | `CLAUDE_API_KEY` | (required) | Anthropic API key |
 | `CLAUDE_MODEL` | `claude-opus-5` | Deliberately not the desktop app's `claude-sonnet-4-6` — this call produces a binding ruling, not a read-only chat answer |
 | `DRY_RUN` | `false` | When true, builds and logs the ruling + IPFS publish but does not submit `submit_ai_ruling` |
+| `STATE_FILE` | `./court-oracle-state.json` | Local JSON file tracking which case_ids have already had `submit_ai_ruling`/`finalize_ruling` submitted, so a crash-restart doesn't redundantly re-run a Claude call — see "Operational robustness" above |
+| `RETRY_BASE_DELAY_SECS` | `60` | Backoff base delay for a case that fails to process — attempt `n` waits `base * 2^(n-1)` |
+| `RETRY_MAX_DELAY_SECS` | `3600` | Cap on the backoff delay above |
+| `RETRY_MAX_ATTEMPTS` | `5` | Consecutive failures before a case is given up on (until process restart) rather than retried again — see "Operational robustness" above |
 
 Create a keys file:
 
@@ -261,9 +325,14 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 ## Test coverage — what's real, what isn't
 
-`cargo test` (52 tests, all passing in this environment, confirmed via `cargo test --release`
-2026-08-23 — up from the 47 previously cited here): case-context rendering for all four
-`CaseSubject` variants, including that IPFS-sourced law text is wrapped in
+`cargo test` (67 tests, all passing in this environment, confirmed via `cargo test --release`
+2026-09-05 — up from the 52 previously cited here, +15 for the "Operational robustness" fixes
+above: 11 in `retry.rs` covering `backoff_delay`'s doubling/capping/no-panic-on-large-attempt
+behavior plus `RetryTracker`'s should-attempt/success/failure/give-up state machine, and 4 in
+`state.rs` covering the `PersistedState` save→load round trip, a missing file loading as an empty
+default rather than an error, a second save fully replacing rather than merging with the first,
+and a corrupt file surfacing as a load error rather than a silent reset): case-context rendering
+for all four `CaseSubject` variants, including that IPFS-sourced law text is wrapped in
 `<untrusted_external_content>` delimiters (prompt-injection mitigation, see below); Claude
 request formatting and `VERDICT:`/`REASONING:` response parsing, including a realistic-shaped
 JSON fixture, a refusal fixture, and that the system prompt actually carries the matching

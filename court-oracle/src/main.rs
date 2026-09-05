@@ -18,6 +18,13 @@
 //! environment** — no network egress to any of the three is available here. See README.md for
 //! exactly what is real (compiles, unit-tested pure logic) vs. assumed (the live-integration
 //! path, never executed).
+//!
+//! Also see README.md's "Operational robustness" section for three later hardening fixes: a
+//! per-case exponential-backoff-then-give-up circuit breaker (`retry.rs`) so a persistently
+//! failing case doesn't burn Claude API budget forever; on-disk persistence of which case_ids
+//! have already been submitted (`state.rs`) so a crash-restart doesn't forget and redundantly
+//! re-bill Claude for one; and a specific diagnostic (in `poll_once` below) for the case where
+//! this service's oracle account has been removed from `Courts::OracleMembers`.
 
 mod cases;
 mod claude;
@@ -26,20 +33,23 @@ mod context;
 mod extrinsic;
 mod ipfs;
 mod keystore;
+mod retry;
 mod rpc;
+mod state;
 
 use cases::{AuditEntry, CaseRecord, CaseStatus, CaseSubject, LawRecord, Verdict};
 use config::Config;
 use context::SubjectContext;
+use retry::{FailureOutcome, RetryTracker};
 use rpc::RpcClient;
+use state::PersistedState;
 
 use anyhow::Context as _;
 use codec::{Decode, Encode};
 use serde::Serialize;
 use sp_core::crypto::{AccountId32, Ss58Codec};
 use sp_core::Pair as _;
-use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -82,12 +92,37 @@ async fn main() -> anyhow::Result<()> {
     let claude_client = claude::ClaudeClient::new(claude_api_key, config.claude_model.clone());
     let ipfs_client = ipfs::IpfsClient::new(config.ipfs_api_url.clone());
 
-    let mut already_processed: HashSet<u32> = HashSet::new();
-    // Tracks case_ids whose `finalize_ruling` extrinsic has already been submitted this run, so
-    // a case doesn't get a second finalize attempt while the first is still pending inclusion
-    // (status only leaves `AIRulingIssued` once the extrinsic actually lands) — same rationale
-    // as `already_processed` above for `submit_ai_ruling`.
-    let mut finalize_processed: HashSet<u32> = HashSet::new();
+    // Loaded from disk so a crash-restart doesn't forget which cases were already submitted and
+    // redundantly re-run (and re-bill) a Claude call for one whose ruling already made it
+    // on-chain — see state.rs's module doc comment. `persisted.processed`/`persisted.finalized`
+    // are what `main.rs` used to call `already_processed`/`finalize_processed`.
+    let mut persisted = PersistedState::load(&config.state_file).unwrap_or_else(|e| {
+        tracing::error!(
+            error = %e,
+            state_file = %config.state_file.display(),
+            "failed to load STATE_FILE -- starting from empty processed/finalized sets. If this \
+             file exists and is simply corrupt, a case already ruled on before this restart may \
+             now trigger one redundant (billed) Claude call before its idempotent on-chain guard \
+             rejects the resubmission -- see state.rs"
+        );
+        PersistedState::default()
+    });
+    tracing::info!(
+        state_file = %config.state_file.display(),
+        already_processed = persisted.processed.len(),
+        already_finalized = persisted.finalized.len(),
+        "loaded persisted case-tracking state"
+    );
+
+    // Per-case exponential backoff + give-up circuit breaker (see retry.rs) so a case that keeps
+    // failing doesn't re-trigger a fresh billed Claude call (or a fresh submission attempt)
+    // every single poll_interval_secs forever. Two independent trackers: a case backing off on
+    // the rule/submit path is unrelated to one backing off on the finalize path.
+    let retry_base = Duration::from_secs(config.retry_base_delay_secs);
+    let retry_max = Duration::from_secs(config.retry_max_delay_secs);
+    let mut rule_retry = RetryTracker::new(retry_base, retry_max, config.retry_max_attempts);
+    let mut finalize_retry = RetryTracker::new(retry_base, retry_max, config.retry_max_attempts);
+
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval_secs));
 
     loop {
@@ -99,8 +134,9 @@ async fn main() -> anyhow::Result<()> {
             &ipfs_client,
             &seed,
             &account_id,
-            &mut already_processed,
-            &mut finalize_processed,
+            &mut persisted,
+            &mut rule_retry,
+            &mut finalize_retry,
         )
         .await
         {
@@ -129,12 +165,38 @@ async fn poll_once(
     ipfs_client: &ipfs::IpfsClient,
     seed: &[u8; 32],
     oracle_account: &AccountId32,
-    already_processed: &mut HashSet<u32>,
-    finalize_processed: &mut HashSet<u32>,
+    persisted: &mut PersistedState,
+    rule_retry: &mut RetryTracker,
+    finalize_retry: &mut RetryTracker,
 ) -> anyhow::Result<()> {
     let model_version = fetch_current_ai_model_version(rpc).await?;
     if model_version == 0 {
         tracing::warn!("CurrentAIModelVersion is 0 (no AI model has ever been governance-approved) — submit_ai_ruling would reject every call with NoApprovedAIModel; skipping this poll cycle entirely rather than ruling on cases we can't submit for");
+        return Ok(());
+    }
+
+    // Diagnostic for the key-rotation/removal gap: `submit_ai_ruling`/`finalize_ruling` are both
+    // gated by `T::OracleOrigin` (`EnsureOracle`), which rejects with `BadOrigin` at *dispatch*
+    // time if the signer isn't in `OracleMembers` -- `author_submitExtrinsic` itself still
+    // returns a tx hash in that case (origin checks run during block execution, not transaction-
+    // pool validation), so a removed oracle account would otherwise show up only as a
+    // mysteriously-never-applied ruling with no error at all, or (on a follow-up cycle re-
+    // attempting the same still-`Filed` case) a confusing repeat with no specific cause. Checking
+    // membership directly against chain state up front turns that into an unambiguous, specific
+    // log line instead -- and, as a bonus, avoids burning a Claude call this cycle on rulings
+    // that could not be accepted anyway.
+    let oracle_members = fetch_oracle_members(rpc).await?;
+    if !oracle_members.iter().any(|m| m == oracle_account) {
+        tracing::error!(
+            oracle_account = %oracle_account.to_ss58check(),
+            oracle_member_count = oracle_members.len(),
+            "this account is NOT currently in Courts::OracleMembers -- submit_ai_ruling/\
+             finalize_ruling calls signed by it will be accepted into a block but rejected at \
+             dispatch with BadOrigin (author_submitExtrinsic would still report a tx hash, which \
+             is NOT confirmation of success). Was this account removed via remove_oracle_member, \
+             or does it still need add_oracle_member run for it? Skipping this poll cycle rather \
+             than submitting rulings that cannot take effect."
+        );
         return Ok(());
     }
     // Needed for the finalize-scheduling branch below; fetched once per cycle (not once per
@@ -173,7 +235,16 @@ async fn poll_once(
 
         match status {
             CaseStatus::Filed => {
-                if already_processed.contains(&case_id) {
+                if persisted.processed.contains(&case_id) {
+                    continue;
+                }
+                let now = Instant::now();
+                if !rule_retry.should_attempt(case_id, now) {
+                    if rule_retry.has_given_up(case_id) {
+                        tracing::debug!(case_id, "still in given-up state from an earlier poll cycle — needs manual attention, not retrying without a restart");
+                    } else {
+                        tracing::debug!(case_id, "still backing off from a recent failure — skipping this poll cycle");
+                    }
                     continue;
                 }
                 tracing::info!(case_id, filer = %filer.to_ss58check(), subject = ?subject, "found filed case, ruling");
@@ -182,7 +253,9 @@ async fn poll_once(
                     Ok((ruling_hash, verdict)) => {
                         if config.dry_run {
                             tracing::info!(case_id, ruling_hash = %hex::encode(ruling_hash), verdict = ?verdict, "DRY_RUN set — not submitting submit_ai_ruling");
-                            already_processed.insert(case_id);
+                            rule_retry.record_success(case_id);
+                            persisted.processed.insert(case_id);
+                            save_persisted_state(persisted, &config.state_file);
                             continue;
                         }
                         let call = extrinsic::SubmitAiRuling { case_id, ruling_hash, model_version, verdict };
@@ -198,20 +271,35 @@ async fn poll_once(
                             Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
                                 Ok(tx_hash) => {
                                     tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted submit_ai_ruling");
-                                    already_processed.insert(case_id);
+                                    rule_retry.record_success(case_id);
+                                    persisted.processed.insert(case_id);
+                                    save_persisted_state(persisted, &config.state_file);
                                 }
-                                Err(e) => tracing::error!(case_id, error = %e, "author_submitExtrinsic failed"),
+                                Err(e) => {
+                                    log_retry_outcome(case_id, "author_submitExtrinsic failed for submit_ai_ruling", &e, rule_retry.record_failure(case_id, now));
+                                }
                             },
-                            Err(e) => tracing::error!(case_id, error = %e, "failed to build/sign extrinsic"),
+                            Err(e) => {
+                                log_retry_outcome(case_id, "failed to build/sign extrinsic", &e, rule_retry.record_failure(case_id, now));
+                            }
                         }
                     }
                     Err(e) => {
-                        tracing::error!(case_id, error = %e, "failed to produce a ruling for this case — leaving it Filed for a later poll cycle");
+                        log_retry_outcome(case_id, "failed to produce a ruling for this case", &e, rule_retry.record_failure(case_id, now));
                     }
                 }
             }
             CaseStatus::AIRulingIssued => {
-                if finalize_processed.contains(&case_id) {
+                if persisted.finalized.contains(&case_id) {
+                    continue;
+                }
+                let now = Instant::now();
+                if !finalize_retry.should_attempt(case_id, now) {
+                    if finalize_retry.has_given_up(case_id) {
+                        tracing::debug!(case_id, "still in given-up state from an earlier poll cycle for finalize_ruling — needs manual attention, not retrying without a restart");
+                    } else {
+                        tracing::debug!(case_id, "still backing off from a recent finalize_ruling failure — skipping this poll cycle");
+                    }
                     continue;
                 }
                 let ruling_block = match fetch_ai_ruling_block(rpc, case_id).await {
@@ -230,7 +318,9 @@ async fn poll_once(
                 tracing::info!(case_id, "appeal window closed unappealed, finalizing");
                 if config.dry_run {
                     tracing::info!(case_id, "DRY_RUN set — not submitting finalize_ruling");
-                    finalize_processed.insert(case_id);
+                    finalize_retry.record_success(case_id);
+                    persisted.finalized.insert(case_id);
+                    save_persisted_state(persisted, &config.state_file);
                     continue;
                 }
                 // No verdict to determine or pass here: finalize_ruling(case_id) applies
@@ -249,11 +339,17 @@ async fn poll_once(
                     Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
                         Ok(tx_hash) => {
                             tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted finalize_ruling");
-                            finalize_processed.insert(case_id);
+                            finalize_retry.record_success(case_id);
+                            persisted.finalized.insert(case_id);
+                            save_persisted_state(persisted, &config.state_file);
                         }
-                        Err(e) => tracing::error!(case_id, error = %e, "author_submitExtrinsic failed for finalize_ruling"),
+                        Err(e) => {
+                            log_retry_outcome(case_id, "author_submitExtrinsic failed for finalize_ruling", &e, finalize_retry.record_failure(case_id, now));
+                        }
                     },
-                    Err(e) => tracing::error!(case_id, error = %e, "failed to build/sign finalize_ruling extrinsic"),
+                    Err(e) => {
+                        log_retry_outcome(case_id, "failed to build/sign finalize_ruling extrinsic", &e, finalize_retry.record_failure(case_id, now));
+                    }
                 }
             }
             _ => continue,
@@ -261,6 +357,69 @@ async fn poll_once(
     }
 
     Ok(())
+}
+
+/// Saves `persisted` to `state_file`, logging (not propagating) any failure — a save failure
+/// should never abort an otherwise-successful poll cycle (the on-chain submission already
+/// happened), but it does mean this restart-safety net has a hole until the next successful
+/// save, which is worth an operator's attention.
+fn save_persisted_state(persisted: &PersistedState, state_file: &std::path::Path) {
+    if let Err(e) = persisted.save(state_file) {
+        tracing::error!(
+            error = %e,
+            state_file = %state_file.display(),
+            "failed to persist case-tracking state to disk -- a crash before the next \
+             successful save could cause a redundant (billed) Claude call and resubmission \
+             attempt on restart for the case just processed (chain-side idempotency still \
+             prevents that resubmission from double-applying anything, see state.rs)"
+        );
+    }
+}
+
+/// Logs a failed processing attempt for `case_id` at the severity appropriate to what
+/// `RetryTracker::record_failure` decided: a routine "will retry in Ns" at `warn`, or a
+/// prominent, distinctly-worded "giving up" at `error` once the circuit breaker trips — see
+/// retry.rs's module doc comment for why this is scoped to be simple (in-memory, per-process)
+/// rather than a durable job-queue.
+fn log_retry_outcome(case_id: u32, context: &str, error: &anyhow::Error, outcome: FailureOutcome) {
+    match outcome {
+        FailureOutcome::WillRetry { attempt, delay } => {
+            tracing::warn!(
+                case_id,
+                error = %error,
+                attempt,
+                retry_in_secs = delay.as_secs(),
+                "{context} — will retry after backoff"
+            );
+        }
+        FailureOutcome::GaveUp { attempts } => {
+            tracing::error!(
+                case_id,
+                error = %error,
+                attempts,
+                "{context} — GIVING UP on this case after {attempts} failed attempts, needs \
+                 manual attention. It will not be retried again until this service restarts \
+                 (which resets its in-memory retry count) — see retry.rs. If this case's \
+                 content is genuinely unrulable (e.g. malformed context), it will immediately \
+                 fail and give up again after restart, so a human should investigate why before \
+                 just bouncing the process."
+            );
+        }
+    }
+}
+
+/// Reads `pallet_courts::OracleMembers` — a plain `StorageValue<BoundedVec<AccountId,
+/// MaxOracleMembers>, ValueQuery>`, no map key. A `BoundedVec`'s SCALE encoding is identical to
+/// a plain `Vec`'s (a compact length prefix followed by the items) — the bound is enforced at
+/// construction/mutation time on-chain, not in the wire format — so decoding as `Vec<AccountId32>`
+/// here is exact, not an approximation. Used once per poll cycle to give an unambiguous,
+/// specific diagnostic if this service's configured oracle account is no longer a registered
+/// member (see the `BadOrigin` doc comment at its call site in `poll_once`) rather than letting
+/// that show up only as silently-inert submissions.
+async fn fetch_oracle_members(rpc: &RpcClient) -> anyhow::Result<Vec<AccountId32>> {
+    let key = rpc::storage_prefix("Courts", "OracleMembers");
+    let Some(bytes) = rpc.get_storage(&key).await? else { return Ok(vec![]) };
+    Vec::<AccountId32>::decode(&mut &bytes[..]).context("could not decode Courts::OracleMembers")
 }
 
 /// Pure decision logic for whether an `AIRulingIssued` case should be finalized this poll

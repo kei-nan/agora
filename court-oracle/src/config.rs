@@ -85,6 +85,34 @@ pub struct Config {
     /// codebase — but this flag exists for safely exercising the rest of the pipeline against
     /// a real chain before trusting it to actually rule on cases.
     pub dry_run: bool,
+    /// Path to a local JSON file this service uses to remember which case_ids it has already
+    /// submitted `submit_ai_ruling`/`finalize_ruling` for (see `state.rs`). Loaded on startup
+    /// and rewritten after every new entry, so a crash-restart doesn't forget work it already
+    /// did and redundantly re-run (and re-bill) a Claude call for a case whose ruling already
+    /// made it on-chain. No existing "local state directory" convention was found elsewhere in
+    /// this service or its siblings (`committee-node`, `oprf-committee-dev`) to follow, so this
+    /// defaults to a plain file next to wherever the process runs, matching `KEYS_FILE`'s
+    /// convention of "an explicit path, overridable via env, mounted as a volume in a real
+    /// deployment."
+    pub state_file: PathBuf,
+    /// Base delay for the exponential backoff applied to a case that keeps failing to fully
+    /// process (Claude call, IPFS publish, or extrinsic build/submit all count — any of them
+    /// leaves the case still `Filed` on-chain, so all of them would otherwise retrigger a fresh
+    /// billed Claude call next poll cycle without this). Attempt `n` (1-indexed) waits
+    /// `base * 2^(n-1)`, capped at `retry_max_delay_secs`. See `retry.rs`.
+    pub retry_base_delay_secs: u64,
+    /// Cap on the exponential backoff delay above, so a persistently-failing case doesn't end
+    /// up waiting an absurd number of days between attempts.
+    pub retry_max_delay_secs: u64,
+    /// After this many consecutive failed attempts on the same case_id, this service stops
+    /// retrying it (until process restart, which resets the in-memory counter) and logs a
+    /// prominent "giving up, needs manual attention" error instead — the circuit breaker this
+    /// finding asked for. Deliberately in-memory only, not persisted: unlike the
+    /// processed/finalized sets above (whose loss on restart would cause a wasted redundant
+    /// Claude call), losing the retry count on restart merely gives a chronically-failing case
+    /// a fresh set of attempts, which is an acceptable, non-harmful outcome for the "don't
+    /// over-engineer this" scope this was built to.
+    pub retry_max_attempts: u32,
 }
 
 impl Config {
@@ -136,6 +164,25 @@ impl Config {
 
         let dry_run = std::env::var("DRY_RUN").map(|v| v == "true" || v == "1").unwrap_or(false);
 
+        let state_file = std::env::var("STATE_FILE")
+            .unwrap_or_else(|_| "./court-oracle-state.json".to_string())
+            .into();
+
+        let retry_base_delay_secs: u64 = std::env::var("RETRY_BASE_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+
+        let retry_max_delay_secs: u64 = std::env::var("RETRY_MAX_DELAY_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3_600);
+
+        let retry_max_attempts: u32 = std::env::var("RETRY_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+
         Ok(Self {
             node_rpc_url,
             keys_file,
@@ -149,6 +196,10 @@ impl Config {
             ipfs_api_url,
             claude_model,
             dry_run,
+            state_file,
+            retry_base_delay_secs,
+            retry_max_delay_secs,
+            retry_max_attempts,
         })
     }
 
