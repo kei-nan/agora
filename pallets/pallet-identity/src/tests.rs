@@ -2329,6 +2329,73 @@ fn prune_oprf_query_removes_a_fully_answered_query_before_expiry() {
     });
 }
 
+/// HIGH-severity fix: a fully-answered-but-not-yet-expired query must not be prunable by
+/// anyone other than `query.submitter` — otherwise any account (even an unregistered one)
+/// could race the submitter's own client and delete the round-1/round-2 data the instant the
+/// last threshold response lands, before the submitter has had any chance to read it.
+#[test]
+fn prune_oprf_query_by_non_submitter_fails_before_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query(); // submitter is citizen 1
+        fully_answer_all_slots(query_id);
+
+        // Still well within the SLA window; account 7 never submitted this query.
+        System::set_block_number(5);
+        assert_noop!(
+            Identity::prune_oprf_query(RuntimeOrigin::signed(7), query_id),
+            Error::<Test>::NotQuerySubmitter
+        );
+
+        // Nothing was actually removed.
+        assert!(PendingOprfQueries::<Test>::get(query_id).is_some());
+        for slot in 0..crate::NUM_COMMITTEES {
+            assert_eq!(
+                OprfRound2Responses::<Test>::get(query_id, slot).len() as u32,
+                2
+            );
+        }
+    });
+}
+
+/// Regression: the actual submitter can still prune their own fully-answered, not-yet-expired
+/// query (this already existed as
+/// `prune_oprf_query_removes_a_fully_answered_query_before_expiry` above; re-asserted here
+/// right next to the non-submitter-fails test for contrast).
+#[test]
+fn prune_oprf_query_by_submitter_still_succeeds_before_expiry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query(); // submitter is citizen 1
+        fully_answer_all_slots(query_id);
+
+        System::set_block_number(5);
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(1), query_id));
+
+        assert!(PendingOprfQueries::<Test>::get(query_id).is_none());
+    });
+}
+
+/// The permissionless-after-expiry path is preserved: once a query is genuinely past its SLA
+/// deadline, a non-submitter account may still prune it (this is the intentional garbage-
+/// collection path — a dead query with no possible legitimate reader left). Confirms the new
+/// submitter check above does not over-restrict this case.
+#[test]
+fn prune_oprf_query_by_non_submitter_succeeds_once_expired_even_if_fully_answered() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        let query_id = setup_pending_query(); // submitter is citizen 1
+        fully_answer_all_slots(query_id);
+
+        // Past the deadline (posted_at 1 + OprfQuerySlaBlocks 10 = 11).
+        System::set_block_number(12);
+        assert_ok!(Identity::prune_oprf_query(RuntimeOrigin::signed(7), query_id));
+
+        assert!(PendingOprfQueries::<Test>::get(query_id).is_none());
+        assert_eq!(PendingOprfQueryCountBySubmitter::<Test>::get(1), 0);
+    });
+}
+
 /// Pruning one citizen's expired query must not touch a different, unrelated citizen's still-
 /// live query, nor a different (also live) query from the same citizen.
 #[test]

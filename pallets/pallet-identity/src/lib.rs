@@ -1157,6 +1157,14 @@ pub mod pallet {
         /// nor fully answered (every committee slot at `T::OprfThreshold` round-2 responses),
         /// so it is still potentially live and must not be pruned yet.
         QueryNotPrunable,
+        /// `prune_oprf_query`: this query is fully answered but not yet past its
+        /// `OprfQuerySlaBlocks` deadline, so only `query.submitter` — the citizen whose
+        /// off-chain client still needs to read and combine the round-1/round-2 data — may
+        /// prune it. A third party could otherwise delete that data out from under the
+        /// submitter's client before it has had a chance to poll it. Once the deadline has
+        /// passed, no legitimate read can still be pending, so anyone may prune (see
+        /// `expired` handling above this check).
+        NotQuerySubmitter,
         /// `recover_account`: no existing citizen is registered under this proof's nullifier —
         /// there is nothing to recover. Use `register_citizen` for a genuinely new identity
         /// instead.
@@ -1929,9 +1937,16 @@ pub mod pallet {
         ///    is read off-chain (the querying citizen's own client combines the round-1/
         ///    round-2 data into the final anchor proof — see `OprfRound2Response`'s doc
         ///    comment; this pallet never reads it back itself), so pruning does not happen
-        ///    automatically the instant this condition is reached: the caller (typically the
-        ///    querying citizen, once their client has retrieved and combined the data) decides
-        ///    the timing, so pruning can never race a legitimate read.
+        ///    automatically the instant this condition is reached: the caller decides the
+        ///    timing. Unlike the expired case, this condition can be reached while the
+        ///    submitter's client still hasn't read the data yet, so **only `query.submitter`
+        ///    may prune here** (`Error::NotQuerySubmitter` otherwise) — permitting any signed
+        ///    account to prune a merely-fully-answered-but-not-expired query would let anyone
+        ///    race the legitimate submitter's own client and delete the data before it's ever
+        ///    read, a cheap unprivileged way to block that citizen's registration indefinitely.
+        ///    Once a query is also past its deadline, no legitimate read can still be pending
+        ///    (see condition 1), so the submitter-only restriction is lifted and anyone may
+        ///    sweep it, same as any other expired-and-dead query.
         ///
         /// Removes `PendingOprfQueries[query_id]` and, for every slot in `0..NUM_COMMITTEES`,
         /// `OprfRound1Commitments[query_id, slot]` and `OprfRound2Responses[query_id, slot]`,
@@ -1939,7 +1954,7 @@ pub mod pallet {
         #[pallet::call_index(18)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn prune_oprf_query(origin: OriginFor<T>, query_id: u64) -> DispatchResult {
-            ensure_signed(origin)?;
+            let who = ensure_signed(origin)?;
             let query = PendingOprfQueries::<T>::get(query_id).ok_or(Error::<T>::QueryNotFound)?;
 
             let deadline = query
@@ -1953,6 +1968,14 @@ pub mod pallet {
             });
 
             ensure!(expired || fully_answered, Error::<T>::QueryNotPrunable);
+
+            // A fully-answered-but-not-yet-expired query may still be mid-read by the
+            // submitter's own off-chain client; only they may decide it's safe to prune. An
+            // expired query can have no legitimate read still pending, so anyone may sweep it
+            // regardless of who submitted it (this is the only permissionless path).
+            if !expired {
+                ensure!(who == query.submitter, Error::<T>::NotQuerySubmitter);
+            }
 
             PendingOprfQueries::<T>::remove(query_id);
             for slot in 0..NUM_COMMITTEES {
