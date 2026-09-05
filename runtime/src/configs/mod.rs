@@ -804,6 +804,12 @@ impl pallet_courts::Config for Runtime {
 	/// quorum (see `pallet_courts::Config::OracleProposalExpiryBlocks`'s doc comment and
 	/// `clear_stale_oracle_proposal`).
 	type OracleProposalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
+	/// 14 days, same as `AdminActionExpiryBlocks`/`OracleProposalExpiryBlocks` — the
+	/// jury-voting counterpart, closing the analogous deadlock for a jury that never reaches
+	/// a majority (no-shows, or a split that never crosses the threshold for either side; see
+	/// `pallet_courts::Config::JuryVotingExpiryBlocks`'s doc comment and
+	/// `clear_stale_jury_deadlock`).
+	type JuryVotingExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	type CitizenSuspender = Runtime;
 	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`
@@ -934,7 +940,13 @@ impl pallet_constitution::Config for Runtime {
 	type ConfirmationPeriodBlocks = ConstU32<{ 4 * 365 * DAYS }>;
 	type FreshLegislatureChecker = Runtime;
 	/// Revocation origin: EnsureRoot for dev. Wire to a minority collective (30–40%) for mainnet.
-	type RevocationOrigin = EnsureRoot<AccountId>;
+	/// `AsEnsureOriginWithArg`-wrapped now that `Config::RevocationOrigin` requires
+	/// `EnsureOriginWithArg<_, u8>` (the stage-dependent revocation threshold — see
+	/// `pallet_constitution`'s module doc comment) — `EnsureRoot` alone only implements the
+	/// plain `EnsureOrigin`, so this wrapper is what lets it satisfy the new bound. Still
+	/// ignores the threshold argument, same dev-only caveat as `LegislatureOrigin`'s tuple
+	/// argument elsewhere in this runtime.
+	type RevocationOrigin = frame_support::traits::AsEnsureOriginWithArg<EnsureRoot<AccountId>>;
 	/// 1 000 citizen signatures required to trigger a referendum.
 	type PetitionThreshold = ConstU32<1_000>;
 	type PetitionApprover = Runtime;
@@ -995,6 +1007,10 @@ impl pallet_legislature::Config for Runtime {
 	type PendingApprovalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	/// Active ministers are blocked from legislature votes (incompatibility rule).
 	type MinisterChecker = Cabinet;
+	/// Bootstrap-phase `add_member` refuses a sitting Accountability Council member, matching
+	/// the overlap bar `pallet_elections`'s post-bootstrap automatic seating already enforces
+	/// (see `pallet_legislature::AccountabilityCouncilChecker`'s doc comment).
+	type AccountabilityCouncilChecker = AccountabilityCouncil;
 	type WeightInfo = pallet_legislature::weights::SubstrateWeight<Runtime>;
 }
 
