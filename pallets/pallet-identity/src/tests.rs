@@ -2709,6 +2709,108 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
     });
 }
 
+// ─── same_citizen ───────────────────────────────────────────────────────────
+//
+// `same_citizen` is what `pallet_elections::CitizenChecker::same_citizen` calls (wired in
+// `runtime/src/configs/mod.rs`) so `remove_backing` can accept a backing nullifier originally
+// submitted by an account that has since been recovered away from. These tests exercise the
+// real `nullifier_of_current_or_recovered`/`RecoveredAccountNullifier`/`NullifierRegistry`
+// mechanism directly, rather than pallet-elections' own mock reimplementation of it.
+
+#[test]
+fn same_citizen_is_true_immediately_after_a_single_recovery() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert!(!Identity::same_citizen(&1, &2));
+
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+
+        // The old (now-vacated) account and the new account resolve to the same citizen...
+        assert!(Identity::same_citizen(&1, &2));
+        // ...but the relation isn't symmetric-by-accident of a naive lookup either way: a
+        // never-registered third account is still unrelated to both.
+        assert!(!Identity::same_citizen(&3, &1));
+        assert!(!Identity::same_citizen(&3, &2));
+    });
+}
+
+#[test]
+fn same_citizen_resolves_across_a_chain_of_two_recoveries() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        // A (account 1) registers, then later recovers to B (account 2), and B later recovers
+        // to C (account 3). `same_citizen(&1, &3)` must resolve in one hop via
+        // `NullifierRegistry` (which `recover_account` keeps pointed at the *current* owner on
+        // every recovery), not by walking A -> B -> C.
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        System::set_block_number(5);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(2),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+
+        System::set_block_number(10);
+        assert_ok!(Identity::recover_account(
+            RuntimeOrigin::signed(3),
+            valid_proof(),
+            public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+            ANCHOR_A,
+            OPRF_PK_HASHES,
+            BACKING_COMMITMENT,
+        ));
+
+        // Both the original account and the intermediate hop resolve to the final owner.
+        assert!(Identity::same_citizen(&1, &3));
+        assert!(Identity::same_citizen(&2, &3));
+        // The stale intermediate tombstone (account 2's `RecoveredAccountNullifier` entry)
+        // must not resolve back to the now-vacated account 1.
+        assert!(!Identity::same_citizen(&2, &1));
+    });
+}
+
+#[test]
+fn same_citizen_is_false_for_two_genuinely_different_citizens() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        register(2, NULLIFIER_B, ANCHOR_B);
+
+        assert!(!Identity::same_citizen(&1, &2));
+        assert!(!Identity::same_citizen(&2, &1));
+    });
+}
+
+#[test]
+fn same_citizen_is_trivially_true_for_the_same_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert!(Identity::same_citizen(&1, &1));
+        // True even for an account that was never registered at all — the identity check
+        // short-circuits before any registry lookup.
+        assert!(Identity::same_citizen(&99, &99));
+    });
+}
+
 // ─── recover_account: cross-pallet orphaning guard ─────────────────────────
 
 #[test]

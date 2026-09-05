@@ -1409,7 +1409,7 @@ pub mod pallet {
             // Use u64 arithmetic to avoid overflow with large citizenries (yes_count * 100 would
             // saturate a u32 above ~42 million votes, causing the check to always pass).
             let passed = total > 0
-                && (yes_count as u64).saturating_mul(100) >= threshold * (total as u64);
+                && (yes_count as u64).saturating_mul(100) >= threshold.saturating_mul(total as u64);
             let new_state = if passed { ReferendumState::Passed } else { ReferendumState::Failed };
             Referenda::<T>::insert(
                 referendum_id,
