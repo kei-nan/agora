@@ -129,7 +129,10 @@ pub async fn agent_ask(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API error {status}: {text}"));
+        // Log the raw upstream error body server-side for debugging, but don't forward
+        // unfiltered third-party response content to the frontend/UI.
+        eprintln!("[agent_ask] Anthropic API error {status}: {text}");
+        return Err(format!("AI request failed (API error {status}). Please try again later."));
     }
 
     let parsed: ClaudeResponse = resp.json().await.map_err(|e| e.to_string())?;
