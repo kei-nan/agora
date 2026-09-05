@@ -25,9 +25,29 @@
  */
 import { NativeModules, Platform } from 'react-native';
 import { Buffer } from 'buffer';
+import { randomAsU8a } from '@polkadot/util-crypto';
 
 /** One randomized liveness challenge asked of the citizen, plus the always-taken frontal baseline. See `RegisterScreen.tsx`. */
 export type LivenessChallenge = 'baseline' | 'blink' | 'turn';
+
+/**
+ * Picks 'blink' or 'turn' for the liveness challenge. Uses `@polkadot/util-crypto`'s
+ * `randomAsU8a` — the same RNG this codebase already uses for other security-relevant
+ * randomness (`../chain/keystoreWallet.ts`'s seed generation, `../screens/qrLivenessChallenge.ts`'s
+ * session nonce) — rather than `Math.random()`, which is not a CSPRNG and is predictable enough
+ * that an attacker could in principle pre-stage a match for whichever challenge is coming next.
+ * A single random byte's low bit is plenty of entropy for a binary choice.
+ *
+ * Shared by `RegisterScreen.tsx` and `RecoverAccountScreen.tsx` (both already import
+ * {@link LivenessChallenge} from this module) — previously each screen kept its own
+ * independent copy of this exact function, which is how one screen's copy got fixed to use
+ * this CSPRNG while the other's was briefly missed and kept using `Math.random()`. Living
+ * here once makes that class of drift structurally impossible instead of relying on
+ * remembering to fix both copies every time.
+ */
+export function pickRandomChallenge(): LivenessChallenge {
+  return (randomAsU8a(1)[0] & 1) === 0 ? 'blink' : 'turn';
+}
 
 /** Per-shot signals `FaceCaptureModule.capturePhoto` reads off the frame via ML Kit, right after capture. */
 export interface CapturedPhoto {
