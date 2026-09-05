@@ -38,7 +38,13 @@ Calls:
 - `flag_entry(expenditure_index, reason_hash)` — auditor only; → `Flagged` with IPFS reason doc
 - `dispute_entry(expenditure_index)` — auditor only; → `Disputed`
 - `resolve_entry(expenditure_index)` — auditor only; Flagged/Disputed → `Cleared` (resolved in the
-  department's favor)
+  department's favor). Fixed `7e288c5` (2026-09-04): the resolving auditor must now be a
+  *different* account from the entry's `flagged_by` auditor (`Error::CannotResolveOwnFlag`
+  otherwise) — previously the same auditor who flagged an entry could immediately clear their own
+  flag, defeating the point of having a second party check the spend. Mirrors the
+  `SameInvestigator`/different-investigator check `pallet_anticorruption::approve_report_action`
+  already enforces (commit `0529508`); this pallet's own test suite had until now codified the
+  self-clear as intended, passing behavior
 - `submit_audit_report(period_hash)` — auditor only; emits `AuditReportSubmitted`
 
 Treasury enforcement: flagging or disputing an entry actually freezes that expenditure's

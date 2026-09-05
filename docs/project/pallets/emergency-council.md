@@ -11,6 +11,7 @@ Storage:
 - `EndVotes`: `AccountId` → `bool`
 - `CooldownUntil`: `BlockNumber` (added 2026-08-20) — block before which `vote_declare_emergency`
   is rejected; set to `now + EmergencyCooldownBlocks` whenever an emergency ends, by any path
+- `Bootstrapped`: `bool` (added `748625f`) — see "Bootstrap lock" below
 
 Config:
 - `MaxEmergencyBlocks = 216_000` (30 days at this chain's actual 12s/block time — constitutional ceiling)
@@ -18,11 +19,38 @@ Config:
 - `SupermajorityNumerator / Denominator = 2/3`
 
 Calls:
-- `add_council_member(account)` / `remove_council_member(account)` — root
+- `add_council_member(account)` / `remove_council_member(account)` — root, but **only while
+  bootstrap is open** (`Bootstrapped == false`; see below) — once `close_bootstrap` has been
+  called, both fail unconditionally, even for root
 - `vote_declare_emergency(reason_hash, duration_blocks)` — council member; duration clamped to
   max; rejected with `EmergencyCooldownActive` if called before `CooldownUntil`; activates on 2/3
   supermajority
 - `vote_end_emergency()` — council member; lifts on 2/3 supermajority, sets `CooldownUntil`
+- `close_bootstrap()` — root, one-time; requires at least one council member already seated
+  (`Error::NoMembersToBootstrap` otherwise). Sets `Bootstrapped = true`; there is no call that
+  ever flips it back.
+
+### Bootstrap lock (fixed `748625f`, 2026-09-04) — permanent freeze, no alternate path
+
+Before this fix, `add_council_member`/`remove_council_member` were permanently
+`ensure_root`-gated with no bootstrap lock, unlike `pallet-accountability-council`'s equivalent
+pattern — since a real `SudoConfig` key exists in genesis, a compromised sudo key could
+unilaterally pack or purge the Emergency Council at any time. `close_bootstrap` closes that:
+while `Bootstrapped == false`, root may freely add/remove members to seed the initial council;
+once closed, `add_council_member`/`remove_council_member` refuse unconditionally
+(`Error::BootstrapClosed`) for everyone, including root, and bootstrap can never reopen.
+
+**This pallet has no alternate post-bootstrap membership path — unlike `pallet-legislature`'s
+identical-looking lock** (see `docs/project/pallets/legislature.md`), which keeps taking new
+membership from `pallet_elections`' automatic seating (`SeatLegislature::replace_members`)
+regardless of whether its own bootstrap is closed. The Emergency Council has no self-governance
+mechanism of its own — its 2/3 supermajority votes govern *declaring/ending an emergency*, not
+council *composition* — so once `close_bootstrap` is called here, the Council's membership is
+**frozen for good**: there is no call, origin, or governance path anywhere in this pallet that
+can ever add, remove, or replace a member again. This is a deliberate tradeoff (closing the
+sudo-capture hole is worth a permanently fixed roster), not an oversight, but it means the
+initial bootstrap membership must be gotten right before `close_bootstrap` is ever called in
+production.
 
 `on_initialize` hook: auto-expires `ActiveEmergency` when `expires_at <= current_block`, emits
 `EmergencyExpired`, sets `CooldownUntil`.

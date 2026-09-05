@@ -88,6 +88,40 @@ Calls:
   the same hash, bumping `CurrentAIModelVersion` — the supermajority gate `submit_ai_ruling`
   checks against
 
+### Stale-proposal recovery: admin actions vs. case-based oracle actions
+
+Two parallel M-of-N proposal mechanisms exist, and each has its own stuck-proposal recovery path.
+
+**Administrative actions** (`propose_admin_action(call_hash)` / `approve_admin_action(call_hash)`,
+any `OracleMembers` member) let the Oracle Council authorize a manual-override call in *another*
+pallet (currently `invalidate_law`/`suspend_citizen`) via `EnsureOracleCouncilApproved` — a
+call-hash-bound proposal accumulates approvals in `PendingAdminAction` until it crosses the
+Council's M-of-N threshold, at which point it moves to `ApprovedAdminAction: call_hash →
+(proposer, block_approved)`, a resolved-but-unconsumed token that `EnsureOracleCouncilApproved`
+lets any current Council member (not only the original proposer) spend once against the matching
+call. If nobody ever consumes it, `clear_stale_admin_action(call_hash)` lets any current member
+discard it once `AdminActionExpiryBlocks` (14 days in the runtime) have passed unconsumed,
+freeing the `call_hash` for a fresh proposal (`Error::ApprovalNotYetStale` if called too early,
+`Error::NoApprovedAdminAction` if there's nothing to clear).
+
+**Case-based oracle actions** (`submit_ai_ruling`/`finalize_ruling`, both via `OracleOrigin`) work
+differently: they apply themselves immediately on crossing the strict-majority threshold rather
+than sitting in an approved-but-unconsumed state, so there is no case-based equivalent of
+`ApprovedAdminAction` to go stale. What *can* get stuck is the **pre-threshold** proposal itself —
+if Council members never cast enough approvals (e.g. because they're offline),
+`Error::OracleActionAlreadyProposed` blocks any fresh `submit_ai_ruling`/`finalize_ruling`
+proposal for that `case_id` forever, with no other way to withdraw one. Fixed `c7bd2e2`
+(2026-09-04): a new `OracleProposalProposedAt: case_id → BlockNumber` map records when
+`PendingOracleProposal` was first inserted for a case, and `clear_stale_oracle_proposal(case_id)`
+— open to any current `OracleMembers` member, mirroring `clear_stale_admin_action`'s
+authorization/staleness model — discards `PendingOracleProposal`/`OracleApprovals`/
+`OracleProposalProposedAt` for that case once `OracleProposalExpiryBlocks` (14 days in the
+runtime, same as `AdminActionExpiryBlocks`) have passed unconsumed (`Error::
+OracleProposalNotYetStale` if called too early), emitting `Event::OracleProposalCleared { case_id
+}` and freeing the case for a fresh proposal. `remove_oracle_member`'s existing
+approval-purging/re-resolution logic (see above) already covered this path correctly with no
+changes needed.
+
 TODOs:
 - Real VRF-based jury randomness. Current scheme (see log #52) is a commit-then-delayed-reveal
   built inside the pallet: `appeal_ruling` timestamps the case (`JuryRequestBlock`), and

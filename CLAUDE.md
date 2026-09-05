@@ -286,11 +286,17 @@ Runs without a server — connects directly to the chain and optionally to a clo
 - The signing key and biometric anchor never leave the phone
 - Desktop receives a time-limited bearer token, real server-side session with enforced expiry,
   verified against a real sr25519 signature over the QR challenge — this part is genuinely wired
-  end-to-end. The token's authorization model covers both read and submit actions in principle
-  (`chain_submit_extrinsic` is a registered, session-gated Tauri command), but **submit is not
-  yet wired to anything**: no phone-side flow exists that produces the already-signed extrinsic
-  this command expects as input, and no frontend code calls it — read is the only path actually
-  in use today.
+  end-to-end. As of `b3681df` (2026-09-04), every `SessionRecord` now carries a `SessionScope`
+  (`Read` or `ReadSubmit`) field, and `chain_submit_extrinsic` is gated by a distinct
+  `require_submit_session` check requiring `ReadSubmit` — plain validity is no longer enough (a
+  separate `require_valid_session` check, requiring no scope, still gates the ordinary read-only
+  commands). Every session the QR-auth flow mints today is `Read`-only, so **no session that
+  exists today — expired or not — can actually pass `chain_submit_extrinsic`'s gate**: this isn't
+  a generic "session-gated" command that some valid session might satisfy, it's a capability that
+  is correctly wired but currently unreachable by construction. **Submit is still not wired to
+  anything**: no phone-side flow exists that produces the already-signed extrinsic this command
+  expects as input, and no frontend code calls it, and even if one did today it would be rejected
+  for lacking `ReadSubmit` scope — read is the only path actually in use today.
 
 ### AI Agent Features (optional cloud, degrades gracefully offline)
 - Citizens can ask natural language questions about any law, proposal, ruling, or budget item

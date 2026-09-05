@@ -45,10 +45,18 @@ input the runtime cross-checks against live governance state — not a plaintext
 counter this pallet maintains). `UsedBackingNullifier` (nullifier → `(submitter, delegate_persona_id)`)
 replaces the old plaintext `BackingOf`/`CitizenBackingCount` maps entirely — no on-chain record
 of *which citizen* backs *which delegate* survives, only that some nullifier currently backs a
-given `delegate_persona_id`. `remove_backing` requires the *same* submitting account to reverse
-its own action (see `UsedBackingNullifier`'s doc comment for the replay-griefing hole this
-closes, since the `backing-nullifier` circuit deliberately binds no `AccountId`); this is not a
-privacy regression since that account was already public in `back_delegate`'s own call data. One
+given `delegate_persona_id`. `remove_backing` requires the submitting account to reverse its own
+action (see `UsedBackingNullifier`'s doc comment for the replay-griefing hole this closes, since
+the `backing-nullifier` circuit deliberately binds no `AccountId`); this is not a privacy
+regression since that account was already public in `back_delegate`'s own call data. Fixed
+`601b936` (2026-09-04): this no longer has to be the *literal same* `AccountId` — it also accepts
+that account's current identity if the citizen has since recovered to a new account via
+`pallet-identity`'s `recover_account` (checked via a new `CitizenChecker::same_citizen(former,
+current)` method, backed by pallet-identity's `RecoveredAccountNullifier` tombstone map, which
+resolves through chained recoveries, not just one hop). Before this fix, a citizen who recovered
+their account could still reconstruct the same `backing_nullifier` (it depends only on their
+`backing_root_secret`/slot index, never `AccountId`) but could never pass the old bare
+`submitter == who` check again, permanently inflating `BackingCount` with no recourse. One
 consequence: `back_delegate` no longer has a `CannotBackSelf` check — the tx signer is not
 cryptographically tied to the nullifier's underlying secret, so that check could not actually
 prevent a determined delegate from spending one of their own `MaxBackingsPerCitizen` slots on
@@ -85,6 +93,16 @@ re-checked at election time (not just trusted from whenever `Active` status was 
 so a delegate suspended since (e.g. an Overturned `CitizenConduct` court ruling) can never be
 seated on stale status. Defaults: 100 seats, 2-year cycle (`DefaultElectionCycleBlocks`), max 5
 backings per citizen.
+
+**Zero-backing seating floor (fixed `601b936`, 2026-09-04).** Final seating used to be a plain
+`sort_by(...).take(seats)` with no floor filter, so a candidate pool smaller than
+`LegislatureSeats` (plausible early in the chain's life, e.g. while a flash-backing maturity lag
+keeps every new delegate's checkpoint at 0) let zero-backing accounts get seated purely to fill
+the count — indistinguishable from a genuinely elected member. Candidates with `backing == 0` are
+now filtered out before seating; an undersized pool simply leaves the remaining seats empty
+rather than filling them this way. Verified safe since `pallet-legislature`'s motion-passage math
+reads live `Members().len()`, not a fixed seat-count constant, so empty seats don't break quorum
+math.
 
 Asset-disclosure currency is checked the same way, alongside citizenship: `T::DisclosureChecker`
 (implemented by pallet-anticorruption — see `docs/project/pallets/anticorruption.md`) must
@@ -148,8 +166,9 @@ Delegate registry:
 - `UsedBackingNullifier`: `[u8; 32]` (`backing_nullifier`) → `(AccountId submitter,
   [u8; 32] delegate_persona_id)` — replaces the old plaintext `BackingOf`/`CitizenBackingCount`
   entirely; no on-chain record of which citizen backs which delegate, only that a nullifier
-  currently backs a given persona. `submitter` is required again by `remove_backing` (see
-  above)
+  currently backs a given persona. `remove_backing` checks the caller against `submitter` via
+  `T::CitizenChecker::same_citizen` (see above) rather than a bare equality check, so it also
+  accepts `submitter`'s current identity post-recovery
 
 Governance-controlled parameters (stored, changeable by governance, seeded from `Default*`
 config at genesis):
@@ -176,8 +195,10 @@ receives backing) / `OnBreak` (served `MaxConsecutiveTerms`, waiting out `break_
   `MaxBackingsPerCitizen`/backing-commitment-root state; rejects backing an `OnBreak` delegate
   or a reused nullifier; auto-activates the delegate on crossing `BackingThreshold`. No
   `CannotBackSelf` check (see above)
-- `remove_backing(delegate, zk_proof, public_inputs)` — must be called by the same account that
-  originally called `back_delegate` for this nullifier; frees the slot for reuse;
+- `remove_backing(delegate, zk_proof, public_inputs)` — must be called by the account that
+  originally called `back_delegate` for this nullifier, or that account's current identity if it
+  has since recovered to a new `AccountId` via `pallet-identity`'s `recover_account` (fixed
+  `601b936` — see `T::CitizenChecker::same_citizen` above); frees the slot for reuse;
   auto-deactivates (back to `Pending`) if the delegate falls below `BackingThreshold`
 - `set_backing_threshold(threshold)` — `GovernanceOrigin`; must stay within
   `BackingThresholdFloor`/`BackingThresholdCeiling`
