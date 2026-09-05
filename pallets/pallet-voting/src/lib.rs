@@ -523,13 +523,14 @@ pub mod pallet {
         EpochStillActive,
         /// duration_blocks is outside [MinEpochDurationBlocks, MaxEpochDurationBlocks].
         InvalidEpochDuration,
-        /// `delegate_vote`: this topic has a referendum whose voting window has already closed
-        /// (`end_block` has passed) but that has not yet been finalized (still
-        /// `ReferendumState::Voting` — e.g. `PendingFinalization` overflowed and
-        /// `finalize_referendum` hasn't been called yet). Creating or modifying a delegation for
-        /// this topic is rejected until that referendum is finalized, closing the window where a
-        /// delegation created after voting effectively ends could still swing that referendum's
-        /// tally — see `delegate_vote`'s doc comment.
+        /// `delegate_vote` and `revoke_delegation`: this topic has a referendum whose voting
+        /// window has already closed (`end_block` has passed) but that has not yet been
+        /// finalized (still `ReferendumState::Voting` — e.g. `PendingFinalization` overflowed and
+        /// `finalize_referendum` hasn't been called yet). Creating, modifying, or revoking a
+        /// delegation for this topic is rejected until that referendum is finalized, closing the
+        /// window where a delegation change made after voting effectively ends could still swing
+        /// that referendum's tally — see `delegate_vote`'s and `revoke_delegation`'s doc
+        /// comments.
         ReferendumVotingWindowClosed,
     }
 
@@ -862,11 +863,29 @@ pub mod pallet {
         }
 
         /// Revoke an existing delegation for a specific topic (active or expired).
+        ///
+        /// ## Rejected if the topic has a closed-but-unfinalized referendum outstanding
+        /// Mirrors the identical guard in `delegate_vote` (see its doc comment for the full
+        /// reasoning) — and for the same reason: `apply_delegated_weight` resolves delegation
+        /// chains against *live* `Delegations` storage at finalization time, not a snapshot taken
+        /// at `end_block`, and vote choices are public plaintext readable at any time. Without
+        /// this check, a delegator could watch how their terminal delegate voted after voting
+        /// closes, then revoke here before finalization actually runs — retroactively pulling
+        /// their weight out of a tally that was supposed to be fixed as of `end_block`. Blocking
+        /// revocation here trades off the same way `delegate_vote` already does: a delegator with
+        /// an unrelated reason to revoke during this (normally near-zero) window is also blocked
+        /// until finalization completes, which is the accepted, symmetric cost of closing the
+        /// race on both the add and remove sides.
         #[pallet::call_index(3)]
         #[pallet::weight(Weight::from_parts(8_000, 0))]
         pub fn revoke_delegation(origin: OriginFor<T>, topic_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(T::CitizenChecker::is_active_citizen(&who), Error::<T>::CitizenNotActive);
+            let now = frame_system::Pallet::<T>::block_number();
+            ensure!(
+                !Self::topic_has_closed_unfinalized_referendum(topic_id, now),
+                Error::<T>::ReferendumVotingWindowClosed
+            );
             let record = Delegations::<T>::take(topic_id, who.clone())
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
             DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
@@ -875,7 +894,6 @@ pub mod pallet {
             // no outgoing delegation on this topic. Also fixes up every intermediate hop's own
             // stored `resolved_weight` along the old chain (see
             // `propagate_weight_along_chain`'s doc comment).
-            let now = frame_system::Pallet::<T>::block_number();
             Self::propagate_weight_along_chain(
                 &record.delegate,
                 topic_id,
@@ -1503,8 +1521,9 @@ pub mod pallet {
 
         /// Whether `topic_id` currently has a referendum that is still `ReferendumState::Voting`
         /// (i.e. not yet finalized) but whose voting window has already closed (`now >
-        /// end_block`). `delegate_vote` uses this to reject creating/modifying a delegation for
-        /// a topic in exactly this state — see its doc comment for the race this closes.
+        /// end_block`). `delegate_vote` and `revoke_delegation` both use this to reject
+        /// creating/modifying/revoking a delegation for a topic in exactly this state — see their
+        /// doc comments for the race this closes.
         ///
         /// Scans `OpenReferenda` — the flat, bounded (`MaxConcurrentReferenda`) list of
         /// currently-`Voting` referendum ids also used by `RecoveryStateChecker` — rather than

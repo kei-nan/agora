@@ -1723,6 +1723,142 @@ fn delegate_vote_fails_when_topic_has_a_closed_but_unfinalized_referendum() {
     });
 }
 
+// ── revoke_delegation: post-window delegation race (unfinalized-but-closed referendum) ──────
+//
+// `revoke_delegation` had no equivalent of `delegate_vote`'s
+// `topic_has_closed_unfinalized_referendum` guard: since `apply_delegated_weight` resolves
+// delegation chains against *live* `Delegations` storage at finalization time (not a snapshot
+// taken at `end_block`), and vote choices are public plaintext readable at any time, a delegator
+// could watch how their terminal delegate voted after voting closes, then revoke before
+// finalization actually runs — retroactively pulling their weight out of a tally that was
+// supposed to be fixed as of `end_block`. These tests mirror
+// `delegate_vote_fails_when_topic_has_a_closed_but_unfinalized_referendum` above, confirming the
+// same guard now also applies on the remove side.
+#[test]
+fn revoke_delegation_fails_when_topic_has_a_closed_but_unfinalized_referendum() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+
+        activate_citizen(1);
+        activate_citizen(2);
+        let topic_id = Voting::topic_id_of(&hash(5));
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, topic_id, MIN_DELEGATION_DURATION));
+
+        // Fill this block's PendingFinalization list to capacity with unrelated referenda
+        // (different topic) so the target referendum below overflows the schedule.
+        for i in 0..MAX_REFERENDA_PER_BLOCK {
+            make_referendum_with_hash(100 + i, ReferendumTier::Ordinary, hash(1));
+        }
+        let finalize_block = 1 + REFERENDUM_DURATION as u64 + 1;
+        assert_eq!(
+            PendingFinalization::<Test>::get(finalize_block).len(),
+            MAX_REFERENDA_PER_BLOCK as usize
+        );
+
+        // The target referendum, same topic (hash(5)) as the existing delegation, never gets
+        // auto-scheduled.
+        let rid = make_referendum_with_hash(999, ReferendumTier::Ordinary, hash(5));
+        assert!(!PendingFinalization::<Test>::get(finalize_block).contains(&rid));
+
+        // Advance past end_block and run the hook: everything scheduled finalizes, but `rid`
+        // (never scheduled) stays stuck in `Voting` with its window already closed.
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+        let (_, _, end_block, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Voting);
+        assert!(System::block_number() > end_block);
+        assert!(OpenReferenda::<Test>::get().contains(&rid));
+
+        // The delegator tries to pull their weight back out during the closed-but-unfinalized
+        // window. Rejected outright.
+        assert_noop!(
+            Voting::revoke_delegation(RuntimeOrigin::signed(1), topic_id),
+            Error::<Test>::ReferendumVotingWindowClosed
+        );
+        assert!(Delegations::<Test>::get(topic_id, 1u64).is_some());
+
+        // Once the referendum is actually finalized (via the permissionless fallback), the
+        // topic is clear again and revocation works normally.
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), rid));
+        assert_ok!(Voting::revoke_delegation(RuntimeOrigin::signed(1), topic_id));
+        assert!(Delegations::<Test>::get(topic_id, 1u64).is_none());
+    });
+}
+
+/// Regression: outside the closed-but-unfinalized window (no open referendum on the topic at
+/// all), `revoke_delegation` is unaffected by the new guard and still succeeds exactly as before.
+#[test]
+fn revoke_delegation_still_succeeds_outside_the_closed_window() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        activate_citizen(1);
+        activate_citizen(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        assert_ok!(Voting::revoke_delegation(RuntimeOrigin::signed(1), 0));
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_none());
+    });
+}
+
+/// End-to-end exploit-closed regression: a delegate votes, the referendum's window closes but it
+/// sits unfinalized (the `PendingFinalization` overflow fallback case), the delegator observes
+/// the public vote choice and tries to revoke to pull their weight back out before finalization
+/// — that attempt now fails — and when finalization does proceed, the delegated weight is
+/// correctly counted in the tally exactly as if the delegation had never been touched.
+#[test]
+fn revoke_delegation_cannot_retroactively_undo_a_counted_delegated_vote() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(Voting::open_voting_epoch(RuntimeOrigin::root(), MAX_EPOCH_DURATION));
+
+        activate_citizen(1); // delegator
+        activate_citizen(2); // terminal delegate / voter
+        let topic_id = Voting::topic_id_of(&hash(5));
+        // Long enough duration that the delegation is still active (`expires_at >= end_block`)
+        // by the time the referendum's voting window closes — MIN_DELEGATION_DURATION would
+        // expire well before REFERENDUM_DURATION elapses, which would make the delegated weight
+        // legitimately not count for an unrelated reason (expiry) rather than exercising the
+        // guard this test targets.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, topic_id, MAX_DELEGATION_DURATION));
+
+        // Fill this block's PendingFinalization list to capacity with unrelated referenda
+        // (different topic) so the target referendum below overflows the schedule.
+        for i in 0..MAX_REFERENDA_PER_BLOCK {
+            make_referendum_with_hash(100 + i, ReferendumTier::Ordinary, hash(1));
+        }
+        let finalize_block = 1 + REFERENDUM_DURATION as u64 + 1;
+
+        // The target referendum, same topic as the delegation, never gets auto-scheduled.
+        let rid = make_referendum_with_hash(999, ReferendumTier::Ordinary, hash(5));
+        assert!(!PendingFinalization::<Test>::get(finalize_block).contains(&rid));
+
+        // The delegate casts their (publicly visible) vote before the window closes.
+        assert_ok!(Voting::vote_referendum(RuntimeOrigin::signed(2), rid, true));
+
+        // Advance past end_block: `rid` is now closed but unfinalized.
+        System::set_block_number(finalize_block);
+        let _ = Voting::on_initialize(finalize_block);
+        let (_, _, end_block, state, _) = Referenda::<Test>::get(rid).unwrap();
+        assert_eq!(state, ReferendumState::Voting);
+        assert!(System::block_number() > end_block);
+
+        // The delegator observes citizen 2 voted "yes" and tries to yank their weight back out
+        // before finalization can count it. Rejected.
+        assert_noop!(
+            Voting::revoke_delegation(RuntimeOrigin::signed(1), topic_id),
+            Error::<Test>::ReferendumVotingWindowClosed
+        );
+
+        // Finalization now proceeds via the permissionless fallback and correctly counts the
+        // delegated weight: citizen 2's own vote plus citizen 1's delegated weight = 2 yes votes.
+        assert_ok!(Voting::finalize_referendum(RuntimeOrigin::signed(1), rid));
+        assert_eq!(ReferendumTally::<Test>::get(rid), (2, 0));
+
+        // The delegation is untouched by any of this and can now be revoked normally.
+        assert_ok!(Voting::revoke_delegation(RuntimeOrigin::signed(1), topic_id));
+    });
+}
+
 // ── OpenReferenda tracking (backs pallet-identity-zk's RecoveryStateChecker) ────────────────
 
 /// `OpenReferenda` must gain the id on creation and lose it once the referendum leaves
