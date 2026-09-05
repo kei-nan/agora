@@ -3,14 +3,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // queries.ts's only real dependency is the shared light-client `getApi()` from ./client — mock
 // that boundary so these tests exercise the byte-decoding logic this codebase actually wrote
 // (storage key/value parsing) without touching the network or a real smoldot connection.
-// `withTimeout` is mocked as a pass-through (just awaits the wrapped promise, ignoring the
-// timeout) — these tests don't exercise Finding 2's timeout behavior itself (see
-// `client.test.ts` for that), they just need `queries.ts`'s calls to `withTimeout(...)` to keep
-// working now that it wraps every `api.rpc.*` call site.
-const { getApiMock } = vi.hoisted(() => ({ getApiMock: vi.fn() }));
+// `withTimeout` defaults to a pass-through (just awaits the wrapped promise, ignoring the
+// timeout) so the byte-decoding tests below don't need to think about timers at all. The actual
+// timeout behavior (`withTimeout`/`RpcTimeoutError` resolving, timing out, and propagating
+// rejections) is unit-tested directly in `client.test.ts`'s `describe("withTimeout", ...)`
+// block; the "chainStatus - timeout propagation" describe block further down this file swaps
+// `withTimeoutMock`'s implementation for the *real* `withTimeout` (via `vi.importActual`) for
+// one end-to-end test confirming a real `queries.ts` call site actually propagates a timeout
+// rejection, not just the bare helper in isolation.
+const { getApiMock, withTimeoutMock } = vi.hoisted(() => ({
+  getApiMock: vi.fn(),
+  withTimeoutMock: vi.fn((promise: Promise<unknown>) => promise),
+}));
 vi.mock("./client", () => ({
   getApi: getApiMock,
-  withTimeout: (promise: Promise<unknown>) => promise,
+  withTimeout: withTimeoutMock,
 }));
 
 import { chainStatus, fetchLaws, fetchProposals } from "./queries";
@@ -165,5 +172,47 @@ describe("fetchProposals", () => {
       votesAgainst: 50,
       endsAt: endBlock,
     });
+  });
+});
+
+describe("chainStatus - timeout propagation (end-to-end)", () => {
+  // Every other test in this file mocks `withTimeout` as a bare pass-through (see the top of
+  // this file). This block instead swaps in the *real* `withTimeout` implementation from
+  // `./client` for a single test, to confirm an actual `queries.ts` call site — not just the
+  // helper in isolation (already covered in `client.test.ts`) — genuinely propagates an
+  // `RpcTimeoutError` when the underlying `api.rpc.*` call hangs forever.
+  beforeEach(() => {
+    getApiMock.mockReset();
+    withTimeoutMock.mockReset();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    // Restore the pass-through default for every other describe block in this file.
+    withTimeoutMock.mockImplementation((promise: Promise<unknown>) => promise);
+  });
+
+  it("rejects with RpcTimeoutError when the underlying api.rpc.chain.getHeader() call hangs", async () => {
+    const actualClient = await vi.importActual<typeof import("./client")>("./client");
+    withTimeoutMock.mockImplementation(actualClient.withTimeout);
+
+    const api = {
+      rpc: {
+        chain: {
+          // Never resolves — simulates a stalled smoldot jsonRpcResponses iterator.
+          getHeader: vi.fn(() => new Promise(() => {})),
+          getFinalizedHead: vi.fn(() => new Promise(() => {})),
+        },
+      },
+    };
+    getApiMock.mockResolvedValue(api);
+
+    const statusPromise = chainStatus();
+    const expectation = expect(statusPromise).rejects.toBeInstanceOf(actualClient.RpcTimeoutError);
+
+    await vi.advanceTimersByTimeAsync(actualClient.DEFAULT_RPC_TIMEOUT_MS);
+
+    await expectation;
   });
 });

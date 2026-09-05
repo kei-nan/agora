@@ -7,7 +7,7 @@ vi.mock("smoldot", () => ({
   start: vi.fn(() => ({ addChain: addChainMock })),
 }));
 
-import { ScShim, discoverWsBootnode } from "./client";
+import { ScShim, discoverWsBootnode, withTimeout, RpcTimeoutError, DEFAULT_RPC_TIMEOUT_MS } from "./client";
 
 function asyncIterableFromArray(items: string[]) {
   return {
@@ -100,6 +100,76 @@ describe("ScShim (smoldot -> ScProvider adapter)", () => {
     await expect(ScShim.createScClient().addWellKnownChain()).rejects.toThrow(
       /well-known chains unsupported/
     );
+  });
+});
+
+describe("withTimeout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resolves with the wrapped promise's value when it settles before the timeout", async () => {
+    const inner = Promise.resolve("chain-header-value");
+
+    const result = await withTimeout(inner, "chain_getHeader", 30_000);
+
+    expect(result).toBe("chain-header-value");
+  });
+
+  it("uses the exported DEFAULT_RPC_TIMEOUT_MS when no explicit timeout is passed", async () => {
+    const neverSettles = new Promise<string>(() => {});
+    const promise = withTimeout(neverSettles, "chain_getHeader");
+    const expectation = expect(promise).rejects.toBeInstanceOf(RpcTimeoutError);
+
+    // One tick before the documented default shouldn't be enough to trip it...
+    await vi.advanceTimersByTimeAsync(DEFAULT_RPC_TIMEOUT_MS - 1);
+    // ...but reaching it should.
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expectation;
+  });
+
+  it("rejects with RpcTimeoutError when the wrapped promise never settles within the timeout window", async () => {
+    const neverSettles = new Promise<string>(() => {});
+    const promise = withTimeout(neverSettles, "state_getStorage", 5_000);
+    // Attach the rejection handler before advancing fake timers, so the rejection is never
+    // briefly unhandled between the timer firing and this test observing it.
+    const expectation = expect(promise).rejects.toBeInstanceOf(RpcTimeoutError);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expectation;
+  });
+
+  it("includes the call label and timeout duration in the timeout error message", async () => {
+    const neverSettles = new Promise<string>(() => {});
+    const promise = withTimeout(neverSettles, "state_getStorage", 5_000);
+    const expectation = expect(promise).rejects.toThrow(/state_getStorage timed out after 5000ms/);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    await expectation;
+  });
+
+  it("rejects with the wrapped promise's own rejection reason, not a timeout error, when it rejects before the timeout", async () => {
+    const innerError = new Error("smoldot: peer disconnected mid-request");
+
+    await expect(withTimeout(Promise.reject(innerError), "chain_getFinalizedHead", 30_000)).rejects.toBe(
+      innerError,
+    );
+  });
+
+  it("does not fire a stray timeout after the wrapped promise already settled", async () => {
+    const inner = Promise.resolve("value");
+
+    await withTimeout(inner, "chain_getHeader", 1_000);
+    // If the timer weren't cleared on resolution, this would still be pending/scheduled;
+    // advancing well past it must not produce any (unhandled) rejection.
+    await vi.advanceTimersByTimeAsync(5_000);
   });
 });
 
