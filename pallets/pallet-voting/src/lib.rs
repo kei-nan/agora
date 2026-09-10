@@ -773,8 +773,10 @@ pub mod pallet {
             // rather than recomputing, since `who`'s own `DelegatedWeight` bucket is already 0
             // (they have had an active outgoing delegation the whole time) and would otherwise
             // make it look like this edge only ever carried weight 1.
-            let resolved_weight = if replacing_same_delegate {
-                maybe_old.as_ref().expect("replacing_same_delegate implies Some").resolved_weight
+            let resolved_weight = if let Some(old_record) =
+                maybe_old.as_ref().filter(|_| replacing_same_delegate)
+            {
+                old_record.resolved_weight
             } else {
                 // `who`'s own contribution to whichever terminal this edge resolves to.
                 //

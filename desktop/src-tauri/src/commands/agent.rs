@@ -122,7 +122,11 @@ pub async fn agent_ask(
             if e.is_connect() || e.is_timeout() {
                 "network".to_string()
             } else {
-                e.to_string()
+                // Log the raw request-send error server-side for debugging, but don't forward
+                // internal error internals (which can include URLs/connection details) to the
+                // frontend/UI — same rationale as the HTTP-status branch below.
+                eprintln!("[agent_ask] request to Anthropic API failed: {e}");
+                "AI request failed. Please try again later.".to_string()
             }
         })?;
 
@@ -135,7 +139,12 @@ pub async fn agent_ask(
         return Err(format!("AI request failed (API error {status}). Please try again later."));
     }
 
-    let parsed: ClaudeResponse = resp.json().await.map_err(|e| e.to_string())?;
+    let parsed: ClaudeResponse = resp.json().await.map_err(|e| {
+        // Log the raw JSON-parse error server-side for debugging, but don't forward internal
+        // error internals to the frontend/UI — same rationale as the HTTP-status branch above.
+        eprintln!("[agent_ask] failed to parse Anthropic API response: {e}");
+        "AI request failed (unexpected response format). Please try again later.".to_string()
+    })?;
     parsed
         .content
         .into_iter()
