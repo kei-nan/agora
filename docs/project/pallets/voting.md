@@ -56,6 +56,18 @@ Delegation guards:
     `DelegatedWeight[who]` is always 0 mid-delegation — silently collapsed a re-targeting
     delegator's real weight down to 1, undercounting delegation concentration and letting the
     cap check for the new edge pass too easily.
+- Retroactive-withdrawal guard on `revoke_delegation` (fixed, commit `153de2d`; distinct from
+  the `DelegationCap` bypass fix above): `revoke_delegation` now carries the same
+  `topic_has_closed_unfinalized_referendum` guard `delegate_vote` already had, rejecting with
+  `Error::ReferendumVotingWindowClosed` when the topic has a referendum whose voting window has
+  closed but hasn't finalized yet (`pallets/pallet-voting/src/lib.rs` ~line 881). Without it, a
+  delegator could watch how their terminal delegate voted after voting closes, then revoke the
+  delegation before `finalize_referendum`/`apply_delegated_weight` runs — `apply_delegated_weight`
+  resolves delegation chains against *live* `Delegations` storage at finalization time, not a
+  snapshot taken at `end_block`, so an un-guarded revoke would retroactively pull the delegator's
+  weight out of a tally that was supposed to be fixed as of `end_block`. Same tradeoff as the
+  `delegate_vote`-side guard: a delegator with an unrelated reason to revoke during this
+  (normally near-zero) window is also blocked until finalization completes.
 
 `Delegations` is only resolved into an actual tally for System 3 (Referenda) below, via
 `finalize_referendum`/`apply_delegated_weight` — a non-voting delegator's weight counts toward

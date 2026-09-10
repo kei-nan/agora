@@ -61,6 +61,19 @@ process whenever convenient. A vacancy is now always filled by an instant-runoff
   were no nominees or no ballots at all, leaves the seat vacant (`PmInvestitureFailedNoWinner`)
   — a fresh round must then be opened.
 
+  **Eligibility is rechecked at installation, not just at nomination (fixed `86d003b`)**: since
+  nomination and voting can span many blocks, `finalize_pm_investiture` re-checks the tallied
+  winner against the same `LegislatureMembership`/`AccountabilityCouncilChecker` pair
+  `nominate_pm` checked at nomination time, rather than trusting a check performed blocks
+  earlier still holds (~`pallets/pallet-executive/src/lib.rs` line 846-852). A winner could have
+  lost their legislature seat in the interval (e.g. via `pallet-elections`' automatic per-epoch
+  reseating) or joined the Accountability Council. If the recheck fails, installation is
+  refused and `Event::PmInvestitureFailedWinnerIneligible { winner }` is emitted instead — the
+  seat stays vacant and a fresh round must be opened, the same "no installable winner" outcome
+  as the no-nominees/no-ballots case, rather than falling back to the next-ranked IRV candidate
+  (there's no existing pattern in this pallet for resuming a tally mid-way, and inventing one for
+  this low-likelihood race isn't warranted).
+
 ### Removing/replacing and resigning the PM
 
 - `remove_and_replace_prime_minister(successor)` — `LegislatureOrigin`. Constructive vote of no

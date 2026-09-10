@@ -14,7 +14,13 @@ Storage:
 Calls:
 - `add_member(account)` / `remove_member(account)` — root, but **only while bootstrap is open**
   (`Bootstrapped == false`; see below) — once `close_bootstrap` has been called, both fail
-  unconditionally, even for root
+  unconditionally, even for root. `add_member` also refuses a sitting Accountability Council
+  member (`Error::AccountabilityCouncilMember`, checked via a new `Config::
+  AccountabilityCouncilChecker`, fixed `86d003b`) — the reverse of the join-time check
+  `pallet_accountability_council::add_member` already performs, and mirrors the same
+  legislature/Council overlap bar `pallet_elections`'s post-bootstrap automatic seating already
+  enforces (see `docs/project/pallets/elections.md`). Before this fix, root could seat a sitting
+  Accountability Council member into the legislature during bootstrap with no equivalent check.
 - `propose_motion(call_hash)` — member only; proposer's aye recorded immediately
 - `vote_motion(motion_id, approve: bool)` — member only; **active ministers blocked** (incompatibility rule via `MinisterChecker`)
 - `close_motion(motion_id)` — anyone, after `end_block`; passes (plants the approval token) if

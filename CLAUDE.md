@@ -381,7 +381,7 @@ authoritative version of this list; treat this section as a summary, not the sou
    whatever was already committed, closing the hole where a compromised oracle credential could
    publish reasoning saying one thing and finalize with a different verdict. Still PARTIAL, not
    done: never run against a real chain/Claude API/IPFS daemon (unit-tested at the pure-logic
-   level only, 52/52 passing as of 2026-08-23 (`cargo test --release` in `court-oracle/`), up from
+   level only, 67/67 passing as of 2026-09-11 (`cargo test --release` in `court-oracle/`), up from
    the 47/47 this line previously cited — added IPFS content-hash verification and Claude
    prompt-injection delimiting after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
    `Sudo::sudo(Courts::set_oracle_account(...))` was called for real against a dedicated oracle

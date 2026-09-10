@@ -26,6 +26,34 @@
 //! itself; see `OprfRound1Commitment`'s doc comment for why, and
 //! `oprf-committee-dev/src/threshold.rs` for the protocol and its own on-chain-independent
 //! verification against a real Noir dependency.
+//!
+//! ## Known sender-anonymity gap: submission-metadata linkability
+//! Every identity-bearing extrinsic here — `register_citizen`, `reverify_citizen`,
+//! `recover_account`, `migrate_oprf_scheme` — is `ensure_signed`, so the extrinsic's signing
+//! `AccountId` is publicly visible on-chain, in the block/extrinsic itself, independent of
+//! anything this pallet stores. Unlike `pallet-voting`'s `commit_vote` or
+//! `pallet-anticorruption`'s `submit_whistleblower_report`, these calls don't even have a
+//! nullifier-vs-`AccountId` map to point at as the linkage mechanism — for `register_citizen`
+//! in particular the `AccountId` *is* the newly-registered citizen's own account, so the link
+//! to their real identity is direct and immediate, not a cross-reference. The same is true of
+//! `reverify_citizen` and `migrate_oprf_scheme` against an already-registered account, and of
+//! `recover_account`'s new `AccountId` once `CitizenAccountRecovered` links it to the nullifier
+//! being recovered.
+//!
+//! This isn't limited to a signer account that *is* the citizen's own registered account,
+//! either: even a fresh, never-registered account created specifically to submit one of these
+//! calls can still be deanonymized by ordinary chain analysis — if it was funded by a direct
+//! on-chain transfer from a citizen-linked account, or submits in close temporal proximity to
+//! other citizen-linked activity, that funding-source or timing correlation breaks pseudonymity
+//! regardless of what the extrinsic's payload proves. A real fix needs the extrinsic to not
+//! carry the signer's `AccountId` at all — e.g. an unsigned extrinsic validated via a custom
+//! `ValidateUnsigned`/`SignedExtension` checking ZK group-membership instead of a signature, or
+//! a relayer/mixnet that decouples submission (and its funding) from the signing key. No such
+//! infrastructure exists anywhere in this repo yet; building one is a genuine architectural
+//! addition, not a local fix to any one call here. See `pallet-voting::commit_vote`'s and
+//! `pallet-anticorruption::submit_whistleblower_report`'s own doc comments for the fuller
+//! writeup of the same structural gap, and `CLAUDE.md`'s Voting System section for the general
+//! reasoning.
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 pub use pallet::*;

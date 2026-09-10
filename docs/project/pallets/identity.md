@@ -77,6 +77,21 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
 - `submit_oprf_query(blinded_query: [u8; 64])` — any registered citizen (`is_citizen` gate); posts a query to the on-chain mailbox and assigns/emits a fresh `query_id`; committee members for the target slot (derived off-chain via `committee_slot_for`) poll `PendingOprfQueries` and answer via `submit_oprf_round1`/`submit_oprf_round2`
 - `submit_oprf_round1(query_id, committee_slot, r_i: [u8;64], d_g: [u8;64], d_q: [u8;64], e_g: [u8;64], e_q: [u8;64])` — round 1 of a genuine `t`-of-`n` threshold OPRF evaluation (Option B, `docs/project/research/oprf-alternatives/11-genuine-threshold-evaluation-design.md`); caller must be on `CommitteeMembers[committee_slot]`; checks slot validity, query existence/expiry (`OprfQuerySlaBlocks`), and no duplicate submission from this caller for this pair; once the `OprfThreshold`-th commitment lands the qualifying set locks (`OprfRound1SetLocked`) and further round-1 submissions for that pair are rejected. Performs no cryptographic verification of the submitted points itself — a deliberate, documented scope boundary (see `OprfRound1Commitment`'s doc comment), not an oversight
 - `submit_oprf_round2(query_id, committee_slot, z_i: [u8; 32])` — round 2; requires round 1 already locked (exactly `OprfThreshold` commitments) and caller to be one of that locked set's members; same no-crypto-verification scope boundary as round 1. Once every member of the locked set has submitted, the citizen's own client combines the round-1/round-2 data into the final proof off-chain (`oprf-committee-dev::threshold::combine_evaluations`/`combine_responses`) — the pallet never computes or stores that combination itself
+- `prune_oprf_query(query_id)` — sweeps a mailbox entry (`PendingOprfQueries[query_id]`, and
+  every slot's `OprfRound1Commitments`/`OprfRound2Responses` for that `query_id`) once it's no
+  longer useful, in either of two cases: (1) **expired** — past its `OprfQuerySlaBlocks`
+  deadline from `posted_at`, at which point `submit_oprf_round1` already refuses further
+  submissions so the partial state can never grow, and *any* signed account may prune it; (2)
+  **fully answered but not yet expired** — every one of the `NUM_COMMITTEES` slots has reached
+  `T::OprfThreshold` round-2 responses. Fixed `bea9cc8` (previously callable by anyone in this
+  case too): the querying citizen's own off-chain client may still be mid-read of a
+  fully-answered-but-unexpired query, so only `query.submitter` may prune it here
+  (`Error::NotQuerySubmitter` otherwise) — letting any signed account prune a
+  merely-fully-answered query would let anyone race the legitimate submitter's own client and
+  delete the data before it's ever read, a cheap unprivileged way to DoS that citizen's
+  in-progress registration. Once a query is also past its deadline, no legitimate read can still
+  be pending, so the submitter-only restriction lifts and anyone may sweep it, same as any other
+  expired query. Also decrements the submitter's `PendingOprfQueryCountBySubmitter`.
 - `recover_account(zk_proof, public_inputs, anchor, oprf_pk_hashes, backing_commitment)` —
   account recovery for a citizen who lost access to their original `AccountId` (e.g. a
   reinstalled/reset mobile wallet — see `mobile/src/chain/keystoreWallet.ts`). Same proof shape

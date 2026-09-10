@@ -22,6 +22,11 @@ Storage:
   have approved the current `PendingOracleProposal`; single-use per member per action, cleared
   alongside it once the action resolves
 - `CaseBonds`: `case_id` → `Balance` — the `CaseFilingBond` reserved by `file_case`, released on finalization
+- `JurySeatedBlock`: `case_id` → `BlockNumber` — set when a jury is seated (`select_jury`),
+  used by `clear_stale_jury_deadlock` to detect a jury that has sat in `JurySeated` for
+  `JuryVotingExpiryBlocks` without a strict majority ever being reached; cleared alongside the
+  rest of the jury's state once the case leaves `JurySeated` (majority reached, or the deadlock
+  cleared and re-seeded)
 - `AIGovernanceCouncil`: `BoundedVec<AccountId, MaxAIGovernanceCouncilSize>` — root-managed, mirrors `pallet-emergency-council`'s `Council`
 - `CurrentAIModelVersion`: `u32` — the governance-approved model version `submit_ai_ruling` checks against
 - `AIModelVersions`: `u32` → `model_hash` — approved model history
@@ -37,6 +42,18 @@ Storage:
 Jury size routing (enforced in `select_jury`):
 - `LawChallenge` → 21 jurors (Level 2 constitutional)
 - All other subjects → 7 jurors (Level 1)
+
+Jury eligibility (`pick_random_jurors`, `pallets/pallet-courts/src/lib.rs` ~line 2174-2212):
+excludes the case's filer and (for `CitizenConduct` cases) the defendant, as before, and — fixed
+commit `988bbe8` — also excludes any sitting `OracleMembers`/`AIGovernanceCouncil` member from
+the eligible pool. This exclusion is unconditional (not gated on case type or history): every
+case that reaches jury selection got there via `appeal_ruling`, which only fires from
+`CaseStatus::AIRulingIssued`, so every jury this function ever seats is reviewing a Level-0 AI
+ruling. `OracleMembers` is the direct conflict — that council is exactly who proposes/approves
+the `submit_ai_ruling`/`finalize_ruling` action for the very ruling under appeal.
+`AIGovernanceCouncil` is a narrower but still real institutional stake: that body approves which
+AI model version produces every Level-0 ruling system-wide, so its members have a standing
+interest in AI rulings holding up on appeal even though they didn't approve this specific one.
 
 Calls:
 - `file_case(subject)` — any active citizen; reserves `CaseFilingBond` (released in full once
@@ -74,6 +91,10 @@ Calls:
   `AIRulingVerdict`. Proposes/requires strict-majority approval the same way
   `submit_ai_ruling` does (see above)
 - `cast_jury_vote(case_id, verdict)` — seated juror only; auto-finalizes on majority
+- `clear_stale_jury_deadlock(case_id)` — case's filer, any Oracle Council member, or (for
+  system-filed cases) any active citizen (same `is_filer_or_oracle` gate as `appeal_ruling`/
+  `select_jury`); only once `JuryVotingExpiryBlocks` blocks have passed since the jury was
+  seated with no majority ever reached (see below)
 - `add_oracle_member(account)` / `remove_oracle_member(account)` — root; manages the
   `OracleMembers` roster, bounded to `MaxOracleMembers` (7). Replaces the earlier
   `set_oracle_account`. `remove_oracle_member` also purges the removed member's already-cast
@@ -121,6 +142,28 @@ OracleProposalNotYetStale` if called too early), emitting `Event::OracleProposal
 }` and freeing the case for a fresh proposal. `remove_oracle_member`'s existing
 approval-purging/re-resolution logic (see above) already covered this path correctly with no
 changes needed.
+
+### Jury deadlock recovery (fixed `988bbe8`)
+
+Before this fix, nothing bounded how long a case could sit in `CaseStatus::JurySeated`: only a
+strict majority via `cast_jury_vote` ever moved a case out of that status, so a jury that never
+reached one (no-shows, or votes split in a way that never crosses the threshold for either
+side) left the case stuck there forever, with no deadline, re-selection mechanism, or admin
+override.
+
+`clear_stale_jury_deadlock(case_id)` — same `is_filer_or_oracle` authorization as
+`appeal_ruling`/`select_jury` (the case's filer, any Oracle Council member, or, for a
+system-initiated case with no natural filer, any active citizen) — recovers this once
+`JuryVotingExpiryBlocks` blocks have passed since `JurySeatedBlock[case_id]`
+(`Error::JuryNotYetStale` if called too early). Rather than merely clearing the stuck jury with
+no path forward, it re-schedules a fresh jury selection through the same delayed-reveal
+commit-then-reveal pipeline `appeal_ruling` uses: the deadlocked jury's pool/votes/tally and any
+leftover `CapturedJurySeed` are discarded, the case moves back to `CaseStatus::InJuryAppeal`, and
+a new `JuryRequestBlock`/seed-capture window is scheduled from the current block — a follow-up
+`select_jury` call draws the replacement jury once that window elapses, same as the original
+flow. This deliberately reuses the existing, already-audited randomness pipeline rather than
+drawing a replacement jury inline from some ad-hoc immediately-available source, which would
+reopen the same grinding hole `JurySeedDelayBlocks` exists to close.
 
 TODOs:
 - Real VRF-based jury randomness. Current scheme (see log #52) is a commit-then-delayed-reveal
