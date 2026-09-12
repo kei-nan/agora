@@ -50,6 +50,15 @@ pub struct Config {
     /// `appeal_ruling` call in between (an appeal moves status to `InJuryAppeal`, which this
     /// call's own `ensure!` rejects with `InvalidStatus`).
     pub finalize_ruling_call_index: u8,
+    /// `approve_ai_ruling`'s call index within pallet-courts. `#[pallet::call_index(11)]` in
+    /// `pallets/pallet-courts/src/lib.rs` — confirmed by reading that file, not guessed. The
+    /// real call is `approve_ai_ruling(case_id: u32)` — co-signs whichever action (`Submission`
+    /// or `Finalization`) is currently pending for `case_id` in `PendingOracleProposal`, gated
+    /// by the same `T::OracleOrigin` as `submit_ai_ruling`/`finalize_ruling`. This crate submits
+    /// it for a pending proposal — proposed by ANY Oracle Council member, including a different
+    /// running instance of this service — that this account has not yet approved; see
+    /// `main.rs`'s oracle-approval polling and README.md's "Oracle Council" section.
+    pub approve_ai_ruling_call_index: u8,
     /// `pallet-courts`'s `AppealWindowBlocks` config constant — how many blocks after
     /// `submit_ai_ruling` a case may still be appealed. `ConstU32<{ 7 * DAYS }>` in
     /// `runtime/src/configs/mod.rs`, and `DAYS` (`runtime/src/lib.rs`) resolves to `7_200`
@@ -151,6 +160,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
 
+        let approve_ai_ruling_call_index: u8 = std::env::var("APPROVE_AI_RULING_CALL_INDEX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(11);
+
         let appeal_window_blocks: u32 = std::env::var("APPEAL_WINDOW_BLOCKS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -192,6 +206,7 @@ impl Config {
             courts_pallet_index,
             submit_ai_ruling_call_index,
             finalize_ruling_call_index,
+            approve_ai_ruling_call_index,
             appeal_window_blocks,
             ipfs_api_url,
             claude_model,

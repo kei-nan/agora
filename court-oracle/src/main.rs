@@ -26,6 +26,22 @@
 //! re-bill Claude for one; and a specific diagnostic (in `poll_once` below) for the case where
 //! this service's oracle account has been removed from `Courts::OracleMembers`.
 //!
+//! ## Co-signing other members' proposals (`approve_ai_ruling`)
+//!
+//! `submit_ai_ruling`/`finalize_ruling` only *propose* an action under the Oracle Council's M-of-N
+//! design — it takes effect only once enough OTHER council members' instances also approve the
+//! same case via `approve_ai_ruling`. `poll_oracle_approvals` (below) is the other half of that:
+//! every poll cycle, it reads `Courts::PendingOracleProposal` for every case_id with a currently
+//! pending action and, for each one this account has not yet approved, submits
+//! `approve_ai_ruling`. Critically, this is a pure on-chain co-signing action — it never re-runs
+//! the Claude/IPFS pipeline (`rule_on_case`) to decide whether to approve; the whole point of
+//! "propose once, co-sign after" is that only the proposer pays for that. "Not yet approved by
+//! this account" already correctly excludes proposals THIS instance itself just originated:
+//! `submit_ai_ruling`/`finalize_ruling` record the proposer's own approval in
+//! `Courts::OracleApprovals` at proposal time (see `pallets/pallet-courts/src/lib.rs`), so
+//! `needs_approval` below sees this account already present and skips it, rather than this
+//! service redundantly trying to approve its own just-submitted proposal.
+//!
 //! ## Submission is not confirmation
 //!
 //! `author_submitExtrinsic` returning `Ok(tx_hash)` means the node's transaction pool accepted
@@ -57,18 +73,19 @@ mod retry;
 mod rpc;
 mod state;
 
-use cases::{AuditEntry, CaseRecord, CaseStatus, CaseSubject, LawRecord, Verdict};
+use cases::{AuditEntry, CaseRecord, CaseStatus, CaseSubject, LawRecord, PendingOracleAction, Verdict};
 use config::Config;
 use context::SubjectContext;
 use retry::{FailureOutcome, RetryTracker};
 use rpc::RpcClient;
-use state::PersistedState;
+use state::{OracleActionKind, PersistedState};
 
 use anyhow::Context as _;
 use codec::{Decode, Encode};
 use serde::Serialize;
 use sp_core::crypto::{AccountId32, Ss58Codec};
 use sp_core::Pair as _;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 #[tokio::main]
@@ -219,6 +236,17 @@ async fn poll_once(
         );
         return Ok(());
     }
+
+    // Co-sign any pending Oracle Council proposal (proposed by this account or, more to the
+    // point, any OTHER council member's own running instance) that this account has not yet
+    // approved. Deliberately does no Claude/IPFS work at all — see this module's doc comment
+    // ("Co-signing other members' proposals") and `poll_oracle_approvals`'s own doc comment.
+    // A failure here is logged but does not abort the rest of this poll cycle (originating fresh
+    // rulings/finalizations below is independent of co-signing existing ones).
+    if let Err(e) = poll_oracle_approvals(rpc, config, seed, oracle_account, persisted).await {
+        tracing::error!(error = %e, "oracle-approval co-signing poll failed, will retry next interval");
+    }
+
     // Needed for the finalize-scheduling branch below; fetched once per cycle (not once per
     // case — the appeal deadline check only cares about "now", which doesn't change mid-cycle).
     let current_block = rpc.get_current_block_number().await?;
@@ -575,6 +603,177 @@ async fn fetch_oracle_members(rpc: &RpcClient) -> anyhow::Result<Vec<AccountId32
     let key = rpc::storage_prefix("Courts", "OracleMembers");
     let Some(bytes) = rpc.get_storage(&key).await? else { return Ok(vec![]) };
     Vec::<AccountId32>::decode(&mut &bytes[..]).context("could not decode Courts::OracleMembers")
+}
+
+/// Reads every case_id with a currently pending Oracle Council action
+/// (`Courts::PendingOracleProposal`, a `StorageMap<_, Blake2_128Concat, u32,
+/// PendingOracleAction>`), decoding each entry so `poll_oracle_approvals` can log which kind
+/// (`Submission` vs `Finalization`) it's co-signing. Mirrors the `Cases` scan in `poll_once`
+/// (same `get_keys_paged` + `query_storage_at` pattern), just against a different storage item.
+async fn fetch_pending_oracle_proposals(rpc: &RpcClient) -> anyhow::Result<Vec<(u32, PendingOracleAction)>> {
+    let prefix = rpc::storage_prefix("Courts", "PendingOracleProposal");
+    let keys = rpc.get_keys_paged(&prefix).await?;
+    if keys.is_empty() {
+        return Ok(vec![]);
+    }
+    let values = rpc.query_storage_at(&keys).await?;
+
+    let mut out = Vec::new();
+    for (key_hex, value_hex) in keys.iter().zip(values.iter()) {
+        let Some(value_hex) = value_hex else { continue };
+        let Some(case_id) = cases::decode_u32_map_key(key_hex) else {
+            tracing::warn!(key = %key_hex, "could not extract case_id from PendingOracleProposal key — skipping");
+            continue;
+        };
+        let Ok(raw) = hex::decode(value_hex.trim_start_matches("0x")) else {
+            tracing::warn!(case_id, "PendingOracleProposal value was not valid hex");
+            continue;
+        };
+        match PendingOracleAction::decode(&mut &raw[..]) {
+            Ok(action) => out.push((case_id, action)),
+            Err(e) => {
+                tracing::warn!(case_id, error = ?e, "could not decode PendingOracleProposal value — storage shape mismatch?");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reads `Courts::OracleApprovals[case_id]` — a `StorageMap<_, Blake2_128Concat, u32,
+/// BoundedVec<AccountId, MaxOracleMembers>>`. Same "`BoundedVec` decodes exactly like `Vec`"
+/// reasoning as `fetch_oracle_members`'s doc comment. A missing entry (no approvals recorded at
+/// all) decodes as an empty list rather than an error — that's a normal, if momentary, state
+/// right after a proposal is created and before this read observes it.
+async fn fetch_oracle_approvals(rpc: &RpcClient, case_id: u32) -> anyhow::Result<Vec<AccountId32>> {
+    let key = map_key_u32("Courts", "OracleApprovals", case_id);
+    let Some(bytes) = rpc.get_storage(&key).await? else { return Ok(vec![]) };
+    Vec::<AccountId32>::decode(&mut &bytes[..]).context("could not decode Courts::OracleApprovals")
+}
+
+/// Pure decision: given that `case_id` currently has a pending Oracle Council proposal
+/// (`has_pending_proposal`), does THIS account still need to call `approve_ai_ruling` for it?
+/// False whenever `oracle_account` already appears in `current_approvals` — which covers both
+/// "another member proposed this and I already co-signed it on an earlier poll cycle" and the
+/// implicit case documented on `pallets/pallet-courts/src/lib.rs`'s `submit_ai_ruling`/
+/// `finalize_ruling`: the proposer's own account is recorded as an approval the instant the
+/// proposal is created, so a proposal THIS account itself just originated already shows up here
+/// as "no longer needs my approval" with no special-casing required. Deliberately symmetric in
+/// who else is in `current_approvals` — the presence of any number of OTHER accounts (co-signed
+/// or not) never affects whether *this* account still needs to approve.
+fn needs_approval(oracle_account: &AccountId32, has_pending_proposal: bool, current_approvals: &[AccountId32]) -> bool {
+    has_pending_proposal && !current_approvals.iter().any(|a| a == oracle_account)
+}
+
+/// Pure decision: has an `approve_ai_ruling` submitted on an earlier poll cycle for `case_id` now
+/// been confirmed (or made moot)? Mirrors `ruling_confirmed_by_status`/
+/// `finalization_confirmed_by_status` above but against `PendingOracleProposal`/`OracleApprovals`
+/// instead of `Cases`' status. True when EITHER: (a) `oracle_account` now appears in a freshly
+/// re-read `current_approvals` — the approval was recorded, even if the action overall hasn't yet
+/// reached the M-of-N threshold; or (b) the proposal for `case_id` no longer exists at all
+/// (`still_pending` is false) — meaning the action already resolved (reached threshold, whether
+/// because of this approval or others') or was cleared as stale (`clear_stale_oracle_proposal`).
+/// Either way there is nothing left to approve for this specific pending action, so this service
+/// should stop tracking it rather than resubmitting into a vacuum.
+fn approval_confirmed(oracle_account: &AccountId32, still_pending: bool, current_approvals: &[AccountId32]) -> bool {
+    !still_pending || current_approvals.iter().any(|a| a == oracle_account)
+}
+
+/// Polls `Courts::PendingOracleProposal` and co-signs (`approve_ai_ruling`) any pending action
+/// this account has not yet approved — the "other half" of the Oracle Council's M-of-N design
+/// that, before this function existed, no code in this crate implemented at all (see README.md's
+/// former "Explicitly out of scope" note, now removed). Deliberately does NOT call
+/// `rule_on_case`/Claude/IPFS for anything found here: approving is pure on-chain co-signing of
+/// an already-published (by the original proposer) ruling_hash/verdict or finalization — the
+/// entire point of "propose once, co-sign after" is that only the proposer pays for that
+/// pipeline. This also means this function does not and cannot independently judge whether the
+/// pending ruling is *correct* — see README.md's "Oracle Council" section for why reconciling
+/// independently-decided rulings is out of scope everywhere in this crate, not just here.
+///
+/// Reuses this crate's existing crash-safe persistence pattern (`PersistedState`, see state.rs):
+/// a submitted-but-unconfirmed approval is recorded in `persisted.pending_approvals` before this
+/// function returns, so a crash-restart mid-flight does not silently forget it tried and
+/// resubmit blindly — though unlike the ruling/finalize paths, a resubmitted `approve_ai_ruling`
+/// costs no billed API call, only a harmless extra extrinsic (rejected on-chain with
+/// `AlreadyApprovedOracleAction` if the first one already landed).
+async fn poll_oracle_approvals(
+    rpc: &RpcClient,
+    config: &Config,
+    seed: &[u8; 32],
+    oracle_account: &AccountId32,
+    persisted: &mut PersistedState,
+) -> anyhow::Result<()> {
+    let pending = fetch_pending_oracle_proposals(rpc).await?;
+    let pending_case_ids: HashSet<u32> = pending.iter().map(|(case_id, _)| *case_id).collect();
+
+    // First, confirm anything submitted on an earlier poll cycle — mirrors the
+    // pending_rulings/pending_finalizations confirmation checks in poll_once's case loop, just
+    // driven by PendingOracleProposal/OracleApprovals instead of Cases' status.
+    let confirmed: Vec<u32> = {
+        let mut confirmed = Vec::new();
+        for &case_id in persisted.pending_approvals.keys() {
+            let still_pending = pending_case_ids.contains(&case_id);
+            let approvals = fetch_oracle_approvals(rpc, case_id).await?;
+            if approval_confirmed(oracle_account, still_pending, &approvals) {
+                confirmed.push(case_id);
+            }
+        }
+        confirmed
+    };
+    for case_id in confirmed {
+        tracing::info!(case_id, "confirmed on-chain: approve_ai_ruling was recorded, or the pending action already resolved/expired in the meantime");
+        persisted.pending_approvals.remove(&case_id);
+        save_persisted_state(persisted, &config.state_file);
+    }
+
+    // Then, co-sign anything currently pending that this account has not yet approved.
+    for (case_id, action) in pending {
+        if persisted.pending_approvals.contains_key(&case_id) {
+            // Already submitted on an earlier cycle and not yet confirmed (checked above) —
+            // don't resubmit every single poll cycle while a first attempt is still in flight.
+            continue;
+        }
+        let approvals = fetch_oracle_approvals(rpc, case_id).await?;
+        if !needs_approval(oracle_account, true, &approvals) {
+            // Either this account is the original proposer (implicitly already approved), or a
+            // previously-submitted approve_ai_ruling already landed and was confirmed on a prior
+            // cycle before pending_approvals was cleared for it.
+            continue;
+        }
+        let kind = match action {
+            PendingOracleAction::Submission { .. } => OracleActionKind::Submission,
+            PendingOracleAction::Finalization => OracleActionKind::Finalization,
+        };
+        tracing::info!(case_id, kind = ?kind, "found a pending oracle proposal not yet approved by this account, co-signing (no Claude/IPFS call)");
+        if config.dry_run {
+            tracing::info!(case_id, kind = ?kind, "DRY_RUN set — not submitting approve_ai_ruling");
+            continue;
+        }
+        let call = extrinsic::ApproveAiRuling { case_id };
+        match extrinsic::build_signed(
+            rpc,
+            seed,
+            config.courts_pallet_index,
+            config.approve_ai_ruling_call_index,
+            call,
+        )
+        .await
+        {
+            Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
+                Ok(tx_hash) => {
+                    tracing::info!(case_id, tx_hash, kind = ?kind, oracle_account = %oracle_account.to_ss58check(), "submitted approve_ai_ruling — NOT yet confirmed on-chain; will confirm once a later poll observes this account among OracleApprovals (or the proposal resolve/expire)");
+                    persisted.pending_approvals.insert(case_id, kind);
+                    save_persisted_state(persisted, &config.state_file);
+                }
+                Err(e) => {
+                    tracing::error!(case_id, error = %e, "author_submitExtrinsic failed for approve_ai_ruling");
+                }
+            },
+            Err(e) => {
+                tracing::error!(case_id, error = %e, "failed to build/sign approve_ai_ruling extrinsic");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pure decision logic for whether an `AIRulingIssued` case should be finalized this poll
@@ -968,6 +1167,92 @@ mod tests {
                 "status {status:?} means finalize_ruling either took effect or is now moot"
             );
         }
+    }
+
+    // ── needs_approval / approval_confirmed ─────────────────────────────────────────────────
+    //
+    // These pin the fix for the review-flagged gap: court-oracle used to only ever originate
+    // fresh submit_ai_ruling/finalize_ruling proposals, never co-sign an existing one via
+    // approve_ai_ruling — meaning no set of running instances could ever actually reach the
+    // Oracle Council's M-of-N threshold. `needs_approval` decides whether to submit
+    // approve_ai_ruling for a given case_id; `approval_confirmed` decides when a submitted one
+    // can stop being tracked as pending.
+
+    fn account(byte: u8) -> AccountId32 {
+        AccountId32::from([byte; 32])
+    }
+
+    #[test]
+    fn needs_approval_when_no_proposal_is_pending() {
+        let me = account(1);
+        assert!(!needs_approval(&me, false, &[]));
+    }
+
+    #[test]
+    fn needs_approval_for_a_pending_proposal_no_one_has_approved_yet() {
+        let me = account(1);
+        assert!(needs_approval(&me, true, &[]));
+    }
+
+    #[test]
+    fn needs_approval_for_a_pending_proposal_only_other_members_have_approved() {
+        // Detects the exact gap this fix closes: a proposal from a DIFFERENT oracle-council
+        // member, with only that member's own (proposer) approval recorded so far — this
+        // account must still see it as needing approval.
+        let me = account(1);
+        let other_proposer = account(2);
+        assert!(needs_approval(&me, true, &[other_proposer]));
+    }
+
+    #[test]
+    fn does_not_need_approval_once_this_account_already_approved() {
+        // Covers both real scenarios that land this account in current_approvals: (a) this
+        // account was the proposer (submit_ai_ruling/finalize_ruling record the proposer's own
+        // approval immediately, per pallets/pallet-courts/src/lib.rs) and (b) a previous
+        // approve_ai_ruling from this same account already landed. needs_approval can't and
+        // needn't distinguish between the two -- either way there is nothing left to submit.
+        let me = account(1);
+        let other_member = account(2);
+        assert!(!needs_approval(&me, true, &[me.clone()]));
+        assert!(!needs_approval(&me, true, &[other_member, me.clone()]));
+    }
+
+    #[test]
+    fn needs_approval_does_not_confuse_the_presence_of_unrelated_accounts_with_this_accounts_own_approval() {
+        // "Unknown/non-member account" isn't separately representable here on purpose: this
+        // pallet already purges a removed member's approvals from every in-flight proposal (see
+        // remove_oracle_member in pallets/pallet-courts/src/lib.rs), and approve_ai_ruling itself
+        // is gated to current OracleMembers only -- so by the time this service reads
+        // OracleApprovals, every entry in it is (or was, at cast time) a legitimate member. The
+        // function is deliberately symmetric in who ELSE appears in the list: any number of
+        // other accounts (members or not) must never be mistaken for this account's own
+        // approval.
+        let me = account(1);
+        let strangers = [account(9), account(10), account(11)];
+        assert!(needs_approval(&me, true, &strangers));
+    }
+
+    #[test]
+    fn approval_is_not_confirmed_while_still_pending_and_unrecorded() {
+        let me = account(1);
+        assert!(!approval_confirmed(&me, true, &[]));
+        assert!(!approval_confirmed(&me, true, &[account(2)]));
+    }
+
+    #[test]
+    fn approval_is_confirmed_once_this_account_appears_in_current_approvals() {
+        let me = account(1);
+        assert!(approval_confirmed(&me, true, &[me.clone()]));
+        assert!(approval_confirmed(&me, true, &[account(2), me.clone()]));
+    }
+
+    #[test]
+    fn approval_is_confirmed_once_the_proposal_no_longer_exists_even_if_unrecorded_here() {
+        // The action resolved (reached threshold) or was cleared as stale -- either way this
+        // service should stop tracking it as needing a resubmission, regardless of whether its
+        // own approve_ai_ruling is the one that's actually recorded in the now-cleared map.
+        let me = account(1);
+        assert!(approval_confirmed(&me, false, &[]));
     }
 
     // ── should_finalize ──────────────────────────────────────────────────────────────────────

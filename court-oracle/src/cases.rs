@@ -54,6 +54,19 @@ pub enum Verdict {
     Overturned,
 }
 
+/// Mirrors `pallet_courts::pallet::PendingOracleAction` — what a pending Oracle Council
+/// proposal for a case_id (`Courts::PendingOracleProposal`) will do once approvals reach the
+/// M-of-N threshold. Variant order matches exactly (SCALE encodes enums by variant index).
+/// `Encode` is included (in addition to `Decode`) purely so unit tests can round-trip a fixture
+/// without needing the real pallet crate as a dependency — this service only ever reads this
+/// value from chain (to log which kind of pending action it's co-signing via
+/// `approve_ai_ruling`), it never constructs/submits one itself.
+#[derive(Clone, Debug, PartialEq, Decode, Encode)]
+pub enum PendingOracleAction {
+    Submission { ruling_hash: [u8; 32], model_version: u32, verdict: Verdict },
+    Finalization,
+}
+
 // ── pallet-constitution (pallets/pallet-constitution/src/lib.rs, this working tree) ─────────
 
 /// Mirrors `pallet_constitution::pallet::LawTier`.
@@ -201,6 +214,22 @@ mod tests {
             let encoded = verdict.encode();
             let decoded = Verdict::decode(&mut &encoded[..]).expect("decode failed");
             assert_eq!(verdict, decoded);
+        }
+    }
+
+    #[test]
+    fn pending_oracle_action_variants_round_trip() {
+        for action in [
+            PendingOracleAction::Submission {
+                ruling_hash: [3u8; 32],
+                model_version: 5,
+                verdict: Verdict::Overturned,
+            },
+            PendingOracleAction::Finalization,
+        ] {
+            let encoded = action.encode();
+            let decoded = PendingOracleAction::decode(&mut &encoded[..]).expect("decode failed");
+            assert_eq!(action, decoded);
         }
     }
 }

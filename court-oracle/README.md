@@ -8,7 +8,11 @@ model_version, verdict) signed by a configured oracle account — the verdict is
 on-chain at this point. Also polls `Cases` for `CaseStatus::AIRulingIssued` entries whose appeal
 window has closed unappealed, and submits the second, separate `finalize_ruling(case_id)` call
 that actually applies enforcement (pausing a law, freezing a department, suspending a citizen)
-— see "`finalize_ruling` scheduling, and the verdict-binding fix" below.
+— see "`finalize_ruling` scheduling, and the verdict-binding fix" below. Separately, every poll
+cycle also co-signs (`approve_ai_ruling`) any pending Oracle Council proposal — originated by
+this account or by a different running instance's own oracle account — that this account has
+not yet approved, without re-running the Claude/IPFS pipeline for it; see "Oracle Council (M-of-N
+ruling approval)" below.
 
 **Read this whole file before running this anywhere real.** Large parts of the live-integration
 path (chain RPC, the Claude API call, IPFS publishing) have never been exercised against a real
@@ -259,26 +263,45 @@ correctly-shaped `submit_ai_ruling`/`finalize_ruling` calls; the chain just won'
 alone unless the council currently has only 1 member (which trivially satisfies any majority) or
 enough *other* instances also approve the same case.
 
-**The real deployment model this implies — not built here, out of scope for this pass**: run one
-independent `court-oracle` instance per Oracle Council member, each with its own signing key
-(its own `KEYS_FILE`) and, ideally, its own Claude API key/account, so a single compromised
-Claude API key or prompt-injected model output can't unilaterally decide a case either — the
-whole point of the M-of-N design is that no single instance's output is trusted alone. Each
-instance independently polls the same chain state, asks its own Claude for a ruling, and submits
-`submit_ai_ruling`; because Claude is not deterministic, independent instances will not always
-reach byte-identical `ruling_hash`/`verdict` — this service does **not** attempt any
-cross-instance ruling-content consensus (a genuinely hard problem: reconciling differing IPFS
-hashes or split verdicts is a design question of its own). What's actually enforced on-chain
-today is coarser: `approve_ai_ruling` requires approving the *same already-proposed* action for
-that case_id, so in practice the realistic path to threshold is either (a) a human/process step
-picks one proposed ruling per case for other members to co-sign (this service has no code for
-that — no polling loop watches for and approves *other* accounts' proposals), or (b) this is run
-with a small council where quicker/majority-model-agreement rulings naturally coincide. Building
-real (a) — a mode where an instance polls `PendingOracleProposal` for cases *other* accounts
-already proposed and independently decides whether to add its approval — is genuine future work,
-not attempted in this pass; this README flags it rather than silently assuming it exists. The
-single-instance path (all existing code, all 52 tests) is exactly what a 1-member council, or the
-proposer's own call reaching threshold in a small council, already exercises correctly.
+**The real deployment model this implies**: run one independent `court-oracle` instance per
+Oracle Council member, each with its own signing key (its own `KEYS_FILE`) and, ideally, its own
+Claude API key/account, so a single compromised Claude API key or prompt-injected model output
+can't unilaterally decide a case either — the whole point of the M-of-N design is that no single
+instance's output is trusted alone. Each instance independently polls the same chain state, asks
+its own Claude for a ruling, and submits `submit_ai_ruling`; because Claude is not deterministic,
+independent instances will not always reach byte-identical `ruling_hash`/`verdict` — this service
+does **not** attempt any cross-instance ruling-content consensus (a genuinely hard problem:
+reconciling differing IPFS hashes or split verdicts is a design question of its own). What's
+actually enforced on-chain is coarser: `approve_ai_ruling` requires approving the *same
+already-proposed* action for that case_id, so the realistic path to threshold is either (a) a
+human/process step picks one proposed ruling per case for other members to co-sign, or (b) this
+is run with a small council where quicker/majority-model-agreement rulings naturally coincide.
+
+**Co-signing other members' proposals is now implemented** (closing a gap a 2026-09 project
+review flagged: without it, no set of running instances could ever reach the M-of-N threshold on
+a multi-member council — each instance could only ever author its own proposal, never co-sign
+someone else's). `poll_oracle_approvals` (`src/main.rs`) runs every poll cycle, independently of
+the `Filed`/`AIRulingIssued` origination paths: it reads `Courts::PendingOracleProposal` for
+every case_id with a currently pending action, checks `Courts::OracleApprovals[case_id]` for
+whether this account is already recorded, and calls `approve_ai_ruling(case_id)` for every one
+where it isn't — proposed by this account or, in the realistic multi-instance deployment, by a
+different running instance's own oracle account. This never re-runs the Claude/IPFS pipeline:
+approving is pure on-chain co-signing of whatever `ruling_hash`/`verdict` (or finalization) the
+original proposer already published, which is the entire point of "propose once, co-sign after"
+— only the proposer pays for that pipeline. It correctly does not try to re-approve a proposal
+this same account already originated: `submit_ai_ruling`/`finalize_ruling` record the proposer's
+own approval in `OracleApprovals` at proposal time (see `pallets/pallet-courts/src/lib.rs`), so
+`needs_approval` (the pure decision function, unit tested) already sees this account present and
+skips it — no special-casing needed. A submitted-but-unconfirmed approval is tracked in
+`PersistedState::pending_approvals` (mirroring `pending_rulings`/`pending_finalizations`) so a
+crash-restart doesn't blindly resubmit; unlike those two, there's no separate long-term "already
+approved" set, since chain state alone (a proposal's absence, or this account's presence in its
+approval list) is already authoritative for whether a given case still needs this account's
+approval.
+
+Reconciling *which* proposal to approve when independent instances disagree on the ruling itself
+remains out of scope, as above — this only closes the "no code path exists to co-sign at all"
+gap, not the ruling-content-consensus question.
 
 ## Configuration
 
@@ -293,6 +316,7 @@ All environment variables, see `src/config.rs` for defaults and full doc comment
 | `COURTS_PALLET_INDEX` | `11` | pallet-courts's runtime index |
 | `SUBMIT_AI_RULING_CALL_INDEX` | `1` | `submit_ai_ruling`'s call index |
 | `FINALIZE_RULING_CALL_INDEX` | `4` | `finalize_ruling`'s call index |
+| `APPROVE_AI_RULING_CALL_INDEX` | `11` | `approve_ai_ruling`'s call index — co-signs another (or this account's own) pending proposal |
 | `APPEAL_WINDOW_BLOCKS` | `50400` | `pallet-courts`'s `AppealWindowBlocks` (7 days at 12s blocks) — used client-side to decide when to attempt `finalize_ruling`; the chain enforces the real deadline independently |
 | `IPFS_API_URL` | `http://127.0.0.1:5001` | Kubo-compatible IPFS daemon HTTP API |
 | `CLAUDE_API_KEY` | (required) | Anthropic API key |
@@ -313,11 +337,13 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 - Calling `Courts::add_oracle_member` to register this service's key on a real chain — a
   governance/root action.
-- Multi-instance orchestration for the Oracle Council (running N independent instances, one per
-  council member, and/or polling for and approving other members' proposals via
-  `approve_ai_ruling`) — see "Oracle Council (M-of-N ruling approval)" above. This service
-  correctly plays the role of *one* council member's instance; coordinating several was not
-  built.
+- Actually running N independent instances, one per council member, in a real deployment — this
+  service plays the role of *one* council member's instance (and, since the fix described in
+  "Oracle Council (M-of-N ruling approval)" above, correctly co-signs *other* instances' pending
+  proposals via `approve_ai_ruling`, not just its own) — but standing up and operating the actual
+  N-instance fleet is a deployment/ops task, not something this crate does itself.
+- Cross-instance ruling-content consensus — reconciling independently-decided rulings/verdicts
+  when instances disagree (see "Oracle Council (M-of-N ruling approval)" above).
 - Jury-vote-driven finalization (`cast_jury_vote`'s own auto-finalize on reaching a majority) —
   that path is entirely on-chain and needs no off-chain scheduler. Only the no-appeal path
   (`finalize_ruling`) needed an off-chain caller, and that's what this service now does — see
@@ -325,13 +351,23 @@ echo '{"oracle_account_seed":"<64 hex chars>"}' | age -p > court-oracle-secrets.
 
 ## Test coverage — what's real, what isn't
 
-`cargo test` (67 tests, all passing in this environment, confirmed via `cargo test --release`
-2026-09-05 — up from the 52 previously cited here, +15 for the "Operational robustness" fixes
-above: 11 in `retry.rs` covering `backoff_delay`'s doubling/capping/no-panic-on-large-attempt
-behavior plus `RetryTracker`'s should-attempt/success/failure/give-up state machine, and 4 in
-`state.rs` covering the `PersistedState` save→load round trip, a missing file loading as an empty
-default rather than an error, a second save fully replacing rather than merging with the first,
-and a corrupt file surfacing as a load error rather than a silent reset): case-context rendering
+`cargo test` (85 tests, all passing in this environment, confirmed via `cargo test --release`
+2026-09-12 — up from the 67 previously cited here, +18 for the `approve_ai_ruling` co-signing fix
+above: 1 in `cases.rs` round-tripping the new `PendingOracleAction` mirror, 1 in `extrinsic.rs`
+pinning `approve_ai_ruling`'s call-byte layout, 2 in `state.rs` covering `pending_approvals`'
+save→load round trip and its `#[serde(default)]` backward-compatibility with an older state file,
+and 8 in `main.rs` covering `needs_approval`/`approval_confirmed` — including a pending proposal
+with only another member's approval recorded (the exact scenario the fix targets), this account
+already present via either the implicit proposer-approval path or a prior confirmed
+`approve_ai_ruling`, the presence of unrelated accounts never being mistaken for this account's
+own approval, and a proposal that's resolved/expired being treated as confirmed even without this
+account's own approval visibly recorded. The previous 67-test baseline (2026-09-05) added 15 for
+the "Operational robustness" fixes above: 11 in `retry.rs` covering `backoff_delay`'s
+doubling/capping/no-panic-on-large-attempt behavior plus `RetryTracker`'s
+should-attempt/success/failure/give-up state machine, and 4 in `state.rs` covering the
+`PersistedState` save→load round trip, a missing file loading as an empty default rather than an
+error, a second save fully replacing rather than merging with the first, and a corrupt file
+surfacing as a load error rather than a silent reset): case-context rendering
 for all four `CaseSubject` variants, including that IPFS-sourced law text is wrapped in
 `<untrusted_external_content>` delimiters (prompt-injection mitigation, see below); Claude
 request formatting and `VERDICT:`/`REASONING:` response parsing, including a realistic-shaped

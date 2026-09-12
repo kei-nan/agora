@@ -137,6 +137,34 @@ impl CourtsCall for FinalizeRuling {
     }
 }
 
+/// Arguments to `pallet-courts::approve_ai_ruling(case_id)` — co-signs whichever action is
+/// currently pending for `case_id` in `PendingOracleProposal` (a `Submission` or a
+/// `Finalization`, see `crate::cases::PendingOracleAction`). Call index 11
+/// (`#[pallet::call_index(11)]` in `pallets/pallet-courts/src/lib.rs`, confirmed by reading that
+/// file directly). Gated by the same `T::OracleOrigin` as `submit_ai_ruling`/`finalize_ruling`;
+/// rejects a repeat approval from the same account (`Error::AlreadyApprovedOracleAction`) and a
+/// case_id with no pending proposal (`Error::NoPendingOracleAction`) — `main.rs` only builds
+/// this after confirming, from freshly-read chain state, that a proposal exists and this
+/// account isn't already among its recorded approvals (which — per that pallet's
+/// `submit_ai_ruling`/`finalize_ruling` — already includes the proposer's own account the
+/// instant a proposal is created, so this crate correctly never tries to approve its own
+/// just-submitted proposal a second time).
+pub struct ApproveAiRuling {
+    pub case_id: u32,
+}
+
+impl CourtsCall for ApproveAiRuling {
+    fn encode_call_bytes(&self, pallet_index: u8, call_index: u8) -> Vec<u8> {
+        // [pallet_index, call_index] ++ case_id -- no other arguments; approve_ai_ruling acts on
+        // whatever PendingOracleProposal already holds for this case_id.
+        let mut call_bytes = Vec::new();
+        call_bytes.push(pallet_index);
+        call_bytes.push(call_index);
+        call_bytes.extend(self.case_id.encode());
+        call_bytes
+    }
+}
+
 /// Builds, signs, and hex-encodes the extrinsic. Returns the "0x"-prefixed hex string ready for
 /// `author_submitExtrinsic`. Generic over `CourtsCall` so both `submit_ai_ruling` and
 /// `finalize_ruling` share this one envelope/signing implementation — the two calls differ only
@@ -255,6 +283,19 @@ mod tests {
         assert_eq!(call_bytes.len(), 2 + 4);
         assert_eq!(call_bytes[0], 11);
         assert_eq!(call_bytes[1], 4);
+        assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
+    }
+
+    /// Same idea for `pallet-courts::approve_ai_ruling(case_id: u32)` — pallet_index, call_index,
+    /// then case_id as a plain little-endian u32. No other arguments.
+    #[test]
+    fn call_bytes_layout_matches_approve_ai_ruling_signature() {
+        let call = ApproveAiRuling { case_id: 42 };
+        let call_bytes = call.encode_call_bytes(11, 11);
+
+        assert_eq!(call_bytes.len(), 2 + 4);
+        assert_eq!(call_bytes[0], 11);
+        assert_eq!(call_bytes[1], 11);
         assert_eq!(&call_bytes[2..6], &42u32.to_le_bytes());
     }
 }

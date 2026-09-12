@@ -49,6 +49,18 @@ pub struct PendingRuling {
     pub verdict: Verdict,
 }
 
+/// Which specific pending Oracle Council action (`pallet_courts::PendingOracleAction`, mirrored
+/// as `crate::cases::PendingOracleAction`) a co-signing `approve_ai_ruling` submission refers
+/// to. Needed because the same `case_id` can carry a `Submission` proposal, have it resolve, and
+/// later carry an unrelated `Finalization` proposal — tracking `pending_approvals` by bare
+/// `case_id` alone would incorrectly treat "I already approved this case_id once" as covering
+/// both, when they're two entirely separate on-chain actions with their own approval lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OracleActionKind {
+    Submission,
+    Finalization,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
     /// case_ids whose `submit_ai_ruling` a LATER poll has confirmed actually took effect
@@ -71,6 +83,20 @@ pub struct PersistedState {
     /// confirmed to have left `AIRulingIssued`.
     #[serde(default)]
     pub pending_finalizations: HashSet<u32>,
+    /// case_ids for which this instance submitted `approve_ai_ruling` (co-signing another
+    /// member's — or its own already-recorded — pending proposal) but no later poll has yet
+    /// confirmed the approval was recorded on-chain, keyed to which action kind was being
+    /// approved (see `OracleActionKind`'s doc comment for why the kind matters). Unlike
+    /// `processed`/`finalized` above, there is no separate long-term "already approved" set:
+    /// once a poll confirms an entry here (this account appears in a freshly re-read
+    /// `Courts::OracleApprovals[case_id]`, or the proposal is simply gone because it already
+    /// resolved/expired), the entry is removed outright — chain state itself is
+    /// authoritative for "does this case currently need my approval", so nothing further needs
+    /// to be remembered locally. `#[serde(default)]` so a state file written before this field
+    /// existed still loads (as "nothing pending"), the same safe-direction convention
+    /// `pending_rulings`/`pending_finalizations` already use.
+    #[serde(default)]
+    pub pending_approvals: HashMap<u32, OracleActionKind>,
 }
 
 impl PersistedState {
@@ -201,6 +227,44 @@ mod tests {
         assert_eq!(loaded.finalized, HashSet::from([2]));
         assert!(loaded.pending_rulings.is_empty());
         assert!(loaded.pending_finalizations.is_empty());
+        assert!(loaded.pending_approvals.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_approvals_round_trip_through_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("court-oracle-state-test-{}", uniq()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let mut state = PersistedState::default();
+        state.pending_approvals.insert(5, OracleActionKind::Submission);
+        state.pending_approvals.insert(6, OracleActionKind::Finalization);
+
+        state.save(&path).expect("save should succeed");
+        let loaded = PersistedState::load(&path).expect("load should succeed");
+        assert_eq!(loaded, state);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_state_file_written_before_pending_approvals_existed_still_loads() {
+        // Simulates a state.json from before pending_approvals was added (including after
+        // pending_rulings/pending_finalizations already existed) — #[serde(default)] must mean
+        // this still loads as "nothing pending approval", not a load error.
+        let dir = std::env::temp_dir().join(format!("court-oracle-state-test-{}", uniq()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old-shape.json");
+        std::fs::write(
+            &path,
+            br#"{"processed":[1],"finalized":[],"pending_rulings":{},"pending_finalizations":[]}"#,
+        )
+        .unwrap();
+
+        let loaded = PersistedState::load(&path).expect("old-shape file should still load");
+        assert!(loaded.pending_approvals.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
