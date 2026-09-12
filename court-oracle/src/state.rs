@@ -18,20 +18,59 @@
 //! so a crash mid-save either leaves the old (still-valid) state file untouched or the new one
 //! fully written — never a half-written, corrupt JSON file that would fail to load on the next
 //! startup.
+//!
+//! ## `processed`/`finalized` mean *confirmed*, not merely *submitted*
+//!
+//! `author_submitExtrinsic` returning `Ok(tx_hash)` is pool acceptance, not dispatch success —
+//! `submit_ai_ruling`/`finalize_ruling` are both gated by `EnsureOracleCouncilApproved`-style
+//! origin/status checks that run at block-*execution* time, not transaction-pool validation time,
+//! so a call can still be rejected (or never get included at all) with no error ever surfacing
+//! here. `pending_rulings`/`pending_finalizations` below track "submitted, awaiting on-chain
+//! confirmation" separately from `processed`/`finalized` ("a later poll actually observed the
+//! case's status move" — see `main.rs`'s `ruling_confirmed_by_status`/
+//! `finalization_confirmed_by_status`). A case only ever moves from pending to
+//! confirmed, never the reverse, and `main.rs` never inserts directly into `processed`/
+//! `finalized` from a submission result alone (`DRY_RUN` is the one deliberate exception: no real
+//! extrinsic is ever submitted in dry-run mode, so there is nothing to confirm).
 
+use crate::cases::Verdict;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+/// The already-computed ruling for a case whose `submit_ai_ruling` extrinsic was submitted but
+/// not yet confirmed on-chain — cached so a resubmission attempt (if the first one never took
+/// effect) never needs a second, redundantly-billed Claude call or IPFS publish for the same
+/// case_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRuling {
+    pub ruling_hash: [u8; 32],
+    pub verdict: Verdict,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedState {
-    /// case_ids `submit_ai_ruling` has already been submitted for (mirrors `main.rs`'s
-    /// `already_processed`).
+    /// case_ids whose `submit_ai_ruling` a LATER poll has confirmed actually took effect
+    /// on-chain (the case's status was observed to have moved off `Filed`) — see this module's
+    /// doc comment. Mirrors `main.rs`'s old `already_processed` name.
     pub processed: HashSet<u32>,
-    /// case_ids `finalize_ruling` has already been submitted for (mirrors `main.rs`'s
-    /// `finalize_processed`).
+    /// case_ids whose `finalize_ruling` a LATER poll has confirmed actually took effect on-chain
+    /// (the case's status was observed to have left `AIRulingIssued`) — see this module's doc
+    /// comment. Mirrors `main.rs`'s old `finalize_processed` name.
     pub finalized: HashSet<u32>,
+    /// case_ids for which `submit_ai_ruling` was submitted (`author_submitExtrinsic` returned
+    /// `Ok`) but no later poll has yet confirmed it took effect — i.e. the case's status was
+    /// still `Filed` on the most recent poll. `#[serde(default)]` so a state file written before
+    /// this field existed still loads (as "nothing pending", the safe direction: at worst a
+    /// resubmission is skipped until it naturally resolves as a fresh `Filed` case instead of a
+    /// pending one, never treated as falsely confirmed).
+    #[serde(default)]
+    pub pending_rulings: HashMap<u32, PendingRuling>,
+    /// Same idea as `pending_rulings`, for `finalize_ruling` — case_ids submitted but not yet
+    /// confirmed to have left `AIRulingIssued`.
+    #[serde(default)]
+    pub pending_finalizations: HashSet<u32>,
 }
 
 impl PersistedState {
@@ -124,6 +163,44 @@ mod tests {
 
         let loaded = PersistedState::load(&path).unwrap();
         assert_eq!(loaded, second, "second save must fully replace, not merge with, the first");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pending_fields_round_trip_through_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("court-oracle-state-test-{}", uniq()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let mut state = PersistedState::default();
+        state.pending_rulings.insert(
+            7,
+            PendingRuling { ruling_hash: [9u8; 32], verdict: Verdict::Overturned },
+        );
+        state.pending_finalizations.insert(11);
+
+        state.save(&path).expect("save should succeed");
+        let loaded = PersistedState::load(&path).expect("load should succeed");
+        assert_eq!(loaded, state);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_state_file_written_before_the_pending_fields_existed_still_loads() {
+        // Simulates a state.json from before pending_rulings/pending_finalizations were added —
+        // #[serde(default)] must mean this still loads (as "nothing pending"), not a load error.
+        let dir = std::env::temp_dir().join(format!("court-oracle-state-test-{}", uniq()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old-shape.json");
+        std::fs::write(&path, br#"{"processed":[1,2],"finalized":[2]}"#).unwrap();
+
+        let loaded = PersistedState::load(&path).expect("old-shape file should still load");
+        assert_eq!(loaded.processed, HashSet::from([1, 2]));
+        assert_eq!(loaded.finalized, HashSet::from([2]));
+        assert!(loaded.pending_rulings.is_empty());
+        assert!(loaded.pending_finalizations.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }

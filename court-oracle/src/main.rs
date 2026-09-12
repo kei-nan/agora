@@ -25,6 +25,26 @@
 //! have already been submitted (`state.rs`) so a crash-restart doesn't forget and redundantly
 //! re-bill Claude for one; and a specific diagnostic (in `poll_once` below) for the case where
 //! this service's oracle account has been removed from `Courts::OracleMembers`.
+//!
+//! ## Submission is not confirmation
+//!
+//! `author_submitExtrinsic` returning `Ok(tx_hash)` means the node's transaction pool accepted
+//! the extrinsic — it is NOT confirmation that `submit_ai_ruling`/`finalize_ruling` actually
+//! dispatched successfully. Both calls are gated by `EnsureOracleCouncilApproved`-style
+//! origin/status checks (`OracleMembers` membership, the M-of-N approval threshold, the case's
+//! current `CaseStatus`) that run at block-*execution* time, not at pool-validation time — a
+//! call can be accepted into the pool and then rejected (or simply never get included at all)
+//! with no error ever surfacing to this service. `poll_once` therefore never marks a case
+//! `processed`/`finalized` off the back of a bare `Ok(tx_hash)` alone. Instead: a successful
+//! submission moves the case_id into `PersistedState::pending_rulings`/`pending_finalizations`
+//! ("submitted, unconfirmed"), and it only graduates to `processed`/`finalized` ("confirmed")
+//! once a LATER poll cycle's fresh read of `Courts::Cases` actually observes the status change
+//! (`ruling_confirmed_by_status`/`finalization_confirmed_by_status` below) — this service already
+//! re-reads every case's status from scratch every `poll_interval_secs`, so that confirmation is
+//! free. If a later poll still finds the case unconfirmed, `poll_once` resubmits it (gated by the
+//! same `RetryTracker` backoff/give-up circuit breaker used elsewhere) using the already-cached
+//! `ruling_hash`/`verdict` — never re-billing Claude or re-publishing to IPFS for a case_id that
+//! already has a pending submission.
 
 mod cases;
 mod claude;
@@ -233,12 +253,86 @@ async fn poll_once(
         };
         let (filer, status, _ruling_hash, subject) = case;
 
+        // Confirm any previously-submitted-but-unconfirmed ruling/finalization against this
+        // poll's freshly-read status — see module doc comment ("submission is not
+        // confirmation"). Checked unconditionally, before the status-specific match below, so a
+        // case that jumps past the immediately-next status within a single poll gap (e.g.
+        // straight to `InJuryAppeal` because an appeal landed in the same window a
+        // `finalize_ruling` was in flight) still gets confirmed correctly rather than being
+        // handled only by one specific match arm.
+        if persisted.pending_rulings.contains_key(&case_id) && ruling_confirmed_by_status(&status) {
+            tracing::info!(case_id, status = ?status, "confirmed on-chain: submit_ai_ruling took effect (case left Filed)");
+            persisted.pending_rulings.remove(&case_id);
+            rule_retry.record_success(case_id);
+            persisted.processed.insert(case_id);
+            save_persisted_state(persisted, &config.state_file);
+        }
+        if persisted.pending_finalizations.contains(&case_id) && finalization_confirmed_by_status(&status) {
+            tracing::info!(case_id, status = ?status, "confirmed on-chain: finalize_ruling took effect (or an appeal was filed instead — either way this case left AIRulingIssued)");
+            persisted.pending_finalizations.remove(&case_id);
+            finalize_retry.record_success(case_id);
+            persisted.finalized.insert(case_id);
+            save_persisted_state(persisted, &config.state_file);
+        }
+
         match status {
             CaseStatus::Filed => {
                 if persisted.processed.contains(&case_id) {
                     continue;
                 }
                 let now = Instant::now();
+
+                if let Some(pending) = persisted.pending_rulings.get(&case_id).cloned() {
+                    // Submitted on an earlier poll cycle but the confirmation check above found
+                    // the case still Filed — dispatch may have failed (e.g. a since-lost Oracle
+                    // Council membership, or a not-yet-cleared approval threshold) or the
+                    // extrinsic never got included at all. Never call `rule_on_case` again for a
+                    // case_id with a pending ruling — that would re-bill Claude and re-publish to
+                    // IPFS for a ruling this service already decided.
+                    if !rule_retry.should_attempt(case_id, now) {
+                        if rule_retry.has_given_up(case_id) {
+                            tracing::error!(case_id, "submit_ai_ruling still unconfirmed and this case has given up retrying — needs manual attention, not retrying without a restart");
+                        } else {
+                            tracing::debug!(case_id, "submit_ai_ruling still unconfirmed, backing off before resubmitting");
+                        }
+                        continue;
+                    }
+                    tracing::warn!(case_id, "submit_ai_ruling was submitted on an earlier poll cycle but the case is still Filed — resubmitting the already-decided ruling (no fresh Claude call)");
+                    let call = extrinsic::SubmitAiRuling {
+                        case_id,
+                        ruling_hash: pending.ruling_hash,
+                        model_version,
+                        verdict: pending.verdict,
+                    };
+                    match extrinsic::build_signed(
+                        rpc,
+                        seed,
+                        config.courts_pallet_index,
+                        config.submit_ai_ruling_call_index,
+                        call,
+                    )
+                    .await
+                    {
+                        Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
+                            Ok(tx_hash) => {
+                                tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "resubmitted submit_ai_ruling — still awaiting on-chain confirmation");
+                                // Deliberately NOT record_success/processed.insert here — the
+                                // pool accepting this resubmission is not confirmation either;
+                                // record_failure below tracks "another cycle passed unconfirmed"
+                                // for backoff/give-up purposes, same as a genuine error would.
+                                log_retry_outcome(case_id, "submit_ai_ruling resubmitted but still not confirmed on-chain", &anyhow::anyhow!("case remained Filed after a prior submission"), rule_retry.record_failure(case_id, now));
+                            }
+                            Err(e) => {
+                                log_retry_outcome(case_id, "author_submitExtrinsic failed while resubmitting submit_ai_ruling", &e, rule_retry.record_failure(case_id, now));
+                            }
+                        },
+                        Err(e) => {
+                            log_retry_outcome(case_id, "failed to build/sign extrinsic while resubmitting submit_ai_ruling", &e, rule_retry.record_failure(case_id, now));
+                        }
+                    }
+                    continue;
+                }
+
                 if !rule_retry.should_attempt(case_id, now) {
                     if rule_retry.has_given_up(case_id) {
                         tracing::debug!(case_id, "still in given-up state from an earlier poll cycle — needs manual attention, not retrying without a restart");
@@ -258,7 +352,7 @@ async fn poll_once(
                             save_persisted_state(persisted, &config.state_file);
                             continue;
                         }
-                        let call = extrinsic::SubmitAiRuling { case_id, ruling_hash, model_version, verdict };
+                        let call = extrinsic::SubmitAiRuling { case_id, ruling_hash, model_version, verdict: verdict.clone() };
                         match extrinsic::build_signed(
                             rpc,
                             seed,
@@ -270,10 +364,13 @@ async fn poll_once(
                         {
                             Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
                                 Ok(tx_hash) => {
-                                    tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted submit_ai_ruling");
-                                    rule_retry.record_success(case_id);
-                                    persisted.processed.insert(case_id);
+                                    tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted submit_ai_ruling — NOT yet confirmed on-chain (author_submitExtrinsic only reports pool acceptance, not dispatch success); will confirm once a later poll observes the case leave Filed");
+                                    persisted.pending_rulings.insert(case_id, state::PendingRuling { ruling_hash, verdict });
                                     save_persisted_state(persisted, &config.state_file);
+                                    // rule_retry is deliberately left untouched here (neither
+                                    // record_success nor record_failure) — the case is now
+                                    // pending confirmation, handled by the branch above on
+                                    // subsequent poll cycles, not this one.
                                 }
                                 Err(e) => {
                                     log_retry_outcome(case_id, "author_submitExtrinsic failed for submit_ai_ruling", &e, rule_retry.record_failure(case_id, now));
@@ -294,6 +391,46 @@ async fn poll_once(
                     continue;
                 }
                 let now = Instant::now();
+
+                if persisted.pending_finalizations.contains(&case_id) {
+                    // Same reasoning as the submit_ai_ruling pending-resubmit branch above: the
+                    // confirmation check found this case still AIRulingIssued despite an earlier
+                    // successful pool submission, so resubmit rather than assume success.
+                    if !finalize_retry.should_attempt(case_id, now) {
+                        if finalize_retry.has_given_up(case_id) {
+                            tracing::error!(case_id, "finalize_ruling still unconfirmed and this case has given up retrying — needs manual attention, not retrying without a restart");
+                        } else {
+                            tracing::debug!(case_id, "finalize_ruling still unconfirmed, backing off before resubmitting");
+                        }
+                        continue;
+                    }
+                    tracing::warn!(case_id, "finalize_ruling was submitted on an earlier poll cycle but the case is still AIRulingIssued — resubmitting");
+                    let call = extrinsic::FinalizeRuling { case_id };
+                    match extrinsic::build_signed(
+                        rpc,
+                        seed,
+                        config.courts_pallet_index,
+                        config.finalize_ruling_call_index,
+                        call,
+                    )
+                    .await
+                    {
+                        Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
+                            Ok(tx_hash) => {
+                                tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "resubmitted finalize_ruling — still awaiting on-chain confirmation");
+                                log_retry_outcome(case_id, "finalize_ruling resubmitted but still not confirmed on-chain", &anyhow::anyhow!("case remained AIRulingIssued after a prior submission"), finalize_retry.record_failure(case_id, now));
+                            }
+                            Err(e) => {
+                                log_retry_outcome(case_id, "author_submitExtrinsic failed while resubmitting finalize_ruling", &e, finalize_retry.record_failure(case_id, now));
+                            }
+                        },
+                        Err(e) => {
+                            log_retry_outcome(case_id, "failed to build/sign extrinsic while resubmitting finalize_ruling", &e, finalize_retry.record_failure(case_id, now));
+                        }
+                    }
+                    continue;
+                }
+
                 if !finalize_retry.should_attempt(case_id, now) {
                     if finalize_retry.has_given_up(case_id) {
                         tracing::debug!(case_id, "still in given-up state from an earlier poll cycle for finalize_ruling — needs manual attention, not retrying without a restart");
@@ -338,9 +475,8 @@ async fn poll_once(
                 {
                     Ok(extrinsic_hex) => match rpc.submit_extrinsic(&extrinsic_hex).await {
                         Ok(tx_hash) => {
-                            tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted finalize_ruling");
-                            finalize_retry.record_success(case_id);
-                            persisted.finalized.insert(case_id);
+                            tracing::info!(case_id, tx_hash, oracle_account = %oracle_account.to_ss58check(), "submitted finalize_ruling — NOT yet confirmed on-chain; will confirm once a later poll observes the case leave AIRulingIssued");
+                            persisted.pending_finalizations.insert(case_id);
                             save_persisted_state(persisted, &config.state_file);
                         }
                         Err(e) => {
@@ -357,6 +493,25 @@ async fn poll_once(
     }
 
     Ok(())
+}
+
+/// Pure decision: has a `submit_ai_ruling` submitted on an earlier poll cycle now been confirmed
+/// by this poll's freshly-read on-chain status? See module doc comment ("Submission is not
+/// confirmation"). Extracted so this logic is unit-testable directly, mirroring `should_finalize`
+/// below it — `poll_once` calls this once per case, before the status-specific match, rather than
+/// relying only on which match arm a case happens to fall into (which would miss a case that
+/// jumps straight past `AIRulingIssued` within a single poll gap).
+fn ruling_confirmed_by_status(status: &CaseStatus) -> bool {
+    *status != CaseStatus::Filed
+}
+
+/// Pure decision: has a `finalize_ruling` submitted on an earlier poll cycle now been confirmed?
+/// True once the case has left `AIRulingIssued` — either because `finalize_ruling` actually took
+/// effect (moving it to `FinalRuling`/`Enforced`), or because an appeal was filed instead (moving
+/// it to `InJuryAppeal`), which makes finalizing moot either way: this service should stop trying
+/// regardless of which of the two happened.
+fn finalization_confirmed_by_status(status: &CaseStatus) -> bool {
+    *status != CaseStatus::AIRulingIssued
 }
 
 /// Saves `persisted` to `state_file`, logging (not propagating) any failure — a save failure
@@ -758,6 +913,62 @@ fn map_key_u64(pallet: &str, item: &str, key: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ruling_confirmed_by_status / finalization_confirmed_by_status ──────────────────────────
+    //
+    // These pin the fix for the review-flagged gap: `author_submitExtrinsic` returning
+    // `Ok(tx_hash)` is pool acceptance, not dispatch confirmation (`EnsureOracleCouncilApproved`-
+    // style origin/status checks run at block-execution time). A case whose submission succeeded
+    // at the pool level but never actually took effect on-chain must keep showing as unconfirmed
+    // ("chain state never reflects the change") rather than being falsely treated as done.
+
+    #[test]
+    fn ruling_is_not_confirmed_while_the_submission_never_took_effect() {
+        // The exact scenario from the review: submit_ai_ruling returned Ok(tx_hash), but a
+        // later poll still observes CaseStatus::Filed — the call was rejected at dispatch time
+        // (or never got included at all). Must NOT be treated as confirmed.
+        assert!(!ruling_confirmed_by_status(&CaseStatus::Filed));
+    }
+
+    #[test]
+    fn ruling_is_confirmed_once_status_has_actually_left_filed() {
+        for status in [
+            CaseStatus::AIRulingIssued,
+            CaseStatus::InJuryAppeal,
+            CaseStatus::JurySeated,
+            CaseStatus::FinalRuling,
+            CaseStatus::Enforced,
+        ] {
+            assert!(
+                ruling_confirmed_by_status(&status),
+                "status {status:?} means submit_ai_ruling demonstrably took effect"
+            );
+        }
+    }
+
+    #[test]
+    fn finalization_is_not_confirmed_while_the_submission_never_took_effect() {
+        // Same scenario for finalize_ruling: Ok(tx_hash) at submission time, but a later poll
+        // still observes CaseStatus::AIRulingIssued unchanged.
+        assert!(!finalization_confirmed_by_status(&CaseStatus::AIRulingIssued));
+    }
+
+    #[test]
+    fn finalization_is_confirmed_once_status_has_actually_left_ai_ruling_issued() {
+        for status in [
+            CaseStatus::Filed, // not a real transition, but confirms the function is a pure
+                                // "not AIRulingIssued" check with no other special-casing
+            CaseStatus::InJuryAppeal,
+            CaseStatus::JurySeated,
+            CaseStatus::FinalRuling,
+            CaseStatus::Enforced,
+        ] {
+            assert!(
+                finalization_confirmed_by_status(&status),
+                "status {status:?} means finalize_ruling either took effect or is now moot"
+            );
+        }
+    }
 
     // ── should_finalize ──────────────────────────────────────────────────────────────────────
 

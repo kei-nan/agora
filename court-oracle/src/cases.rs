@@ -7,6 +7,7 @@
 //! guessed; the doc comment on each type says which file it was checked against.
 
 use codec::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use sp_core::crypto::AccountId32;
 
 // ── pallet-courts (pallets/pallet-courts/src/lib.rs, this working tree) ─────────────────────
@@ -42,7 +43,12 @@ pub type CaseRecord = (AccountId32, CaseStatus, Option<[u8; 32]>, CaseSubject);
 /// explicit fourth argument and commits it on-chain at submission time (see README.md's
 /// "`finalize_ruling` scheduling, and the verdict-binding fix" section) — `finalize_ruling`
 /// itself takes no verdict argument at all — so `extrinsic::SubmitAiRuling` encodes one of these.
-#[derive(Clone, Debug, PartialEq, Decode, Encode)]
+///
+/// `Serialize`/`Deserialize` (in addition to the SCALE `Decode`/`Encode` above) are needed so
+/// `state::PendingRuling` can cache a case's already-decided verdict on disk between "submitted"
+/// and "confirmed on-chain" — see state.rs's module doc comment and main.rs's confirmation-via-
+/// poll logic.
+#[derive(Clone, Debug, PartialEq, Eq, Decode, Encode, Serialize, Deserialize)]
 pub enum Verdict {
     Upheld,
     Overturned,
