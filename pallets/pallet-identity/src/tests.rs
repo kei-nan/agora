@@ -1088,6 +1088,37 @@ fn reverify_citizen_works() {
     });
 }
 
+/// Regression test for the identity-hijack fix (see
+/// `register_citizen_fails_when_signer_does_not_match_bound_account`'s own doc comment for the
+/// full attack narrative): account 2 signs here while `bound_account` still claims account 1,
+/// the citizen who is actually registered and reverification-eligible.
+#[test]
+fn reverify_citizen_fails_when_signer_does_not_match_bound_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        assert_eq!(ReverificationDeadline::<Test>::get(1), Some(11));
+
+        System::set_block_number(5);
+        assert_noop!(
+            Identity::reverify_citizen(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REVERIFY_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+                1, // bound_account claims account 1, but account 2 is the actual signer.
+            ),
+            Error::<Test>::BoundAccountMismatch
+        );
+        // Citizen 1's reverification deadline is untouched -- the extrinsic never got past
+        // the bound-account check to extend it.
+        assert_eq!(ReverificationDeadline::<Test>::get(1), Some(11));
+    });
+}
+
 #[test]
 fn reverify_citizen_fails_when_not_registered() {
     new_test_ext().execute_with(|| {
@@ -1327,6 +1358,37 @@ fn migrate_oprf_scheme_works() {
         System::assert_last_event(
             Event::OprfAnchorMigrated { who: 1, new_scheme_version: 1 }.into(),
         );
+    });
+}
+
+/// Regression test for the identity-hijack fix (see
+/// `register_citizen_fails_when_signer_does_not_match_bound_account`'s own doc comment for the
+/// full attack narrative): account 2 signs here while `bound_account` still claims account 1,
+/// the citizen who is actually registered and migration-eligible.
+#[test]
+fn migrate_oprf_scheme_fails_when_signer_does_not_match_bound_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+        approve_committee_keys(1); // new_version's committee keys
+
+        assert_noop!(
+            Identity::migrate_oprf_scheme(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                migration_public_inputs(ROOT, ANCHOR_A, ANCHOR_B),
+                ANCHOR_B,
+                OPRF_PK_HASHES,
+                OPRF_PK_HASHES,
+                1, // bound_account claims account 1, but account 2 is the actual signer.
+            ),
+            Error::<Test>::BoundAccountMismatch
+        );
+        // Citizen 1's anchor is untouched -- no migration occurred under either account.
+        assert_eq!(CitizenAnchor::<Test>::get(1), Some((0, ANCHOR_A)));
+        assert_eq!(IdentityAnchorRegistry::<Test>::get((0, ANCHOR_A)), Some(1));
+        assert!(IdentityAnchorRegistry::<Test>::get((1, ANCHOR_B)).is_none());
     });
 }
 

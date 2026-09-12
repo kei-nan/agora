@@ -169,6 +169,21 @@ fn has_current_disclosure_false_once_past_due_date() {
     });
 }
 
+#[test]
+fn has_current_disclosure_true_exactly_at_due_date() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        assert_ok!(AntiCorruption::submit_asset_disclosure(RuntimeOrigin::signed(1), [5u8; 32]));
+
+        // Exactly at update_due_at (now == update_due_at): still current. `has_current_disclosure`
+        // uses inclusive `<=` semantics by design -- a disclosure lapses only once `now` strictly
+        // exceeds `update_due_at`, not at the due date itself. This pins that boundary so a future
+        // refactor can't silently flip it to exclusive.
+        System::set_block_number(1 + RENEWAL_BLOCKS as u64);
+        assert!(AntiCorruption::has_current_disclosure(&1));
+    });
+}
+
 // ─── DisclosureChecker (pallet-elections seating gate) ──────────────────────
 //
 // Exercises the trait impl itself (`pallet_elections::DisclosureChecker::has_current_disclosure`
