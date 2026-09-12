@@ -737,6 +737,15 @@ pub mod pallet {
         SeatingSkippedAccountabilityCouncilMember { account: T::AccountId },
         /// Constitutional election parameters were updated.
         ElectionParamsChanged { seats: u32, cycle_blocks: u32, max_backings_per_citizen: u32 },
+        /// `T::LegislatureSeating::replace_members` rejected this cycle's winners (the only
+        /// failure mode is `winners.len() > MaxMembers` — see that trait's implementation in
+        /// pallet-legislature). `winners` is capped by `.take(seats)` in `run_election`, but
+        /// `seats` is `LegislatureSeats`, which `set_election_params` lets `ConstitutionalOrigin`
+        /// set to any value > 0 with no upper bound tied to `MaxMembers` — so this is reachable
+        /// in principle (an oversized `LegislatureSeats` plus a large eligible candidate pool),
+        /// just not under today's configured seat count. This cycle's seating is dropped rather
+        /// than partially applied; the previous `Members` set is left untouched.
+        SeatingReplaceMembersFailed { attempted: u32 },
 
         // ── Governance parameters ──
         BackingThresholdChanged { new_threshold: u32 },
@@ -1525,12 +1534,21 @@ pub mod pallet {
                     .collect();
 
                 let seated = winners.len() as u32;
-                let _ = T::LegislatureSeating::replace_members(winners);
+                // `replace_members` can only fail if `winners.len() > MaxMembers` — see
+                // `Event::SeatingReplaceMembersFailed`'s doc comment for why that's not fully
+                // ruled out structurally (an oversized `LegislatureSeats` could get there), even
+                // though it can't happen under today's configured seat count. Surface it on-chain
+                // rather than silently discarding the `Result`, instead of panicking in an
+                // `on_initialize` hook. The rest of this cycle's bookkeeping (cursor/progress
+                // reset, `LastElectionBlock`) proceeds the same either way, exactly as before this
+                // Result was being checked at all.
+                match T::LegislatureSeating::replace_members(winners) {
+                    Ok(()) => Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated }),
+                    Err(_) => Self::deposit_event(Event::SeatingReplaceMembersFailed { attempted: seated }),
+                }
                 LastElectionBlock::<T>::put(now);
                 ElectionScanInProgress::<T>::put(false);
                 weight = weight.saturating_add(T::DbWeight::get().writes(3 + seated as u64));
-
-                Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated });
             } else {
                 ElectionScanCursor::<T>::put(
                     last_key.expect("examined >= batch_size > 0 implies at least one entry seen"),
