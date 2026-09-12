@@ -18,9 +18,9 @@ Full separation of powers (legislature, executive, judiciary) enforced by smart 
 - Desktop app (Tauri 2) functional — reads real chain data, has Claude AI agent panel
 - Mobile: `mobile/android/` is a real, committed native project (Gradle 8.6, hand-written
   `NfcPassportModule.kt`/`com.agora.facematch` native modules) with the JS/TS test suite passing
-  (356 tests across 26 suites, confirmed by running `npx jest` in `mobile/` 2026-08-29 — up from
-  the 77 changelog #80 originally verified, 228→297 per commit `4a628d1`'s own message, 297→300→337→356
-  since); no JDK/Android
+  (361 tests across 26 suites, confirmed by running `npx jest` in `mobile/` 2026-09-12 — up from
+  the 77 changelog #80 originally verified, 228→297 per commit `4a628d1`'s own message,
+  297→300→337→356→361 since); no JDK/Android
   SDK in this WSL2 environment yet, so no Gradle build has actually run here — `ios/` still doesn't
   exist (see `docs/project/apps/mobile.md`, changelog #80)
 
@@ -110,6 +110,12 @@ runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/Z
   submitted end-to-end), and no mobile-side UI/call wrapper exists yet to drive it (see
   `mobile/src/chain/keystoreWallet.ts`'s doc comment) — the mechanism is real, the flow isn't
   wired up end-to-end.
+- Identity-hijack gap closed (fixed 2026-09-12, `bb8b3e3`): `register_citizen`/
+  `reverify_citizen`/`recover_account`/`migrate_oprf_scheme` now each require a `bound_account:
+  AccountId` argument, checked via `ensure!(who == bound_account, Error::BoundAccountMismatch)`
+  — previously an attacker who copied a victim's pending signed extrinsic verbatim and got it
+  mined first under their own account could hijack the victim's identity slot, worst on
+  `recover_account` since it has no dispute window. See `docs/project/pallets/identity.md`.
 - Passport-only for v1 (country allowlist — some countries lack stable national ID in NFC chip)
 - **Submission-metadata linkability applies to every identity-bearing extrinsic, not just
   votes.** `register_citizen`/`reverify_citizen`/`recover_account`/`migrate_oprf_scheme` are all
@@ -251,11 +257,14 @@ Runs without a server — connects directly to the chain and optionally to a clo
   and `@polkadot/api` were already JS-only dependencies in `desktop/package.json` (smoldot's
   primary distribution is a JS/WASM package), and a real Rust-embeddable option
   (`smoldot-light` the crate) was evaluated and passed over in favor of following that
-  existing signal. `desktop/src/lib/invoke.ts` transparently routes the nine chain-read
+  existing signal. `desktop/src/lib/invoke.ts` transparently routes eleven chain-read
   command names (`chain_status`, `fetch_proposals`, `fetch_laws`, `fetch_treasury`,
   `fetch_department_budgets`, `fetch_rulings`, `fetch_legislature_data`,
-  `fetch_elections_data`, `fetch_anticorruption_data`) to this light client instead of Tauri
-  IPC, so the React pages that call `invoke(...)` needed zero changes. Proven working
+  `fetch_elections_data`, `fetch_anticorruption_data`, plus `fetch_oracle_council_info` and
+  `fetch_oracle_pending_approvals` — added later for the oracle-council-transparency feature and
+  migrated onto this same light-client path in a follow-up pass once confirmed to be the same
+  storage-read shapes as the rest) to this light client instead of Tauri IPC, so the React pages
+  that call `invoke(...)` needed zero changes. Proven working
   end-to-end in this environment: a real production Vite build, driven headlessly, synced
   smoldot against a real local `agora-node --dev` chain over its actual libp2p `/ws` transport
   and rendered a correct live block number in the app's own `ChainStatusBar` UI — not just "it

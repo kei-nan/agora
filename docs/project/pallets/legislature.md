@@ -7,8 +7,10 @@ Storage:
 - `Motions`: `motion_id` → `Motion { call_hash, proposer, ayes, nays, end_block, executed }`
 - `MotionVotes`: `(motion_id, AccountId)` → `bool`
 - `NextMotionId`
-- `PendingLegislatureApproval`: `(call_hash, proposer, ayes, total_members)` — planted by `close_motion`
-  when a motion clears the floor; `ayes`/`total_members` are the tally frozen at close time (see below)
+- `PendingLegislatureApproval`: `(call_hash, proposer, ayes, total_members, planted_at)` — planted
+  by `close_motion` when a motion clears the floor; `ayes`/`total_members` are the tally frozen at
+  close time (see below); `planted_at` is the block the token was written, used by
+  `clear_stale_approval` to tell a genuinely stale token from a fresh one
 - `Bootstrapped`: `bool` (added `748625f`) — see "Bootstrap lock" below
 
 Calls:
@@ -25,6 +27,11 @@ Calls:
 - `vote_motion(motion_id, approve: bool)` — member only; **active ministers blocked** (incompatibility rule via `MinisterChecker`)
 - `close_motion(motion_id)` — anyone, after `end_block`; passes (plants the approval token) if
   `ayes * 100 >= PassageThreshold(51) * total_members`. This is only the *floor* — see below.
+- `clear_stale_approval()` — any current member; discards an unconsumed `PendingLegislatureApproval`
+  token once `PendingApprovalExpiryBlocks` have passed since `planted_at`, recovering the
+  legislature from a proposer (or every consuming member) who never executes the queued action —
+  `close_motion` otherwise refuses to overwrite a pending token, which would block every future
+  motion from passing.
 - `close_bootstrap()` — root, one-time; requires at least one member already seated
   (`Error::NoMembersToBootstrap` otherwise). Sets `Bootstrapped = true`; there is no call that
   ever flips it back.

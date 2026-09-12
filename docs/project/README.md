@@ -36,15 +36,13 @@ democracy-chain/
 ├── runtime/                       # WASM runtime (agora-runtime) — all 12 pallets wired in
 │   ├── assets/
 │   │   ├── vk_zkpassport_outer_count_4.bin  # ZKPassport outer VK — real, 1888 bytes (log #71); real bb 5.0.0 pairing check since #72
-│   │   ├── vk_sha256.bin          # STALE — Rarimo Groth16 VK, referenced by nothing since #70
-│   │   └── vk_sha1.bin            # STALE — ditto
+│   │   └── vk_backing_nullifier.bin  # delegate-persona/backing-proof VK (delegate-privacy build, 2026-08-22/23)
 │   └── src/
 │       ├── configs/mod.rs         # all pallet Config impls + cross-pallet trait wiring
 │       ├── lib.rs                 # runtime construction (#[frame_support::runtime] macro, not the legacy construct_runtime!)
 │       └── verifier.rs            # ZkPassportUltraHonkVerifier (!dev-mode) — verifying, see changelog #72
 ├── pallets/                       # see pallets/ below, one file per pallet
 ├── scripts/
-│   ├── convert_vk.py              # STALE — Rarimo snarkjs JSON VK → ark-serialize binary
 │   └── certificate-registry/      # builds our own DSC Merkle tree (see changelog #63) — off-chain only
 ├── circuits/
 │   └── oprf-identity-anchor/      # forked ZKPassport OPRF circuits (Noir) — see changelog #69
