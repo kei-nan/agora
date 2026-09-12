@@ -331,7 +331,18 @@ Runs without a server — connects directly to the chain and optionally to a clo
 democracy-chain/
 ├── node/              ← chain binary (agora-node)
 ├── runtime/           ← WASM runtime (agora-runtime)
+├── env-setup/         ← Nix flake + rust-toolchain pin for a reproducible dev environment
+├── scripts/
+│   └── certificate-registry/ ← passport CSCA/DSC certificate tree tooling (see docs/project/README.md)
 ├── pallets/
+│   ├── pallet-template/          ← unmodified FRAME scaffold pallet, wired into the production
+│   │                                runtime at index 7 (confirmed 2026-09-13 by reading
+│   │                                `runtime/src/lib.rs`/`Cargo.toml` directly); whether it's
+│   │                                needed in a mainnet build or should be removed is an open
+│   │                                question — no removal plan is written down anywhere yet
+│   ├── poseidon2-bn254/          ← Poseidon2 over BN254, ported/validated against
+│   │                                noir-lang/poseidon v0.3.0; used by pallet-identity and the
+│   │                                runtime (see docs/project/next-steps.md log #75)
 │   ├── pallet-identity/          ← citizen registry, ZK proof verification, OPRF mailbox (index 8)
 │   ├── pallet-voting/            ← MACI, liquid democracy, referenda            (index 9)
 │   ├── pallet-treasury-ledger/   ← public budget ledger, audit hook             (index 10)
@@ -390,9 +401,10 @@ authoritative version of this list; treat this section as a summary, not the sou
    whatever was already committed, closing the hole where a compromised oracle credential could
    publish reasoning saying one thing and finalize with a different verdict. Still PARTIAL, not
    done: never run against a real chain/Claude API/IPFS daemon (unit-tested at the pure-logic
-   level only, 67/67 passing as of 2026-09-11 (`cargo test --release` in `court-oracle/`), up from
-   the 47/47 this line previously cited — added IPFS content-hash verification and Claude
-   prompt-injection delimiting after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
+   level only, 85/85 passing as of 2026-09-13 (`cargo test --release` in `court-oracle/`), up
+   from the 67/67 previously cited here — the 67/67 was itself up from the 47/47 this line
+   originally cited, added IPFS content-hash verification and Claude prompt-injection delimiting
+   after a 2026-08-16 review; see `court-oracle/README.md`). **Update, log #090**:
    `Sudo::sudo(Courts::set_oracle_account(...))` was called for real against a dedicated oracle
    account, confirmed via storage query — `court-oracle` was then built and run for real against
    a real chain and a real local IPFS daemon and got as far as a genuine (rejected) call to the
