@@ -384,6 +384,15 @@ pub mod pallet {
         /// cryptography itself is out of scope for this pallet (see HANDOFF log #67/#68) —
         /// use a passthrough impl for dev/testing until the OPRF circuit work lands.
         type AnchorVerifier: AnchorProofVerifier;
+        /// Converts a `T::AccountId` to its raw 32-byte representation, for binding
+        /// `bound_account` into a registration/reverification/migration proof's
+        /// `param_commitment` (see `runtime/src/anchor_verifier.rs`'s `account_to_field_limbs`)
+        /// exactly the way the citizen's own wallet packed it when building the proof. Same
+        /// pluggable-Config-item pattern as `pallet_elections::AccountIdToBytes` — see that
+        /// trait's doc comment for why this is a Config item rather than a bare `T::AccountId:
+        /// Into<[u8; 32]>` bound threaded through every `impl` block in this file (a test
+        /// mock's `u64` `AccountId` doesn't need to satisfy a genuine 32-byte encoding).
+        type AccountIdToBytes: AccountIdToBytes<Self::AccountId>;
         /// Number of blocks a registration/reverification remains valid before
         /// `is_active_citizen` lazily starts treating the citizen as inactive for voting
         /// purposes. A governance-tunable parameter (see HANDOFF log #67: "make the rotation
@@ -522,6 +531,14 @@ pub mod pallet {
         type RecoveryStateChecker: RecoveryStateChecker<Self::AccountId>;
     }
 
+    /// Converts a `T::AccountId` to its raw 32-byte representation — see
+    /// `Config::AccountIdToBytes`'s doc comment for why this is a pluggable Config item.
+    /// Structurally identical to `pallet_elections::AccountIdToBytes`, duplicated rather than
+    /// shared across pallets since neither pallet depends on the other.
+    pub trait AccountIdToBytes<AccountId> {
+        fn to_bytes(who: &AccountId) -> [u8; 32];
+    }
+
     /// Trait for verifying Rarimo-style Groth16 ZK passport proofs.
     /// Implement this in the runtime, plugging in the real Rarimo verifier key and circuit.
     pub trait ZkProofVerifier {
@@ -560,17 +577,33 @@ pub mod pallet {
         ///
         /// `backing_commitment` is a second, independent public value folded into the same
         /// `disclosure`-circuit `param_commitment` preimage as `anchor`/`scheme_version`/
-        /// `oprf_pk_hashes` (widened from 8 to 9 fields, no new proof-type tag — see
-        /// `runtime/src/anchor_verifier.rs`'s module docs and
+        /// `oprf_pk_hashes` — see `runtime/src/anchor_verifier.rs`'s module docs and
         /// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s
-        /// `derive_backing_root_term`/`derive_backing_commitment`). Unlike `anchor`, it binds
+        /// `derive_backing_root_term`/`derive_backing_commitment`. Unlike `anchor`, it binds
         /// to no specific target/delegate, so no front-running protection is needed for it.
+        ///
+        /// `bound_account` — the raw bytes of the `AccountId` this proof authorizes to submit
+        /// it — closes a real identity-hijack gap: without it, all proof material is plaintext
+        /// in a pending signed extrinsic, so an attacker could copy a victim's pending
+        /// `register_citizen`/`recover_account` call verbatim into their own signed call and
+        /// get it mined first (stealing a citizenship slot, or — since `recover_account` has no
+        /// dispute window by design — permanently and irreversibly hijacking the victim's
+        /// identity). It is folded into `param_commitment` the same way
+        /// `pallet_elections::register_as_delegate`'s `persona_account` already is (see that
+        /// call's doc comment and `runtime/src/anchor_verifier.rs`'s `bound_account` section),
+        /// so a copied proof resubmitted against a different account no longer recomputes to
+        /// any `param_commitments[i]` the outer proof exposes. Callers (`register_citizen`/
+        /// `reverify_citizen`/`recover_account`/`migrate_oprf_scheme`) additionally assert
+        /// `who == bound_account` before calling this, mirroring
+        /// `register_as_delegate`'s `ensure!(who == persona_account, ...)` — a
+        /// redundant-but-good outer check on top of the real circuit-level binding.
         fn verify_registration_anchor(
             outer_public_inputs: &[[u8; 32]],
             anchor: [u8; 32],
             scheme_version: u32,
             oprf_pk_hashes: [[u8; 32]; 5],
             backing_commitment: [u8; 32],
+            bound_account: [u8; 32],
         ) -> bool;
         /// Verifies a reverification/liveness proof: the citizen currently holds a
         /// still-valid, unexpired passport that recomputes to the same anchor already on
@@ -579,14 +612,20 @@ pub mod pallet {
         /// rationale as `verify_registration_anchor`'s parameter of the same name (a
         /// standalone anchor proof's `comm_in` is an unauthenticated private witness; riding
         /// inside a fresh outer proof is what proves the passport is *currently* valid, not
-        /// just was at original registration). `backing_commitment` is checked the same way —
-        /// see `verify_registration_anchor`'s doc comment.
+        /// just was at original registration). `backing_commitment`/`bound_account` are checked
+        /// the same way — see `verify_registration_anchor`'s doc comment. `reverify_citizen`
+        /// itself is not independently exploitable via a copied-extrinsic attack even without
+        /// this binding (it reads `on_file_anchor` from the caller's own `CitizenAnchor` entry
+        /// before ever reaching this check — see that call's doc comment), but shares this
+        /// method's implementation with `verify_registration_anchor` and therefore gets the
+        /// same widened signature regardless.
         fn verify_reverification(
             outer_public_inputs: &[[u8; 32]],
             anchor: [u8; 32],
             scheme_version: u32,
             oprf_pk_hashes: [[u8; 32]; 5],
             backing_commitment: [u8; 32],
+            bound_account: [u8; 32],
         ) -> bool;
         /// Verifies a migration consistency ("dual evaluation") proof: `old_anchor` and
         /// `new_anchor` were both derived from the same underlying personal-number value,
@@ -595,7 +634,11 @@ pub mod pallet {
         /// has just validated via `T::ZkVerifier::verify` (HANDOFF log #76) — same rationale
         /// as above: a standalone `migrate` proof's `comm_in` is unauthenticated, so this
         /// rides inside a fresh outer proof (`circuits/oprf-identity-anchor/migrate-disclosure`)
-        /// instead.
+        /// instead. `bound_account` is checked the same way `verify_registration_anchor` checks
+        /// it, applied here for consistency — `migrate_oprf_scheme` reads `old_anchor` from the
+        /// caller's own on-chain storage before this is called, so it was not independently
+        /// exploitable the way `register_citizen`/`recover_account` were (see that call's doc
+        /// comment for the precise reasoning).
         fn verify_migration(
             outer_public_inputs: &[[u8; 32]],
             old_anchor: [u8; 32],
@@ -604,6 +647,7 @@ pub mod pallet {
             new_scheme_version: u32,
             old_oprf_pk_hashes: [[u8; 32]; 5],
             new_oprf_pk_hashes: [[u8; 32]; 5],
+            bound_account: [u8; 32],
         ) -> bool;
     }
 
@@ -1103,6 +1147,13 @@ pub mod pallet {
         TotalCitizensOverflow,
         /// A suspended citizen may not self-revoke to escape an active court ruling.
         CannotRevokeWhileSuspended,
+        /// `register_citizen`/`reverify_citizen`/`recover_account`/`migrate_oprf_scheme`:
+        /// `bound_account` did not equal the calling account. The proof binds `bound_account`,
+        /// not `who`, into `param_commitment` (see `AnchorProofVerifier::verify_registration_anchor`'s
+        /// doc comment) — this is the redundant-but-good outer check on top of that real
+        /// circuit-level binding, mirroring `pallet_elections::register_as_delegate`'s
+        /// `PersonaAccountMismatch`.
+        BoundAccountMismatch,
         /// The identity-anchor registration proof failed verification.
         InvalidAnchorProof,
         /// This anchor is already registered under the current OPRF scheme version — either a
@@ -1252,6 +1303,18 @@ pub mod pallet {
         /// itself is perfectly valid, since the whole point of the anchor is to catch
         /// same-person double registration that a fresh, renewal-stable-nullifier-free
         /// passport proof alone cannot.
+        ///
+        /// `bound_account` closes a real identity-hijack gap (see
+        /// `AnchorProofVerifier::verify_registration_anchor`'s doc comment for the full
+        /// rationale, and `pallet_elections::register_as_delegate`'s identical
+        /// `persona_account` pattern this mirrors): without it, all proof material here is
+        /// plaintext in a pending signed extrinsic, so an attacker could copy a victim's
+        /// pending `register_citizen` call verbatim into their own signed call and get it
+        /// mined first, stealing the victim's citizenship slot. `bound_account` must equal
+        /// `who` (checked immediately below) and is folded into the proof's
+        /// cryptographically-verified `param_commitment` by `T::AnchorVerifier`, so a copied
+        /// proof resubmitted against a different account fails there even before this outer
+        /// check would catch it.
         #[pallet::call_index(0)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn register_citizen(
@@ -1266,8 +1329,10 @@ pub mod pallet {
             // value folded into the same `disclosure`-circuit `param_commitment` preimage as
             // `anchor`, checked and stored the same way.
             backing_commitment: [u8; 32],
+            bound_account: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(who == bound_account, Error::<T>::BoundAccountMismatch);
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
 
             // 1-2. Allowlist + proof-scope + ZK proof verification (expensive BN254 pairing) —
@@ -1312,6 +1377,7 @@ pub mod pallet {
                     scheme_version,
                     oprf_pk_hashes,
                     backing_commitment,
+                    T::AccountIdToBytes::to_bytes(&bound_account),
                 ),
                 Error::<T>::InvalidAnchorProof
             );
@@ -1500,6 +1566,14 @@ pub mod pallet {
         /// folded into `zk_proof`) to the same anchor already on file — checked directly here
         /// via `CitizenAnchor`, not left to the proof alone, so a citizen cannot "reverify"
         /// into a different anchor than the one their account is registered under.
+        ///
+        /// `bound_account` (must equal `who`, checked below) is folded into the proof the same
+        /// way `register_citizen`'s is — see that call's doc comment and
+        /// `AnchorProofVerifier::verify_reverification`'s. This call was not independently
+        /// exploitable via a copied-extrinsic attack even before this parameter existed (it
+        /// already reads `on_file_anchor` from the caller's own `CitizenAnchor` entry above,
+        /// before any proof check runs), but shares `disclosure` — the same circuit
+        /// `register_citizen` uses — and therefore needed the widened call shape regardless.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(20_000, 0))]
         pub fn reverify_citizen(
@@ -1514,8 +1588,10 @@ pub mod pallet {
             // committee evaluation, so a genuine reverification proof always recomputes to the
             // exact same values already on file.
             backing_commitment: [u8; 32],
+            bound_account: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(who == bound_account, Error::<T>::BoundAccountMismatch);
             let (scheme_version, on_file_anchor) =
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
             ensure!(anchor == on_file_anchor, Error::<T>::AnchorMismatch);
@@ -1541,6 +1617,7 @@ pub mod pallet {
                     scheme_version,
                     oprf_pk_hashes,
                     backing_commitment,
+                    T::AccountIdToBytes::to_bytes(&bound_account),
                 ),
                 Error::<T>::InvalidReverificationProof
             );
@@ -1571,6 +1648,17 @@ pub mod pallet {
         /// migrate incrementally and in any order during a rotation window rather than all
         /// needing to act atomically with a global cutover; a citizen who has missed more than
         /// one rotation simply needs to call this once per generation to catch up.
+        ///
+        /// `bound_account` (must equal `who`, checked below) is folded into the proof the same
+        /// way `register_citizen`'s is — applied here for consistency with
+        /// `disclosure`/`migrate-disclosure`'s shared account-binding pattern (see
+        /// `AnchorProofVerifier::verify_migration`'s doc comment), though this call was not
+        /// independently exploitable via a copied-extrinsic attack even before this parameter
+        /// existed: `old_anchor`/`old_version` above are already read from the caller's own
+        /// `CitizenAnchor` entry before any proof check runs, so a copied extrinsic resubmitted
+        /// under an attacker's account substitutes the attacker's own stored values, which
+        /// won't match the victim's embedded `param_commitment` unless the attacker already
+        /// owns the victim's exact anchor.
         #[pallet::call_index(7)]
         #[pallet::weight(Weight::from_parts(25_000, 0))]
         pub fn migrate_oprf_scheme(
@@ -1580,8 +1668,10 @@ pub mod pallet {
             new_anchor: [u8; 32],
             old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
             new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES as usize],
+            bound_account: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(who == bound_account, Error::<T>::BoundAccountMismatch);
             let (old_version, old_anchor) =
                 CitizenAnchor::<T>::get(&who).ok_or(Error::<T>::NotRegistered)?;
             let new_version =
@@ -1612,6 +1702,7 @@ pub mod pallet {
                     new_version,
                     old_oprf_pk_hashes,
                     new_oprf_pk_hashes,
+                    T::AccountIdToBytes::to_bytes(&bound_account),
                 ),
                 Error::<T>::InvalidMigrationProof
             );
@@ -2099,6 +2190,17 @@ pub mod pallet {
         /// limitation" section for the fuller accounting. Any UI that calls this extrinsic must
         /// disclose the remaining gap plainly to the citizen before they confirm — see
         /// `mobile/src/screens/RecoverAccountScreen.tsx`.
+        ///
+        /// **`bound_account` is the single most important place this binding matters.** This
+        /// call has no dispute window by design (see above), so without it, an attacker who
+        /// observed a victim's pending `recover_account` extrinsic could copy it verbatim into
+        /// their own signed call, get it mined first, and **permanently and irreversibly
+        /// hijack the victim's identity** — there would be nothing the victim could do to
+        /// contest it after the fact. `bound_account` must equal `who` (the new account being
+        /// recovered *to* — checked immediately below) and is folded into the proof's
+        /// cryptographically-verified `param_commitment` by `T::AnchorVerifier`, exactly as
+        /// `register_citizen`'s is: a copied proof resubmitted against a different account no
+        /// longer recomputes to any `param_commitments[i]` the outer proof exposes.
         #[pallet::call_index(20)]
         #[pallet::weight(Weight::from_parts(50_000, 0))]
         pub fn recover_account(
@@ -2110,8 +2212,10 @@ pub mod pallet {
             // Must match the old account's on-file `BackingCommitment` — see
             // `reverify_citizen`'s `backing_commitment` parameter doc comment for why.
             backing_commitment: [u8; 32],
+            bound_account: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(who == bound_account, Error::<T>::BoundAccountMismatch);
             ensure!(!CitizenNullifier::<T>::contains_key(&who), Error::<T>::AlreadyRegistered);
 
             // Verify the real proof before touching any registry state keyed on its claimed
@@ -2145,6 +2249,7 @@ pub mod pallet {
                     scheme_version,
                     oprf_pk_hashes,
                     backing_commitment,
+                    T::AccountIdToBytes::to_bytes(&bound_account),
                 ),
                 Error::<T>::InvalidReverificationProof
             );

@@ -76,6 +76,22 @@ function committeeHashes(seedOffset: number): OprfCommitteeKeyHashes {
   ];
 }
 
+/**
+ * The `boundAccount` every valid-params fixture below must use: the real, resolved signing
+ * keypair's own public key (`identity.ts`'s `assertBoundAccountMatchesSigner` requires exact
+ * equality with whatever `getSigningKeypair()` actually returns — in this jest environment,
+ * with no Keystore native module linked, that's the deterministic `DEV_ONLY_MNEMONIC` keypair,
+ * see `getSigningKeypair (signing-key selection)` below). Resolved once and cached, mirroring
+ * `identity.ts`'s own module-scope caching of the same keypair.
+ */
+let _signerPublicKeyPromise: Promise<Uint8Array> | null = null;
+async function signerPublicKey(): Promise<Uint8Array> {
+  if (!_signerPublicKeyPromise) {
+    _signerPublicKeyPromise = getSigningKeypair().then(({ keypair }) => keypair.publicKey);
+  }
+  return _signerPublicKeyPromise;
+}
+
 interface RecordedCall {
   name: string;
   args: unknown[];
@@ -130,21 +146,23 @@ beforeEach(() => {
 });
 
 describe('registerCitizen', () => {
-  function validParams(): RegisterCitizenParams {
+  async function validParams(): Promise<RegisterCitizenParams> {
     return {
       zkProof: new Uint8Array([1, 2, 3, 4]),
       publicInputs: validPublicInputs(),
       outerCount: 4,
       anchor: bytes32(0xaa),
       oprfPkHashes: committeeHashes(1),
+      backingCommitment: bytes32(0xbb),
+      boundAccount: await signerPublicKey(),
     };
   }
 
-  it('submits register_citizen with the 4 arguments in the pallet\'s order', async () => {
+  it('submits register_citizen with the 6 arguments in the pallet\'s order', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
 
-    const params = validParams();
+    const params = await validParams();
     await registerCitizen(params);
 
     expect(calls).toHaveLength(1);
@@ -154,37 +172,39 @@ describe('registerCitizen', () => {
       params.publicInputs,
       params.anchor,
       params.oprfPkHashes,
+      params.backingCommitment,
+      params.boundAccount,
     ]);
   });
 
   it('resolves when the extrinsic finalizes without a dispatch error', async () => {
     const { api } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(registerCitizen(validParams())).resolves.toBeUndefined();
+    await expect(registerCitizen(await validParams())).resolves.toBeUndefined();
   });
 
   it('rejects when the chain reports a dispatch error', async () => {
     const { api } = fakeApi({ dispatchError: { toString: () => 'identity.InvalidAnchorProof' } });
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(registerCitizen(validParams())).rejects.toThrow('identity.InvalidAnchorProof');
+    await expect(registerCitizen(await validParams())).rejects.toThrow('identity.InvalidAnchorProof');
   });
 
   it('rejects a malformed public-input array before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     params.publicInputs = params.publicInputs.slice(0, 5); // wrong length for outerCount 4
     await expect(registerCitizen(params)).rejects.toThrow(RangeError);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects a short anchor before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     params.anchor = new Uint8Array(31);
     await expect(registerCitizen(params)).rejects.toThrow(/anchor is 31 bytes/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects the wrong number of OPRF committee key hashes before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).oprfPkHashes = committeeHashes(1).slice(0, 4);
     await expect(registerCitizen(params)).rejects.toThrow(
       new RegExp(`expected ${NUM_OPRF_COMMITTEES} OPRF committee key hashes`),
@@ -193,31 +213,54 @@ describe('registerCitizen', () => {
   });
 
   it('rejects an undersized individual committee key hash before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     const hashes = committeeHashes(1).slice() as Uint8Array[];
     hashes[2] = new Uint8Array(16);
     (params as any).oprfPkHashes = hashes;
     await expect(registerCitizen(params)).rejects.toThrow(/committee key hash 2 is 16 bytes/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
+
+  it('rejects a malformed backingCommitment before ever calling getApi', async () => {
+    const params = await validParams();
+    (params as any).backingCommitment = new Uint8Array(31);
+    await expect(registerCitizen(params)).rejects.toThrow(/backingCommitment.*31 bytes/);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Regression test for the identity-hijack fix: a `boundAccount` that does not match the
+   * actual signing keypair must be rejected locally, before the chain would reject it too
+   * (`Error::BoundAccountMismatch`) — see `assertBoundAccountMatchesSigner`'s doc comment.
+   */
+  it('rejects a boundAccount that does not match the signing keypair, before ever calling getApi', async () => {
+    const { api } = fakeApi();
+    mockedGetApi.mockResolvedValue(api as any);
+    const params = await validParams();
+    params.boundAccount = bytes32(0xff); // some other account, not the real signer's key
+    await expect(registerCitizen(params)).rejects.toThrow(/boundAccount does not match/);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
 });
 
 describe('reverifyCitizen', () => {
-  function validParams(): ReverifyCitizenParams {
+  async function validParams(): Promise<ReverifyCitizenParams> {
     return {
       zkProof: new Uint8Array([5, 6, 7]),
       publicInputs: validPublicInputs(),
       outerCount: 4,
       anchor: bytes32(0xbb),
       oprfPkHashes: committeeHashes(11),
+      backingCommitment: bytes32(0xcc),
+      boundAccount: await signerPublicKey(),
     };
   }
 
-  it('submits reverify_citizen with the 4 arguments in the pallet\'s order', async () => {
+  it('submits reverify_citizen with the 6 arguments in the pallet\'s order', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
 
-    const params = validParams();
+    const params = await validParams();
     await reverifyCitizen(params);
 
     expect(calls).toHaveLength(1);
@@ -227,25 +270,34 @@ describe('reverifyCitizen', () => {
       params.publicInputs,
       params.anchor,
       params.oprfPkHashes,
+      params.backingCommitment,
+      params.boundAccount,
     ]);
   });
 
   it('rejects when the chain reports a dispatch error (e.g. AnchorMismatch)', async () => {
     const { api } = fakeApi({ dispatchError: { toString: () => 'identity.AnchorMismatch' } });
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(reverifyCitizen(validParams())).rejects.toThrow('identity.AnchorMismatch');
+    await expect(reverifyCitizen(await validParams())).rejects.toThrow('identity.AnchorMismatch');
   });
 
   it('rejects a malformed anchor before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).anchor = new Uint8Array(0);
     await expect(reverifyCitizen(params)).rejects.toThrow(RangeError);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects a boundAccount that does not match the signing keypair, before ever calling getApi', async () => {
+    const params = await validParams();
+    params.boundAccount = bytes32(0xff);
+    await expect(reverifyCitizen(params)).rejects.toThrow(/boundAccount does not match/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 });
 
 describe('recoverAccount', () => {
-  function validParams(): RecoverAccountParams {
+  async function validParams(): Promise<RecoverAccountParams> {
     return {
       zkProof: new Uint8Array([8, 7, 6]),
       publicInputs: validPublicInputs(),
@@ -253,14 +305,15 @@ describe('recoverAccount', () => {
       anchor: bytes32(0xdd),
       oprfPkHashes: committeeHashes(41),
       backingCommitment: bytes32(0xee),
+      boundAccount: await signerPublicKey(),
     };
   }
 
-  it('submits recover_account with the 5 arguments in the pallet\'s order', async () => {
+  it('submits recover_account with the 6 arguments in the pallet\'s order', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
 
-    const params = validParams();
+    const params = await validParams();
     await recoverAccount(params);
 
     expect(calls).toHaveLength(1);
@@ -271,47 +324,60 @@ describe('recoverAccount', () => {
       params.anchor,
       params.oprfPkHashes,
       params.backingCommitment,
+      params.boundAccount,
     ]);
   });
 
   it('resolves when the extrinsic finalizes without a dispatch error', async () => {
     const { api } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(recoverAccount(validParams())).resolves.toBeUndefined();
+    await expect(recoverAccount(await validParams())).resolves.toBeUndefined();
   });
 
   it('rejects when the chain reports a dispatch error (e.g. RecoveryCooldownActive)', async () => {
     const { api } = fakeApi({ dispatchError: { toString: () => 'identity.RecoveryCooldownActive' } });
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(recoverAccount(validParams())).rejects.toThrow('identity.RecoveryCooldownActive');
+    await expect(recoverAccount(await validParams())).rejects.toThrow('identity.RecoveryCooldownActive');
   });
 
   it('rejects a malformed anchor before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).anchor = new Uint8Array(0);
     await expect(recoverAccount(params)).rejects.toThrow(RangeError);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects a malformed backingCommitment before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).backingCommitment = new Uint8Array(31);
     await expect(recoverAccount(params)).rejects.toThrow(/backingCommitment.*31 bytes/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects the wrong number of OPRF committee key hashes before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).oprfPkHashes = committeeHashes(41).slice(0, 4);
     await expect(recoverAccount(params)).rejects.toThrow(
       new RegExp(`expected ${NUM_OPRF_COMMITTEES} OPRF committee key hashes`),
     );
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
+
+  /**
+   * Regression test for the identity-hijack fix, on the highest-stakes call it applies to
+   * (`recover_account` has no dispute window — see `pallets/pallet-identity/src/lib.rs`'s doc
+   * comment on that extrinsic).
+   */
+  it('rejects a boundAccount that does not match the signing keypair, before ever calling getApi', async () => {
+    const params = await validParams();
+    params.boundAccount = bytes32(0xff); // an account the actual signer does not control
+    await expect(recoverAccount(params)).rejects.toThrow(/boundAccount does not match/);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
 });
 
 describe('migrateOprfScheme', () => {
-  function validParams(): MigrateOprfSchemeParams {
+  async function validParams(): Promise<MigrateOprfSchemeParams> {
     return {
       zkProof: new Uint8Array([9, 9, 9]),
       publicInputs: validPublicInputs(),
@@ -319,59 +385,67 @@ describe('migrateOprfScheme', () => {
       newAnchor: bytes32(0xcc),
       oldOprfPkHashes: committeeHashes(21),
       newOprfPkHashes: committeeHashes(31),
+      boundAccount: await signerPublicKey(),
     };
   }
 
-  it('submits migrate_oprf_scheme with the 5 arguments in the pallet\'s order (no old_anchor)', async () => {
+  it('submits migrate_oprf_scheme with the 6 arguments in the pallet\'s order (no old_anchor)', async () => {
     const { api, calls } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
 
-    const params = validParams();
+    const params = await validParams();
     await migrateOprfScheme(params);
 
     expect(calls).toHaveLength(1);
     expect(calls[0].name).toBe('migrateOprfScheme');
-    // 5 arguments, not 6: old_anchor is read on-chain from CitizenAnchor (log #76), never
-    // supplied by the caller.
+    // old_anchor is read on-chain from CitizenAnchor (log #76), never supplied by the caller.
     expect(calls[0].args).toEqual([
       params.zkProof,
       params.publicInputs,
       params.newAnchor,
       params.oldOprfPkHashes,
       params.newOprfPkHashes,
+      params.boundAccount,
     ]);
   });
 
   it('resolves when the extrinsic finalizes without a dispatch error', async () => {
     const { api } = fakeApi();
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(migrateOprfScheme(validParams())).resolves.toBeUndefined();
+    await expect(migrateOprfScheme(await validParams())).resolves.toBeUndefined();
   });
 
   it('rejects when the chain reports a dispatch error (e.g. NewAnchorAlreadyUsed)', async () => {
     const { api } = fakeApi({ dispatchError: { toString: () => 'identity.NewAnchorAlreadyUsed' } });
     mockedGetApi.mockResolvedValue(api as any);
-    await expect(migrateOprfScheme(validParams())).rejects.toThrow('identity.NewAnchorAlreadyUsed');
+    await expect(migrateOprfScheme(await validParams())).rejects.toThrow('identity.NewAnchorAlreadyUsed');
   });
 
   it('rejects a malformed new anchor before ever calling getApi', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).newAnchor = new Uint8Array(40);
     await expect(migrateOprfScheme(params)).rejects.toThrow(/anchor is 40 bytes/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects malformed old committee key hashes distinctly from new ones', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).oldOprfPkHashes = committeeHashes(21).slice(0, 3);
     await expect(migrateOprfScheme(params)).rejects.toThrow(/\(old\)/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 
   it('rejects malformed new committee key hashes distinctly from old ones', async () => {
-    const params = validParams();
+    const params = await validParams();
     (params as any).newOprfPkHashes = committeeHashes(31).slice(0, 3);
     await expect(migrateOprfScheme(params)).rejects.toThrow(/\(new\)/);
+    expect(mockedGetApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects a boundAccount that does not match the signing keypair, before ever calling getApi', async () => {
+    const params = await validParams();
+    params.boundAccount = bytes32(0xff);
+    await expect(migrateOprfScheme(params)).rejects.toThrow(/boundAccount does not match/);
     expect(mockedGetApi).not.toHaveBeenCalled();
   });
 });

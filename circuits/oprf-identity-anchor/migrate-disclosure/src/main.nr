@@ -24,6 +24,16 @@
 //! own `param_commitments` array. One proof, one `comm_in`, authenticated end-to-end back to
 //! the certificate registry root.
 //!
+//! # Binding `bound_account` (anti-front-running)
+//!
+//! Same fix, same rationale as `../disclosure`'s own "Binding `bound_account`" section: without
+//! it, a copied `migrate_oprf_scheme` extrinsic could in principle be resubmitted under a
+//! different signer (see that section for the full argument — CLAUDE.md's correction notes
+//! `migrate_oprf_scheme` is not independently exploitable today because it reads `old_anchor`
+//! from the caller's own on-chain storage first, but the fix is applied here anyway for
+//! consistency with `../disclosure`, and because `reverify_citizen` shares this circuit's
+//! sibling `../disclosure` for its own proof and needed the same treatment regardless).
+//!
 //! # Status
 //!
 //! Compiles and produces a verification key, but — like `../disclosure` and `../migrate` before
@@ -38,18 +48,26 @@ use identity_anchor::{
 };
 use oprf::oprf_output::verified_oprf;
 use poseidon::poseidon2::Poseidon2;
+use utils::pack_be_bytes_into_fields;
 use utils::types::{DG1Data, MRZExpiryDate, OPRFProof, SaltedValue};
 
-/// Agora-specific proof type tag for the migration parameter commitment. Deliberately distinct
-/// from `disclosure`'s `PROOF_TYPE_AGORA_IDENTITY_ANCHOR` (200) so a migration commitment can
-/// never be confused with (or substituted for) a registration/reverification one — the two
-/// have different arities and different security obligations on the Rust-verifier side.
-global PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE: Field = 201;
+/// Proof-type tag 201 (`PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE`, the original unbound
+/// 15-element migration commitment shape, distinct from `../disclosure`'s retired 200 by
+/// arity/obligations even though both are retired) is retired the same way `../disclosure`'s
+/// 200 is — superseded outright by [`PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND`] below, no
+/// migration path needed (see that module's doc comment for why), no `global` declared for it.
+/// 201 must never be reused for anything else regardless.
+///
+/// Agora's proof-type tag for the **account-bound** migration parameter commitment. See
+/// `../disclosure`'s `PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND` (203) doc comment for why 204 is
+/// a distinct tag from every other Agora proof type rather than a reused one.
+global PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND: Field = 204;
 
-/// `param_commitment = Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE, old_anchor,
+/// `param_commitment = Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND, old_anchor,
 /// new_anchor, old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5],
-/// new_oprf_pk_hashes[0..5])` — 14 elements. Mirrors `disclosure::calculate_param_commitment`'s
-/// shape (tag, then every disclosed parameter in argument order).
+/// new_oprf_pk_hashes[0..5], bound_account_lo, bound_account_hi)` — 17 elements. Mirrors
+/// `disclosure::calculate_param_commitment`'s shape (tag, then every disclosed parameter in
+/// argument order, `bound_account`'s two limbs last).
 fn calculate_param_commitment(
     old_anchor: Field,
     new_anchor: Field,
@@ -57,10 +75,12 @@ fn calculate_param_commitment(
     new_scheme_version: Field,
     old_oprf_pk_hashes: [Field; NUM_COMMITTEES],
     new_oprf_pk_hashes: [Field; NUM_COMMITTEES],
+    bound_account_lo: Field,
+    bound_account_hi: Field,
 ) -> Field {
     Poseidon2::hash(
         [
-            PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE,
+            PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND,
             old_anchor,
             new_anchor,
             old_scheme_version,
@@ -75,8 +95,10 @@ fn calculate_param_commitment(
             new_oprf_pk_hashes[2],
             new_oprf_pk_hashes[3],
             new_oprf_pk_hashes[4],
+            bound_account_lo,
+            bound_account_hi,
         ],
-        15,
+        17,
     )
 }
 
@@ -89,6 +111,7 @@ fn main(
     current_date: pub u64,
     old_scheme_version: Field,
     new_scheme_version: Field,
+    bound_account: [u8; 32],
     salted_dg1: SaltedValue<DG1Data>,
     salted_expiry_date: SaltedValue<MRZExpiryDate>,
     salted_dg2_hash: SaltedValue<Field>,
@@ -116,6 +139,7 @@ fn main(
         new_scheme_version != old_scheme_version,
         "Migration must move between two different OPRF scheme versions",
     );
+    assert(bound_account != [0; 32], "bound_account must not be the zero AccountId");
 
     // Same "valid at registration AND at vote time" requirement disclosure enforces — a
     // citizen migrating must currently hold an unexpired passport, not just have held one at
@@ -167,6 +191,7 @@ fn main(
 
     let old_anchor = combine_committee_anchors(old_terms);
     let new_anchor = combine_committee_anchors(new_terms);
+    let bound_account_fields: [Field; 2] = pack_be_bytes_into_fields::<32, 2, 31>(bound_account);
     let param_commitment = calculate_param_commitment(
         old_anchor,
         new_anchor,
@@ -174,6 +199,8 @@ fn main(
         new_scheme_version,
         old_oprf_pk_hashes,
         new_oprf_pk_hashes,
+        bound_account_fields[0],
+        bound_account_fields[1],
     );
 
     // Silence unused-parameter warnings without changing the constrained system: these two
