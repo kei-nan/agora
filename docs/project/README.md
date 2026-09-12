@@ -71,7 +71,7 @@ Build is clean. Next available pallet index: **20**.
 | Mobile app (React Native) | [apps/mobile.md](apps/mobile.md) |
 | Remaining work, prioritized | [next-steps.md](next-steps.md) |
 | External docs/repos referenced throughout | [references.md](references.md) |
-| Historical "completed work" log (86 entries as of this writing, chronological, append-only — see `changelog/` for the current highest entry) | [changelog/](changelog/) — chunked by entry range, see below |
+| Historical "completed work" log (99 entries as of this writing, chronological, append-only — see `changelog/` for the current highest entry) | [changelog/](changelog/) — chunked by entry range, see below |
 
 ### Pallets (`pallets/`)
 
@@ -122,6 +122,19 @@ find a specific one, or jump straight to its range file:
 | 84 | [084.md](changelog/084.md) — `committee/`'s `CommitteeCrypto` is no longer a throwing stub: a real implementation now loads and calls the actual `oprf-committee-dev` crypto core from React Native, closing the gap entry 83 left open |
 | 85 | [085.md](changelog/085.md) — DKG ceremony orchestration tooling for the OPRF founding phase, the specific open question entry 82 flagged and left unresolved ("DKG ceremony mechanics across heterogeneous member-owned devices") |
 | 86 | [086.md](changelog/086.md) — built `court-oracle/`, a new standalone Rust service that generates and submits Level-0 AI court rulings, the off-chain half of `pallet-courts`' AI-first court system |
+| 87 | [087.md](changelog/087.md) — closed `next-steps.md` item 12: real on-device face match + liveness detection (Android), a custom CameraX `com.agora.facematch` module + MobileFaceNet TFLite embedding comparison + ML Kit blink/turn challenge, wired into `RegisterScreen.tsx` in place of the old TODO; runtime-unverified (no Android SDK/JDK in this environment) |
+| 88 | [088.md](changelog/088.md) — design-only decision record: device-update authorship for the OPRF founding-phase citizen-hosted node software, the open question entry 82 left unresolved; no `committee`/`committee-node` code changed |
+| 89 | [089.md](changelog/089.md) — wired a real embedded smoldot light client into the desktop app's JS frontend (not the Rust backend) for the nine chain-read commands, replacing the hardcoded-RPC-only path; proven end-to-end syncing against a real local `agora-node --dev` chain over libp2p `/ws` |
+| 90 | [090.md](changelog/090.md) — ran `court-oracle` against a real dev chain and a real local IPFS daemon for the first time, getting as far as a genuine (rejected) Anthropic API call; no Claude API key exists in this environment, so no ruling was produced and `submit_ai_ruling`/`finalize_ruling` remain unexercised against a live chain |
+| 91 | [091.md](changelog/091.md) — project review (2026-08-18), 7 parallel agents: no critical findings; one confirmed high-severity security gap, one same-commit cross-doc contradiction, one undocumented mobile-registration gap |
+| 92 | [092.md](changelog/092.md) — persona-based multi-agent review (security researcher/citizen/product-manager angles) plus two fixes: a post-emergency cooldown added to both `pallet-emergency-council` and `pallet-executive`'s independent emergency mechanism, and `remove_oracle_member` now purges the removed member's already-cast approvals from in-flight proposals |
+| 93 | [093.md](changelog/093.md) — new delegate-persona-creation ZK proof: circuit additions in `circuits/oprf-identity-anchor` plus a standalone Rust verifier; circuit + verifier only, no pallet extrinsic calls it yet |
+| 94 | [094.md](changelog/094.md) — new backing-nullifier ZK proof for anonymously backing a delegate (Semaphore-style Merkle-membership + range-checked slot index): circuit additions plus a standalone Rust verifier; circuit + verifier only, no pallet extrinsic calls it yet |
+| 95 | [095.md](changelog/095.md) — `pallet-elections` now actually consumes entries 93/94's delegate-persona and backing-nullifier proofs in `register_as_delegate`/`back_delegate`/`remove_backing` instead of trusting the caller's signature or tracking backing in plaintext |
+| 96 | [096.md](changelog/096.md) — wired the mobile app to the real delegate-persona and backing-nullifier cryptography (entries 93–95): a second, independently-generated Keystore-backed delegate-persona keypair plus updated call sites matching `pallet-elections`' new on-chain signatures |
+| 97 | [097.md](changelog/097.md) — project review (2026-08-29): fixed a real `pallet-elections` benchmark regression (stale scope-check fixture) and refreshed stale test-count claims across `CLAUDE.md`/`docs/project/apps/mobile.md`/`docs/project/next-steps.md` |
+| 98 | [098.md](changelog/098.md) — three same-day/next-day commits given their own entry: chain-wide DoS/capture/privacy hardening across nine pallets from an independent five-lens review, an accessible QR-code liveness fallback plus Play Integrity attestation on mobile, and closing the reverse-direction legislature/executive↔accountability-council overlap gate |
+| 99 | [099.md](changelog/099.md) — seven same-day fix commits given their own entry: bootstrap-lock membership freeze on legislature/emergency-council, an auditor self-resolve fix, a recovered-citizen backing/seating-floor fix in `pallet-elections`, a stale-oracle-proposal recovery path in `pallet-courts`, saturating QV refund math, and mobile signing-key/NFC/liveness-RNG hardening |
 
 Quick lookup for a specific entry number:
 ```bash

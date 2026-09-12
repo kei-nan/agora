@@ -5,7 +5,7 @@ so an agent can grep or open just the file it needs instead of loading one monol
 with [docs/project/README.md](docs/project/README.md) — it has the environment, build command,
 monorepo structure, and an index into everything else (per-pallet status, architecture, desktop/
 mobile app state, remaining work, and the chronological completed-work log in
-[docs/project/changelog/](docs/project/changelog/), currently through entry #086, chunked into
+[docs/project/changelog/](docs/project/changelog/), currently through entry #099, chunked into
 page-sized files by entry range).
 
 Also read `CLAUDE.md` in this same directory for architecture decisions and references.

@@ -54,6 +54,21 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   - Requires a mandatory OPRF identity-anchor check (`anchor` + `oprf_pk_hashes`, verified via
     `AnchorVerifier`) as the Sybil-resistance gate, rejecting if `anchor` already exists under
     the current `OprfSchemeVersion` in `IdentityAnchorRegistry`
+  - **Known gap — CRITICAL, unfixed (found by 2026-09-11 security review, see
+    `docs/project/next-steps.md` item 0 for the full writeup): no cryptographic binding to
+    `who`.** `zk_proof`/`public_inputs`/`anchor`/`oprf_pk_hashes`/`backing_commitment` are all
+    plaintext in the pending signed extrinsic; nothing here (or in
+    `T::AnchorVerifier::verify_registration_anchor`, or in the `disclosure` circuit that produces
+    `param_commitment`) ties any of them to the signer. Anyone watching the mempool can copy the
+    whole tuple into their own signed call and front-run the real submitter, stealing their
+    citizenship slot (the legitimate submission then fails on `NullifierAlreadyUsed`/
+    `AnchorAlreadyUsed`). `pallet-elections::register_as_delegate` closed the equivalent gap for
+    delegate-persona registration by folding `persona_account` into its proof's
+    `param_commitment` as a genuine private circuit witness (confirmed real, not just an
+    unconstrained argument check) — `disclosure/src/main.nr` has no equivalent witness, so the
+    same fix cannot be ported without a real Noir circuit change (new witness, widened
+    `param_commitment`, new VK, mobile-side proving changes). Not attempted; see next-steps.md
+    item 0 for exactly what closing it requires.
 - `revoke_citizen()` — swap-and-pop, clears suspension (both `SuspendedNullifiers` and `SuspendedByJuryReview`)
 - `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (wired to `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's M-of-N approval of this exact call, not a single member — fixed after a project review found the prior `EnsureOracle` wiring let any one member suspend any citizen unilaterally); always writes `SuspendedByJuryReview = false` — this extrinsic-driven path is oracle-only, never jury-reviewed
 - `restore_citizen_rights(nullifier)` — `SuspensionOrigin` (same M-of-N gating as above); clears both `SuspendedNullifiers` and `SuspendedByJuryReview`
@@ -122,6 +137,19 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   `AccountId`, so an existing suspension carries over onto the new account automatically —
   recovery cannot be used to launder away an active court-ordered suspension. Emits
   `CitizenAccountRecovered { old_account, new_account, nullifier_hash }`.
+
+  **Known gap — CRITICAL, unfixed (found by 2026-09-11 security review, see
+  `docs/project/next-steps.md` item 0): same missing account-binding as `register_citizen`
+  above, with worse consequences.** Nothing constrains `who` to the intended recoverer either —
+  an observer who copies a victim's pending `recover_account` extrinsic (proof, public inputs,
+  anchor, oprf_pk_hashes, backing_commitment — all plaintext) into their own signed call and gets
+  it mined first **permanently and irreversibly hijacks the victim's identity** to an account the
+  attacker controls, with no dispute window to undo it (that no-dispute-window property is
+  otherwise a deliberate, separately-discussed design tradeoff — see above — not itself the bug;
+  the bug is that this call has no way to authenticate that `who` is who the proof's owner
+  intended). Same root cause and same fix path as `register_citizen`'s note above: a real fix
+  needs a new private witness in the `disclosure` circuit (this call's proof shares the same
+  circuit/verifier path as registration/reverification), not a Rust-only patch.
 
   **Cross-pallet orphaning — guarded, not migrated.** This call still only *rebinds*
   pallet-identity's own storage listed above; it never moves any other pallet's per-account
