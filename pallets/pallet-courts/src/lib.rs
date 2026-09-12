@@ -450,6 +450,27 @@ pub mod pallet {
         /// touches `CaseStatus::JurySeated`. See `clear_stale_jury_deadlock`.
         #[pallet::constant]
         type JuryVotingExpiryBlocks: Get<u32>;
+        /// Maximum number of times `clear_stale_jury_deadlock` may discard a deadlocked jury
+        /// and draw a fresh one for the same case before it must instead force a conclusion.
+        ///
+        /// Without this cap, `clear_stale_jury_deadlock` gave any losing-side voting bloc a
+        /// costless, unlimited "reroll" button: jury votes are public
+        /// (`JuryVotes`/`JuryTally`), so a bloc that can see it's losing can simply withhold
+        /// enough votes to prevent either side from ever reaching a strict majority, wait out
+        /// `JuryVotingExpiryBlocks`, and force a brand-new jury draw — repeating indefinitely
+        /// until a jury composition happens to favor them, at no cost (`clear_stale_jury_deadlock`
+        /// reserves no bond, and is open to the filer/any Oracle Council member/any active
+        /// citizen on a system case, same as `select_jury`).
+        ///
+        /// Once a case has been redrawn `MaxJuryRedraws` times, `clear_stale_jury_deadlock`
+        /// stops drawing a fresh jury and instead finalizes the case from whatever votes the
+        /// (final) seated jury actually cast, treating every juror who never voted as
+        /// abstaining rather than requiring full participation — see
+        /// `clear_stale_jury_deadlock`'s doc comment for the tie-breaking rule this uses. This
+        /// guarantees eventual finalization no matter how a bloc behaves, while still tolerating
+        /// a bounded number of genuine no-show/split deadlocks via the normal redraw path.
+        #[pallet::constant]
+        type MaxJuryRedraws: Get<u32>;
         /// Hook called to suspend a citizen when a CitizenConduct verdict is Overturned (guilty).
         type CitizenSuspender: CitizenSuspender<BlockNumberFor<Self>>;
         /// Number of blocks, starting the block *after* a case enters jury appeal, whose
@@ -588,6 +609,17 @@ pub mod pallet {
     /// `select_jury` seats a jury for the case.
     #[pallet::storage]
     pub type JurySeatedBlock<T: Config> = StorageMap<_, Blake2_128Concat, u32, BlockNumberFor<T>>;
+
+    /// case_id -> number of times `clear_stale_jury_deadlock` has discarded a deadlocked jury
+    /// and drawn a fresh one for this case (see `Config::MaxJuryRedraws`). Incremented each
+    /// time the redraw path is taken; the forced-finalization path (taken once this reaches
+    /// `MaxJuryRedraws`) does not increment it further, since there is no further redraw to
+    /// count. Cleared by `auto_finalize` alongside `JurySeatedBlock` once the case actually
+    /// reaches a jury-reviewed final ruling — whether via a normal `cast_jury_vote` majority or
+    /// via `clear_stale_jury_deadlock`'s own forced finalization at the cap — so a case's
+    /// counter never lingers past the case's lifetime.
+    #[pallet::storage]
+    pub type JuryRedrawCount<T: Config> = StorageMap<_, Blake2_128Concat, u32, u32, ValueQuery>;
 
     /// The Oracle Council — the M-of-N body whose members may propose/approve AI ruling
     /// submission (`submit_ai_ruling`) and finalization (`finalize_ruling`). Replaces the
@@ -865,8 +897,27 @@ pub mod pallet {
         /// strict majority and was cleared via `clear_stale_jury_deadlock`. The case is moved
         /// back to `InJuryAppeal` and a fresh delayed-reveal jury-selection window is scheduled
         /// (the same mechanism `appeal_ruling` uses) — `select_jury` may be called again for
-        /// `case_id` once that window elapses.
-        JuryDeadlockCleared { case_id: u32 },
+        /// `case_id` once that window elapses. `redraw_count` is the number of redraws this
+        /// case has now had (starts at 1) — once it reaches `Config::MaxJuryRedraws`, the next
+        /// deadlock instead resolves via `JuryDeadlockForcedFinalization`, not another one of
+        /// these.
+        JuryDeadlockCleared { case_id: u32, redraw_count: u32 },
+        /// A jury deadlock hit `Config::MaxJuryRedraws` and `clear_stale_jury_deadlock` forced
+        /// the case to a conclusion instead of drawing yet another jury — tallying whatever
+        /// votes the final seated jury actually cast, treating every juror who never voted as
+        /// abstaining rather than requiring full participation. This is what closes the
+        /// costless-indefinite-reroll gap `JuryDeadlockCleared` alone left open: a losing-side
+        /// bloc can force at most `MaxJuryRedraws` free rerolls before the case resolves anyway.
+        /// `upheld_votes`/`overturned_votes` are the raw cast tally that decided `verdict` — a
+        /// tie (including no votes cast at all) resolves to `Verdict::Upheld`, since overturning
+        /// the AI ruling under appeal requires an affirmative case for it, not merely the
+        /// absence of one (see `clear_stale_jury_deadlock`'s doc comment).
+        JuryDeadlockForcedFinalization {
+            case_id: u32,
+            verdict: Verdict,
+            upheld_votes: u32,
+            overturned_votes: u32,
+        },
     }
 
     // ── Errors ──────────────────────────────────────────────────────────────────
@@ -1743,25 +1794,38 @@ pub mod pallet {
         /// moves a case out of `JurySeated`, so a jury that never reaches one leaves the case
         /// stuck there forever.
         ///
-        /// Rather than merely clearing the stuck jury with no path forward, this re-schedules
-        /// a fresh jury selection through exactly the same delayed-reveal commit-then-reveal
-        /// pipeline `appeal_ruling` uses (see `Config::JurySeedDelayBlocks`): the case moves
-        /// back to `CaseStatus::InJuryAppeal`, the deadlocked jury's pool/votes/tally are
-        /// discarded, and a new `JuryRequestBlock`/`SeedCaptureDue` entry is scheduled from the
-        /// current block — a follow-up `select_jury` call (same as the original flow) draws the
-        /// new jury once that window elapses. This deliberately reuses the existing, already-
+        /// **Redraw path** (below `Config::MaxJuryRedraws`): re-schedules a fresh jury
+        /// selection through exactly the same delayed-reveal commit-then-reveal pipeline
+        /// `appeal_ruling` uses (see `Config::JurySeedDelayBlocks`): the case moves back to
+        /// `CaseStatus::InJuryAppeal`, the deadlocked jury's pool/votes/tally are discarded,
+        /// and a new `JuryRequestBlock`/`SeedCaptureDue` entry is scheduled from the current
+        /// block — a follow-up `select_jury` call (same as the original flow) draws the new
+        /// jury once that window elapses. This deliberately reuses the existing, already-
         /// audited randomness pipeline instead of drawing a replacement jury inline from some
         /// ad-hoc immediately-available randomness source: the latter would reopen exactly the
-        /// grinding hole `JurySeedDelayBlocks` was built to close, since whoever is authorized
-        /// to call this could otherwise pick their submission moment once a favorable outcome
-        /// was already computable. A bare "clear with no next step" was considered and rejected
-        /// as strictly less useful for the same implementation cost, since the re-seed above
-        /// needs nothing beyond storage this pallet already has.
+        /// grinding hole `JurySeedDelayBlocks` was built to close. `JuryRedrawCount[case_id]`
+        /// is incremented so the cap below can actually be enforced.
+        ///
+        /// **Forced-finalization path** (at `Config::MaxJuryRedraws`): jury votes are public
+        /// (`JuryVotes`/`JuryTally`), so without a cap on redraws, a losing-side voting bloc
+        /// could see it was losing, withhold votes past every expiry, and force a costless,
+        /// indefinite reroll until a jury composition favored it. Once a case has already been
+        /// redrawn `MaxJuryRedraws` times, this call no longer draws another jury — instead it
+        /// finalizes the case immediately from whatever votes the (final) seated jury actually
+        /// cast, treating non-voters as abstaining: `overturned > upheld` finalizes
+        /// `Verdict::Overturned`, and any other outcome (including a tie or zero votes cast at
+        /// all) finalizes `Verdict::Upheld` — mirroring `cast_jury_vote`'s own rule that
+        /// overturning the AI ruling under appeal requires an affirmative majority for it, not
+        /// merely the absence of one. This guarantees every case eventually reaches a final
+        /// ruling no matter how a bloc behaves, at the cost of tolerating up to
+        /// `MaxJuryRedraws` genuine no-show/split deadlocks via the redraw path first.
         ///
         /// Also clears any `CapturedJurySeed` left over from the deadlocked jury's own window —
         /// without this, `select_jury` would see a stale, already fully-computable seed from
         /// the old window still present and could be called immediately, bypassing the new
-        /// delayed-reveal window entirely.
+        /// delayed-reveal window entirely. (Irrelevant to the forced-finalization path itself,
+        /// but cleared there too since no further `select_jury` call for this case will ever
+        /// follow.)
         ///
         /// Authorization mirrors `select_jury`/`appeal_ruling`'s own gate
         /// (`is_filer_or_oracle`): the case's filer, any Oracle Council member, or — for a
@@ -1771,7 +1835,13 @@ pub mod pallet {
         /// the parties already entitled to drive this case through the rest of the appeal
         /// pipeline are the closer fit for recovering a stuck jury on it too.
         #[pallet::call_index(16)]
-        #[pallet::weight(Weight::from_parts(20_000, 0))]
+        // Base cost mirrors the previous flat estimate (jury pool/votes/tally discard plus
+        // either a re-schedule or a `Cases` status flip). The forced-finalization branch
+        // additionally calls `auto_finalize`, doing the same order of work `finalize_ruling`/
+        // `cast_jury_vote`'s majority path already price at 20_000 (enforcement calls into
+        // `LawEnforcer`/`TreasuryEnforcer`/`CitizenSuspender` included) — added here so the
+        // flat weight covers this call's worst case, not just the redraw branch.
+        #[pallet::weight(Weight::from_parts(20_000, 0).saturating_add(Weight::from_parts(20_000, 0)))]
         pub fn clear_stale_jury_deadlock(origin: OriginFor<T>, case_id: u32) -> DispatchResult {
             let who = ensure_signed(origin)?;
             let case = Cases::<T>::get(case_id).ok_or(Error::<T>::CaseNotFound)?;
@@ -1782,6 +1852,33 @@ pub mod pallet {
             let now = frame_system::Pallet::<T>::block_number();
             let expiry = BlockNumberFor::<T>::from(T::JuryVotingExpiryBlocks::get());
             ensure!(now >= seated_at.saturating_add(expiry), Error::<T>::JuryNotYetStale);
+
+            let redraw_count = JuryRedrawCount::<T>::get(case_id);
+            if redraw_count >= T::MaxJuryRedraws::get() {
+                // The redraw budget is exhausted -- force a conclusion from whatever votes the
+                // seated jury actually cast rather than handing out another free reroll.
+                let (upheld, overturned) = JuryTally::<T>::get(case_id);
+                let verdict = if overturned > upheld { Verdict::Overturned } else { Verdict::Upheld };
+
+                if let Some(old_jury) = JuryPool::<T>::take(case_id) {
+                    for juror in old_jury.iter() {
+                        JuryVotes::<T>::remove((case_id, juror.clone()));
+                    }
+                }
+                JuryTally::<T>::remove(case_id);
+                CapturedJurySeed::<T>::remove(case_id);
+                // `Cases` status is deliberately left as `JurySeated` here -- `auto_finalize`
+                // reads it to derive `jury_reviewed`, and it also performs its own cleanup of
+                // `JurySeatedBlock`/`JuryRedrawCount` for exactly this case (jury_reviewed ==
+                // true), so there is nothing left for this branch to do afterward.
+                Self::deposit_event(Event::JuryDeadlockForcedFinalization {
+                    case_id,
+                    verdict: verdict.clone(),
+                    upheld_votes: upheld,
+                    overturned_votes: overturned,
+                });
+                return Self::auto_finalize(case_id, verdict);
+            }
 
             // Discard the deadlocked jury's pool, votes, and tally.
             if let Some(old_jury) = JuryPool::<T>::take(case_id) {
@@ -1814,7 +1911,10 @@ pub mod pallet {
             })?;
             JuryRequestBlock::<T>::insert(case_id, now);
 
-            Self::deposit_event(Event::JuryDeadlockCleared { case_id });
+            let new_redraw_count = redraw_count.saturating_add(1);
+            JuryRedrawCount::<T>::insert(case_id, new_redraw_count);
+
+            Self::deposit_event(Event::JuryDeadlockCleared { case_id, redraw_count: new_redraw_count });
             Ok(())
         }
     }
@@ -1882,9 +1982,12 @@ pub mod pallet {
             // reviewed it). Captured now, before the mutation below overwrites it.
             let jury_reviewed = case.1 == CaseStatus::JurySeated;
             if jury_reviewed {
-                // The case is leaving JurySeated for good (majority reached) — clear the
-                // staleness timestamp so it can't be mistaken for a still-pending deadlock.
+                // The case is leaving JurySeated for good (a normal `cast_jury_vote` majority,
+                // or `clear_stale_jury_deadlock`'s own forced finalization at the
+                // `MaxJuryRedraws` cap) — clear the staleness timestamp and redraw counter so
+                // neither lingers past this case's lifetime.
                 JurySeatedBlock::<T>::remove(case_id);
+                JuryRedrawCount::<T>::remove(case_id);
             }
             Cases::<T>::try_mutate(case_id, |maybe_case| {
                 let c = maybe_case.as_mut().ok_or(Error::<T>::CaseNotFound)?;

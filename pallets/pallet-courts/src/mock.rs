@@ -31,6 +31,11 @@ pub const ORACLE_PROPOSAL_EXPIRY: u32 = 20;
 /// blocks.
 pub const JURY_VOTING_EXPIRY: u32 = 20;
 
+/// How many times `clear_stale_jury_deadlock` may redraw a fresh jury for the same case before
+/// it must force a conclusion instead. Small (but > 1, so the redraw path itself is still
+/// exercisable before the cap) so tests can reach the cap without looping dozens of times.
+pub const MAX_JURY_REDRAWS: u32 = 2;
+
 #[frame_support::runtime]
 mod runtime {
 	// The main runtime
@@ -229,6 +234,7 @@ impl pallet_courts::Config for Test {
 	type AdminActionExpiryBlocks = ConstU32<ADMIN_ACTION_EXPIRY>;
 	type OracleProposalExpiryBlocks = ConstU32<ORACLE_PROPOSAL_EXPIRY>;
 	type JuryVotingExpiryBlocks = ConstU32<JURY_VOTING_EXPIRY>;
+	type MaxJuryRedraws = ConstU32<MAX_JURY_REDRAWS>;
 	type CitizenSuspender = MockCitizenSuspender;
 	// Short delay so tests don't need to advance hundreds of blocks.
 	type JurySeedDelayBlocks = ConstU32<3>;

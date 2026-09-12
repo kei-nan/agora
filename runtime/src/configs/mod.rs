@@ -820,6 +820,14 @@ impl pallet_courts::Config for Runtime {
 	/// `pallet_courts::Config::JuryVotingExpiryBlocks`'s doc comment and
 	/// `clear_stale_jury_deadlock`).
 	type JuryVotingExpiryBlocks = ConstU32<{ 14 * DAYS }>;
+	/// Up to 3 free jury redraws per case before `clear_stale_jury_deadlock` must force a
+	/// conclusion from whatever votes were actually cast — see
+	/// `pallet_courts::Config::MaxJuryRedraws`'s doc comment for the costless-indefinite-reroll
+	/// gap this closes. 3 is generous enough to absorb ordinary no-show/split deadlocks (each
+	/// redraw already costs a fresh `JurySeedDelayBlocks` + `JuryVotingExpiryBlocks` wait, so
+	/// this isn't free to attempt even below the cap) while keeping the guaranteed-finalization
+	/// bound tight once a bloc is actually gaming the mechanism.
+	type MaxJuryRedraws = ConstU32<3>;
 	type CitizenSuspender = Runtime;
 	/// 10 minutes' worth of blocks after an appeal is filed before jury selection can use
 	/// the resulting (delayed-reveal) seed. See `pallet_courts::Config::JurySeedDelayBlocks`

@@ -27,6 +27,9 @@ Storage:
   `JuryVotingExpiryBlocks` without a strict majority ever being reached; cleared alongside the
   rest of the jury's state once the case leaves `JurySeated` (majority reached, or the deadlock
   cleared and re-seeded)
+- `JuryRedrawCount`: `case_id` → `u32` — how many times `clear_stale_jury_deadlock` has redrawn
+  a fresh jury for this case (see `MaxJuryRedraws` below); cleared alongside `JurySeatedBlock`
+  once the case reaches a jury-reviewed final ruling
 - `AIGovernanceCouncil`: `BoundedVec<AccountId, MaxAIGovernanceCouncilSize>` — root-managed, mirrors `pallet-emergency-council`'s `Council`
 - `CurrentAIModelVersion`: `u32` — the governance-approved model version `submit_ai_ruling` checks against
 - `AIModelVersions`: `u32` → `model_hash` — approved model history
@@ -94,7 +97,8 @@ Calls:
 - `clear_stale_jury_deadlock(case_id)` — case's filer, any Oracle Council member, or (for
   system-filed cases) any active citizen (same `is_filer_or_oracle` gate as `appeal_ruling`/
   `select_jury`); only once `JuryVotingExpiryBlocks` blocks have passed since the jury was
-  seated with no majority ever reached (see below)
+  seated with no majority ever reached; redraws a fresh jury up to `MaxJuryRedraws` times, then
+  forces finalization from whatever votes were actually cast (see below)
 - `add_oracle_member(account)` / `remove_oracle_member(account)` — root; manages the
   `OracleMembers` roster, bounded to `MaxOracleMembers` (7). Replaces the earlier
   `set_oracle_account`. `remove_oracle_member` also purges the removed member's already-cast
@@ -143,7 +147,7 @@ OracleProposalNotYetStale` if called too early), emitting `Event::OracleProposal
 approval-purging/re-resolution logic (see above) already covered this path correctly with no
 changes needed.
 
-### Jury deadlock recovery (fixed `988bbe8`)
+### Jury deadlock recovery (fixed `988bbe8`; bounded-redraw fix on top, see below)
 
 Before this fix, nothing bounded how long a case could sit in `CaseStatus::JurySeated`: only a
 strict majority via `cast_jury_vote` ever moved a case out of that status, so a jury that never
@@ -164,6 +168,31 @@ a new `JuryRequestBlock`/seed-capture window is scheduled from the current block
 flow. This deliberately reuses the existing, already-audited randomness pipeline rather than
 drawing a replacement jury inline from some ad-hoc immediately-available source, which would
 reopen the same grinding hole `JurySeedDelayBlocks` exists to close.
+
+**Bounded redraws (`MaxJuryRedraws`).** The original fix above left a redraw itself unbounded and
+free: since jury votes are public (`JuryVotes`/`JuryTally`), a losing-side voting bloc could see
+it was losing, simply withhold enough votes to keep either side short of a strict majority, wait
+out `JuryVotingExpiryBlocks`, and force a brand-new jury draw — repeating indefinitely, at no
+cost, until a jury composition happened to favor it. `JuryRedrawCount: case_id → u32` now counts
+how many times a case has been redrawn, and `Config::MaxJuryRedraws` (3 in the runtime) caps it:
+
+- **Below the cap**, `clear_stale_jury_deadlock` behaves exactly as described above (redraw a
+  fresh jury) and increments `JuryRedrawCount`, emitting `JuryDeadlockCleared { case_id,
+  redraw_count }`.
+- **At the cap**, it no longer draws another jury. Instead it finalizes the case immediately —
+  calling the same `auto_finalize` a normal `cast_jury_vote` majority would — from whatever votes
+  the (final) seated jury actually cast, treating every juror who never voted as abstaining
+  rather than requiring full participation: `overturned > upheld` finalizes `Verdict::Overturned`,
+  and any other outcome (a tie, or zero votes cast at all) finalizes `Verdict::Upheld` — mirroring
+  `cast_jury_vote`'s own rule that overturning the AI ruling under appeal requires an affirmative
+  majority for it, not merely the absence of one. This emits `JuryDeadlockForcedFinalization {
+  case_id, verdict, upheld_votes, overturned_votes }` instead of `JuryDeadlockCleared`, and
+  `JuryRedrawCount`/`JurySeatedBlock` are cleared the same way a normal majority finalization
+  clears them. The case reaches `CaseStatus::FinalRuling` (and `Enforced`, if the verdict triggers
+  auto-enforcement) exactly as `cast_jury_vote` would, guaranteeing every case eventually
+  resolves no matter how a voting bloc behaves — a bloc can force at most `MaxJuryRedraws` free
+  rerolls, each of which still costs a full `JurySeedDelayBlocks` + `JuryVotingExpiryBlocks` wait,
+  before the case resolves against it anyway.
 
 TODOs:
 - Real VRF-based jury randomness. Current scheme (see log #52) is a commit-then-delayed-reveal

@@ -2505,3 +2505,120 @@ fn clear_stale_jury_deadlock_succeeds_after_expiry_and_reseeds_a_working_jury() 
 		assert_eq!(status, CaseStatus::FinalRuling);
 	});
 }
+
+// ─── clear_stale_jury_deadlock: bounded redraws (MaxJuryRedraws) ────────────────────────────
+//
+// Regression coverage for the fix closing the costless-indefinite-reroll gap: because jury
+// votes are public (`JuryVotes`/`JuryTally`), a losing-side voting bloc could previously see it
+// was losing, withhold votes past every `JuryVotingExpiryBlocks` expiry, and force a brand-new
+// jury draw indefinitely, at no cost, until a jury composition favored it. `MAX_JURY_REDRAWS`
+// (2 in the mock) now caps how many times `clear_stale_jury_deadlock` will draw a fresh jury for
+// the same case before it must instead force a conclusion from whatever votes were actually cast.
+
+#[test]
+fn clear_stale_jury_deadlock_allows_redraws_up_to_cap_then_forces_finalization() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+
+		// Redraw MAX_JURY_REDRAWS (2) times -- each one a genuine deadlock (nobody votes at
+		// all), each still going through the normal re-seed path since the cap hasn't been
+		// reached yet.
+		for round in 0..MAX_JURY_REDRAWS {
+			set_window_hashes(case_id, &[H256::repeat_byte(0x10 + round as u8); 3]);
+			let seated_block = capture_jury_seed(case_id);
+			assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+			System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64);
+			assert_ok!(Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id));
+
+			let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+			assert_eq!(status, CaseStatus::InJuryAppeal);
+			assert_eq!(crate::JuryRedrawCount::<Test>::get(case_id), round + 1);
+			System::assert_last_event(
+				Event::JuryDeadlockCleared { case_id, redraw_count: round + 1 }.into(),
+			);
+		}
+
+		// One more deadlock: the cap (2) has now been reached, so this must force a
+		// conclusion instead of drawing a third jury. Seat this last jury with a genuine
+		// split (3 Overturned, 1 Upheld -- short of the 4-of-7 majority either way) so the
+		// forced-finalization tally logic is exercised on real cast votes, not just zeroes.
+		set_window_hashes(case_id, &[H256::repeat_byte(0x99); 3]);
+		let seated_block = capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		let jury = JuryPool::<Test>::get(case_id).unwrap();
+		assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(jury[0]), case_id, Verdict::Overturned));
+		assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(jury[1]), case_id, Verdict::Overturned));
+		assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(jury[2]), case_id, Verdict::Overturned));
+		assert_ok!(Courts::cast_jury_vote(RuntimeOrigin::signed(jury[3]), case_id, Verdict::Upheld));
+
+		System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64);
+		assert_ok!(Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id));
+
+		// Forced finalization applied -- Overturned wins the cast-vote plurality (3 > 1) even
+		// though neither side ever reached the 4-of-7 strict majority `cast_jury_vote` itself
+		// requires.
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::FinalRuling);
+		assert_eq!(crate::Rulings::<Test>::get(case_id), Some(Verdict::Overturned));
+		System::assert_has_event(
+			Event::JuryDeadlockForcedFinalization {
+				case_id,
+				verdict: Verdict::Overturned,
+				upheld_votes: 1,
+				overturned_votes: 3,
+			}
+			.into(),
+		);
+		// Redraw bookkeeping is cleared now that the case has actually reached a final ruling
+		// (mirrors `JurySeatedBlock`'s own cleanup in `auto_finalize`).
+		assert_eq!(crate::JuryRedrawCount::<Test>::get(case_id), 0);
+
+		// The case is no longer `JurySeated` at all -- calling again fails on status, not on
+		// some fresh redraw/staleness check, proving the cap didn't just leave the case
+		// dangling.
+		assert_noop!(
+			Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id),
+			Error::<Test>::InvalidStatus
+		);
+	});
+}
+
+/// The pathological edge case: a jury that hits the redraw cap having cast *zero* votes at all
+/// (every juror no-showed). Forced finalization must neither panic nor default to Overturned --
+/// a 0-0 tie resolves to `Verdict::Upheld`, the same "overturning requires an affirmative
+/// majority, not merely its absence" rule `cast_jury_vote`'s own majority check already applies.
+#[test]
+fn clear_stale_jury_deadlock_forced_finalization_defaults_to_upheld_on_zero_votes() {
+	new_test_ext().execute_with(|| {
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+
+		// Burn through the redraw budget with juries nobody ever votes on.
+		for round in 0..MAX_JURY_REDRAWS {
+			set_window_hashes(case_id, &[H256::repeat_byte(0x10 + round as u8); 3]);
+			let seated_block = capture_jury_seed(case_id);
+			assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+			System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64);
+			assert_ok!(Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id));
+		}
+
+		// Final jury: still nobody votes at all.
+		set_window_hashes(case_id, &[H256::repeat_byte(0x77); 3]);
+		let seated_block = capture_jury_seed(case_id);
+		assert_ok!(Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7));
+		System::set_block_number(seated_block + JURY_VOTING_EXPIRY as u64);
+		assert_ok!(Courts::clear_stale_jury_deadlock(RuntimeOrigin::signed(1), case_id));
+
+		let (_, status, _, _) = crate::pallet::Cases::<Test>::get(case_id).unwrap();
+		assert_eq!(status, CaseStatus::FinalRuling);
+		assert_eq!(crate::Rulings::<Test>::get(case_id), Some(Verdict::Upheld));
+		System::assert_has_event(
+			Event::JuryDeadlockForcedFinalization {
+				case_id,
+				verdict: Verdict::Upheld,
+				upheld_votes: 0,
+				overturned_votes: 0,
+			}
+			.into(),
+		);
+	});
+}
