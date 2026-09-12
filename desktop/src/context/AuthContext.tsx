@@ -2,6 +2,7 @@ import {
   createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode,
 } from "react";
 import { invoke } from "../lib/invoke";
+import { toSafeErrorMessage } from "../lib/errors";
 
 interface Session {
   nullifierHash: string;
@@ -117,7 +118,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setQrExpiresAt(null);
       }, QR_TIMEOUT_MS);
     } catch (err) {
-      setQrError(String(err));
+      setQrError(
+        toSafeErrorMessage(
+          err,
+          "[AuthContext] auth_generate_challenge failed",
+          "Unable to generate a QR code. Please try again.",
+        ),
+      );
       setIsGeneratingQr(false);
     }
   }, [cancelPoll, callbackPort]);

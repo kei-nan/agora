@@ -7,7 +7,16 @@ vi.mock("smoldot", () => ({
   start: vi.fn(() => ({ addChain: addChainMock })),
 }));
 
-import { ScShim, discoverWsBootnode, withTimeout, RpcTimeoutError, DEFAULT_RPC_TIMEOUT_MS } from "./client";
+import {
+  ScShim,
+  discoverWsBootnode,
+  withTimeout,
+  RpcTimeoutError,
+  DEFAULT_RPC_TIMEOUT_MS,
+  getApi,
+  onConnectionState,
+} from "./client";
+import { DEFAULT_SAFE_ERROR_MESSAGE } from "../lib/errors";
 
 function asyncIterableFromArray(items: string[]) {
   return {
@@ -236,5 +245,34 @@ describe("discoverWsBootnode", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(discoverWsBootnode("http://127.0.0.1:9944")).rejects.toThrow(/method not found/);
+  });
+});
+
+describe("connect() error sanitization (via getApi())", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("rejects with a generic message — never the raw discoverWsBootnode/fetch error text — and reports the same generic message via onConnectionState", async () => {
+    // Both the chain-spec fetch and discoverWsBootnode's system_localListenAddresses call go
+    // through the same global `fetch`; failing it makes connect() hit its catch block before it
+    // ever needs a real ScProvider/ApiPromise, so those don't need mocking here.
+    const sensitiveDetail = "connect ECONNREFUSED 127.0.0.1:9944 (internal socket detail)";
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError(sensitiveDetail)));
+
+    const states: Array<{ state: string; error?: string }> = [];
+    const unsubscribe = onConnectionState((state, error) => states.push({ state, error }));
+
+    await expect(getApi()).rejects.toThrow(DEFAULT_SAFE_ERROR_MESSAGE);
+
+    const errorStates = states.filter((s) => s.state === "error");
+    expect(errorStates.length).toBeGreaterThan(0);
+    for (const s of errorStates) {
+      expect(s.error).toBe(DEFAULT_SAFE_ERROR_MESSAGE);
+      expect(s.error).not.toContain("ECONNREFUSED");
+      expect(s.error).not.toContain("9944");
+    }
+
+    unsubscribe();
   });
 });

@@ -113,6 +113,31 @@ describe("AuthContext", () => {
     expect(screen.getByTestId("error")).toHaveTextContent(/not registered on-chain/);
   });
 
+  it("shows a generic, sanitized qrError — never the raw error text — when auth_generate_challenge fails", async () => {
+    mockedInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "auth_start_callback_server") return undefined;
+      if (cmd === "auth_generate_challenge") {
+        throw new Error("Tauri IPC error: ECONNREFUSED 127.0.0.1:9944 dial failed");
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+
+    render(
+      <AuthProvider>
+        <TestHarness />
+      </AuthProvider>
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("requestQr"));
+    });
+
+    const errorText = screen.getByTestId("error").textContent ?? "";
+    expect(errorText).not.toBe("none");
+    expect(errorText).not.toMatch(/ECONNREFUSED|9944/);
+    expect(screen.getByTestId("generating")).toHaveTextContent("false");
+  });
+
   it("expires the QR challenge client-side after the 5-minute timeout", async () => {
     mockedInvoke.mockImplementation(async (cmd: string) => {
       if (cmd === "auth_start_callback_server") return undefined;

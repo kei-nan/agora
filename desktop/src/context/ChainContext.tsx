@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react";
 import { invoke } from "../lib/invoke";
+import { toSafeErrorMessage } from "../lib/errors";
 
 type ChainStatus = "connecting" | "syncing" | "ready" | "error";
 
@@ -31,7 +32,14 @@ export function ChainProvider({ children }: { children: ReactNode }) {
       .then(({ best, finalized }) =>
         setState({ status: "ready", bestBlock: best, finalizedBlock: finalized, error: null })
       )
-      .catch((err) => setState({ status: "error", bestBlock: null, finalizedBlock: null, error: String(err) }));
+      .catch((err) =>
+        setState({
+          status: "error",
+          bestBlock: null,
+          finalizedBlock: null,
+          error: toSafeErrorMessage(err, "[ChainContext] chain_status failed"),
+        })
+      );
 
     pollRef.current = setInterval(() => {
       invoke<{ best: number; finalized: number }>("chain_status")
@@ -42,7 +50,14 @@ export function ChainProvider({ children }: { children: ReactNode }) {
         // surface it as "error" instead of silently keeping the last-known "ready" state,
         // which would otherwise show a stale "Live, Block #N" indistinguishable from a
         // genuinely synced chain.
-        .catch((err) => setState({ status: "error", bestBlock: null, finalizedBlock: null, error: String(err) }));
+        .catch((err) =>
+          setState({
+            status: "error",
+            bestBlock: null,
+            finalizedBlock: null,
+            error: toSafeErrorMessage(err, "[ChainContext] chain_status poll failed"),
+          })
+        );
     }, 6000);
 
     return () => {

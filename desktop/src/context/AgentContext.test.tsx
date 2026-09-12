@@ -107,8 +107,8 @@ describe("AgentContext", () => {
     expect(screen.getByTestId("available")).toHaveTextContent("false");
   });
 
-  it("shows the raw error (and stays available) for a non-network error", async () => {
-    mockedInvoke.mockRejectedValue(new Error("Claude API rate limited"));
+  it("shows a generic, sanitized message (and stays available) for a non-network error — never the raw error text", async () => {
+    mockedInvoke.mockRejectedValue(new Error("Claude API rate limited: key sk-ant-abc123 over quota"));
     render(
       <AgentProvider>
         <TestHarness />
@@ -117,7 +117,9 @@ describe("AgentContext", () => {
 
     fireEvent.click(screen.getByText("ask"));
 
-    expect(await screen.findByTestId("msg-assistant")).toHaveTextContent(/rate limited/);
+    const msg = await screen.findByTestId("msg-assistant");
+    expect(msg).toHaveTextContent(/unexpected error/i);
+    expect(msg.textContent).not.toMatch(/rate limited|sk-ant/);
     expect(screen.getByTestId("available")).toHaveTextContent("true");
   });
 

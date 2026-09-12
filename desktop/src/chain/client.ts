@@ -9,6 +9,7 @@
 // `invoke("fetch_proposals")`-style command surface the pages already call.
 import { start, type Client as SmoldotClient, type Chain as SmoldotChain } from "smoldot";
 import { ApiPromise, ScProvider } from "@polkadot/api";
+import { toSafeErrorMessage } from "../lib/errors";
 
 /** Same hardcoded local dev node address the Rust backend has always used. */
 export const NODE_URL = "http://127.0.0.1:9944";
@@ -230,11 +231,16 @@ async function connect(): Promise<ApiPromise> {
     await withTimeout(api.isReady, "api.isReady");
     setState("ready");
     api.on("disconnected", () => setState("error", "light client disconnected"));
-    api.on("error", (e: unknown) => setState("error", e instanceof Error ? e.message : String(e)));
+    api.on("error", (e: unknown) =>
+      setState("error", toSafeErrorMessage(e, "[chain] light client runtime error")),
+    );
     return api;
   } catch (err) {
     apiPromise = null; // allow a fresh connect() attempt on the next getApi() call
-    const message = err instanceof Error ? err.message : String(err);
+    // Sanitize before it's stored (`setState`) or rethrown to `getApi()`'s callers (`queries.ts`
+    // -> `invoke()` -> `ChainContext.tsx`) — this is the one place a raw discoverWsBootnode/
+    // ScProvider/ApiPromise error is converted into what the rest of the app is allowed to see.
+    const message = toSafeErrorMessage(err, "[chain] connect() failed");
     setState("error", message);
     throw new Error(message);
   }

@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useState, ReactNode } from "react";
 import { invoke } from "../lib/invoke";
+import { toSafeErrorMessage } from "../lib/errors";
 
 export interface Message {
   role: "user" | "assistant";
@@ -53,7 +54,9 @@ export function AgentProvider({ children }: { children: ReactNode }) {
         setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
         setIsAvailable(true);
       } catch (err) {
-        const errMsg = String(err);
+        // Raw message text is only ever inspected here, server-side of the UI boundary, to
+        // decide which branch to take — it never reaches `content` below unsanitized.
+        const errMsg = err instanceof Error ? err.message : String(err);
         const isOffline = errMsg.includes("network") || errMsg.includes("connect") || errMsg.includes("timeout");
         setIsAvailable(!isOffline);
         setMessages((prev) => [
@@ -62,7 +65,11 @@ export function AgentProvider({ children }: { children: ReactNode }) {
             role: "assistant",
             content: isOffline
               ? "AI assistant is unavailable offline. Browse the full text of this item above."
-              : `Error: ${errMsg}`,
+              : toSafeErrorMessage(
+                  err,
+                  "[AgentContext] agent_ask failed",
+                  "The AI assistant hit an unexpected error. Please try again.",
+                ),
           },
         ]);
       } finally {
