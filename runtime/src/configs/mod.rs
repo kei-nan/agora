@@ -267,6 +267,7 @@ impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
 		_scheme_version: u32,
 		_oprf_pk_hashes: [[u8; 32]; 5],
 		_backing_commitment: [u8; 32],
+		_bound_account: [u8; 32],
 	) -> bool {
 		true
 	}
@@ -277,6 +278,7 @@ impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
 		_scheme_version: u32,
 		_oprf_pk_hashes: [[u8; 32]; 5],
 		_backing_commitment: [u8; 32],
+		_bound_account: [u8; 32],
 	) -> bool {
 		true
 	}
@@ -289,6 +291,7 @@ impl pallet_identity_zk::AnchorProofVerifier for PassthroughAnchorVerifier {
 		_new_scheme_version: u32,
 		_old_oprf_pk_hashes: [[u8; 32]; 5],
 		_new_oprf_pk_hashes: [[u8; 32]; 5],
+		_bound_account: [u8; 32],
 	) -> bool {
 		true
 	}
@@ -326,6 +329,11 @@ impl pallet_identity_zk::Config for Runtime {
 	type AdminOrigin = pallet_legislature::EnsureLegislatureMotion<Runtime>;
 	/// See `PassthroughAnchorVerifier`'s doc comment — no real OPRF verifier exists yet.
 	type AnchorVerifier = PassthroughAnchorVerifier;
+	/// Real byte-identity `AccountId` conversion, backing the `bound_account` identity-hijack
+	/// fix — not dev-mode-gated (see the impl's own doc comment): it performs no cryptographic
+	/// verification, just a structural conversion, so there is nothing for dev-mode to stub
+	/// out (same reasoning as `pallet_elections::Config::AccountIdToBytes`'s wiring).
+	type AccountIdToBytes = Runtime;
 	/// Placeholder cadence (~1 year — `DAYS` is block-time-derived, so this stays accurate
 	/// regardless of block time) pending the human decision flagged as open in HANDOFF log #67
 	/// (whether the liveness re-verification cadence should be shorter than the 4-year
@@ -417,6 +425,8 @@ impl pallet_identity_zk::Config for Runtime {
 	/// migration via `migrate-disclosure`; HANDOFF log #75/#76) — see
 	/// `crate::anchor_verifier::Poseidon2AnchorVerifier`'s doc comment for the full trail.
 	type AnchorVerifier = crate::anchor_verifier::Poseidon2AnchorVerifier;
+	/// See the `dev-mode` impl above for the same rationale.
+	type AccountIdToBytes = Runtime;
 	/// See the `dev-mode` impl above for the placeholder-cadence rationale.
 	type ReverificationPeriod = ConstU32<{ 365 * DAYS }>;
 	/// See the `dev-mode` impl above — same `EnsureActiveEmergency` wiring.
@@ -1172,6 +1182,19 @@ impl pallet_elections::CitizenChecker<AccountId> for Runtime {
 /// byte-identity conversion, not a placeholder — see `pallet_elections::AccountIdToBytes`'s doc
 /// comment for why it's a pluggable Config item rather than a bare trait bound.
 impl pallet_elections::AccountIdToBytes<AccountId> for Runtime {
+	fn to_bytes(who: &AccountId) -> [u8; 32] {
+		who.clone().into()
+	}
+}
+
+/// Same real byte-identity conversion as `pallet_elections::AccountIdToBytes` above, for
+/// `pallet_identity_zk::Config::AccountIdToBytes` — backs `register_citizen`/
+/// `reverify_citizen`/`recover_account`/`migrate_oprf_scheme`'s `bound_account` binding (see
+/// `pallet_identity_zk::AccountIdToBytes`'s doc comment). A separate `impl` block rather than
+/// a shared one, since the two traits live in different pallet crates and Rust's orphan rules
+/// require the impl to live where either the trait or the type is defined — `Runtime` is local
+/// here, so this is the natural place for both.
+impl pallet_identity_zk::AccountIdToBytes<AccountId> for Runtime {
 	fn to_bytes(who: &AccountId) -> [u8; 32] {
 		who.clone().into()
 	}

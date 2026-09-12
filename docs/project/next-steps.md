@@ -1,93 +1,95 @@
 # Next steps (remaining work)
 
-0. **[CRITICAL, UNFIXED, added 2026-09-11 by security review] `register_citizen`/`recover_account`
-   have no cryptographic binding between the submitted ZK proof and the submitting `AccountId` —
-   front-runnable citizenship theft / permanent identity hijack.** Both calls
-   (`pallets/pallet-identity/src/lib.rs`, `register_citizen` ~L1257-1344, `recover_account`
-   ~L2104-2226) verify `zk_proof`/`public_inputs` via `T::ZkVerifier::verify` and then check
-   `anchor`/`oprf_pk_hashes`/`backing_commitment` against the outer proof's `param_commitments`
-   via `T::AnchorVerifier` — but nowhere in that chain does anything constrain `who` (the
-   extrinsic's signer). `calculate_param_commitment` (`runtime/src/anchor_verifier.rs:134-151`,
-   mirrored by `circuits/oprf-identity-anchor/disclosure/src/main.nr`'s
-   `calculate_param_commitment`) hashes only `(anchor, scheme_version, oprf_pk_hashes,
-   backing_commitment)` — no account. Every one of those values, plus the full `zk_proof` bytes
-   and `public_inputs`, is ordinary plaintext in a signed-but-pending extrinsic, visible to
-   anyone watching the mempool (or just polling the mempool RPC). An attacker copies all of it
-   verbatim into their **own** signed extrinsic and gets it included first. For
-   `register_citizen` this steals the victim's citizenship slot (the victim's real registration
-   then fails with `NullifierAlreadyUsed`/`AnchorAlreadyUsed`). For `recover_account` — which has
-   no dispute window by design (see `docs/project/pallets/identity.md`'s `recover_account`
-   writeup) — this **permanently and irreversibly hijacks the victim's on-chain identity** to an
-   account the attacker controls, the instant the victim (or their client) submits a recovery.
-   This is not theoretical mempool-watching paranoia: it is the literal, intended visibility of a
-   public extrinsic pool.
-   - **What `pallet-elections` already does, and why it's real (not a false-positive "already
-     fixed"):** `register_as_delegate` (`pallets/pallet-elections/src/lib.rs:1009-1069`) takes a
-     `persona_account` argument and asserts `who == persona_account`
-     (`Error::PersonaAccountMismatch`, line 1027) — but the reason this is genuine security, and
-     not merely an unconstrained-argument comparison, is that `persona_account` is *also* folded
-     as a private witness into the `delegate-persona` circuit's own `param_commitment`
-     (`circuits/oprf-identity-anchor/delegate-persona/src/main.nr:99-121,131-199`, via
-     `pack_be_bytes_into_fields::<32,2,31>`, mirrored in Rust by
-     `anchor_verifier.rs::calculate_delegate_param_commitment` /
-     `account_to_field_limbs`, lines 266-353). That `param_commitment` is one of the outer
-     ZKPassport proof's *pairing-checked* public inputs (`param_commitments[5..5+D]`, per
-     `runtime/src/verifier.rs`'s documented layout). So swapping `persona_account` without
-     regenerating the whole proof changes the recomputed hash and it no longer matches any
-     verified `param_commitments[i]` slot — the copied proof is cryptographically tied to the
-     original prover's chosen account. Confirmed genuinely real, confirmed by reading the circuit
-     source directly, not assumed from the doc comments (which independently, correctly, describe
-     this as closing "the front-running attack").
-   - **Why identity's calls have no equivalent today:** `disclosure/src/main.nr`'s `main()`
-     (used by both `register_citizen` and `recover_account`/`reverify_citizen`) has **no account
-     parameter at all** — confirmed by reading its full signature
-     (`circuits/oprf-identity-anchor/disclosure/src/main.nr:100-112`). `backing_commitment`,
-     which *is* folded into `param_commitment` there, provides no defense: it is itself a plain
-     extrinsic argument, visible in the same pending transaction an attacker is copying, so it
-     copies over trivially — it was designed to prevent a caller substituting a *different*
-     claimed `backing_commitment` against a proof that didn't produce it, not to authenticate the
-     submitting account, and its own doc comment (`anchor_verifier.rs:61-74`) says as much
-     ("unlike the delegate-persona commitment, it binds to no specific target and carries no
-     front-running risk" — true for what it protects, irrelevant to this gap). Confirmed by grep
-     across `circuits/` that no `bound_account`/`dest_account`/`target_account` witness exists
-     anywhere in the identity-anchor circuit family.
-   - **Why this cannot be closed with a pallet/runtime-only patch, and must not be faked:**
-     adding a `bound_account: T::AccountId` argument to `register_citizen`/`recover_account` and
-     asserting `who == bound_account` — the shape of pallet-elections' *outer* check — would
-     provide **zero** real security on its own here, because unlike `persona_account`, nothing
-     in the actual verified proof commits to it: an attacker copying a victim's proof would
-     simply set `bound_account` to their own account in their copy and the check would trivially
-     "pass," since both `who` and `bound_account` are attacker-chosen values in the attacker's
-     own extrinsic. Implementing that alone would be worse than the current honestly-documented
-     gap — it would look fixed while providing no protection. A real fix needs the same pattern
-     `delegate-persona` uses: a new private witness (the destination `AccountId`, e.g. limb-packed
-     the same way) added to `disclosure/src/main.nr` (and its `../migrate-disclosure` sibling, for
-     `migrate_oprf_scheme`, which has the identical gap though out of this review's stated scope),
-     folded into a widened `param_commitment` preimage under a distinct proof-type tag (avoid
-     colliding with 200/201/202), with `runtime/src/anchor_verifier.rs::calculate_param_commitment`
-     /`check_registration_anchor` updated to recompute and check the same widened hash including
-     `who`, and `register_citizen`/`recover_account` updated to pass `who` through to that check
-     — exactly mirroring `check_delegate_persona`'s existing pattern, just applied to
-     `disclosure` instead of `delegate-persona`. Concretely this requires: (1) Noir circuit
-     changes to `disclosure` and `migrate-disclosure`, (2) recompiling and re-running `bb
-     write_vk` for both (a VK-breaking change — every citizen who already registered under the
-     old VK shape would need to be handled via a versioned transition, since the account-bound
-     and account-unbound circuit variants are not proof-compatible), (3) a new real end-to-end
-     `nargo`/`bb` test vector to replace the ones this session found in `anchor_verifier.rs`'s
-     test module (which only exercise the *unbound* shape and would need equivalents for the new
-     one), (4) Rust changes to `anchor_verifier.rs` and both call sites in
-     `pallets/pallet-identity/src/lib.rs`, with new regression tests ("a valid proof submitted by
-     a different signer than intended is rejected"), and (5) mobile-side (`zkProving.ts`) changes
-     to supply the new witness at proving time. None of this was attempted in this session — it
-     is real circuit-engineering work requiring the `nargo`/`bb` toolchain, not something safely
-     done blind. **Practically**, this gap is currently masked by, but does not depend on, the
-     standing OPRF-committee blocker (item 1 below): since no real committee exists, no genuine
-     end-to-end proof has ever been submitted to either call in this environment, so the exploit
-     is not live *today*. It must be fixed before either call is exposed to a real committee/real
-     users — do not treat the OPRF blocker as making this gap lower-priority; fix it in the same
-     wave as (or before) standing up a real committee, not after. See
-     `docs/project/pallets/identity.md`'s `register_citizen`/`recover_account` writeups for the
-     cross-referenced known-gap notes added alongside this entry.
+0. [DONE] **CRITICAL security fix: identity-hijack via copied extrinsic.**
+   `pallets/pallet-identity/src/lib.rs`'s `register_citizen` and `recover_account` verified a ZK
+   proof and checked `anchor`/`oprf_pk_hashes`/`backing_commitment` against the proof's
+   `param_commitments` — but nothing constrained `who` (the transaction's signer). All proof
+   material is plaintext in a pending signed extrinsic, so an attacker could copy a victim's
+   pending extrinsic verbatim into their own signed call and get it mined first: for
+   `register_citizen` this stole the victim's citizenship slot; for `recover_account` (no
+   dispute window by design) this would have **permanently and irreversibly hijacked the
+   victim's identity**. Fixed by mirroring `pallet_elections::register_as_delegate`'s pre-
+   existing `persona_account` pattern: `circuits/oprf-identity-anchor/disclosure` and
+   `.../migrate-disclosure` now fold a `bound_account: [u8; 32]` private witness into their own
+   `param_commitment` (tag `203`, 11-element hash, for `disclosure`; tag `204`, 17-element, for
+   `migrate-disclosure` — retiring tags `200`/`201` outright, no migration path needed since no
+   real citizen has ever registered on this chain — genesis seeds no identity data, no OPRF
+   committee has ever existed to produce a real proof). `pallets/pallet-identity/src/lib.rs`'s
+   `register_citizen`/`reverify_citizen`/`recover_account`/`migrate_oprf_scheme` each gained a
+   `bound_account: T::AccountId` argument with `ensure!(who == bound_account,
+   Error::BoundAccountMismatch)` (mirroring `register_as_delegate`'s `PersonaAccountMismatch`),
+   and pass its raw bytes (via a new `Config::AccountIdToBytes`, mirroring
+   `pallet_elections::AccountIdToBytes`) through to the widened `T::AnchorVerifier`.
+   `runtime/src/anchor_verifier.rs`'s `calculate_param_commitment`/`check_registration_anchor`
+   and `calculate_migration_param_commitment`/`check_migration_anchor` recompute and check the
+   widened commitment, reusing the existing `account_to_field_limbs` helper `check_delegate_persona`
+   already had.
+
+   **Precisely which calls were exploitable** (the correction to this item's original framing):
+   `register_citizen` and `recover_account` were genuinely exploitable — neither reads any
+   caller-keyed on-chain state before accepting the submitted tuple. `reverify_citizen` and
+   `migrate_oprf_scheme` were **not** independently exploitable the same way, even before this
+   fix: both read `old_anchor`/`scheme_version` from the *caller's own* on-chain `CitizenAnchor`
+   storage before ever consulting the proof, so a copied extrinsic resubmitted under an
+   attacker's account gets the attacker's own stored values substituted in, which won't match
+   the victim's embedded `param_commitment` unless the attacker already owns the victim's exact
+   anchor — a precondition that defeats the point of attacking in the first place. Both were
+   fixed anyway, for consistency: cheap once the circuit-level pattern exists, and
+   `reverify_citizen` shares `disclosure` (the same circuit `register_citizen` uses) so it
+   needed the widened call shape regardless.
+
+   **Real, run, verified end-to-end** — not just written: `nargo 1.0.0-beta.22`/`bb 5.0.0` are
+   installed and dependencies are cached offline in this environment, confirmed working before
+   starting. Both widened circuits compile (`nargo compile --workspace`) and the full circuit
+   workspace test suite passes (50 tests). Fresh real vectors generated via `nargo execute` +
+   `bb write_vk`/`bb prove`/`bb verify` for both `disclosure` (param_commitment
+   `0x2237299ee0cd8718848e31f976cf471aca278622d4043c38b39a1f022d778298`) and `migrate-disclosure`
+   (`0x1ac43a326cdeec097f8ec5ae560f87d7f279c7dd8913460acbd22db709da5a5f`), plus a companion real
+   run of the standalone `oprf_identity_anchor_migrate` circuit to recover `old_anchor`/
+   `new_anchor`/committee-key-hash values as direct public outputs, and one small-int edge-case
+   vector (all-zero pk-hashes) generated via a temporary Noir `#[test]` (added, run via `nargo
+   test --show-output`, captured, then removed — not fabricated). `runtime/src/anchor_verifier.rs`'s
+   Rust Poseidon2 recomputation matches every one of these real vectors byte-for-byte
+   (`calculate_param_commitment_matches_the_real_nargo_and_bb_vector`,
+   `calculate_migration_param_commitment_matches_the_real_nargo_and_bb_vector`, and the all-zero
+   variant), confirming the widened Rust-side hash construction is correct, not just internally
+   consistent.
+
+   **Test results, this session, in this environment**: `cargo test -p pallet-identity-zk`:
+   161/161 passing (159 pre-existing + 2 new regression tests —
+   `register_citizen_fails_when_signer_does_not_match_bound_account`,
+   `recover_account_fails_when_signer_does_not_match_bound_account`). `cargo test -p
+   agora-runtime`: 88/88 passing (39 in `anchor_verifier` alone, including the real-vector tests
+   above and `rejects_registration_with_a_swapped_bound_account`/
+   `rejects_migration_with_a_swapped_bound_account`, mirroring
+   `rejects_delegate_persona_with_a_swapped_persona_account`). `cargo check -p agora-runtime`
+   clean both with and without `--features dev-mode` (`PassthroughAnchorVerifier` updated to the
+   widened trait signature, still unconditionally accepting — dev-mode's whole point). Mobile:
+   `mobile/src/chain/identity.ts`'s four params interfaces
+   (`RegisterCitizenParams`/`ReverifyCitizenParams`/`MigrateOprfSchemeParams`/
+   `RecoverAccountParams`) gained `boundAccount: Uint8Array`, validated locally
+   (`assertBoundAccountMatchesSigner`, checked against `getSigningKeypair()`'s own
+   `keypair.publicKey` before ever touching the network) and threaded through as an explicit
+   extrinsic argument; `npx tsc --noEmit` clean, `npm test`: 361/361 passing (356 pre-existing +
+   5 new — 4 `boundAccount`-mismatch regression tests plus 1 for a pre-existing, unrelated
+   staleness gap this pass also fixed in passing: `RegisterCitizenParams`/`ReverifyCitizenParams`
+   were missing the already-required `backingCommitment` argument entirely, silently broken
+   against the live pallet signature since before this session — fixed alongside `boundAccount`
+   since both are positional arguments to the same extrinsic and couldn't be wired correctly in
+   isolation). `zkProving.ts` needed no changes — `proveRegistration`/`proveReverification`/
+   `proveMigration` are witness-agnostic pass-throughs whose `SubproofRequest.inputs` is a free-
+   form `Record<string, unknown>`, confirmed by reading the file directly. No code currently
+   assembles the `disclosure`/`migrate-disclosure` `SubproofRequest.inputs` for any of the three
+   register/reverify/recover calls (true before this session too, not something broken here) —
+   whoever builds that assembly point must supply `bound_account` as `keypair.publicKey` (raw
+   32-byte `Uint8Array`), per `RegisterCitizenParams`'s doc comment.
+
+   Deliberately out of scope, unchanged: `anchor`/`migrate` (the standalone, non-outer-embedded
+   circuits) — a separate, pre-existing, already-documented gap. The OPRF-committee blocker
+   (item 1 below) is unaffected either way — this fix closes a real, independently-exploitable
+   vulnerability class but does not touch, and is not gated on, that blocker. See
+   `docs/project/pallets/identity.md`'s "Fixed: identity-hijack via copied extrinsic" section for
+   the full accounting.
 
 1. [DONE, SUPERSEDED] **VK assets** — this originally referred to real 424-byte Rarimo Groth16
    BN254 VKs in `runtime/assets/`. Those are gone: the Rarimo→ZKPassport migration (log #65,

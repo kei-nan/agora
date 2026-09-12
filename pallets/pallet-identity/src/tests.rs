@@ -105,6 +105,7 @@ fn register(who: u64, nullifier: [u8; 32], anchor: [u8; 32]) {
         anchor,
         OPRF_PK_HASHES,
         BACKING_COMMITMENT,
+        who,
     ));
 }
 
@@ -143,6 +144,7 @@ fn register_citizen_works() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            1,
         ));
 
         assert_eq!(CitizenNullifier::<Test>::get(1), Some(NULLIFIER_A));
@@ -153,6 +155,44 @@ fn register_citizen_works() {
         System::assert_last_event(
             Event::CitizenRegistered { who: 1, nullifier: NULLIFIER_A }.into(),
         );
+    });
+}
+
+/// Regression test for the identity-hijack fix: a valid proof/public_inputs pair, submitted
+/// by a signer other than the `bound_account` the proof itself commits to, must be rejected —
+/// not silently accepted and registered to whichever account happened to sign the extrinsic.
+/// Before this fix, all proof material was plaintext in a pending signed extrinsic, so an
+/// attacker could copy a victim's pending `register_citizen` call verbatim into their own
+/// signed call and get it mined first, stealing the victim's citizenship slot. Account 2
+/// signs here while `bound_account` still claims account 1 — the real
+/// `Poseidon2AnchorVerifier` would reject this at the circuit-commitment-recomputation layer
+/// (see `runtime/src/anchor_verifier.rs`'s `rejects_registration_with_a_swapped_bound_account`
+/// for that layer's own coverage); this pallet-level test instead exercises the outer
+/// `who == bound_account` guard (`Error::BoundAccountMismatch`), which fires first and applies
+/// regardless of which `AnchorVerifier` is plugged in.
+#[test]
+fn register_citizen_fails_when_signer_does_not_match_bound_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        approve_committee_keys(0);
+
+        assert_noop!(
+            Identity::register_citizen(
+                RuntimeOrigin::signed(2),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_REGISTER_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+                1, // bound_account claims account 1, but account 2 is the actual signer.
+            ),
+            Error::<Test>::BoundAccountMismatch
+        );
+        // Nothing was registered under either account.
+        assert_eq!(CitizenNullifier::<Test>::get(1), None);
+        assert_eq!(CitizenNullifier::<Test>::get(2), None);
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), None);
     });
 }
 
@@ -185,6 +225,7 @@ fn register_citizen_fails_when_already_registered() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AlreadyRegistered
         );
@@ -208,6 +249,7 @@ fn register_citizen_fails_with_too_few_public_inputs() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -234,6 +276,7 @@ fn register_citizen_fails_when_service_scope_wrong() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidProofScope
         );
@@ -261,6 +304,7 @@ fn register_citizen_fails_when_service_subscope_wrong() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidProofScope
         );
@@ -286,6 +330,7 @@ fn reverify_citizen_fails_when_proof_scope_is_actually_register_citizens() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidProofScope
         );
@@ -311,6 +356,7 @@ fn recover_account_fails_when_proof_scope_is_actually_reverify_citizens() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::InvalidProofScope
         );
@@ -330,6 +376,7 @@ fn register_citizen_fails_when_issuer_not_allowed() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::IssuerNotAllowed
         );
@@ -350,6 +397,7 @@ fn register_citizen_fails_when_proof_invalid() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -373,6 +421,7 @@ fn register_citizen_fails_when_nullifier_already_used() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::NullifierAlreadyUsed
         );
@@ -398,6 +447,7 @@ fn register_citizen_fails_when_anchor_already_used() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::AnchorAlreadyUsed
         );
@@ -419,6 +469,7 @@ fn register_citizen_fails_when_committee_key_not_approved() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::CommitteeKeyMismatch
         );
@@ -442,6 +493,7 @@ fn register_citizen_fails_when_a_single_committee_key_is_wrong() {
                 ANCHOR_A,
                 wrong_hashes,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::CommitteeKeyMismatch
         );
@@ -467,6 +519,7 @@ fn register_citizen_fails_when_anchor_verification_fails() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidAnchorProof
         );
@@ -492,6 +545,7 @@ fn register_citizen_fails_when_proof_is_stale() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AnchorProofStale
         );
@@ -517,6 +571,7 @@ fn register_citizen_fails_when_proof_is_future_dated() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AnchorProofFuture
         );
@@ -543,6 +598,7 @@ fn register_citizen_fails_with_malformed_proof_date() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::MalformedProofDate
         );
@@ -565,6 +621,7 @@ fn register_citizen_fails_on_total_citizens_overflow() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::TotalCitizensOverflow
         );
@@ -1020,6 +1077,7 @@ fn reverify_citizen_works() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            1,
         ));
 
         // Deadline is pushed forward from "now" (5), not from the old deadline (11).
@@ -1042,6 +1100,7 @@ fn reverify_citizen_fails_when_not_registered() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::NotRegistered
         );
@@ -1064,6 +1123,7 @@ fn reverify_citizen_fails_when_anchor_does_not_match_on_file() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AnchorMismatch
         );
@@ -1085,6 +1145,7 @@ fn reverify_citizen_fails_with_invalid_zk_proof() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -1113,6 +1174,7 @@ fn reverify_citizen_fails_when_outer_proof_does_not_contain_anchor() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::InvalidReverificationProof
         );
@@ -1138,6 +1200,7 @@ fn reverify_citizen_fails_when_committee_key_not_approved() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::CommitteeKeyMismatch
         );
@@ -1162,6 +1225,7 @@ fn reverify_citizen_fails_when_proof_is_stale() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AnchorProofStale
         );
@@ -1187,6 +1251,7 @@ fn reverify_citizen_fails_when_proof_is_future_dated() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                1,
             ),
             Error::<Test>::AnchorProofFuture
         );
@@ -1226,6 +1291,7 @@ fn reverify_citizen_reactivates_a_lapsed_citizen() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            1,
         ));
         assert!(Identity::is_active_citizen(&1));
     });
@@ -1249,6 +1315,7 @@ fn migrate_oprf_scheme_works() {
             ANCHOR_B,
             OPRF_PK_HASHES,
             OPRF_PK_HASHES,
+            1,
         ));
 
         assert_eq!(CitizenAnchor::<Test>::get(1), Some((1, ANCHOR_B)));
@@ -1275,6 +1342,7 @@ fn migrate_oprf_scheme_fails_when_caller_not_registered() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::NotRegistered
         );
@@ -1302,6 +1370,7 @@ fn migrate_oprf_scheme_fails_when_new_anchor_already_used() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::NewAnchorAlreadyUsed
         );
@@ -1334,6 +1403,7 @@ fn migrate_oprf_scheme_does_not_leak_anchor_registry_membership_via_bogus_proof(
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -1356,6 +1426,7 @@ fn migrate_oprf_scheme_fails_with_invalid_zk_proof() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -1383,6 +1454,7 @@ fn migrate_oprf_scheme_fails_with_invalid_migration_proof() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::InvalidMigrationProof
         );
@@ -1405,6 +1477,7 @@ fn migrate_oprf_scheme_fails_when_new_committee_key_not_approved() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::CommitteeKeyMismatch
         );
@@ -1430,6 +1503,7 @@ fn migrate_oprf_scheme_fails_when_proof_is_stale() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 OPRF_PK_HASHES,
+                1,
             ),
             Error::<Test>::AnchorProofStale
         );
@@ -2534,6 +2608,7 @@ fn recover_account_rebinds_identity_storage_and_invalidates_old_account() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         // New account holds everything the old one used to.
@@ -2584,6 +2659,7 @@ fn recover_account_carries_over_self_declaration() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         assert!(SelfDeclaredSingleDocument::<Test>::get(2));
@@ -2607,6 +2683,7 @@ fn recover_account_preserves_suspension_across_the_rebind() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         // SuspendedNullifiers is keyed by nullifier, not AccountId — the suspension follows
@@ -2632,6 +2709,7 @@ fn recover_account_fails_for_a_nullifier_that_was_never_registered() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::NoExistingRegistrationForNullifier
         );
@@ -2654,6 +2732,7 @@ fn recover_account_fails_when_anchor_does_not_match_on_file() {
                 ANCHOR_B,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::AnchorMismatch
         );
@@ -2679,9 +2758,49 @@ fn recover_account_fails_when_target_account_is_already_registered() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::AlreadyRegistered
         );
+    });
+}
+
+/// Regression test for the identity-hijack fix, on the highest-stakes call it applies to:
+/// `recover_account` has no dispute window by design (see that call's own doc comment), so
+/// before this fix an attacker who observed a victim's pending `recover_account` extrinsic
+/// could copy it verbatim into their own signed call, get it mined first, and permanently and
+/// irreversibly hijack the victim's identity. Here account 3 signs while claiming
+/// `bound_account` = account 4 (an account 3 does not control) — a clean signer/bound_account
+/// mismatch, exercising the outer `who == bound_account` guard (`Error::BoundAccountMismatch`)
+/// the same way `register_citizen_fails_when_signer_does_not_match_bound_account` does above.
+/// The real `Poseidon2AnchorVerifier` would additionally reject a genuinely copied proof at
+/// the circuit-commitment-recomputation layer regardless of what this outer check catches
+/// (see `runtime/src/anchor_verifier.rs`'s own real-vector-based coverage of that layer).
+#[test]
+fn recover_account_fails_when_signer_does_not_match_bound_account() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        allow_root();
+        register(1, NULLIFIER_A, ANCHOR_A);
+
+        assert_noop!(
+            Identity::recover_account(
+                RuntimeOrigin::signed(3),
+                valid_proof(),
+                public_inputs(NULLIFIER_A, ROOT, ANCHOR_A, AGORA_IDENTITY_RECOVER_SUBSCOPE),
+                ANCHOR_A,
+                OPRF_PK_HASHES,
+                BACKING_COMMITMENT,
+                4, // bound_account claims account 4, but account 3 is the actual signer.
+            ),
+            Error::<Test>::BoundAccountMismatch
+        );
+        // Citizen 1's identity storage is untouched -- no hijack occurred under either
+        // account 3 or account 4.
+        assert_eq!(CitizenNullifier::<Test>::get(1), Some(NULLIFIER_A));
+        assert_eq!(CitizenNullifier::<Test>::get(3), None);
+        assert_eq!(CitizenNullifier::<Test>::get(4), None);
+        assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(1));
     });
 }
 
@@ -2700,6 +2819,7 @@ fn recover_account_fails_with_invalid_zk_proof() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::InvalidZKProof
         );
@@ -2721,6 +2841,7 @@ fn recover_account_fails_twice_within_the_cooldown() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(LastRecoveryBlock::<Test>::get(NULLIFIER_A), Some(5));
 
@@ -2735,6 +2856,7 @@ fn recover_account_fails_twice_within_the_cooldown() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                3,
             ),
             Error::<Test>::RecoveryCooldownActive
         );
@@ -2758,6 +2880,7 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         // Exactly at the boundary (last + MinBlocksBetweenRecoveries) recovery is allowed again.
@@ -2769,6 +2892,7 @@ fn recover_account_succeeds_again_once_the_cooldown_has_passed() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            3,
         ));
 
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(3));
@@ -2800,6 +2924,7 @@ fn same_citizen_is_true_immediately_after_a_single_recovery() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         // The old (now-vacated) account and the new account resolve to the same citizen...
@@ -2830,6 +2955,7 @@ fn same_citizen_resolves_across_a_chain_of_two_recoveries() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
 
         System::set_block_number(10);
@@ -2840,6 +2966,7 @@ fn same_citizen_resolves_across_a_chain_of_two_recoveries() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            3,
         ));
 
         // Both the original account and the intermediate hop resolve to the final owner.
@@ -2896,6 +3023,7 @@ fn recover_account_fails_when_old_account_has_nonzero_balance() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedNonzeroBalance
         );
@@ -2911,6 +3039,7 @@ fn recover_account_fails_when_old_account_has_nonzero_balance() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -2932,6 +3061,7 @@ fn recover_account_fails_when_old_account_is_registered_delegate() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedActiveDelegate
         );
@@ -2946,6 +3076,7 @@ fn recover_account_fails_when_old_account_is_registered_delegate() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -2967,6 +3098,7 @@ fn recover_account_fails_when_old_account_holds_legislature_seat() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedLegislatureSeat
         );
@@ -2981,6 +3113,7 @@ fn recover_account_fails_when_old_account_holds_legislature_seat() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -3002,6 +3135,7 @@ fn recover_account_fails_when_old_account_holds_cabinet_role() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedCabinetRole
         );
@@ -3016,6 +3150,7 @@ fn recover_account_fails_when_old_account_holds_cabinet_role() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -3041,6 +3176,7 @@ fn recover_account_fails_when_old_account_has_open_referendum_vote() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedOpenReferendumVote
         );
@@ -3056,6 +3192,7 @@ fn recover_account_fails_when_old_account_has_open_referendum_vote() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -3077,6 +3214,7 @@ fn recover_account_fails_when_old_account_has_unclaimed_current_epoch_budget() {
                 ANCHOR_A,
                 OPRF_PK_HASHES,
                 BACKING_COMMITMENT,
+                2,
             ),
             Error::<Test>::RecoveryBlockedUnclaimedEpochBudget
         );
@@ -3092,6 +3230,7 @@ fn recover_account_fails_when_old_account_has_unclaimed_current_epoch_budget() {
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -3116,6 +3255,7 @@ fn recover_account_succeeds_when_old_account_holds_none_of_the_blocking_state() 
             ANCHOR_A,
             OPRF_PK_HASHES,
             BACKING_COMMITMENT,
+            2,
         ));
         assert_eq!(NullifierRegistry::<Test>::get(NULLIFIER_A), Some(2));
     });
@@ -3142,6 +3282,7 @@ fn register_with_backing(who: u64, nullifier: [u8; 32], anchor: [u8; 32], backin
         anchor,
         OPRF_PK_HASHES,
         backing_commitment,
+        who,
     ));
 }
 

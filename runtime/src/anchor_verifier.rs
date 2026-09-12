@@ -61,17 +61,66 @@
 //! # `backing_commitment`
 //!
 //! [`calculate_param_commitment`]/[`check_registration_anchor`] additionally recompute and
-//! check a `backing_commitment` value, folded into the same 8-field `param_commitment` preimage
-//! (widened to 9 fields) `anchor`/`scheme_version`/`oprf_pk_hashes` already occupy — no new
-//! proof-type tag, since (unlike the delegate-persona commitment) `backing_commitment` binds to
-//! no specific target and carries no front-running risk. It is the Poseidon2 hash of a private
-//! `backing_root_secret` the citizen's wallet derives via the same committee-OPRF-blinding
-//! construction as `anchor` itself (see
+//! check a `backing_commitment` value, folded into the same `param_commitment` preimage
+//! `anchor`/`scheme_version`/`oprf_pk_hashes`/`bound_account` occupy — no new proof-type tag of
+//! its own, since (unlike the delegate-persona commitment, and unlike `bound_account` below) it
+//! binds to no specific target/delegate and carries no front-running risk. It is the Poseidon2
+//! hash of a private `backing_root_secret` the citizen's wallet derives via the same
+//! committee-OPRF-blinding construction as `anchor` itself (see
 //! `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s `derive_backing_root_term`/
 //! `derive_backing_commitment`) — safe to store on-chain per citizen
 //! (`pallet_identity_zk::BackingCommitment`) as a future Merkle-tree leaf, because unlike a
 //! bare hash of `identity_input` it does not admit the personal-number brute-force attack a
 //! low-entropy preimage would.
+//!
+//! # `bound_account` — the identity-hijack fix
+//!
+//! **The problem this closes.** `register_citizen` and `recover_account` verify a ZK proof and
+//! check `anchor`/`oprf_pk_hashes`/`backing_commitment` against the proof's `param_commitments`
+//! — but until this fix, nothing constrained `who` (the transaction's signer). All proof
+//! material is plaintext in a pending signed extrinsic, so an attacker could copy a victim's
+//! pending extrinsic verbatim into their own signed call and get it mined first: for
+//! `register_citizen` this stole the victim's citizenship slot; for `recover_account` (which
+//! has no dispute window, by design — see that call's own doc comment) this would have
+//! **permanently and irreversibly hijacked the victim's identity**.
+//!
+//! **The fix.** `disclosure`/`migrate-disclosure` (`circuits/oprf-identity-anchor/`) now fold a
+//! `bound_account: [u8; 32]` private witness into their own `param_commitment`, exactly the way
+//! `pallet_elections::register_as_delegate`'s `delegate-persona` circuit already folds in
+//! `persona_account` (see that circuit's doc comment, and
+//! [`calculate_delegate_param_commitment`]/[`check_delegate_persona`] below, for the pattern
+//! this mirrors). Because `param_commitment` is itself one of the outer proof's
+//! cryptographically-verified public inputs, a copied proof resubmitted against a different
+//! `bound_account` no longer recomputes to any `param_commitments[i]` the outer proof exposes —
+//! [`check_registration_anchor`]/[`check_migration_anchor`] below fail even though the outer
+//! proof's own pairing check still passes. `pallets/pallet-identity/src/lib.rs`'s
+//! `register_citizen`/`reverify_citizen`/`recover_account`/`migrate_oprf_scheme` each take a
+//! `bound_account: T::AccountId` argument and assert `who == bound_account` before calling into
+//! this module (a redundant-but-good outer check on top of the real circuit-level binding,
+//! mirroring `register_as_delegate`'s `ensure!(who == persona_account, ...)`), and pass
+//! `bound_account`'s raw bytes through to the widened `T::AnchorVerifier` calls below.
+//!
+//! **Exploitability, precisely.** `register_citizen` and `recover_account` were genuinely
+//! exploitable this way: neither reads any caller-keyed on-chain state before accepting the
+//! submitted `anchor`/`oprf_pk_hashes`/`backing_commitment` tuple, so a copied extrinsic
+//! resubmitted under an attacker's account would have passed every check. `reverify_citizen`
+//! and `migrate_oprf_scheme` were **not** independently exploitable the same way, even before
+//! this fix: both read `old_anchor`/`scheme_version` from the **caller's own** on-chain
+//! `CitizenAnchor` storage first (see `pallets/pallet-identity/src/lib.rs`), so a copied
+//! extrinsic resubmitted under an attacker's account gets the attacker's own stored values
+//! substituted in, which won't match the victim's embedded `param_commitment` unless the
+//! attacker already owns the victim's exact anchor — a precondition that defeats the point of
+//! attacking in the first place. The fix is applied to those two calls anyway, for consistency
+//! (cheap once the circuit-level pattern exists for `register_citizen`/`recover_account`, and
+//! `reverify_citizen` shares `disclosure` — the same circuit `register_citizen` uses — so it
+//! needed the widened call shape regardless).
+//!
+//! Proof-type tags 200 (unbound registration/reverification, 9-element) and 201 (unbound
+//! migration, 15-element) are retired outright in favor of 203/204 — not run in parallel with
+//! them — since no real citizen has ever registered on this chain (no OPRF committee has ever
+//! existed to produce a real proof; see CLAUDE.md), so there is no migration path to preserve.
+//! See `circuits/oprf-identity-anchor/disclosure/src/main.nr` and
+//! `.../migrate-disclosure/src/main.nr` for the circuit-side half of this.
 
 #![cfg(not(feature = "dev-mode"))]
 
@@ -97,17 +146,19 @@ fn is_canonical_fr(value: &[u8; 32]) -> bool {
 /// `crate::verifier::FIXED_PUBLIC_INPUT_COUNT` for the same reason as the modulus above.
 const FIXED_PUBLIC_INPUT_COUNT: usize = 8;
 
-/// Agora's proof-type tag for the registration/reverification parameter commitment — must
-/// match `circuits/oprf-identity-anchor/disclosure/src/main.nr`'s
-/// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR`.
-const PROOF_TYPE_AGORA_IDENTITY_ANCHOR: u8 = 200;
+/// Agora's proof-type tag for the **account-bound** registration/reverification parameter
+/// commitment — must match `circuits/oprf-identity-anchor/disclosure/src/main.nr`'s
+/// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND`. Supersedes the retired, unbound tag 200 outright
+/// (see this module's top-of-file docs on `bound_account` for why there is no parallel unbound
+/// path to maintain).
+const PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND: u8 = 203;
 
-/// Agora's proof-type tag for the migration parameter commitment — must match
-/// `circuits/oprf-identity-anchor/migrate-disclosure/src/main.nr`'s
-/// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE`. Deliberately distinct from the registration
-/// tag above so a migration commitment (15 elements) can never be confused with a
-/// registration one (8 elements).
-const PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE: u8 = 201;
+/// Agora's proof-type tag for the **account-bound** migration parameter commitment — must
+/// match `circuits/oprf-identity-anchor/migrate-disclosure/src/main.nr`'s
+/// `PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND`. Deliberately distinct from
+/// [`PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND`] so a migration commitment (17 elements) can never
+/// be confused with a registration one (11 elements). Supersedes the retired, unbound tag 201.
+const PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND: u8 = 204;
 
 /// Number of OPRF committees — must match
 /// `circuits/oprf-identity-anchor/lib/identity-anchor`'s `NUM_COMMITTEES` (changelog entry
@@ -120,45 +171,64 @@ fn u32_to_field_bytes(value: u32) -> [u8; 32] {
     bytes
 }
 
-/// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR, anchor, scheme_version, oprf_pk_hashes[0],
-/// .., oprf_pk_hashes[4], backing_commitment)` — a 9-element hash, matching
-/// `disclosure::calculate_param_commitment` field-for-field and argument-for-argument.
-///
-/// `backing_commitment` was folded into this preimage (widening it from 8 to 9 elements) rather
-/// than given its own proof-type tag, because — unlike the delegate-persona commitment — it
-/// binds to no specific target/delegate at proof time, so there is no front-running risk a
-/// dedicated tag would need to close. See
-/// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s `derive_backing_root_term`
-/// doc comment for the full derivation and why reusing the anchor's own per-committee
-/// `oprf_output_i` values for it is safe.
+/// Splits a raw 32-byte value (an `AccountId`) into the same two BN254-field-safe limbs every
+/// account-binding circuit below derives via `utils::pack_be_bytes_into_fields::<32, 2,
+/// 31>(account)` — `(lo, hi)` where `hi` holds `account[0]` alone (so it is always canonical: a
+/// single byte is always `< r`) and `lo` holds `account[1..32]` (31 bytes, also always
+/// canonical: 31 bytes is 248 bits, strictly below BN254's ~254-bit modulus). An arbitrary
+/// 32-byte value cannot always be represented as one canonical `Field` on its own — BN254's
+/// modulus is a little under `2^254` — hence the split, matching how `SaltedValue<[u8;
+/// N]>::get_hash` in ZKPassport's own `utils` crate already packs arbitrary byte arrays for
+/// Poseidon2 hashing. Shared by [`calculate_param_commitment`],
+/// [`calculate_migration_param_commitment`] and [`calculate_delegate_param_commitment`] — all
+/// three account-binding circuits use the identical packing.
+fn account_to_field_limbs(account: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mut hi = [0u8; 32];
+    hi[31] = account[0];
+    let mut lo = [0u8; 32];
+    lo[1..32].copy_from_slice(&account[1..32]);
+    (lo, hi)
+}
+
+/// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND, anchor, scheme_version, oprf_pk_hashes[0],
+/// .., oprf_pk_hashes[4], backing_commitment, bound_account_lo, bound_account_hi)` — an
+/// 11-element hash, matching `disclosure::calculate_param_commitment` field-for-field and
+/// argument-for-argument (including the `[lo, hi]` limb order — see
+/// [`account_to_field_limbs`]).
 pub fn calculate_param_commitment(
     anchor: [u8; 32],
     scheme_version: u32,
     oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
     backing_commitment: [u8; 32],
+    bound_account: [u8; 32],
 ) -> [u8; 32] {
     let mut tag = [0u8; 32];
-    tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR;
+    tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND;
+    let (lo, hi) = account_to_field_limbs(bound_account);
 
-    let mut input: Vec<[u8; 32]> = Vec::with_capacity(4 + NUM_COMMITTEES);
+    let mut input: Vec<[u8; 32]> = Vec::with_capacity(6 + NUM_COMMITTEES);
     input.push(tag);
     input.push(anchor);
     input.push(u32_to_field_bytes(scheme_version));
     input.extend_from_slice(&oprf_pk_hashes);
     input.push(backing_commitment);
+    input.push(lo);
+    input.push(hi);
 
     poseidon2_bn254::hash_bytes(&input)
 }
 
 /// The pure, storage-free half of the registration-anchor check — see the module docs for
 /// what this does and does not cover. `outer_public_inputs` is the same `public_inputs`
-/// array `register_citizen` already validated via `T::ZkVerifier::verify`.
+/// array `register_citizen` already validated via `T::ZkVerifier::verify`. `bound_account` is
+/// the account this proof authorizes to submit it — see the module's `bound_account` docs.
 pub fn check_registration_anchor(
     outer_public_inputs: &[[u8; 32]],
     anchor: [u8; 32],
     scheme_version: u32,
     oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
     backing_commitment: [u8; 32],
+    bound_account: [u8; 32],
 ) -> bool {
     // A `count_N` outer proof always exposes at least one param_commitment (register_citizen
     // already enforces public_inputs.len() >= 9, but this function is also unit-tested
@@ -178,19 +248,31 @@ pub fn check_registration_anchor(
     if !is_canonical_fr(&backing_commitment) {
         return false;
     }
+    // Defense-in-depth, mirroring check_delegate_persona's own zero-account rejection: the
+    // circuit already asserts bound_account != 0, so a genuine proof can never carry a zero
+    // value here, but rejecting it on the Rust side too costs nothing and removes any reliance
+    // on that circuit-side assertion alone.
+    if bound_account == [0u8; 32] {
+        return false;
+    }
 
     // param_commitments occupy indices 5..len-3 — see crate::verifier's module docs for the
     // full outer-circuit public-input table this mirrors.
     let param_commitments = &outer_public_inputs[5..outer_public_inputs.len() - 3];
 
-    let recomputed =
-        calculate_param_commitment(anchor, scheme_version, oprf_pk_hashes, backing_commitment);
+    let recomputed = calculate_param_commitment(
+        anchor,
+        scheme_version,
+        oprf_pk_hashes,
+        backing_commitment,
+        bound_account,
+    );
     param_commitments.iter().any(|commitment| *commitment == recomputed)
 }
 
-/// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE, old_anchor, new_anchor,
-/// old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5])`
-/// — a 15-element hash, matching
+/// `Poseidon2(PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND, old_anchor, new_anchor,
+/// old_scheme_version, new_scheme_version, old_oprf_pk_hashes[0..5], new_oprf_pk_hashes[0..5],
+/// bound_account_lo, bound_account_hi)` — a 17-element hash, matching
 /// `migrate_disclosure::calculate_param_commitment` field-for-field and argument-for-argument.
 pub fn calculate_migration_param_commitment(
     old_anchor: [u8; 32],
@@ -199,11 +281,13 @@ pub fn calculate_migration_param_commitment(
     new_scheme_version: u32,
     old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
     new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    bound_account: [u8; 32],
 ) -> [u8; 32] {
     let mut tag = [0u8; 32];
-    tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE;
+    tag[31] = PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND;
+    let (lo, hi) = account_to_field_limbs(bound_account);
 
-    let mut input: Vec<[u8; 32]> = Vec::with_capacity(5 + 2 * NUM_COMMITTEES);
+    let mut input: Vec<[u8; 32]> = Vec::with_capacity(7 + 2 * NUM_COMMITTEES);
     input.push(tag);
     input.push(old_anchor);
     input.push(new_anchor);
@@ -211,6 +295,8 @@ pub fn calculate_migration_param_commitment(
     input.push(u32_to_field_bytes(new_scheme_version));
     input.extend_from_slice(&old_oprf_pk_hashes);
     input.extend_from_slice(&new_oprf_pk_hashes);
+    input.push(lo);
+    input.push(hi);
 
     poseidon2_bn254::hash_bytes(&input)
 }
@@ -227,6 +313,7 @@ pub fn check_migration_anchor(
     new_scheme_version: u32,
     old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
     new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+    bound_account: [u8; 32],
 ) -> bool {
     if outer_public_inputs.len() <= FIXED_PUBLIC_INPUT_COUNT {
         return false;
@@ -240,6 +327,9 @@ pub fn check_migration_anchor(
             return false;
         }
     }
+    if bound_account == [0u8; 32] {
+        return false;
+    }
 
     let param_commitments = &outer_public_inputs[5..outer_public_inputs.len() - 3];
 
@@ -250,6 +340,7 @@ pub fn check_migration_anchor(
         new_scheme_version,
         old_oprf_pk_hashes,
         new_oprf_pk_hashes,
+        bound_account,
     );
     param_commitments.iter().any(|commitment| *commitment == recomputed)
 }
@@ -257,28 +348,13 @@ pub fn check_migration_anchor(
 /// Agora's proof-type tag for the delegate-persona parameter commitment — must match
 /// `circuits/oprf-identity-anchor/delegate-persona/src/main.nr`'s
 /// `PROOF_TYPE_AGORA_DELEGATE_PERSONA`. Deliberately distinct from both the registration tag
-/// (200) and the migration tag (201) — see that circuit's module docs for the full rationale
-/// and, more importantly, `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s
+/// ([`PROOF_TYPE_AGORA_IDENTITY_ANCHOR_BOUND`], 203) and the migration tag
+/// ([`PROOF_TYPE_AGORA_IDENTITY_ANCHOR_MIGRATE_BOUND`], 204) — see that circuit's module docs
+/// for the full rationale and, more importantly,
+/// `circuits/oprf-identity-anchor/lib/identity-anchor/src/lib.nr`'s
 /// `derive_delegate_identity_input` doc comment for why delegate-persona creation is backed by
 /// a genuinely separate OPRF query rather than a reuse of the registration anchor's evaluation.
 const PROOF_TYPE_AGORA_DELEGATE_PERSONA: u8 = 202;
-
-/// Splits a raw 32-byte value (an `AccountId`) into the same two BN254-field-safe limbs
-/// `delegate-persona/src/main.nr` derives via `utils::pack_be_bytes_into_fields::<32, 2,
-/// 31>(persona_account)` — `(lo, hi)` where `hi` holds `account[0]` alone (so it is always
-/// canonical: a single byte is always `< r`) and `lo` holds `account[1..32]` (31 bytes, also
-/// always canonical: 31 bytes is 248 bits, strictly below BN254's ~254-bit modulus). An
-/// arbitrary 32-byte value cannot always be represented as one canonical `Field` on its own —
-/// BN254's modulus is a little under `2^254` — hence the split, matching how
-/// `SaltedValue<[u8; N]>::get_hash` in ZKPassport's own `utils` crate already packs arbitrary
-/// byte arrays for Poseidon2 hashing.
-fn account_to_field_limbs(account: [u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let mut hi = [0u8; 32];
-    hi[31] = account[0];
-    let mut lo = [0u8; 32];
-    lo[1..32].copy_from_slice(&account[1..32]);
-    (lo, hi)
-}
 
 /// `Poseidon2(PROOF_TYPE_AGORA_DELEGATE_PERSONA, delegate_persona_id, persona_account_lo,
 /// persona_account_hi, scheme_version, oprf_pk_hashes[0..5])` — a 10-element hash, matching
@@ -366,6 +442,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         scheme_version: u32,
         oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
         backing_commitment: [u8; 32],
+        bound_account: [u8; 32],
     ) -> bool {
         check_registration_anchor(
             outer_public_inputs,
@@ -373,6 +450,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
             scheme_version,
             oprf_pk_hashes,
             backing_commitment,
+            bound_account,
         )
     }
 
@@ -382,6 +460,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         scheme_version: u32,
         oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
         backing_commitment: [u8; 32],
+        bound_account: [u8; 32],
     ) -> bool {
         check_registration_anchor(
             outer_public_inputs,
@@ -389,6 +468,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
             scheme_version,
             oprf_pk_hashes,
             backing_commitment,
+            bound_account,
         )
     }
 
@@ -400,6 +480,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
         new_scheme_version: u32,
         old_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
         new_oprf_pk_hashes: [[u8; 32]; NUM_COMMITTEES],
+        bound_account: [u8; 32],
     ) -> bool {
         check_migration_anchor(
             outer_public_inputs,
@@ -409,6 +490,7 @@ impl pallet_identity_zk::AnchorProofVerifier for Poseidon2AnchorVerifier {
             new_scheme_version,
             old_oprf_pk_hashes,
             new_oprf_pk_hashes,
+            bound_account,
         )
     }
 }
@@ -453,6 +535,15 @@ mod tests {
         v
     }
 
+    fn hex32(h: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let bytes = (0..32)
+            .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap())
+            .collect::<Vec<u8>>();
+        out.copy_from_slice(&bytes);
+        out
+    }
+
     const ANCHOR: [u8; 32] = {
         let mut b = [0u8; 32];
         b[31] = 42;
@@ -473,11 +564,26 @@ mod tests {
         b[31] = 77;
         b
     };
+    /// Arbitrary, non-zero fixture account for the small-int mutation-style tests below —
+    /// deliberately distinct byte pattern from `delegate_persona_account()`'s `[1, 2, .., 32]`
+    /// (used by the real-vector tests further down) so a test bug that accidentally swaps the
+    /// two fixtures would be caught rather than silently passing.
+    const BOUND_ACCOUNT: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[0] = 9;
+        b[31] = 1;
+        b
+    };
 
     #[test]
     fn accepts_a_correctly_recomputed_commitment() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(check_registration_anchor(
             &public_inputs,
@@ -485,6 +591,7 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -493,8 +600,13 @@ mod tests {
         // Two disclosure subproofs (D = 2): param_commitments at indices 5 and 6. The
         // anchor's commitment is the *second* one — check_registration_anchor must not
         // assume it's always index 5.
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let mut public_inputs = alloc::vec![[0u8; 32]; 10];
         public_inputs[5] = [9u8; 32]; // an unrelated disclosure subproof's commitment
         public_inputs[6] = commitment;
@@ -504,13 +616,19 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
     #[test]
     fn rejects_wrong_anchor() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         let mut wrong_anchor = ANCHOR;
         wrong_anchor[0] ^= 1;
@@ -520,13 +638,19 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
     #[test]
     fn rejects_wrong_scheme_version() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(!check_registration_anchor(
             &public_inputs,
@@ -534,13 +658,19 @@ mod tests {
             SCHEME_VERSION + 1,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
     #[test]
     fn rejects_a_single_mutated_pk_hash() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         for i in 0..NUM_COMMITTEES {
             let mut mutated = PK_HASHES;
@@ -551,7 +681,8 @@ mod tests {
                     ANCHOR,
                     SCHEME_VERSION,
                     mutated,
-                    BACKING_COMMITMENT
+                    BACKING_COMMITMENT,
+                    BOUND_ACCOUNT,
                 ),
                 "mutating pk_hash slot {i} must be rejected",
             );
@@ -563,8 +694,13 @@ mod tests {
         // The whole point of folding backing_commitment into param_commitment: a caller cannot
         // resubmit a valid proof/public_inputs paired with a different claimed
         // backing_commitment and have it silently accepted.
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         let mut wrong = BACKING_COMMITMENT;
         wrong[0] ^= 1;
@@ -574,6 +710,54 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             wrong,
+            BOUND_ACCOUNT,
+        ));
+    }
+
+    /// The whole point of folding `bound_account` into `param_commitment` (the identity-hijack
+    /// fix this module's top-of-file docs describe): copying a victim's valid proof and
+    /// resubmitting it against a *different* claimed `bound_account` must fail, not silently
+    /// bind the proof to the new account. Mirrors
+    /// `rejects_delegate_persona_with_a_swapped_persona_account` below.
+    #[test]
+    fn rejects_registration_with_a_swapped_bound_account() {
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        let mut other_account = BOUND_ACCOUNT;
+        other_account[1] ^= 1;
+        assert!(!check_registration_anchor(
+            &public_inputs,
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            other_account,
+        ));
+    }
+
+    #[test]
+    fn rejects_registration_with_zero_bound_account() {
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(!check_registration_anchor(
+            &public_inputs,
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            [0u8; 32],
         ));
     }
 
@@ -586,13 +770,19 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
     #[test]
     fn rejects_non_canonical_anchor() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(!check_registration_anchor(
             &public_inputs,
@@ -600,13 +790,19 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
     }
 
     #[test]
     fn rejects_non_canonical_backing_commitment() {
-        let commitment =
-            calculate_param_commitment(ANCHOR, SCHEME_VERSION, PK_HASHES, BACKING_COMMITMENT);
+        let commitment = calculate_param_commitment(
+            ANCHOR,
+            SCHEME_VERSION,
+            PK_HASHES,
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
+        );
         let public_inputs = outer_public_inputs_with_commitment(commitment);
         assert!(!check_registration_anchor(
             &public_inputs,
@@ -614,6 +810,7 @@ mod tests {
             SCHEME_VERSION,
             PK_HASHES,
             BN254_FR_MODULUS_BE,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -624,56 +821,62 @@ mod tests {
             ANCHOR,
             SCHEME_VERSION,
             PK_HASHES,
-            BACKING_COMMITMENT
+            BACKING_COMMITMENT,
+            BOUND_ACCOUNT,
         ));
+    }
+
+    /// Real end-to-end vector, generated fresh for the `bound_account` widening: `nargo execute
+    /// --package oprf_identity_anchor_disclosure` against `disclosure/Prover.toml` (a
+    /// DEV-ONLY committee-simulator-backed fixture, with `bound_account = [1, 2, .., 32]`
+    /// added), followed by a real `bb write_vk`/`bb prove`/`bb verify` round-trip that accepted
+    /// the resulting proof (`target/bb-disclosure/public_inputs` in
+    /// `circuits/oprf-identity-anchor/`).
+    ///
+    /// `anchor` and `backing_commitment` are unchanged from the pre-widening vector (confirmed
+    /// byte-identical — `bound_account` does not affect their derivation, only
+    /// `param_commitment`'s own preimage), read off `oprf_identity_anchor_migrate`'s own
+    /// `old_anchor` output and cross-checked identical to what `disclosure`'s witness solves
+    /// internally, since both share the same identity_input/oprf_proofs. `oprf_pk_hashes` are
+    /// likewise unchanged. `param_commitment` is the real, freshly-regenerated `bb`-produced
+    /// public output for the widened (tag-203, 11-element) shape — not the old tag-200 value.
+    fn real_disclosure_anchor() -> [u8; 32] {
+        hex32("0beff326e082ed177b5ad64c97336db7af826a90a072cdb18f65de2ac6d5326f")
+    }
+
+    fn real_disclosure_backing_commitment() -> [u8; 32] {
+        hex32("221383d2793ff2aece98eeb39646dc8350d535ff862ffbb17ffa7eb137990571")
+    }
+
+    fn real_disclosure_param_commitment() -> [u8; 32] {
+        hex32("2237299ee0cd8718848e31f976cf471aca278622d4043c38b39a1f022d778298")
     }
 
     #[test]
     fn calculate_param_commitment_matches_the_real_nargo_and_bb_vector() {
-        // Real end-to-end vector: `nargo execute --package oprf_identity_anchor_disclosure`
-        // against `disclosure/Prover.toml` (a DEV-ONLY committee-simulator-backed fixture —
-        // reuses the same 5-committee proofs as `anchor/Prover.toml`, confirmed byte-identical
-        // by diffing the two files), followed by a real `bb write_vk`/`bb prove`/`bb verify`
-        // round-trip that accepted the resulting proof.
-        //
-        // `anchor` and `backing_commitment` here are `anchor`/`disclosure`'s own real circuit
-        // outputs (read off `target/bb-anchor/public_inputs` indices 2/8, and cross-checked
-        // identical to what `disclosure`'s witness solves internally, since both Prover.tomls
-        // drive the same identity_input/oprf_proofs) — not fabricated small integers, unlike
-        // the fixtures above. `oprf_pk_hashes` and `param_commitment` are `oprf_identity_anchor`
-        // /`oprf_identity_anchor_disclosure`'s own real public outputs
-        // (`target/bb-anchor/public_inputs` indices 3-7, `target/bb-disclosure/public_inputs`
-        // index 4) — the same simulated committee key set `delegate_oprf_pk_hashes` below (and
-        // the delegate-persona phase's own vector) already uses, confirmed byte-for-byte.
-        let anchor =
-            hex32("0beff326e082ed177b5ad64c97336db7af826a90a072cdb18f65de2ac6d5326f");
-        let oprf_pk_hashes = delegate_oprf_pk_hashes();
-        let backing_commitment =
-            hex32("221383d2793ff2aece98eeb39646dc8350d535ff862ffbb17ffa7eb137990571");
-        let got = calculate_param_commitment(anchor, 1, oprf_pk_hashes, backing_commitment);
-        let expected =
-            hex32("242b02c97c624472577d4e4af2a2b3b09b0182f586558f465091472ec2b8ae0c");
-        assert_eq!(got, expected);
+        let got = calculate_param_commitment(
+            real_disclosure_anchor(),
+            1,
+            delegate_oprf_pk_hashes(),
+            real_disclosure_backing_commitment(),
+            delegate_persona_account(),
+        );
+        assert_eq!(got, real_disclosure_param_commitment());
     }
 
     #[test]
     fn accepts_the_real_nargo_and_bb_vector_via_check_registration_anchor() {
         // Same real vector as above, exercised through the full `check_registration_anchor`
         // path (canonicality checks + param_commitments scan), not just the raw hash.
-        let anchor =
-            hex32("0beff326e082ed177b5ad64c97336db7af826a90a072cdb18f65de2ac6d5326f");
-        let oprf_pk_hashes = delegate_oprf_pk_hashes();
-        let backing_commitment =
-            hex32("221383d2793ff2aece98eeb39646dc8350d535ff862ffbb17ffa7eb137990571");
-        let param_commitment =
-            hex32("242b02c97c624472577d4e4af2a2b3b09b0182f586558f465091472ec2b8ae0c");
-        let public_inputs = outer_public_inputs_with_commitment(param_commitment);
+        let public_inputs =
+            outer_public_inputs_with_commitment(real_disclosure_param_commitment());
         assert!(check_registration_anchor(
             &public_inputs,
-            anchor,
+            real_disclosure_anchor(),
             1,
-            oprf_pk_hashes,
-            backing_commitment,
+            delegate_oprf_pk_hashes(),
+            real_disclosure_backing_commitment(),
+            delegate_persona_account(),
         ));
     }
 
@@ -718,6 +921,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         )
     }
 
@@ -733,6 +937,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -750,6 +955,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -767,6 +973,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -783,6 +990,7 @@ mod tests {
             OLD_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -802,6 +1010,7 @@ mod tests {
                     NEW_SCHEME_VERSION,
                     mutated,
                     NEW_PK_HASHES,
+                    BOUND_ACCOUNT,
                 ),
                 "mutating old_pk_hash slot {i} must be rejected",
             );
@@ -824,10 +1033,48 @@ mod tests {
                     NEW_SCHEME_VERSION,
                     OLD_PK_HASHES,
                     mutated,
+                    BOUND_ACCOUNT,
                 ),
                 "mutating new_pk_hash slot {i} must be rejected",
             );
         }
+    }
+
+    /// Mirrors `rejects_registration_with_a_swapped_bound_account` — the identity-hijack fix
+    /// applies to migration too (see this module's top-of-file docs on why `migrate_oprf_scheme`
+    /// is fixed for consistency even though it was not independently exploitable).
+    #[test]
+    fn rejects_migration_with_a_swapped_bound_account() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        let mut other_account = BOUND_ACCOUNT;
+        other_account[1] ^= 1;
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+            other_account,
+        ));
+    }
+
+    #[test]
+    fn rejects_migration_with_zero_bound_account() {
+        let commitment = migration_commitment();
+        let public_inputs = outer_public_inputs_with_commitment(commitment);
+        assert!(!check_migration_anchor(
+            &public_inputs,
+            OLD_ANCHOR,
+            NEW_ANCHOR,
+            OLD_SCHEME_VERSION,
+            NEW_SCHEME_VERSION,
+            OLD_PK_HASHES,
+            NEW_PK_HASHES,
+            [0u8; 32],
+        ));
     }
 
     #[test]
@@ -842,6 +1089,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -856,6 +1104,7 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
@@ -873,32 +1122,19 @@ mod tests {
             NEW_SCHEME_VERSION,
             OLD_PK_HASHES,
             NEW_PK_HASHES,
+            BOUND_ACCOUNT,
         ));
     }
 
-    #[test]
-    fn calculate_migration_param_commitment_matches_the_real_nargo_vector() {
-        // Real `nargo test --show-output` vector against
-        // `migrate-disclosure::calculate_param_commitment`'s exact shape: tag=201,
-        // old_anchor=111, new_anchor=222, old_scheme_version=1, new_scheme_version=2,
-        // old_oprf_pk_hashes=[10,20,30,40,50], new_oprf_pk_hashes=[60,70,80,90,100].
-        let got = migration_commitment();
-        let expected_hex = "1fc03013b1ebd0943d9fe6702ba50f7b7224d38ce69bdd3106f993d4f905ae88";
-        let expected = {
-            let mut out = [0u8; 32];
-            let bytes = (0..32)
-                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
-                .collect::<Vec<u8>>();
-            out.copy_from_slice(&bytes);
-            out
-        };
-        assert_eq!(got, expected);
-    }
-
+    /// Small-int edge-case vector (all-zero `oprf_pk_hashes`), generated the same way the
+    /// pre-widening test suite's own all-zero vector was: a temporary `#[test]` calling
+    /// `calculate_param_commitment` directly with literal inputs, added to
+    /// `migrate-disclosure/src/main.nr`, run via `nargo test --show-output`, the printed
+    /// `Field` captured here, then removed — not a fabricated value. `old_anchor = 5,
+    /// new_anchor = 6, old_scheme_version = 3, new_scheme_version = 4, both pk-hash arrays
+    /// zero, bound_account = [1, 2, .., 32]` (same fixture bytes as `delegate_persona_account`).
     #[test]
     fn calculate_migration_param_commitment_matches_the_all_zero_pk_hashes_nargo_vector() {
-        // Second real `nargo` vector, exercising all-zero pk-hash slots: tag=201, old_anchor=5,
-        // new_anchor=6, old_scheme_version=3, new_scheme_version=4, both pk-hash arrays zero.
         let mut old_anchor = [0u8; 32];
         old_anchor[31] = 5;
         let mut new_anchor = [0u8; 32];
@@ -910,29 +1146,54 @@ mod tests {
             4,
             [[0u8; 32]; NUM_COMMITTEES],
             [[0u8; 32]; NUM_COMMITTEES],
+            delegate_persona_account(),
         );
-        let expected_hex = "179f60a933aa9e2ea3ffcb201052443276bb8e1e16281ef0f0c9c816bad0d3f1";
-        let expected = {
-            let mut out = [0u8; 32];
-            let bytes = (0..32)
-                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
-                .collect::<Vec<u8>>();
-            out.copy_from_slice(&bytes);
-            out
-        };
+        let expected =
+            hex32("08620dcacbc18baebdfad57a23e6beb7f9e85681e55f42e0061d5d8788df0d7d");
+        assert_eq!(got, expected);
+    }
+
+    /// Real end-to-end vector, generated fresh for the `bound_account` widening:
+    /// `nargo execute --package oprf_identity_anchor_migrate_disclosure` against
+    /// `migrate-disclosure/Prover.toml` (with `bound_account` added), followed by a real
+    /// `bb write_vk`/`bb prove`/`bb verify` round-trip that accepted the resulting proof
+    /// (`target/bb-migrate-disclosure/public_inputs` in `circuits/oprf-identity-anchor/`).
+    /// `old_anchor`/`new_anchor`/`old_oprf_pk_hashes`/`new_oprf_pk_hashes` were read off a
+    /// companion real `nargo execute --package oprf_identity_anchor_migrate` +
+    /// `bb write_vk`/`bb prove`/`bb verify` run against `migrate/Prover.toml` (whose header
+    /// comment already documents it shares the SAME old/new committee proofs as
+    /// `migrate-disclosure/Prover.toml`) — that standalone circuit exposes them directly as
+    /// public outputs, confirming `old_anchor` matches `real_disclosure_anchor()` above
+    /// byte-for-byte (both driven from the same committee generation and identity input,
+    /// consistent with `README.md`'s existing cross-check for the pre-widening vectors).
+    #[test]
+    fn calculate_migration_param_commitment_matches_the_real_nargo_and_bb_vector() {
+        let old_anchor = real_disclosure_anchor();
+        let new_anchor =
+            hex32("1c873a5f7ea81a5701ce2e4fd740ae56435687c92a0e2176954c9acd80690342");
+        let old_oprf_pk_hashes = delegate_oprf_pk_hashes();
+        let new_oprf_pk_hashes = [
+            hex32("1330ef4ceb04fac773b175235420e6426d0832a985c2b6298147fe7f5a403676"),
+            hex32("27e673e96f75ddff060f0591e56f953f97209a500e666a7a1aca5f9099bf2248"),
+            hex32("15f0fea0a2155d5f6f104b16ff3bd6ec85cae7c2280ebb50ea024374f8312919"),
+            hex32("023491a0450e421fb30f4bacc2c08ed2936d6c8562b22671acb894cecbbdee5a"),
+            hex32("094160020b1e6c5ea518dbc98505f150eb8bbf3d43fd22672d53ebcd066d9e62"),
+        ];
+        let got = calculate_migration_param_commitment(
+            old_anchor,
+            new_anchor,
+            1,
+            2,
+            old_oprf_pk_hashes,
+            new_oprf_pk_hashes,
+            delegate_persona_account(),
+        );
+        let expected =
+            hex32("1ac43a326cdeec097f8ec5ae560f87d7f279c7dd8913460acbd22db709da5a5f");
         assert_eq!(got, expected);
     }
 
     // --- check_delegate_persona / calculate_delegate_param_commitment ---
-
-    fn hex32(h: &str) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        let bytes = (0..32)
-            .map(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap())
-            .collect::<Vec<u8>>();
-        out.copy_from_slice(&bytes);
-        out
-    }
 
     /// A real end-to-end vector: `nargo execute --package oprf_delegate_persona` against a
     /// real committee-simulator-backed `Prover.toml` (`oprf-committee-dev`'s
@@ -982,7 +1243,7 @@ mod tests {
     fn account_to_field_limbs_matches_the_circuits_pack_be_bytes_into_fields_split() {
         // `account = [1, 2, .., 32]` (big-endian) — `hi` must hold just `account[0] = 1`, `lo`
         // must hold `account[1..32] = [2, .., 32]`. Cross-checked structurally here (not just
-        // via the end-to-end vector above) so a future refactor of the limb split alone, with
+        // via the end-to-end vectors above) so a future refactor of the limb split alone, with
         // an unchanged Poseidon2 hash, still gets caught.
         let account: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
         let (lo, hi) = account_to_field_limbs(account);
@@ -1117,7 +1378,7 @@ mod tests {
 
     /// A delegate-persona commitment must never collide with a registration/reverification or
     /// migration commitment built from a superficially similar tuple — the distinct proof-type
-    /// tags (200/201/202) are what make substituting one for another fail even if a caller
+    /// tags (202/203/204) are what make substituting one for another fail even if a caller
     /// mixed up which check to call.
     #[test]
     fn delegate_persona_commitment_differs_from_registration_commitment_under_similar_inputs() {
@@ -1126,6 +1387,7 @@ mod tests {
             1,
             delegate_oprf_pk_hashes(),
             delegate_persona_account(), // any similarly-shaped [u8; 32] stand-in
+            BOUND_ACCOUNT,
         );
         assert_ne!(registration_style, delegate_param_commitment());
     }

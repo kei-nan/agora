@@ -196,6 +196,41 @@ function assertValidAnchor(anchor: Uint8Array, label: string): void {
   }
 }
 
+/**
+ * `boundAccount` closes a real identity-hijack gap (see
+ * `pallets/pallet-identity/src/lib.rs`'s `AnchorProofVerifier::verify_registration_anchor` doc
+ * comment, and `docs/project/pallets/identity.md`'s "Fixed: identity-hijack via copied
+ * extrinsic" section): the ZK proof folds `bound_account` into its own cryptographically-
+ * verified `param_commitment`, and the pallet separately asserts `who == bound_account`
+ * (`Error::BoundAccountMismatch`). This function pre-flight-checks the same equality locally —
+ * before ever touching the network — for exactly the reason every other local validation in
+ * this file exists: a caller who assembled `boundAccount` from the wrong keypair (e.g. copy-
+ * pasted a stale value, or mixed up which account is signing) gets a specific, actionable error
+ * message here instead of a bare on-chain `BoundAccountMismatch` after wasting a real
+ * transaction fee.
+ */
+function assertBoundAccountMatchesSigner(
+  boundAccount: Uint8Array,
+  keypair: KeyringPair,
+  label: string,
+): void {
+  if (boundAccount.length !== 32) {
+    throw new RangeError(`${label}: boundAccount is ${boundAccount.length} bytes, expected 32`);
+  }
+  const signerBytes = keypair.publicKey;
+  if (
+    boundAccount.length !== signerBytes.length ||
+    !boundAccount.every((byte, index) => byte === signerBytes[index])
+  ) {
+    throw new Error(
+      `${label}: boundAccount does not match the signing keypair's own public key — the chain ` +
+        'will reject this with Error::BoundAccountMismatch regardless, since the proof must be ' +
+        'bound to whichever account actually signs and submits it. Build boundAccount from ' +
+        "getSigningKeypair()'s keypair.publicKey, not a different account.",
+    );
+  }
+}
+
 function assertValidOprfCommitteeKeyHashes(
   hashes: OprfCommitteeKeyHashes,
   label: string,
@@ -220,10 +255,24 @@ function assertValidOprfCommitteeKeyHashes(
  * and the 5 per-committee key hashes it was derived under. There is no
  * separate anchor SNARK proof parameter — the `disclosure` circuit rides
  * inside `zkProof` itself as a recursively-verified subproof.
+ *
+ * `backingCommitment`: a second, independent public value the `disclosure` circuit folds into
+ * the same `param_commitment` preimage as `anchor` (see
+ * `pallets/pallet-identity/src/lib.rs`'s `BackingCommitment` storage doc comment) — a required
+ * on-chain argument this interface was previously missing entirely (a pre-existing staleness
+ * gap, fixed alongside `boundAccount` below since a caller can't correctly wire one without the
+ * other: both are positional arguments to the same extrinsic).
+ *
+ * `boundAccount`: the raw 32-byte public key of the account this proof authorizes to submit it
+ * — the identity-hijack fix (see `assertBoundAccountMatchesSigner`'s doc comment). Must equal
+ * `getSigningKeypair()`'s own `keypair.publicKey`, checked locally by `registerCitizen` before
+ * ever touching the network.
  */
 export interface RegisterCitizenParams extends OuterProofPayload {
   anchor: Uint8Array;
   oprfPkHashes: OprfCommitteeKeyHashes;
+  backingCommitment: Uint8Array;
+  boundAccount: Uint8Array;
 }
 
 /**
@@ -250,11 +299,20 @@ export async function registerCitizen(params: RegisterCitizenParams): Promise<vo
   assertValidPublicInputs(params.outerCount, params.publicInputs);
   assertValidAnchor(params.anchor, 'registerCitizen');
   assertValidOprfCommitteeKeyHashes(params.oprfPkHashes, 'registerCitizen');
+  assertValidAnchor(params.backingCommitment, 'registerCitizen (backingCommitment)');
 
-  const api = await getApi();
   const { keypair } = await getSigningKeypair();
+  assertBoundAccountMatchesSigner(params.boundAccount, keypair, 'registerCitizen');
+  const api = await getApi();
   return submitExtrinsic(
-    api.tx.identity.registerCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes),
+    api.tx.identity.registerCitizen(
+      params.zkProof,
+      params.publicInputs,
+      params.anchor,
+      params.oprfPkHashes,
+      params.backingCommitment,
+      params.boundAccount,
+    ),
     keypair,
   );
 }
@@ -281,11 +339,20 @@ export async function reverifyCitizen(params: ReverifyCitizenParams): Promise<vo
   assertValidPublicInputs(params.outerCount, params.publicInputs);
   assertValidAnchor(params.anchor, 'reverifyCitizen');
   assertValidOprfCommitteeKeyHashes(params.oprfPkHashes, 'reverifyCitizen');
+  assertValidAnchor(params.backingCommitment, 'reverifyCitizen (backingCommitment)');
 
-  const api = await getApi();
   const { keypair } = await getSigningKeypair();
+  assertBoundAccountMatchesSigner(params.boundAccount, keypair, 'reverifyCitizen');
+  const api = await getApi();
   return submitExtrinsic(
-    api.tx.identity.reverifyCitizen(params.zkProof, params.publicInputs, params.anchor, params.oprfPkHashes),
+    api.tx.identity.reverifyCitizen(
+      params.zkProof,
+      params.publicInputs,
+      params.anchor,
+      params.oprfPkHashes,
+      params.backingCommitment,
+      params.boundAccount,
+    ),
     keypair,
   );
 }
@@ -296,11 +363,18 @@ export async function reverifyCitizen(params: ReverifyCitizenParams): Promise<vo
  * old anchor is no longer caller-supplied — the pallet reads it directly
  * from the caller's own `CitizenAnchor` entry, which is also what stops a
  * citizen from "migrating" using someone else's anchor value.
+ *
+ * `boundAccount`: see `RegisterCitizenParams`'s doc comment on the field of the same name —
+ * this call was never independently exploitable via a copied-extrinsic attack (it reads
+ * `old_anchor`/`old_version` from the caller's own on-chain storage before checking the proof),
+ * but gained the parameter for consistency once the underlying circuit widened. Must equal
+ * `getSigningKeypair()`'s own `keypair.publicKey`, checked locally before submission.
  */
 export interface MigrateOprfSchemeParams extends OuterProofPayload {
   newAnchor: Uint8Array;
   oldOprfPkHashes: OprfCommitteeKeyHashes;
   newOprfPkHashes: OprfCommitteeKeyHashes;
+  boundAccount: Uint8Array;
 }
 
 /**
@@ -316,8 +390,9 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
   assertValidOprfCommitteeKeyHashes(params.oldOprfPkHashes, 'migrateOprfScheme (old)');
   assertValidOprfCommitteeKeyHashes(params.newOprfPkHashes, 'migrateOprfScheme (new)');
 
-  const api = await getApi();
   const { keypair } = await getSigningKeypair();
+  assertBoundAccountMatchesSigner(params.boundAccount, keypair, 'migrateOprfScheme');
+  const api = await getApi();
   return submitExtrinsic(
     api.tx.identity.migrateOprfScheme(
       params.zkProof,
@@ -325,6 +400,7 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
       params.newAnchor,
       params.oldOprfPkHashes,
       params.newOprfPkHashes,
+      params.boundAccount,
     ),
     keypair,
   );
@@ -341,11 +417,19 @@ export async function migrateOprfScheme(params: MigrateOprfSchemeParams): Promis
  * Unlike `reverify_citizen`, the caller signing this extrinsic is a *different* account
  * than the one the registration currently lives under — that old account is looked up
  * on-chain via the proof's own nullifier, never supplied here directly.
+ *
+ * `boundAccount` is the single highest-stakes instance of the identity-hijack fix (see
+ * `RegisterCitizenParams`'s doc comment on the field of the same name): `recover_account` has
+ * no dispute window by design, so without this binding, a copied pending extrinsic could have
+ * permanently and irreversibly hijacked a citizen's identity onto an attacker's account. Must
+ * equal `getSigningKeypair()`'s own `keypair.publicKey` — the *new* account being recovered
+ * onto, not the old (lost) one — checked locally before submission.
  */
 export interface RecoverAccountParams extends OuterProofPayload {
   anchor: Uint8Array;
   oprfPkHashes: OprfCommitteeKeyHashes;
   backingCommitment: Uint8Array;
+  boundAccount: Uint8Array;
 }
 
 /**
@@ -375,8 +459,9 @@ export async function recoverAccount(params: RecoverAccountParams): Promise<void
   assertValidOprfCommitteeKeyHashes(params.oprfPkHashes, 'recoverAccount');
   assertValidAnchor(params.backingCommitment, 'recoverAccount (backingCommitment)');
 
-  const api = await getApi();
   const { keypair } = await getSigningKeypair();
+  assertBoundAccountMatchesSigner(params.boundAccount, keypair, 'recoverAccount');
+  const api = await getApi();
   return submitExtrinsic(
     api.tx.identity.recoverAccount(
       params.zkProof,
@@ -384,6 +469,7 @@ export async function recoverAccount(params: RecoverAccountParams): Promise<void
       params.anchor,
       params.oprfPkHashes,
       params.backingCommitment,
+      params.boundAccount,
     ),
     keypair,
   );

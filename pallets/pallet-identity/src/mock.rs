@@ -29,9 +29,14 @@ pub const INVALID_PROOF_MARKER: u8 = 0;
 /// log #75/#76 — the disclosure/migrate-disclosure subproof rides inside the already-verified
 /// outer proof, so there is no separate anchor SNARK); this mock instead treats a proof as
 /// valid whenever `outer_public_inputs` contains a `param_commitments[i]` equal to the
-/// claimed anchor(s). That is not how the real `Poseidon2AnchorVerifier` computes a match (see
-/// `runtime/src/anchor_verifier.rs`), but it is deterministic and lets pallet-level tests
-/// drive both the accept and reject paths without depending on the crypto crate.
+/// claimed anchor(s), *and* `bound_account` is non-zero. That is not how the real
+/// `Poseidon2AnchorVerifier` computes a match (see `runtime/src/anchor_verifier.rs`), but it
+/// is deterministic and lets pallet-level tests drive both the accept and reject paths without
+/// depending on the crypto crate. The `bound_account` check is deliberately shallow (only
+/// "non-zero", not "recomputes to a real Poseidon2 commitment") — this pallet's own tests
+/// exercise the `who == bound_account` outer check (`Error::BoundAccountMismatch`), not the
+/// real circuit-level binding, which is covered by `runtime/src/anchor_verifier.rs`'s own real
+/// vector-based tests instead.
 pub struct TestAnchorVerifier;
 
 impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
@@ -41,8 +46,9 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         _scheme_version: u32,
         _oprf_pk_hashes: [[u8; 32]; 5],
         _backing_commitment: [u8; 32],
+        bound_account: [u8; 32],
     ) -> bool {
-        outer_public_inputs.contains(&anchor)
+        outer_public_inputs.contains(&anchor) && bound_account != [0u8; 32]
     }
 
     fn verify_reverification(
@@ -51,8 +57,9 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         _scheme_version: u32,
         _oprf_pk_hashes: [[u8; 32]; 5],
         _backing_commitment: [u8; 32],
+        bound_account: [u8; 32],
     ) -> bool {
-        outer_public_inputs.contains(&anchor)
+        outer_public_inputs.contains(&anchor) && bound_account != [0u8; 32]
     }
 
     fn verify_migration(
@@ -63,8 +70,23 @@ impl pallet_identity_zk::AnchorProofVerifier for TestAnchorVerifier {
         _new_scheme_version: u32,
         _old_oprf_pk_hashes: [[u8; 32]; 5],
         _new_oprf_pk_hashes: [[u8; 32]; 5],
+        bound_account: [u8; 32],
     ) -> bool {
-        outer_public_inputs.contains(&old_anchor) && outer_public_inputs.contains(&new_anchor)
+        outer_public_inputs.contains(&old_anchor)
+            && outer_public_inputs.contains(&new_anchor)
+            && bound_account != [0u8; 32]
+    }
+}
+
+/// Converts the mock's `u64` `AccountId` to its raw 32-byte representation — same convention
+/// as `pallet-elections`' own mock `TestAccountIdToBytes` (right-aligned big-endian bytes in
+/// the low 8 bytes of an otherwise-zeroed 32-byte array).
+pub struct TestAccountIdToBytes;
+impl pallet_identity_zk::AccountIdToBytes<u64> for TestAccountIdToBytes {
+    fn to_bytes(who: &u64) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        bytes[24..32].copy_from_slice(&who.to_be_bytes());
+        bytes
     }
 }
 
@@ -163,6 +185,7 @@ impl pallet_identity_zk::Config for Test {
     type SuspensionOrigin = frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type AdminOrigin = frame_support::traits::AsEnsureOriginWithArg<frame_system::EnsureRoot<u64>>;
     type AnchorVerifier = TestAnchorVerifier;
+    type AccountIdToBytes = TestAccountIdToBytes;
     // Short period so tests can cross a reverification deadline without huge block numbers.
     type ReverificationPeriod = frame_support::traits::ConstU32<10>;
     // Wired to the real `pallet_emergency_council::EnsureActiveEmergency`, mirroring the

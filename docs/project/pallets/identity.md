@@ -36,8 +36,9 @@ Storage:
 - `OprfRound2Responses`: `(query_id, committee_slot)` → `BoundedVec<OprfRound2Response, OprfThreshold>` (`ValueQuery`) — round-2 response scalars (`member, z_i: [u8;32]`), same shape/locking pattern as `OprfRound1Commitments`
 - `LastRecoveryBlock`: `[u8;32]` (nullifier) → `BlockNumber` — last block a `recover_account` succeeded for this nullifier; backs the `MinBlocksBetweenRecoveries` cooldown
 
-Calls (params reflect the pallet's current structure post-#75/#76 restructuring):
-- `register_citizen(zk_proof [≤4096 bytes], public_inputs [≤18 × [u8;32]], anchor, oprf_pk_hashes: [[u8;32]; NUM_COMMITTEES])`
+Calls (params reflect the pallet's current structure post-#75/#76 restructuring, and the
+`bound_account` identity-hijack fix below):
+- `register_citizen(zk_proof [≤4096 bytes], public_inputs [≤18 × [u8;32]], anchor, oprf_pk_hashes: [[u8;32]; NUM_COMMITTEES], backing_commitment, bound_account: AccountId)`
   - Verifies the ZKPassport outer proof via `ZkVerifier`; the nullifier is *not* a separate
     argument — it's extracted directly from the proof's own public inputs
     (`scoped_nullifier`, see the module doc comment)
@@ -54,28 +55,16 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   - Requires a mandatory OPRF identity-anchor check (`anchor` + `oprf_pk_hashes`, verified via
     `AnchorVerifier`) as the Sybil-resistance gate, rejecting if `anchor` already exists under
     the current `OprfSchemeVersion` in `IdentityAnchorRegistry`
-  - **Known gap — CRITICAL, unfixed (found by 2026-09-11 security review, see
-    `docs/project/next-steps.md` item 0 for the full writeup): no cryptographic binding to
-    `who`.** `zk_proof`/`public_inputs`/`anchor`/`oprf_pk_hashes`/`backing_commitment` are all
-    plaintext in the pending signed extrinsic; nothing here (or in
-    `T::AnchorVerifier::verify_registration_anchor`, or in the `disclosure` circuit that produces
-    `param_commitment`) ties any of them to the signer. Anyone watching the mempool can copy the
-    whole tuple into their own signed call and front-run the real submitter, stealing their
-    citizenship slot (the legitimate submission then fails on `NullifierAlreadyUsed`/
-    `AnchorAlreadyUsed`). `pallet-elections::register_as_delegate` closed the equivalent gap for
-    delegate-persona registration by folding `persona_account` into its proof's
-    `param_commitment` as a genuine private circuit witness (confirmed real, not just an
-    unconstrained argument check) — `disclosure/src/main.nr` has no equivalent witness, so the
-    same fix cannot be ported without a real Noir circuit change (new witness, widened
-    `param_commitment`, new VK, mobile-side proving changes). Not attempted; see next-steps.md
-    item 0 for exactly what closing it requires.
+  - `bound_account` must equal the calling account (`Error::BoundAccountMismatch` otherwise) and
+    is folded into the proof's own cryptographically-verified `param_commitment` — see "Fixed:
+    identity-hijack via copied extrinsic" below.
 - `revoke_citizen()` — swap-and-pop, clears suspension (both `SuspendedNullifiers` and `SuspendedByJuryReview`)
 - `suspend_citizen(nullifier, until)` — `SuspensionOrigin` (wired to `pallet_courts::EnsureOracleCouncilApproved`: a manual override requiring the Oracle Council's M-of-N approval of this exact call, not a single member — fixed after a project review found the prior `EnsureOracle` wiring let any one member suspend any citizen unilaterally); always writes `SuspendedByJuryReview = false` — this extrinsic-driven path is oracle-only, never jury-reviewed
 - `restore_citizen_rights(nullifier)` — `SuspensionOrigin` (same M-of-N gating as above); clears both `SuspendedNullifiers` and `SuspendedByJuryReview`
 - `add_allowed_merkle_root(root)` / `remove_allowed_merkle_root(root)` — `AdminOrigin`
-- `reverify_citizen(proof)` — any registered citizen; extends `ReverificationDeadline` via `AnchorVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep)
+- `reverify_citizen(zk_proof, public_inputs, anchor, oprf_pk_hashes, backing_commitment, bound_account: AccountId)` — any registered citizen; extends `ReverificationDeadline` via `AnchorVerifier::verify_reverification`; a citizen past their deadline is treated as inactive by `is_active_citizen` (lazy check, no background sweep). `bound_account` must equal the caller (`Error::BoundAccountMismatch`); see "Fixed: identity-hijack via copied extrinsic" below for why this call gained the parameter despite not being independently exploitable the way `register_citizen`/`recover_account` are.
 - `migrate_oprf_scheme(zk_proof, public_inputs, new_anchor, old_oprf_pk_hashes,
-  new_oprf_pk_hashes)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own
+  new_oprf_pk_hashes, bound_account: AccountId)` — dual-evaluation OPRF-scheme rotation migration; targets the caller's own
   on-file scheme version + 1. Verifies the outer proof and its freshness, then checks committee
   keys and the migration proof itself, and only *after* all of that checks whether `new_anchor`
   is already taken (`NewAnchorAlreadyUsed`) — this verify-then-check ordering was a fix (commit
@@ -83,7 +72,11 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   `zk_proof` with a guessed `new_anchor` and learn, from the returned error alone and at zero
   real proof-computation cost, whether that `(new_version, new_anchor)` pair already belongs to
   another citizen — leaking cross-citizen anchor-registry membership ahead of proof
-  authentication.
+  authentication. `bound_account` must equal the caller (`Error::BoundAccountMismatch`); see
+  "Fixed: identity-hijack via copied extrinsic" below — this call was never independently
+  exploitable via a copied-extrinsic attack (it reads `old_anchor`/`old_version` from the
+  caller's own `CitizenAnchor` entry above, before any proof check runs), but gained the
+  parameter for consistency once the underlying circuit widened.
 - `rotate_oprf_scheme()` — `AdminOrigin`; scheduled-path advance of `OprfSchemeVersion` (the ~4-year cycle)
 - `emergency_rotate_oprf_scheme()` — `EmergencyRotationOrigin`; out-of-cycle rotation if the current OPRF scheme is suspected broken. As of this session, wired in the runtime to `pallet_emergency_council::EnsureActiveEmergency<Runtime>` — **not** the bare `EnsureRoot` placeholder earlier versions of this doc described. Succeeds only when the caller is `Root` *and* `pallet_emergency_council::ActiveEmergency` is currently `Some(..)` (a real, council-declared, not-yet-lifted-or-expired emergency); root alone can no longer force this call. See `pallets/pallet-emergency-council/src/lib.rs`'s `EnsureActiveEmergency` doc comment and `runtime/src/configs/mod.rs` for the full wiring, and this pallet's `EmergencyRotationOrigin` Config-field doc comment above for the rationale.
 - `declare_no_other_passport()` — any registered citizen; records a self-declaration attestation used only as an ex-post basis for a `pallet-courts` `CitizenConduct` case if later found false
@@ -107,11 +100,13 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   in-progress registration. Once a query is also past its deadline, no legitimate read can still
   be pending, so the submitter-only restriction lifts and anyone may sweep it, same as any other
   expired query. Also decrements the submitter's `PendingOprfQueryCountBySubmitter`.
-- `recover_account(zk_proof, public_inputs, anchor, oprf_pk_hashes, backing_commitment)` —
+- `recover_account(zk_proof, public_inputs, anchor, oprf_pk_hashes, backing_commitment, bound_account: AccountId)` —
   account recovery for a citizen who lost access to their original `AccountId` (e.g. a
   reinstalled/reset mobile wallet — see `mobile/src/chain/keystoreWallet.ts`). Same proof shape
   and the same real `ZkVerifier`/`AnchorVerifier` verification path as
-  `register_citizen`/`reverify_citizen` — no weakened check, no dev-mode shortcut.
+  `register_citizen`/`reverify_citizen` — no weakened check, no dev-mode shortcut. `bound_account`
+  must equal the caller (`Error::BoundAccountMismatch`) — the highest-stakes instance of the
+  "Fixed: identity-hijack via copied extrinsic" gap below, since this call has no dispute window.
   `backing_commitment` must match the old account's on-file `BackingCommitment`, checked the
   same way `reverify_citizen`'s own parameter of the same name is. Where `register_citizen`
   rejects outright when the proof's nullifier is already in `NullifierRegistry`, this call
@@ -137,19 +132,6 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   `AccountId`, so an existing suspension carries over onto the new account automatically —
   recovery cannot be used to launder away an active court-ordered suspension. Emits
   `CitizenAccountRecovered { old_account, new_account, nullifier_hash }`.
-
-  **Known gap — CRITICAL, unfixed (found by 2026-09-11 security review, see
-  `docs/project/next-steps.md` item 0): same missing account-binding as `register_citizen`
-  above, with worse consequences.** Nothing constrains `who` to the intended recoverer either —
-  an observer who copies a victim's pending `recover_account` extrinsic (proof, public inputs,
-  anchor, oprf_pk_hashes, backing_commitment — all plaintext) into their own signed call and gets
-  it mined first **permanently and irreversibly hijacks the victim's identity** to an account the
-  attacker controls, with no dispute window to undo it (that no-dispute-window property is
-  otherwise a deliberate, separately-discussed design tradeoff — see above — not itself the bug;
-  the bug is that this call has no way to authenticate that `who` is who the proof's owner
-  intended). Same root cause and same fix path as `register_citizen`'s note above: a real fix
-  needs a new private witness in the `disclosure` circuit (this call's proof shares the same
-  circuit/verifier path as registration/reverification), not a Rust-only patch.
 
   **Cross-pallet orphaning — guarded, not migrated.** This call still only *rebinds*
   pallet-identity's own storage listed above; it never moves any other pallet's per-account
@@ -192,6 +174,62 @@ Calls (params reflect the pallet's current structure post-#75/#76 restructuring)
   gap plainly to the citizen before they can confirm.
 
 `AdminOrigin`, like `pallet-legislature::EnsureLegislatureMotion` elsewhere, is `EnsureOriginWithArg<_, [u8; 32]>`: each call above passes a domain-separated hash of its own parameters, checked against the specific motion that authorized it, so one passed motion can't be replayed to authorize a different call.
+
+**Fixed: identity-hijack via copied extrinsic.** `register_citizen`/`recover_account` verify a
+ZK proof and check `anchor`/`oprf_pk_hashes`/`backing_commitment` against the proof's
+`param_commitments` — but until this fix, nothing constrained `who` (the transaction's signer).
+All proof material is plaintext in a pending signed extrinsic, so an attacker could copy a
+victim's pending extrinsic verbatim into their own signed call and get it mined first: for
+`register_citizen` this stole the victim's citizenship slot; for `recover_account` (no dispute
+window by design — see that call's own writeup above) this would have **permanently and
+irreversibly hijacked the victim's identity**, with nothing the victim could do about it after
+the fact.
+
+The fix mirrors `pallet_elections::register_as_delegate`'s pre-existing `persona_account`
+pattern (see `docs/project/pallets/elections.md`): `circuits/oprf-identity-anchor/disclosure`
+and `.../migrate-disclosure` now fold a `bound_account: [u8; 32]` private witness into their own
+`param_commitment` — tag `203` for the widened `disclosure` shape (11 Poseidon2 elements,
+retiring tag `200`'s 9-element shape outright, no migration path needed since no real citizen
+has ever registered on this chain), tag `204` for `migrate-disclosure` (17 elements, retiring
+`201`'s 15). `runtime/src/anchor_verifier.rs`'s `calculate_param_commitment`/
+`check_registration_anchor` and `calculate_migration_param_commitment`/`check_migration_anchor`
+recompute and check the widened commitment (fresh real `nargo execute`/`bb write_vk`/`bb prove`/
+`bb verify` vectors for both, plus a temporary-Noir-test-derived small-int edge-case vector for
+the all-zero-pk-hashes migration case — see that module's test suite). `register_citizen`/
+`reverify_citizen`/`recover_account`/`migrate_oprf_scheme` each take a new `bound_account:
+AccountId` argument and `ensure!(who == bound_account, Error::BoundAccountMismatch)` before
+calling into `T::AnchorVerifier` (a new `Config::AccountIdToBytes` item, mirroring
+`pallet_elections::AccountIdToBytes`, converts the account to raw bytes for the circuit-shaped
+call) — a redundant-but-good outer check on top of the real circuit-level binding: a copied
+proof resubmitted against a different account no longer recomputes to any `param_commitments[i]`
+the outer proof exposes, so `check_registration_anchor`/`check_migration_anchor` reject it even
+though the outer proof's own pairing check still passes.
+
+**Precisely which calls were exploitable.** `register_citizen` and `recover_account` were
+genuinely exploitable this way — neither reads any caller-keyed on-chain state before accepting
+the submitted `anchor`/`oprf_pk_hashes`/`backing_commitment` tuple, so a copied extrinsic
+resubmitted under an attacker's account passed every check. `reverify_citizen` and
+`migrate_oprf_scheme` were **not** independently exploitable the same way, even before this fix:
+both read `old_anchor`/`scheme_version` from the *caller's own* on-chain `CitizenAnchor` storage
+before ever consulting the proof, so a copied extrinsic resubmitted under an attacker's account
+gets the attacker's own stored values substituted in, which won't match the victim's embedded
+`param_commitment` unless the attacker already owns the victim's exact anchor — a precondition
+that defeats the point of attacking in the first place. The fix was applied to those two calls
+anyway, for consistency (cheap once the circuit-level pattern exists for
+`register_citizen`/`recover_account`, and `reverify_citizen` shares `disclosure` — the same
+circuit `register_citizen` uses — so it needed the widened call shape regardless).
+
+New regression tests: `register_citizen_fails_when_signer_does_not_match_bound_account` and
+`recover_account_fails_when_signer_does_not_match_bound_account`
+(`pallets/pallet-identity/src/tests.rs`), plus real-vector-based coverage in
+`runtime/src/anchor_verifier.rs` (`rejects_registration_with_a_swapped_bound_account`,
+`rejects_migration_with_a_swapped_bound_account`, and the zero-`bound_account` rejection tests).
+`anchor`/`migrate` (the standalone, non-outer-embedded circuits) were deliberately left
+untouched — out of scope, a separate pre-existing gap (they're already superseded as the
+production verification target by `disclosure`/`migrate-disclosure`, per the "ZK proof format
+and verifier" section below). Mobile-layer wiring (`mobile/src/chain/identity.ts`'s
+`boundAccount` parameters) status: see `docs/project/next-steps.md` item 0 for what did or did
+not land in this same pass.
 
 Public helpers:
 - `is_active_citizen(who)` — registered AND no active suspension AND not past `ReverificationDeadline`
