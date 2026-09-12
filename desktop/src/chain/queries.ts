@@ -337,18 +337,77 @@ export async function fetchRulings(): Promise<Ruling[]> {
 // ── Oracle Council transparency (project-review #092, Citizen/UX finding: "Oracle council
 // composition/approval count is invisible to citizens viewing a ruling") ───────────────────────
 //
-// Unlike the reads above, `fetchOracleCouncilInfo`/case-pending-approval lookups are NOT
-// mirrored here: `fetch_oracle_council_info` and `fetch_oracle_pending_approvals` are new
-// Tauri/reqwest-only commands (see `desktop/src-tauri/src/commands/chain.rs`) — they're absent
-// from `LIGHT_CLIENT_COMMANDS` in `desktop/src/lib/invoke.ts`, so `invoke(...)` calls them
-// through the real Tauri IPC path instead, the same way `fetch_ipfs_content` and
-// `chain_submit_extrinsic` already do. That means these two reads are *not* independently
-// verified against finalized GRANDPA consensus by smoldot the way every other query on this page
-// is — they trust the local node's plain JSON-RPC response, same trust level `fetch_rulings` had
-// before the smoldot migration (changelog #089). Acceptable for now given how low-stakes the
-// data is (council size/threshold and a live approval counter, not a value anything is gated
-// on) — flagged here so it isn't silently assumed to carry the same guarantee as the rest of
-// this file's reads.
+// Migrated onto this light-client path (project review, low-severity finding: these two reads
+// were added — see `desktop/src-tauri/src/commands/chain.rs`'s own doc comments on
+// `fetch_oracle_council_info`/`fetch_oracle_pending_approvals` — after the original smoldot
+// migration, and shipped only in `LIGHT_CLIENT_COMMANDS`'s Tauri/reqwest fallback instead of
+// being wired up here too). Both turned out to be the same shape as reads already mirrored
+// above — no capability smoldot's exposed RPC surface doesn't cleanly support was needed:
+//   - `fetchOracleCouncilInfo` reads `Courts::OracleMembers`, a single `StorageValue` whose
+//     compact-encoded length is decoded — exactly the pattern `investigatorCount` below already
+//     uses for `PalletAntiCorruption::Investigators`.
+//   - `fetchOraclePendingApprovals` follows the list-keys-then-match-by-suffix pattern used
+//     throughout this file (`Cases`, `Rulings`, `Motions`, `Delegates`) against
+//     `Courts::PendingOracleProposal`/`Courts::OracleApprovals`, then decodes the matched
+//     `OracleApprovals` value's compact length the same way as `fetchOracleCouncilInfo`.
+// Both are now independently verified against finalized GRANDPA consensus by smoldot, same as
+// every other read in this file — see `desktop/src/lib/invoke.ts`'s `LIGHT_CLIENT_COMMANDS` map.
+
+export interface OracleCouncilInfo {
+  councilSize: number;
+  approvalNumerator: number;
+  approvalDenominator: number;
+}
+
+/** Mirrors `pallet_courts::Config::OracleApprovalNumerator`/`OracleApprovalDenominator` as wired
+ * in `runtime/src/configs/mod.rs` — compile-time `Get<u32>` runtime constants, not on-chain
+ * storage, so there's no RPC read for them; only `councilSize` below is a live chain read. Keep
+ * this in sync with the identical constants in `desktop/src-tauri/src/commands/chain.rs` if the
+ * runtime config ever changes. */
+const ORACLE_APPROVAL_NUMERATOR = 1;
+const ORACLE_APPROVAL_DENOMINATOR = 2;
+
+/** Fetches the Oracle Council's current size (`Courts::OracleMembers`) plus the approval
+ * threshold fraction it takes for a proposed AI ruling or finalization to apply. Council-wide,
+ * not per-case — see `fetchOraclePendingApprovals` for a specific case's live approval count. */
+export async function fetchOracleCouncilInfo(): Promise<OracleCouncilInfo> {
+  const api = await getApi();
+  const key = storagePrefix("Courts", "OracleMembers");
+  const hex = await getStorage(api, key);
+  const councilSize = hex ? decodeCompact(hexToBytes(hex))[0] : 0;
+  return {
+    councilSize,
+    approvalNumerator: ORACLE_APPROVAL_NUMERATOR,
+    approvalDenominator: ORACLE_APPROVAL_DENOMINATOR,
+  };
+}
+
+/** For `caseId`, returns the live approval count if an oracle ruling/finalization proposal is
+ * currently pending for it (`Courts::PendingOracleProposal[caseId]` exists), or `null` if it
+ * isn't — either never proposed, or already resolved (cleared together with `OracleApprovals`
+ * the instant an action resolves). A case that already has a finalized `Courts::Rulings` entry
+ * (the only kind `fetchRulings` returns) is by definition no longer pending, so this will
+ * normally return `null` for any `caseId` taken from `fetchRulings`'s output. */
+export async function fetchOraclePendingApprovals(caseId: number): Promise<number | null> {
+  const api = await getApi();
+
+  const pendingPrefix = storagePrefix("Courts", "PendingOracleProposal");
+  const pendingKeys = await getKeysPaged(api, pendingPrefix);
+  const isPending = pendingKeys.some((keyHex) => extractU32KeySuffix(hexToBytes(keyHex)) === caseId);
+  if (!isPending) return null;
+
+  const approvalsPrefix = storagePrefix("Courts", "OracleApprovals");
+  const approvalKeys = await getKeysPaged(api, approvalsPrefix);
+  const approvalKey = approvalKeys.find((keyHex) => extractU32KeySuffix(hexToBytes(keyHex)) === caseId);
+  if (!approvalKey) {
+    // PendingOracleProposal exists but OracleApprovals doesn't (shouldn't happen — both pallet
+    // call paths insert them together — but decode defensively rather than error).
+    return 0;
+  }
+
+  const valueHex = await getStorage(api, approvalKey);
+  return valueHex ? decodeCompact(hexToBytes(valueHex))[0] : 0;
+}
 
 // ── fetch_legislature_data ────────────────────────────────────────────────────────────────
 

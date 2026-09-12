@@ -23,6 +23,12 @@ async function getTauriInvoke() {
 // `@polkadot/api` + `smoldot` were already JS-only dependencies, which is why this lives in the
 // frontend rather than the Rust backend.
 //
+// `fetch_oracle_council_info` / `fetch_oracle_pending_approvals` joined this map in a later pass
+// (project review, low-severity finding) — they shipped smoldot-eligible in shape but were only
+// ever wired to the Tauri/reqwest fallback below. See `../chain/queries.ts`'s Oracle Council
+// section for why migrating them was straightforward (same storage-read shapes already mirrored
+// elsewhere in that file).
+//
 // Deliberately NOT migrated here (still Tauri/reqwest, unchanged):
 //   - auth_generate_challenge / auth_poll_session / auth_start_callback_server: the QR-auth
 //     flow's HTTP callback server has to run in the Rust process, not a webview.
@@ -42,6 +48,9 @@ const LIGHT_CLIENT_COMMANDS: Record<string, (args?: Record<string, unknown>) => 
   fetch_legislature_data: () => chainQueries.fetchLegislatureData(),
   fetch_elections_data: () => chainQueries.fetchElectionsData(),
   fetch_anticorruption_data: () => chainQueries.fetchAnticorruptionData(),
+  fetch_oracle_council_info: () => chainQueries.fetchOracleCouncilInfo(),
+  fetch_oracle_pending_approvals: (args) =>
+    chainQueries.fetchOraclePendingApprovals(args?.caseId as number),
 };
 
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

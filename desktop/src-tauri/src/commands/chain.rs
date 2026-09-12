@@ -1,31 +1,33 @@
 // ARCHITECTURE NOTE (changelog #087): the frontend's actual chain-read path for
 // `chain_status`/`fetch_proposals`/`fetch_laws`/`fetch_treasury`/`fetch_department_budgets`/
-// `fetch_rulings`/`fetch_legislature_data`/`fetch_elections_data`/`fetch_anticorruption_data`
-// no longer goes through these Tauri commands. `desktop/src/lib/invoke.ts` now routes those
-// nine command names to `desktop/src/chain/queries.ts`, which reads the same storage items
-// through an embedded smoldot light client (`desktop/src/chain/client.ts`) instead of this
-// module's plain `reqwest` JSON-RPC. See CLAUDE.md's "Desktop App > Stack" section for why the
-// light client lives in the JS frontend rather than here: `smoldot` and `@polkadot/api` were
-// already JS-only dependencies, and smoldot's primary distribution is a JS/WASM package, not a
-// Rust crate embedded in a host process.
+// `fetch_rulings`/`fetch_legislature_data`/`fetch_elections_data`/`fetch_anticorruption_data`/
+// `fetch_oracle_council_info`/`fetch_oracle_pending_approvals` no longer goes through these
+// Tauri commands. `desktop/src/lib/invoke.ts` now routes those eleven command names to
+// `desktop/src/chain/queries.ts`, which reads the same storage items through an embedded
+// smoldot light client (`desktop/src/chain/client.ts`) instead of this module's plain `reqwest`
+// JSON-RPC. See CLAUDE.md's "Desktop App > Stack" section for why the light client lives in the
+// JS frontend rather than here: `smoldot` and `@polkadot/api` were already JS-only dependencies,
+// and smoldot's primary distribution is a JS/WASM package, not a Rust crate embedded in a host
+// process.
+//
+// The last two of those eleven — `fetch_oracle_council_info`/`fetch_oracle_pending_approvals`,
+// added for project-review #092's oracle-council-transparency finding — originally shipped
+// Tauri/reqwest-only and were only migrated onto the light client in a later pass (project
+// review, low-severity finding) once it was confirmed both are the same storage-read shapes
+// already mirrored elsewhere in `queries.ts` (a `StorageValue` length read and a
+// paged-keys-then-match lookup) — see that file's Oracle Council section for the detail.
 //
 // The `#[tauri::command]` functions below are kept — not deleted — for two reasons: they're
 // still correct, tested, and behind their own unit tests below; and they remain the actual
 // implementation for `auth_verify_nullifier`'s trust-boundary-flagged callers (see
 // `lookup_registered_account` below) and `chain_submit_extrinsic`, neither of which moved to
-// the JS light client in this pass. If a future change also migrates those, this whole module
-// (and `rpc.rs`) may become fully dead code — check `invoke.ts`'s `LIGHT_CLIENT_COMMANDS` map
-// before assuming that, since it's the actual source of truth for what the frontend still calls
-// here.
-//
-// `fetch_oracle_council_info`/`fetch_oracle_pending_approvals` (added for project-review #092's
-// oracle-council-transparency finding) are new commands that join `fetch_ipfs_content`/
-// `chain_submit_extrinsic` in this second category — Tauri/reqwest-only, not in
-// `LIGHT_CLIENT_COMMANDS`, so not smoldot-verified. See their own doc comments and the note atop
-// `desktop/src/chain/queries.ts`'s Oracle Council section for why that's an acceptable trade-off
-// here. `fetch_rulings`'s `Ruling` struct here gained a `case_id` field in the same change —
-// that one *is* mirrored in `queries.ts` since `fetch_rulings` is one of the nine migrated
-// commands above and this file's copy of it is otherwise dead code for the live app.
+// the JS light client. If a future change also migrates those, this whole module (and `rpc.rs`)
+// may become fully dead code — check `invoke.ts`'s `LIGHT_CLIENT_COMMANDS` map before assuming
+// that, since it's the actual source of truth for what the frontend still calls here.
+// `fetch_rulings`'s `Ruling` struct here gained a `case_id` field alongside the original
+// oracle-council addition — that one *is* mirrored in `queries.ts` since `fetch_rulings` is one
+// of the migrated commands above and this file's copy of it is otherwise dead code for the live
+// app.
 use serde::{Deserialize, Serialize};
 use crate::rpc::{RpcClient, storage_prefix};
 use std::collections::HashMap;
@@ -51,6 +53,18 @@ fn chain_rpc_err<E: std::fmt::Display>(e: E) -> String {
 fn ipfs_gateway_err<E: std::fmt::Display>(e: E) -> String {
     eprintln!("[fetch_ipfs_content] IPFS gateway request failed: {e}");
     "IPFS gateway unreachable".to_string()
+}
+
+/// Same rationale as `chain_rpc_err` above, applied to a hex-decode failure on caller-supplied
+/// input (a nullifier or content hash) rather than an RPC/network error. `hex::FromHexError`'s
+/// `Display` embeds the offending byte position, which — like the raw RPC error text
+/// `chain_rpc_err` sanitizes — has no business reaching the frontend; this brings those call
+/// sites in line with the rest of this file's convention instead of echoing that detail
+/// verbatim. `label` (e.g. "nullifier", "hash") only affects the server-side log line and which
+/// fixed, non-leaking message comes back to the frontend.
+fn invalid_hex_err<E: std::fmt::Display>(label: &str, e: E) -> String {
+    eprintln!("[chain] invalid {label} hex input: {e}");
+    format!("invalid {label} format")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -425,7 +439,7 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
         .await
         .map_err(chain_rpc_err)?;
     let target = hex::decode(nullifier_hex.trim_start_matches("0x"))
-        .map_err(|e| format!("invalid nullifier hex: {e}"))?;
+        .map_err(|e| invalid_hex_err("nullifier", e))?;
     // Each key is: 32-byte prefix + 16-byte blake2_128 hash + 32-byte nullifier
     // So the nullifier occupies the last 32 bytes of the key.
     for key_hex in &keys {
@@ -775,7 +789,7 @@ async fn fetch_ipfs_content_from(gateway_base: &str, hash_hex: String) -> Result
     use sha2::{Digest, Sha256};
 
     let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
-        .map_err(|e| format!("invalid hash hex: {e}"))?;
+        .map_err(|e| invalid_hex_err("hash", e))?;
     let cid = hash_to_cid(&hash_bytes).ok_or("hash must be exactly 32 bytes")?;
     let url = format!("{gateway_base}/{cid}");
     let client = reqwest::Client::builder()
@@ -818,7 +832,10 @@ async fn fetch_ipfs_content_from(gateway_base: &str, hash_hex: String) -> Result
         );
     }
 
-    String::from_utf8(body).map_err(|e| format!("IPFS content is not valid UTF-8: {e}"))
+    String::from_utf8(body).map_err(|e| {
+        eprintln!("[fetch_ipfs_content] fetched content is not valid UTF-8: {e}");
+        "IPFS content is not valid UTF-8".to_string()
+    })
 }
 
 // ── Legislature + Elections commands ─────────────────────────────────────────
