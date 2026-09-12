@@ -639,6 +639,12 @@ impl pallet_voting::Config for Runtime {
 	/// concurrently open), while unlike `MaxReferendaPerBlock`, overflowing this one fails
 	/// referendum creation outright rather than silently proceeding untracked.
 	type MaxConcurrentReferenda = ConstU32<500>;
+	/// Bounds `pallet_voting::PendingDelegationExpiry`'s per-block schedule of delegations whose
+	/// `expires_at` falls due that block — see that storage item's doc comment. 500 mirrors
+	/// `MaxReferendaPerBlock` above: generous relative to realistic delegation-expiry clustering,
+	/// and any overflow still expires correctly via the pre-existing lazy-cleanup fallbacks
+	/// (`has_delegation_cycle`'s incidental walk, or an explicit `revoke_delegation`).
+	type MaxExpiringDelegationsPerBlock = ConstU32<500>;
 }
 
 /// Type alias for the audit pallet used in cross-pallet trait wiring.

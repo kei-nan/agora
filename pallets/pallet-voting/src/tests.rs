@@ -1,9 +1,9 @@
 use crate::{
     mock::*, ActiveEpoch, BudgetBalance, CategoryVotes, CitizenClaimedEpoch, DelegatedWeight,
     DelegatorCount, Delegations, EpochNumber, EpochTokenAllocation, Error, Event, FiscalYearEpoch,
-    NextProposalId, NextReferendumId, OpenReferenda, PendingFinalization, PetitionReferendum,
-    ProposalResults, Proposals, ReferendumHasVoted, ReferendumState, ReferendumTally,
-    ReferendumTier, Referenda, VoteCommitments,
+    NextProposalId, NextReferendumId, OpenReferenda, PendingDelegationExpiry, PendingFinalization,
+    PetitionReferendum, ProposalResults, Proposals, ReferendumHasVoted, ReferendumState,
+    ReferendumTally, ReferendumTier, Referenda, VoteCommitments,
 };
 use frame_support::{assert_noop, assert_ok, traits::Hooks, BoundedVec};
 
@@ -835,6 +835,157 @@ fn delegate_vote_lazily_cleans_up_expired_delegation_in_chain() {
             |e| matches!(e, RuntimeEvent::Voting(Event::DelegationExpired { delegator: 40, topic_id: 9 }))
         ));
         assert_eq!(Delegations::<Test>::get(9u32, 42u64).unwrap().delegate, 40);
+    });
+}
+
+// ── PendingDelegationExpiry scheduled sweep ──────────────────────────────────
+//
+// Reproduces and closes the stale-`DelegatedWeight` cap-enforcement bug: before this sweep
+// existed, a delegation's weight was only ever reclaimed by an explicit `revoke_delegation` or
+// by `has_delegation_cycle`'s *incidental* lazy-cleanup walk (which only fires as a side effect
+// of some other citizen's `delegate_vote` happening to walk forward through that exact stale
+// node). If neither happened, an expired delegation's weight stayed stuck in its old delegate's
+// `DelegatedWeight` bucket forever, able to wrongly block legitimate new delegations to that
+// delegate under `DelegationCap` even though the stale delegation no longer represents anyone's
+// real backing.
+
+/// Core mechanism test: a delegation naturally expires, and — critically — nothing else in the
+/// system ever incidentally walks through it (no other citizen delegates to or through the
+/// expired delegator) and the delegator never calls `revoke_delegation`. Before this fix, this
+/// exact scenario left the weight permanently stuck. `on_initialize` at the scheduled block must
+/// reclaim it on its own.
+#[test]
+fn on_initialize_sweeps_expired_delegation_with_no_incidental_walk_or_revoke() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(1); // A
+        activate_citizen(2); // B (terminal)
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        let expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        assert_eq!(expires_at, 1 + MIN_DELEGATION_DURATION as u64);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        // Scheduled for cleanup at expires_at + 1.
+        assert!(PendingDelegationExpiry::<Test>::get(expires_at + 1)
+            .contains(&(0u32, 1u64)));
+
+        // Nobody else ever interacts with topic 0 or citizen 1's delegation. Advance straight to
+        // the scheduled cleanup block and run the hook, simulating ordinary block production.
+        let cleanup_at = expires_at + 1;
+        System::set_block_number(cleanup_at);
+        let _ = Voting::on_initialize(cleanup_at);
+
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_none());
+        assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 0);
+        // Weight reclaimed off the stale terminal and restored to the now-terminal-again A.
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 0);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 1u64)), 1);
+        assert!(last_event_matches(
+            |e| matches!(e, RuntimeEvent::Voting(Event::DelegationExpired { delegator: 1, topic_id: 0 }))
+        ));
+    });
+}
+
+/// The denial-of-legitimate-delegation scenario from the bug report: a stale, expired
+/// delegation's weight sits at a delegate's `DelegationCap` limit. Without the scheduled sweep
+/// reclaiming it, a brand new, entirely legitimate delegation to that same delegate would be
+/// wrongly rejected even though the delegate is not really at capacity anymore. cap = 40%,
+/// total_citizens = 4 -> at most weight 1 may sit at any one delegate.
+#[test]
+fn expired_delegation_no_longer_wrongly_blocks_new_delegation_after_scheduled_sweep() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(4);
+        activate_citizen(1); // A — will delegate then go stale
+        activate_citizen(2); // B — shared delegate, sits at the cap via A alone
+        activate_citizen(3); // D — new, legitimate delegator arriving later
+
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        let expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1); // B is already at the cap (1)
+
+        // Let A's delegation to B expire and run the scheduled sweep — nothing else ever
+        // incidentally walks through A's record, so without this sweep the weight below would
+        // stay stuck at B forever.
+        let cleanup_at = expires_at + 1;
+        System::set_block_number(cleanup_at);
+        let _ = Voting::on_initialize(cleanup_at);
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 0);
+
+        // D's brand new delegation to B is now correctly accepted — B's real, current backing is
+        // zero, not the stale 1 that would have wrongly blocked this under the old behavior.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(3), 2, 0, MIN_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+    });
+}
+
+/// Companion to the previous test: the sweep must not disturb a genuinely still-active
+/// delegation on an unrelated schedule, and `DelegationCap` must keep correctly rejecting a new
+/// delegation to a delegate who is genuinely (not just stale-ly) at capacity.
+#[test]
+fn on_initialize_expiry_sweep_leaves_active_delegation_cap_enforcement_intact() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(4); // cap allows at most weight 1 per delegate
+        activate_citizen(1); // A — short-lived, will expire and be swept
+        activate_citizen(2); // B — A's delegate (unrelated to the active chain below)
+        activate_citizen(10); // E — long-lived, genuinely active delegator
+        activate_citizen(11); // F — E's delegate, genuinely at the cap
+        activate_citizen(12); // G — new delegator who should still be correctly rejected
+
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        let expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        // A different topic so this delegation is wholly unaffected by A/B's expiry schedule.
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(10), 11, 1, MAX_DELEGATION_DURATION));
+        assert_eq!(DelegatedWeight::<Test>::get((1u32, 11u64)), 1);
+
+        // Run the sweep for A/B's (topic 0) expiry block — must not touch topic 1's still-active
+        // E -> F delegation at all.
+        let cleanup_at = expires_at + 1;
+        System::set_block_number(cleanup_at);
+        let _ = Voting::on_initialize(cleanup_at);
+        assert!(Delegations::<Test>::get(1u32, 10u64).is_some());
+        assert_eq!(DelegatedWeight::<Test>::get((1u32, 11u64)), 1);
+
+        // F is genuinely, not just stale-ly, at the cap — a new delegation must still be rejected.
+        assert_noop!(
+            Voting::delegate_vote(RuntimeOrigin::signed(12), 11, 1, MIN_DELEGATION_DURATION),
+            Error::<Test>::DelegationCapExceeded
+        );
+    });
+}
+
+/// A delegator who renews (re-delegates to the same delegate, extending `expires_at`) before
+/// their old schedule entry fires must not have their delegation incorrectly torn down at the
+/// old, now-superseded schedule block — `sweep_expired_delegation` must re-check the live record
+/// rather than trusting the schedule entry blindly.
+#[test]
+fn pending_delegation_expiry_schedule_entry_is_harmless_after_renewal() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(1); // A
+        activate_citizen(2); // B
+
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        let old_expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        let old_cleanup_at = old_expires_at + 1;
+
+        // Renew well before the old schedule entry would have fired, extending expires_at far
+        // into the future.
+        System::set_block_number(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        let new_expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        assert!(new_expires_at > old_cleanup_at);
+
+        // The stale schedule entry from the first delegation still fires at old_cleanup_at, but
+        // must be a safe no-op: the live record now has a later expires_at.
+        System::set_block_number(old_cleanup_at);
+        let _ = Voting::on_initialize(old_cleanup_at);
+
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_some());
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 2u64)), 1);
+        assert_eq!(DelegatorCount::<Test>::get((0u32, 2u64)), 1);
     });
 }
 

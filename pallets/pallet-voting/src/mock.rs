@@ -161,6 +161,7 @@ pub const MAX_REFERENDA_PER_BLOCK: u32 = 10;
 // deliberately create more than MAX_REFERENDA_PER_BLOCK concurrently-open referenda to exercise
 // that fallback, so this needs enough headroom not to spuriously block referendum creation.
 pub const MAX_CONCURRENT_REFERENDA: u32 = 50;
+pub const MAX_EXPIRING_DELEGATIONS_PER_BLOCK: u32 = 10;
 
 #[frame_support::runtime]
 mod runtime {
@@ -220,6 +221,7 @@ impl pallet_voting::Config for Test {
     type MaxEpochDurationBlocks = ConstU32<MAX_EPOCH_DURATION>;
     type MaxReferendaPerBlock = ConstU32<MAX_REFERENDA_PER_BLOCK>;
     type MaxConcurrentReferenda = ConstU32<MAX_CONCURRENT_REFERENDA>;
+    type MaxExpiringDelegationsPerBlock = ConstU32<MAX_EXPIRING_DELEGATIONS_PER_BLOCK>;
 }
 
 // Build genesis storage according to the mock runtime.

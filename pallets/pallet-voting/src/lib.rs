@@ -231,6 +231,19 @@ pub mod pallet {
         /// rather than silently proceeding without tracking it.
         #[pallet::constant]
         type MaxConcurrentReferenda: Get<u32>;
+        /// Bounds `PendingDelegationExpiry`, the per-block schedule of delegation records whose
+        /// `expires_at` falls due that block. See that storage item's doc comment for the gap
+        /// this closes: without a scheduled sweep, a delegation that naturally expires with no
+        /// other citizen's `delegate_vote` happening to walk through it (via
+        /// `has_delegation_cycle`'s incidental lazy-cleanup path) and no explicit
+        /// `revoke_delegation` from the delegator themselves would leave its weight permanently
+        /// stuck in the old delegate's `DelegatedWeight` cap-tracking total, able to wrongly
+        /// block legitimate new delegations to that delegate forever. If more delegations than
+        /// this bound happen to share an exact expiry block, the excess simply aren't
+        /// auto-scheduled and fall back to the pre-existing lazy-cleanup paths — mirrors
+        /// `MaxReferendaPerBlock`'s fallback pattern.
+        #[pallet::constant]
+        type MaxExpiringDelegationsPerBlock: Get<u32>;
     }
 
     // ── 1p1v / MACI storage ─────────────────────────────────────────────────
@@ -289,9 +302,53 @@ pub mod pallet {
     /// `apply_delegated_weight` never reads this — it always re-resolves the real
     /// `Delegations` graph fresh from scratch, so tallying correctness never depends on this
     /// cache staying perfectly accurate.
+    ///
+    /// A record's weight is reclaimed out of here when it stops being valid via three paths:
+    /// an explicit `revoke_delegation`, `has_delegation_cycle`'s incidental lazy-cleanup walk (a
+    /// side effect of some other citizen's `delegate_vote`, only reached if that walk happens to
+    /// pass through the exact stale record), and — closing the gap the first two leave open when
+    /// neither happens to fire — `PendingDelegationExpiry`'s scheduled sweep in `on_initialize`,
+    /// which guarantees every naturally-expired record's weight is reclaimed by the block after
+    /// its `expires_at`, not just incidentally or never.
     #[pallet::storage]
     pub type DelegatedWeight<T: Config> =
         StorageMap<_, Blake2_128Concat, (u32, T::AccountId), u32, ValueQuery>;
+
+    /// Schedules a lazy expiry cleanup of a `(topic_id, delegator)` delegation record: block
+    /// number -> the `(topic_id, delegator)` pairs whose `expires_at` falls due at that block
+    /// (i.e. `record.expires_at + 1`, the first block at which the record is treated as
+    /// expired — mirrors `PendingFinalization`'s `end_block + 1` convention). Populated by
+    /// `delegate_vote` whenever it inserts a `DelegationRecord` (both first-time delegations and
+    /// renewals/re-targets get a fresh schedule entry for their new `expires_at`).
+    ///
+    /// Before this existed, the ONLY paths that ever cleaned up a naturally-expired delegation
+    /// were an explicit `revoke_delegation` by the delegator themselves, or `has_delegation_cycle`
+    /// incidentally walking through that exact stale record as a side effect of some OTHER
+    /// citizen's `delegate_vote` call. If neither happened, the record — and the weight it
+    /// contributed to its (old) delegate's `DelegatedWeight` entry — lingered forever, which could
+    /// falsely make `DelegationCap` believe a delegate was at/over their cap when they were not,
+    /// wrongly blocking legitimate new delegations to that delegate. This schedule closes that
+    /// gap in the general case: `on_initialize` drains the current block's entries and actually
+    /// removes+reclaims-weight for any that are still present and still genuinely expired.
+    ///
+    /// An entry here can go stale without causing incorrect cleanup: if the delegator renewed or
+    /// re-targeted their delegation after scheduling (giving the record a new, later
+    /// `expires_at`), or explicitly revoked it, the sweep re-reads the live record at fire time
+    /// and only acts if it is both still present and still expired relative to `now` — see
+    /// `Pallet::sweep_expired_delegation`.
+    ///
+    /// Bounded per block by `MaxExpiringDelegationsPerBlock` to keep `on_initialize`'s worst-case
+    /// cost bounded; on overflow the entry is simply not scheduled here and relies on the
+    /// pre-existing lazy-cleanup fallbacks above — delegation creation itself never fails because
+    /// of this.
+    #[pallet::storage]
+    pub type PendingDelegationExpiry<T: Config> = StorageMap<
+        _,
+        Blake2_128Concat,
+        BlockNumberFor<T>,
+        BoundedVec<(u32, T::AccountId), T::MaxExpiringDelegationsPerBlock>,
+        ValueQuery,
+    >;
 
     /// Next proposal id counter.
     #[pallet::storage]
@@ -860,6 +917,10 @@ pub mod pallet {
                 who.clone(),
                 DelegationRecord { delegate: delegate.clone(), expires_at, resolved_weight },
             );
+            // Schedule the general expiry sweep so this record's weight is reclaimed even if no
+            // other citizen's `has_delegation_cycle` walk ever happens to pass through it and
+            // `who` never calls `revoke_delegation` — see `PendingDelegationExpiry`'s doc comment.
+            Self::schedule_delegation_expiry(topic_id, who.clone(), expires_at);
             Self::deposit_event(Event::DelegationSet { delegator: who, delegate, topic_id, expires_at });
             Ok(())
         }
@@ -888,23 +949,14 @@ pub mod pallet {
                 !Self::topic_has_closed_unfinalized_referendum(topic_id, now),
                 Error::<T>::ReferendumVotingWindowClosed
             );
-            let record = Delegations::<T>::take(topic_id, who.clone())
+            let record = Delegations::<T>::get(topic_id, who.clone())
                 .ok_or(Error::<T>::NoDelegationOnTopic)?;
-            DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| *c = c.saturating_sub(1));
-            // Move the weight this delegation carried back from wherever it resolved to
-            // onto `who` themselves — they are a terminal delegate again now that they have
-            // no outgoing delegation on this topic. Also fixes up every intermediate hop's own
-            // stored `resolved_weight` along the old chain (see
+            // Moves the weight this delegation carried back from wherever it resolved to onto
+            // `who` themselves — they are a terminal delegate again now that they have no
+            // outgoing delegation on this topic — and removes the record. Also fixes up every
+            // intermediate hop's own stored `resolved_weight` along the old chain (see
             // `propagate_weight_along_chain`'s doc comment).
-            Self::propagate_weight_along_chain(
-                &record.delegate,
-                topic_id,
-                now,
-                -(record.resolved_weight as i64),
-            );
-            DelegatedWeight::<T>::mutate((topic_id, &who), |w| {
-                *w = w.saturating_add(record.resolved_weight)
-            });
+            Self::remove_delegation_and_reclaim_weight(topic_id, who.clone(), &record, now);
             Self::deposit_event(Event::DelegationRevoked { delegator: who, topic_id });
             Ok(())
         }
@@ -1274,6 +1326,20 @@ pub mod pallet {
                 });
             }
 
+            // Bounded by MaxExpiringDelegationsPerBlock (the BoundedVec's capacity), so this
+            // loop's worst-case cost per block is fixed regardless of how many delegations exist
+            // overall. See `PendingDelegationExpiry`'s doc comment for the stale-`DelegatedWeight`
+            // gap this closes: without it, a delegation's expiry is only ever noticed if some
+            // other citizen's `delegate_vote` happens to walk through it, or the delegator
+            // themselves calls `revoke_delegation`.
+            let expiring = PendingDelegationExpiry::<T>::take(now);
+            let per_expiry_steps = 4u64.saturating_add(T::MaxDelegationDepth::get() as u64);
+            let per_expiry = Weight::from_parts(1_000, 0).saturating_mul(per_expiry_steps);
+            for (topic_id, delegator) in expiring.into_iter() {
+                weight = weight.saturating_add(per_expiry);
+                Self::sweep_expired_delegation(topic_id, delegator, now);
+            }
+
             weight
         }
     }
@@ -1468,20 +1534,12 @@ pub mod pallet {
                         // carried back onto `current` (which becomes a terminal delegate again)
                         // from wherever the now-invalid chain used to resolve to, fixing up every
                         // intermediate hop's own stored `resolved_weight` along that old chain too.
-                        // Mirrors what `revoke_delegation` does for an explicit revoke.
-                        Self::propagate_weight_along_chain(
-                            &record.delegate,
-                            topic_id,
-                            now,
-                            -(record.resolved_weight as i64),
-                        );
-                        DelegatedWeight::<T>::mutate((topic_id, &current), |w| {
-                            *w = w.saturating_add(record.resolved_weight)
-                        });
-                        DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| {
-                            *c = c.saturating_sub(1)
-                        });
-                        Delegations::<T>::remove(topic_id, current.clone());
+                        // Mirrors what `revoke_delegation` does for an explicit revoke. This is
+                        // only an *incidental* cleanup path (it fires only when some other
+                        // citizen's `delegate_vote` happens to walk forward through this exact
+                        // node) — `PendingDelegationExpiry`'s scheduled sweep is what guarantees
+                        // this also happens even when no such walk ever occurs.
+                        Self::remove_delegation_and_reclaim_weight(topic_id, current.clone(), &record, now);
                         Self::deposit_event(Event::DelegationExpired {
                             delegator: current,
                             topic_id,
@@ -1597,6 +1655,77 @@ pub mod pallet {
                 base.saturating_add(delta as u32)
             } else {
                 base.saturating_sub(delta.unsigned_abs() as u32)
+            }
+        }
+
+        /// Tears down `record`, the `(topic_id, delegator)` delegation record, moving the weight
+        /// it carried back onto `delegator` (who becomes a terminal delegate again now that they
+        /// have no outgoing delegation on this topic) and decrementing `record.delegate`'s
+        /// `DelegatorCount`. Also fixes up every intermediate hop's own stored `resolved_weight`
+        /// along the old chain via `propagate_weight_along_chain` — see that function's doc
+        /// comment for why that matters.
+        ///
+        /// Shared by all three call sites that ever remove a `DelegationRecord` outright:
+        /// `revoke_delegation` (explicit revoke), `has_delegation_cycle`'s incidental lazy-cleanup
+        /// walk, and `sweep_expired_delegation`'s scheduled cleanup. Only the emitted event
+        /// differs between them (`DelegationRevoked` vs `DelegationExpired`), so this helper does
+        /// not emit one itself — callers do that afterward.
+        fn remove_delegation_and_reclaim_weight(
+            topic_id: u32,
+            delegator: T::AccountId,
+            record: &DelegationRecord<T::AccountId, BlockNumberFor<T>>,
+            now: BlockNumberFor<T>,
+        ) {
+            Self::propagate_weight_along_chain(
+                &record.delegate,
+                topic_id,
+                now,
+                -(record.resolved_weight as i64),
+            );
+            DelegatedWeight::<T>::mutate((topic_id, &delegator), |w| {
+                *w = w.saturating_add(record.resolved_weight)
+            });
+            DelegatorCount::<T>::mutate((topic_id, &record.delegate), |c| {
+                *c = c.saturating_sub(1)
+            });
+            Delegations::<T>::remove(topic_id, delegator);
+        }
+
+        /// Schedules `PendingDelegationExpiry` cleanup for `(topic_id, delegator)` at
+        /// `expires_at + 1` — the first block at which the record is treated as expired (mirrors
+        /// `schedule_finalization`'s `end_block + 1` convention). Called from `delegate_vote`
+        /// every time it inserts a `DelegationRecord`, including renewals/re-targets, so each
+        /// delegation is always covered by whatever its *current* `expires_at` is.
+        ///
+        /// If that block's schedule is already at `MaxExpiringDelegationsPerBlock` capacity, this
+        /// entry is simply left unscheduled — the delegation still expires correctly, just without
+        /// the guaranteed-prompt sweep; it falls back to the pre-existing lazy-cleanup paths
+        /// (`has_delegation_cycle`'s incidental walk, or an explicit `revoke_delegation`). Never
+        /// fails `delegate_vote` itself.
+        fn schedule_delegation_expiry(
+            topic_id: u32,
+            delegator: T::AccountId,
+            expires_at: BlockNumberFor<T>,
+        ) {
+            let cleanup_at = expires_at.saturating_add(BlockNumberFor::<T>::from(1u32));
+            PendingDelegationExpiry::<T>::mutate(cleanup_at, |scheduled| {
+                let _ = scheduled.try_push((topic_id, delegator));
+            });
+        }
+
+        /// Runs due at `now` for one `(topic_id, delegator)` entry drained from
+        /// `PendingDelegationExpiry`. Only actually removes anything if the delegation record is
+        /// still present AND its `expires_at` is still in the past relative to `now` — a
+        /// delegator who renewed/re-targeted (giving the record a new, later `expires_at`) or
+        /// explicitly revoked their delegation since this entry was scheduled will have already
+        /// invalidated it, so this is a safe no-op in that case rather than incorrectly tearing
+        /// down a still-active or already-gone record.
+        fn sweep_expired_delegation(topic_id: u32, delegator: T::AccountId, now: BlockNumberFor<T>) {
+            if let Some(record) = Delegations::<T>::get(topic_id, delegator.clone()) {
+                if record.expires_at < now {
+                    Self::remove_delegation_and_reclaim_weight(topic_id, delegator.clone(), &record, now);
+                    Self::deposit_event(Event::DelegationExpired { delegator, topic_id });
+                }
             }
         }
 
