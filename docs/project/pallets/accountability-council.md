@@ -126,7 +126,17 @@ Calls:
 - `remove_member(who)` — same dual gate as `add_member`. Also purges the removed member's
   already-cast approvals from every in-flight `PendingAction`, mirroring
   `pallet_courts::remove_oracle_member`'s identical rationale: a departing/compromised member's
-  vote shouldn't keep counting toward quorum on still-open proposals
+  vote shouldn't keep counting toward quorum on still-open proposals — **and then re-checks every
+  such action against the now-shrunk supermajority threshold**, resolving (moving to
+  `ApprovedAction`) any that the remaining approvers' votes already satisfy. The purge alone isn't
+  sufficient: the threshold's denominator is `Members::<T>::get().len()`, so removing a member
+  shrinks it, and without this re-check an action could be permanently stranded in
+  `PendingAction` (no stale-clear path exists for it, unlike `ApprovedAction`) if the remaining
+  approvers already met the shrunk threshold but no one was left to call `approve_action` to
+  trigger resolution. Bounded to `MAX_ACTIONS_RERESOLVED_PER_REMOVAL` (20) re-resolutions per
+  call; the purge itself always covers every in-flight action regardless of that cap. Mirrors
+  `pallet_courts::remove_oracle_member`'s fix for the identical bug in its own
+  `OracleApprovals`/`PendingAdminAction` mechanisms.
 - `close_bootstrap()` — `Root`; one-time; see above
 - `propose_action(call_hash)` — current Council member only; proposes an action identified by its
   domain-separated call hash and casts the proposer's own approval immediately (resolves

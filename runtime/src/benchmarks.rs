@@ -36,4 +36,5 @@ frame_benchmarking::define_benchmarks!(
 	[pallet_elections, PalletElections]
 	[pallet_emergency_council, EmergencyCouncil]
 	[pallet_executive, Cabinet]
+	[pallet_accountability_council, AccountabilityCouncil]
 );

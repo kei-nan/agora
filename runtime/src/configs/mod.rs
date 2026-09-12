@@ -1448,4 +1448,5 @@ impl pallet_accountability_council::Config for Runtime {
 	type ApprovalExpiryBlocks = ConstU32<{ 14 * DAYS }>;
 	type LegislatureChecker = Runtime;
 	type ExecutiveChecker = Runtime;
+	type WeightInfo = pallet_accountability_council::weights::SubstrateWeight<Runtime>;
 }

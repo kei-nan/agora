@@ -1210,7 +1210,30 @@ pub mod pallet {
             // over-reject a pool that would technically still work. Not worth detecting
             // precisely for a vanishingly rare case — erring toward over-rejection here is the
             // safe side.
-            let excluded = 1u32 + defendant_nullifier.is_some() as u32;
+            //
+            // `pick_random_jurors` also unconditionally excludes any citizen who is a current
+            // `OracleMembers`/`AIGovernanceCouncil` member (see that function's doc comment) —
+            // this pre-check must account for the same exclusion or it can pass eligibility on a
+            // pool that's actually too small once that exclusion is applied, stranding the case
+            // in `InJuryAppeal` forever (identical failure mode to the filer/defendant gap this
+            // check already guards against, just for a different exclusion that was added to
+            // `pick_random_jurors` later without a matching update here). Only members who are
+            // themselves active citizens count against the pool — a council member who isn't a
+            // citizen was never part of `total` to begin with, so subtracting them would
+            // over-reject. Deduplicated so a citizen sitting on both councils is only counted
+            // once, matching `pick_random_jurors`'s `||` (not additive) exclusion check.
+            let oracle_members = OracleMembers::<T>::get();
+            let ai_governance_members = AIGovernanceCouncil::<T>::get();
+            let mut conflicted_citizens: alloc::vec::Vec<T::AccountId> = alloc::vec::Vec::new();
+            for acct in oracle_members.iter().chain(ai_governance_members.iter()) {
+                if !conflicted_citizens.contains(acct) && T::CitizenChecker::is_active_citizen(acct)
+                {
+                    conflicted_citizens.push(acct.clone());
+                }
+            }
+            let excluded = 1u32
+                .saturating_add(defendant_nullifier.is_some() as u32)
+                .saturating_add(conflicted_citizens.len() as u32);
             let eligible = total.saturating_sub(excluded);
             ensure!(eligible >= required_size as u32, Error::<T>::NotEnoughCitizens);
             // Read the pre-captured delayed-reveal seed rather than recomputing it from live

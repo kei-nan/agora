@@ -986,3 +986,51 @@ fn election_seating_path_unaffected_by_closed_bootstrap() {
         assert_eq!(Members::<Test>::get().to_vec(), vec![9, 10]);
     });
 }
+
+/// Regression test for the low-severity correctness gap this fix closes: a wholesale
+/// election-driven reseat (`SeatLegislature::replace_members`) used to leave a still-unconsumed
+/// `PendingLegislatureApproval` token in storage untouched. Because
+/// `EnsureLegislatureMotion::try_origin` accepts consumption from *any current member* (not
+/// only the original proposer -- see that type's doc comment), a member of the brand-new
+/// legislature who had no part whatsoever in the vote that produced the token could
+/// nonetheless consume it, violating the "the vote legitimizes the action" invariant. After the
+/// fix, `replace_members` discards any outstanding token as part of the reseat, so no
+/// newly-seated member can consume a stale one.
+#[test]
+fn replace_members_discards_stale_pending_approval_on_full_reseat() {
+    use pallet_elections::pallet::SeatLegislature;
+
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        add(2);
+
+        // The outgoing legislature (members 1, 2) passes a motion and plants a token that
+        // nobody consumes before the election-driven reseat happens.
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(1), CALL_HASH_A));
+        assert_ok!(Legislature::vote_motion(RuntimeOrigin::signed(2), 0, true));
+        System::set_block_number(1 + MOTION_DURATION as u64);
+        assert_ok!(Legislature::close_motion(RuntimeOrigin::signed(1), 0));
+        assert!(PendingLegislatureApproval::<Test>::get().is_some());
+
+        // The election cycle wholesale-reseats the legislature with entirely new members who
+        // had no part in the vote that produced the pending token.
+        assert_ok!(<Legislature as SeatLegislature<u64>>::replace_members(vec![9, 10]));
+        assert_eq!(Members::<Test>::get().to_vec(), vec![9, 10]);
+
+        // The stale token must be gone ...
+        assert!(PendingLegislatureApproval::<Test>::get().is_none());
+        System::assert_last_event(
+            Event::PendingApprovalDiscardedOnReseat { call_hash: CALL_HASH_A }.into(),
+        );
+
+        // ... so a newly-seated member cannot consume it to authorize the outgoing
+        // legislature's call, even though they are a legitimate current member and present
+        // the exact hash that was originally approved.
+        let new_member_origin: RuntimeOrigin = RuntimeOrigin::signed(9);
+        assert!(
+            EnsureLegislatureMotion::<Test>::try_origin(new_member_origin, &CALL_HASH_A)
+                .is_err()
+        );
+    });
+}

@@ -90,7 +90,11 @@ pub mod pallet {
     /// availability, and requiring the exact proposer created a permanent-deadlock risk if
     /// they went offline or were removed before executing it. If no member consumes it
     /// before `PendingApprovalExpiryBlocks` elapses, `clear_stale_approval` lets any member
-    /// discard it so a new motion can pass. This is enforced with
+    /// discard it so a new motion can pass. Note this "any current member" reasoning only
+    /// holds for ordinary `add_member`/`remove_member` churn, not a wholesale reseat —
+    /// `SeatLegislature::replace_members` (see the impl at the bottom of this file) discards
+    /// any outstanding token itself rather than letting it survive into an entirely new
+    /// legislature that had no part in the vote that produced it. This is enforced with
     /// `EnsureOriginWithArg` (rather than plain `EnsureOrigin`) so the check lives inside
     /// the origin gate itself: a consuming call site cannot forget to verify the token,
     /// because there is no path to a successful origin without supplying a matching hash.
@@ -332,6 +336,14 @@ pub mod pallet {
         /// A `PendingLegislatureApproval` token expired unconsumed and was discarded via
         /// `clear_stale_approval`, freeing the legislature to pass a new motion.
         PendingApprovalExpired { call_hash: [u8; 32] },
+        /// A `PendingLegislatureApproval` token was still unconsumed when
+        /// `SeatLegislature::replace_members` performed a full election-driven reseat, and was
+        /// discarded as part of that reseat rather than surviving into the new legislature. See
+        /// `replace_members`'s doc comment for why a wholesale membership swap — unlike ordinary
+        /// `add_member`/`remove_member` churn — must invalidate any outstanding token instead of
+        /// leaving it consumable by newly-seated members who had no part in the vote that
+        /// produced it.
+        PendingApprovalDiscardedOnReseat { call_hash: [u8; 32] },
         /// `Root` closed the bootstrap phase; `add_member`/`remove_member` can never be called
         /// successfully again (see `Bootstrapped`'s doc comment).
         BootstrapClosed,
@@ -608,6 +620,30 @@ impl<T: pallet::Config> pallet_elections::pallet::SeatLegislature<T::AccountId>
                 "election winners exceed MaxMembers",
             ))?;
         pallet::Members::<T>::put(bounded);
+        // A full reseat invalidates any outstanding `PendingLegislatureApproval` token.
+        // `EnsureLegislatureMotion::try_origin`'s "any current member may consume it" rule
+        // (see that type's doc comment) is only safe under ordinary `add_member`/
+        // `remove_member` churn, where membership overlaps almost entirely with the
+        // legislature that actually cast the vote. A wholesale reseat like this one can
+        // replace the *entire* membership set at once, so a token planted by the outgoing
+        // legislature — still unconsumed, e.g. within the `PendingApprovalExpiryBlocks`
+        // window — would otherwise remain consumable by an incoming member who had no part
+        // in the vote that produced it, violating the "the vote legitimizes the action"
+        // invariant the origin relies on. Discarding it here mirrors the "structural
+        // membership change purges in-flight approval state" pattern
+        // `pallet_courts::remove_oracle_member` already applies to its own pending
+        // proposals/admin actions on a membership change, adapted to this pallet's simpler
+        // single-token (rather than per-member-vote) approval model: there's nothing to
+        // partially purge and re-resolve, so the whole token is just discarded outright.
+        // The queued action is lost, not deferred — whoever wanted it enacted must get a
+        // fresh motion passed by the newly-seated legislature.
+        if let Some((call_hash, _proposer, _ayes, _total, _planted_at)) =
+            pallet::PendingLegislatureApproval::<T>::take()
+        {
+            pallet::Pallet::<T>::deposit_event(
+                pallet::Event::PendingApprovalDiscardedOnReseat { call_hash },
+            );
+        }
         Ok(())
     }
 }

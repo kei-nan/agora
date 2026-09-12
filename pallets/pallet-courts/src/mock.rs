@@ -145,7 +145,18 @@ impl CitizenSelector<AccountId> for MockCitizenSelector {
 pub struct MockCitizenChecker;
 impl CitizenChecker<AccountId> for MockCitizenChecker {
 	fn is_active_citizen(who: &AccountId) -> bool {
-		!SUSPENDED.with(|s| s.borrow().contains(who))
+		// Must actually be one of the registered citizens (`MockCitizenSelector`'s `1..=
+		// CITIZEN_COUNT` range), not merely "any account that hasn't been suspended" — the real
+		// runtime's `pallet_identity_zk::is_active_citizen` returns `false` outright for an
+		// account with no `CitizenNullifier` record at all (see that pallet's `lib.rs`), so an
+		// account that was never registered (e.g. a root-appointed Oracle/AI-governance-council
+		// member who isn't also a citizen) must not read as active here either. Without this
+		// range check, `select_jury`'s eligibility pre-check (which asks this trait "is this
+		// council member also a citizen" to decide how many seats to subtract) would treat
+		// every non-citizen council account used in these tests as a phantom eligible-pool
+		// deduction.
+		let total = CITIZEN_COUNT.with(|c| *c.borrow());
+		(1..=total as u64).contains(who) && !SUSPENDED.with(|s| s.borrow().contains(who))
 	}
 
 	fn citizen_nullifier(who: &AccountId) -> Option<[u8; 32]> {

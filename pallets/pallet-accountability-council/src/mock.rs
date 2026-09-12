@@ -90,6 +90,7 @@ impl pallet_accountability_council::Config for Test {
     type ApprovalExpiryBlocks = ConstU32<APPROVAL_EXPIRY>;
     type LegislatureChecker = MockLegislatureChecker;
     type ExecutiveChecker = MockExecutiveChecker;
+    type WeightInfo = ();
 }
 
 // Build genesis storage according to the mock runtime.

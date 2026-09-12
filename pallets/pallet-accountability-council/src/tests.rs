@@ -334,6 +334,44 @@ fn remove_member_purges_their_approval_from_pending_actions() {
     });
 }
 
+/// The medium-severity bug this test guards against: purging a removed member's votes from
+/// `PendingAction` without re-checking the (now-shrunk) threshold could permanently strand an
+/// action in `PendingAction` — no stale-clear path exists for it (unlike `ApprovedAction`), and
+/// the same call_hash can never be re-proposed (`Error::ActionAlreadyProposed`). Mirrors
+/// `pallet_courts`'s
+/// `remove_oracle_member_reresolves_case_action_crossing_threshold_after_shrink`.
+#[test]
+fn remove_member_reresolves_pending_action_crossing_threshold_after_shrink() {
+    new_test_ext().execute_with(|| {
+        bootstrap_members(&[1, 2, 3, 4]);
+        let hash = [42u8; 32];
+
+        // 2 of 4 is short of 2/3 (2*3=6 < 4*2=8) — stays pending.
+        assert_ok!(AccountabilityCouncil::propose_action(RuntimeOrigin::signed(1), hash));
+        assert_ok!(AccountabilityCouncil::approve_action(RuntimeOrigin::signed(2), hash));
+        assert!(PendingAction::<Test>::get(hash).is_some());
+        assert!(ApprovedAction::<Test>::get(hash).is_none());
+
+        // Remove member 4, who never approved this action at all. The council shrinks to 3,
+        // and the threshold shrinks with it: 2 of 3 now exactly clears 2/3 (2*3=6 >= 3*2=6),
+        // even though member 4's removal has nothing to do with this action's own approvers.
+        assert_ok!(AccountabilityCouncil::remove_member(RuntimeOrigin::root(), 4));
+
+        // Without re-resolution, this action would incorrectly stay in `PendingAction` even
+        // though its now-shrunk threshold is already satisfied by the existing approvals — it
+        // would only get resolved later, incidentally, if member 3 (the sole remaining
+        // non-approver) happened to also call `approve_action`. In the more severe variant of
+        // this bug (every surviving member already approved), there would be no one left to
+        // call `approve_action` at all, permanently stranding the action (no stale-clear path
+        // exists for `PendingAction`, unlike `ApprovedAction`, and the same call_hash can never
+        // be re-proposed per `Error::ActionAlreadyProposed`). `remove_member` itself must
+        // resolve it immediately, regardless of whether any such member remains.
+        assert!(PendingAction::<Test>::get(hash).is_none());
+        assert!(ApprovedAction::<Test>::get(hash).is_some());
+        System::assert_has_event(Event::ActionApproved { call_hash: hash }.into());
+    });
+}
+
 // ─── clear_stale_action ─────────────────────────────────────────────────────────────────────
 
 #[test]

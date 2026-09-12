@@ -55,6 +55,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::WeightInfo;
+
 #[frame_support::pallet]
 pub mod pallet {
 
@@ -63,6 +68,7 @@ pub mod pallet {
     use frame_support::traits::EnsureOriginWithArg;
     use frame_system::pallet_prelude::*;
     use sp_runtime::traits::Saturating;
+    use crate::weights::WeightInfo;
 
     #[pallet::pallet]
     pub struct Pallet<T>(_);
@@ -106,6 +112,24 @@ pub mod pallet {
         frame_support::Hashable::blake2_256(&preimage)
     }
 
+    /// Maximum number of pending actions `remove_member` will attempt to re-resolve
+    /// (`try_resolve_action`) in a single call, after purging the removed member's approvals.
+    /// Mirrors `pallet_courts::MAX_ORACLE_ACTIONS_RERESOLVED_PER_REMOVAL` — see that constant's
+    /// doc comment for the fuller weight-pricing rationale; in short: the purge itself (walking
+    /// every `PendingAction` entry to strip the removed member's vote, and collecting every
+    /// call_hash for the re-check below) stays unbounded regardless of this cap — skipping an
+    /// entry there would leave a removed member's vote silently still counting toward some
+    /// pending action's threshold forever, defeating the whole point of removal — but that purge
+    /// is cheap, bounded per-item work (`BoundedVec` position/remove, capped at
+    /// `MaxCouncilSize` entries). What's bounded is the optional *re-resolution* step: an
+    /// unbounded number of pending actions could otherwise make a single `remove_member` call's
+    /// weight scale with however many actions happen to be in flight at removal time. Any action
+    /// left un-resolved past this cap simply stays pending, already purged of the removed
+    /// member's vote, and resolves itself the moment any other Council member's next
+    /// `approve_action`/`propose_action` call touches it — not stuck, just not resolved *within
+    /// this specific call*.
+    const MAX_ACTIONS_RERESOLVED_PER_REMOVAL: usize = 20;
+
     // ── EnsureOriginWithArg ──────────────────────────────────────────────────────
 
     /// `EnsureOriginWithArg<RuntimeOrigin, [u8; 32]>` that succeeds only when
@@ -146,11 +170,14 @@ pub mod pallet {
             }
         }
 
-        // NOTE: this cfg can never currently activate — this crate declares no
-        // `runtime-benchmarks` feature of its own and has no `benchmarking.rs`. See
-        // `pallet_courts::EnsureOracleCouncilApproved`'s identical note for the full accounting;
-        // making this real requires adding the feature to this crate's Cargo.toml, wiring it
-        // into `runtime/Cargo.toml`, and writing an actual `#[benchmarks]` module.
+        // This crate now declares a real `runtime-benchmarks` feature (wired into
+        // `runtime/Cargo.toml`) and a real `benchmarking.rs` (see that file and `weights.rs`'s
+        // module doc comment) — so this cfg does activate when the runtime is built with that
+        // feature. Unlike `pallet_courts::EnsureOracleCouncilApproved`'s still-outstanding
+        // identical note (that crate has neither yet), this pallet's benchmarking scaffolding
+        // isn't itself machine-run against a real built runtime either — see `weights.rs` — but
+        // the wiring this function needs to actually be exercised by `cargo build --features
+        // runtime-benchmarks` / `benchmark pallet` is now in place.
         #[cfg(feature = "runtime-benchmarks")]
         fn try_successful_origin(call_hash: &[u8; 32]) -> Result<T::RuntimeOrigin, ()> {
             let member = Members::<T>::get().first().cloned().ok_or(())?;
@@ -191,6 +218,8 @@ pub mod pallet {
         /// Checks whether a prospective member currently holds executive power (minister or
         /// Prime Minister) — enforces the executive/Council incompatibility rule.
         type ExecutiveChecker: ExecutiveChecker<Self::AccountId>;
+        /// Weight functions needed for this pallet's extrinsics.
+        type WeightInfo: crate::weights::WeightInfo;
     }
 
     // ── Storage ─────────────────────────────────────────────────────────────────
@@ -301,7 +330,7 @@ pub mod pallet {
         /// Council adds its own new members by its own supermajority vote. Either way, `who`
         /// must pass the legislature/executive incompatibility check.
         #[pallet::call_index(0)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::add_member())]
         pub fn add_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             Self::authorize_membership_change(origin, b"pallet-accountability-council::add_member", &who)?;
             ensure!(
@@ -319,8 +348,37 @@ pub mod pallet {
 
         /// Remove a member from the Council. Same dual-gate as `add_member`: `Root` pre-
         /// bootstrap, supermajority-approved call post-bootstrap.
+        ///
+        /// Also purges the removed member's already-cast approvals from every in-flight
+        /// `PendingAction` and then re-checks *every* such action against the (now-shrunk)
+        /// supermajority threshold — mirrors `pallet_courts::remove_oracle_member`'s identical
+        /// fix for its own analogous `OracleApprovals`/`PendingAdminAction` mechanisms. This
+        /// Council exists specifically to survive a compromised/departing member, so their vote
+        /// shouldn't keep counting toward quorum on still-open proposals after removal — but the
+        /// purge alone isn't sufficient: the supermajority threshold's denominator is
+        /// `Members::<T>::get().len()`, so removing a member shrinks it, and a proposal that was
+        /// short of quorum before the removal can become already-satisfied by the *remaining*
+        /// approvers' votes alone. Without re-resolving here, such an action would never move
+        /// out of `PendingAction` (there's no stale-clear path for it, only for `ApprovedAction`)
+        /// if every surviving member had already approved — nobody would be left to call
+        /// `approve_action` to trigger resolution, and the same `call_hash` could never be
+        /// re-proposed (`Error::ActionAlreadyProposed`), permanently stranding it.
+        ///
+        /// Every call_hash with an in-flight `PendingAction` is re-checked, not only ones the
+        /// removed member had personally approved — mirrors `pallet_courts::
+        /// remove_oracle_member`'s `OracleApprovals` re-check (the broader of that function's two
+        /// re-checks), not its narrower `PendingAdminAction` one, which that function's own doc
+        /// comment flags as gated too narrowly for this exact failure mode: the council shrinking
+        /// is what crosses the threshold, independent of whether the removed member happened to
+        /// have voted on any given action.
         #[pallet::call_index(1)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        // See `weights.rs`'s module doc comment for what `WeightInfo::remove_member`'s estimate
+        // does and doesn't price: it accounts for the bounded
+        // `MAX_ACTIONS_RERESOLVED_PER_REMOVAL`-capped re-resolution loop below, but not the
+        // unavoidably full-map `PendingAction::translate` purge scan itself (unbounded by any
+        // `Config` item), same caveat `pallet_courts::remove_oracle_member`'s own flat,
+        // unbenchmarked weight carries for its analogous purge.
+        #[pallet::weight(T::WeightInfo::remove_member())]
         pub fn remove_member(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
             Self::authorize_membership_change(origin, b"pallet-accountability-council::remove_member", &who)?;
             Members::<T>::try_mutate(|members| {
@@ -331,15 +389,26 @@ pub mod pallet {
             // Purge this member's already-cast approvals from every in-flight PendingAction —
             // mirrors pallet_courts::remove_oracle_member's identical rationale: this Council
             // exists specifically to survive a compromised/departing member, so their vote
-            // shouldn't keep counting toward quorum on still-open proposals after removal.
+            // shouldn't keep counting toward quorum on still-open proposals after removal. Every
+            // call_hash is collected here, whether or not `who` had actually approved it —
+            // removing a member shrinks the threshold's denominator for *every* pending action,
+            // not just the ones they personally voted on (see this call's doc comment).
+            let mut affected: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::new();
             PendingAction::<T>::translate(
-                |_call_hash, (proposer, mut approvers): (T::AccountId, BoundedVec<T::AccountId, T::MaxCouncilSize>)| {
+                |call_hash, (proposer, mut approvers): (T::AccountId, BoundedVec<T::AccountId, T::MaxCouncilSize>)| {
                     if let Some(pos) = approvers.iter().position(|m| m == &who) {
                         approvers.remove(pos);
                     }
+                    affected.push(call_hash);
                     Some((proposer, approvers))
                 },
             );
+            // Bounded to `MAX_ACTIONS_RERESOLVED_PER_REMOVAL` — see that constant's doc comment.
+            // Every entry was already purged of the removed member's vote above regardless of
+            // whether it gets re-resolved here.
+            for call_hash in affected.into_iter().take(MAX_ACTIONS_RERESOLVED_PER_REMOVAL) {
+                Self::try_resolve_action(call_hash);
+            }
             Self::deposit_event(Event::MemberRemoved { who });
             Ok(())
         }
@@ -348,7 +417,7 @@ pub mod pallet {
         /// already seated. After this, `Root` can never again unilaterally add or remove a
         /// Council member — see the module doc comment and `add_member`/`remove_member`.
         #[pallet::call_index(2)]
-        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        #[pallet::weight(T::WeightInfo::close_bootstrap())]
         pub fn close_bootstrap(origin: OriginFor<T>) -> DispatchResult {
             ensure_root(origin)?;
             ensure!(!Bootstrapped::<T>::get(), Error::<T>::AlreadyBootstrapped);
@@ -364,7 +433,7 @@ pub mod pallet {
         /// callable by a current Council member; this both proposes the action and casts the
         /// proposer's own approval, exactly like `pallet_courts::propose_admin_action`.
         #[pallet::call_index(3)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::propose_action())]
         pub fn propose_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotCouncilMember);
@@ -383,7 +452,7 @@ pub mod pallet {
 
         /// Cast a Council approval on `call_hash`'s pending action. See `propose_action`.
         #[pallet::call_index(4)]
-        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        #[pallet::weight(T::WeightInfo::approve_action())]
         pub fn approve_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotCouncilMember);
@@ -401,7 +470,7 @@ pub mod pallet {
         /// since it was approved. Open to any current Council member. Mirrors
         /// `pallet_courts::clear_stale_admin_action`.
         #[pallet::call_index(5)]
-        #[pallet::weight(Weight::from_parts(5_000, 0))]
+        #[pallet::weight(T::WeightInfo::clear_stale_action())]
         pub fn clear_stale_action(origin: OriginFor<T>, call_hash: [u8; 32]) -> DispatchResult {
             let who = ensure_signed(origin)?;
             ensure!(Members::<T>::get().contains(&who), Error::<T>::NotCouncilMember);

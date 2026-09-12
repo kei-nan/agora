@@ -352,6 +352,34 @@ fn select_jury_eligibility_check_accounts_for_citizen_conduct_exclusions() {
 	});
 }
 
+#[test]
+fn select_jury_eligibility_check_accounts_for_oracle_and_governance_council_exclusions() {
+	new_test_ext().execute_with(|| {
+		// 8 citizens: one more than the filer-only case above, but `pick_random_jurors` also
+		// unconditionally excludes any citizen who is a current `OracleMembers`/
+		// `AIGovernanceCouncil` member (see that function's doc comment) -- an exclusion added
+		// after this eligibility pre-check was originally written, and never back-ported to it.
+		// Account 2 is both a citizen and (added below) an Oracle Council member, so the true
+		// eligible pool is 8 - filer(1) - oracle member(2) = 6, one short of the 7-juror
+		// requirement. Before the fix, the pre-check only subtracted the filer (and, for
+		// CitizenConduct, the defendant), so it computed 8 - 1 = 7 >= 7 and let the call
+		// through -- `pick_random_jurors` would then exhaust `max_attempts` and return
+		// `NotEnoughCitizens` itself, but only after burning its retry budget against an
+		// already-fixed `CapturedJurySeed`, so every retry would have hit the identical
+		// deterministic failure with no way to recover short of more citizens registering.
+		set_citizen_count(8);
+		let case_id = file_ai_rule_and_appeal(1, CaseSubject::General);
+		assert_ok!(Courts::add_oracle_member(RuntimeOrigin::root(), 2));
+		set_window_hashes(case_id, &[H256::repeat_byte(0x11); 3]);
+		capture_jury_seed(case_id);
+
+		assert_noop!(
+			Courts::select_jury(RuntimeOrigin::signed(1), case_id, 7),
+			Error::<Test>::NotEnoughCitizens
+		);
+	});
+}
+
 /// The core security property of the delayed-reveal scheme: the resulting jury depends only
 /// on the fixed window `[request_block + 1, request_block + JurySeedDelayBlocks]`, not on
 /// anything that happens afterwards — not the block `select_jury` is actually called in, and
@@ -790,12 +818,17 @@ fn vote_approve_ai_model_rejects_non_council_member() {
 fn file_case_fails_with_insufficient_balance_and_leaves_no_dangling_reserve() {
 	new_test_ext().execute_with(|| {
 		let case_id = crate::NextCaseId::<Test>::get();
-		// Account 999 was never funded in genesis (only 1..=30 are).
+		// Account 31 is a registered citizen (widen the pool so it's in range) but was never
+		// funded in genesis (only 1..=30 are) — unlike account 999 (used here before
+		// `MockCitizenChecker::is_active_citizen` was tightened to also check citizen-pool
+		// range), it passes the active-citizen gate and fails on the balance check that follows
+		// it, which is what this test actually means to exercise.
+		set_citizen_count(31);
 		assert_noop!(
-			file_case_as(999, CaseSubject::General),
+			file_case_as(31, CaseSubject::General),
 			Error::<Test>::InsufficientBalance
 		);
-		assert_eq!(Balances::reserved_balance(999), 0);
+		assert_eq!(Balances::reserved_balance(31), 0);
 		assert!(crate::pallet::Cases::<Test>::get(case_id).is_none());
 		assert!(CaseBonds::<Test>::get(case_id).is_none());
 		// NextCaseId must not have advanced — the call failed before any state was written.
