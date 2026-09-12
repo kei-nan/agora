@@ -34,6 +34,25 @@ use tauri::State;
 
 const NODE_URL: &str = "http://127.0.0.1:9944";
 
+/// Logs a chain-RPC failure's real error server-side, then returns a fixed, non-leaking message
+/// for the frontend. Raw `reqwest`/JSON-RPC error text (connection details, resolved addresses,
+/// etc.) has no business reaching the UI — same rationale `agent.rs`'s `agent_ask` already
+/// applies to its own error branches. These are local dev-node connection errors, not secrets,
+/// so this is about consistency/hygiene rather than a real leak, but every chain-RPC call site in
+/// this file should sanitize the same way rather than some forwarding raw text and others not.
+fn chain_rpc_err<E: std::fmt::Display>(e: E) -> String {
+    eprintln!("[chain] RPC call failed: {e}");
+    "chain unreachable".to_string()
+}
+
+/// Same rationale as `chain_rpc_err` above, for the IPFS gateway fetch path in
+/// `fetch_ipfs_content_from` — a separate helper because "chain unreachable" would be a
+/// misleading message for a gateway-side failure.
+fn ipfs_gateway_err<E: std::fmt::Display>(e: E) -> String {
+    eprintln!("[fetch_ipfs_content] IPFS gateway request failed: {e}");
+    "IPFS gateway unreachable".to_string()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ChainStatusResponse {
     pub best: u64,
@@ -129,7 +148,7 @@ async fn fetch_chain_status(url: &str) -> Result<ChainStatusResponse, String> {
         .chain_block_numbers()
         .await
         .map(|(best, finalized)| ChainStatusResponse { best, finalized })
-        .map_err(|e| format!("chain unreachable: {e}"))
+        .map_err(chain_rpc_err)
 }
 
 /// Fetches active referenda from pallet-voting (Voting.Referenda + Voting.ReferendumTally).
@@ -153,18 +172,18 @@ pub async fn fetch_proposals() -> Result<Vec<Proposal>, String> {
     let ref_keys = client
         .get_keys_paged(&ref_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     // ── Fetch tallies keyed by referendum_id ─────────────────────────────────
     let tally_prefix = storage_prefix("Voting", "ReferendumTally");
     let tally_keys = client
         .get_keys_paged(&tally_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let tally_values = client
         .query_storage_at(&tally_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     // Build referendum_id → (yes, no) map
     let mut tallies: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -189,7 +208,7 @@ pub async fn fetch_proposals() -> Result<Vec<Proposal>, String> {
     let ref_values = client
         .query_storage_at(&ref_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     let mut proposals = Vec::new();
     for (key_hex, val_opt) in ref_keys.iter().zip(ref_values.iter()) {
@@ -246,14 +265,14 @@ pub async fn fetch_laws() -> Result<Vec<Law>, String> {
     let keys = client
         .get_keys_paged(&prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     if keys.is_empty() {
         return Ok(vec![]);
     }
     let values = client
         .query_storage_at(&keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut laws = Vec::new();
     for (i, (key_hex, val_opt)) in keys.iter().zip(values.iter()).enumerate() {
         if let Some(val_hex) = val_opt {
@@ -297,14 +316,14 @@ pub async fn fetch_treasury() -> Result<Vec<TreasuryEntry>, String> {
     let keys = client
         .get_keys_paged(&prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     if keys.is_empty() {
         return Ok(vec![]);
     }
     let values = client
         .query_storage_at(&keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut entries = Vec::new();
     for (i, val_opt) in values.iter().enumerate() {
         if let Some(val_hex) = val_opt {
@@ -344,20 +363,20 @@ pub async fn fetch_department_budgets() -> Result<Vec<DepartmentBudget>, String>
     let budget_keys = client
         .get_keys_paged(&budget_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let spent_keys = client
         .get_keys_paged(&spent_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     let budget_vals = client
         .query_storage_at(&budget_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let spent_vals = client
         .query_storage_at(&spent_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     // Build dept_id → spent map
     let mut spent_map: HashMap<u32, u128> = HashMap::new();
@@ -404,7 +423,7 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
     let keys = client
         .get_keys_paged(&prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let target = hex::decode(nullifier_hex.trim_start_matches("0x"))
         .map_err(|e| format!("invalid nullifier hex: {e}"))?;
     // Each key is: 32-byte prefix + 16-byte blake2_128 hash + 32-byte nullifier
@@ -478,14 +497,14 @@ pub async fn auth_verify_nullifier(nullifier_hex: String) -> Result<bool, String
 pub(crate) async fn lookup_registered_account(nullifier: &[u8; 32]) -> Result<Option<[u8; 32]>, String> {
     let client = RpcClient::new(NODE_URL);
     let prefix = storage_prefix("Identity", "NullifierRegistry");
-    let keys = client.get_keys_paged(&prefix).await.map_err(|e| e.to_string())?;
+    let keys = client.get_keys_paged(&prefix).await.map_err(chain_rpc_err)?;
     // Each key is: 32-byte prefix + 16-byte blake2_128 hash + 32-byte nullifier (Blake2_128Concat),
     // so the nullifier occupies the last 32 bytes of the key — same layout auth_verify_nullifier
     // above already relies on.
     for key_hex in &keys {
         let key_bytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
         if key_bytes.len() >= 32 && key_bytes[key_bytes.len() - 32..] == nullifier[..] {
-            let value = client.get_storage(key_hex).await.map_err(|e| e.to_string())?;
+            let value = client.get_storage(key_hex).await.map_err(chain_rpc_err)?;
             if let Some(val_bytes) = value {
                 if val_bytes.len() == 32 {
                     let mut account = [0u8; 32];
@@ -537,7 +556,7 @@ pub async fn chain_submit_extrinsic(
             serde_json::Value::Array(vec![serde_json::Value::String(extrinsic_hex)]),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(chain_rpc_err)?;
     result
         .as_str()
         .map(|s| s.to_string())
@@ -562,11 +581,11 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
     let case_keys = client
         .get_keys_paged(&cases_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let case_values = client
         .query_storage_at(&case_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     // case_id → ipfs_hash (32 bytes, may be all zeros if no ruling hash yet)
     let mut case_ipfs: HashMap<u32, String> = HashMap::new();
@@ -592,14 +611,14 @@ pub async fn fetch_rulings() -> Result<Vec<Ruling>, String> {
     let ruling_keys = client
         .get_keys_paged(&ruling_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     if ruling_keys.is_empty() {
         return Ok(vec![]);
     }
     let ruling_values = client
         .query_storage_at(&ruling_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
 
     let mut rulings = Vec::new();
     for (key_hex, val_opt) in ruling_keys.iter().zip(ruling_values.iter()) {
@@ -664,7 +683,7 @@ pub async fn fetch_oracle_council_info() -> Result<OracleCouncilInfo, String> {
     let bytes = client
         .get_storage(&key)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let council_size = bytes.map(|b| decode_compact(&b).0).unwrap_or(0);
     Ok(OracleCouncilInfo {
         council_size,
@@ -696,7 +715,7 @@ pub async fn fetch_oracle_pending_approvals(case_id: u32) -> Result<Option<u32>,
     let pending_keys = client
         .get_keys_paged(&pending_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let is_pending = pending_keys.iter().any(|key_hex| {
         let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
         extract_u32_key_suffix(&kbytes) == case_id
@@ -709,7 +728,7 @@ pub async fn fetch_oracle_pending_approvals(case_id: u32) -> Result<Option<u32>,
     let approval_keys = client
         .get_keys_paged(&approvals_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let approval_key = approval_keys.into_iter().find(|key_hex| {
         let kbytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
         extract_u32_key_suffix(&kbytes) == case_id
@@ -722,7 +741,7 @@ pub async fn fetch_oracle_pending_approvals(case_id: u32) -> Result<Option<u32>,
     let value = client
         .get_storage(&key)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let count = value.map(|b| decode_compact(&b).0).unwrap_or(0);
     Ok(Some(count))
 }
@@ -762,9 +781,9 @@ async fn fetch_ipfs_content_from(gateway_base: &str, hash_hex: String) -> Result
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(ipfs_gateway_err)?;
     let resp = client.get(&url).send().await
-        .map_err(|e| format!("gateway unreachable: {e}"))?;
+        .map_err(ipfs_gateway_err)?;
     if !resp.status().is_success() {
         return Err(format!("gateway returned {}", resp.status()));
     }
@@ -782,7 +801,7 @@ async fn fetch_ipfs_content_from(gateway_base: &str, hash_hex: String) -> Result
     let mut body = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("error reading gateway response: {e}"))?;
+        let chunk = chunk.map_err(ipfs_gateway_err)?;
         if body.len() + chunk.len() > MAX_IPFS_CONTENT_BYTES {
             return Err(format!(
                 "gateway response exceeds {MAX_IPFS_CONTENT_BYTES}-byte cap"
@@ -842,7 +861,7 @@ pub async fn fetch_legislature_data() -> Result<LegislatureData, String> {
     let members_bytes = client
         .get_storage(&members_key)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut members: Vec<String> = Vec::new();
     if let Some(bytes) = members_bytes {
         let (count, offset) = decode_compact(&bytes);
@@ -860,13 +879,13 @@ pub async fn fetch_legislature_data() -> Result<LegislatureData, String> {
     let motion_keys = client
         .get_keys_paged(&motions_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut motions: Vec<LegislatureMotion> = Vec::new();
     if !motion_keys.is_empty() {
         let values = client
             .query_storage_at(&motion_keys)
             .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
+            .map_err(chain_rpc_err)?;
         for (key_hex, val_opt) in motion_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -929,11 +948,11 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
     let backing_keys = client
         .get_keys_paged(&backing_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let backing_values = client
         .query_storage_at(&backing_keys)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut backing_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for (key_hex, val_opt) in backing_keys.iter().zip(backing_values.iter()) {
         if let Some(val_hex) = val_opt {
@@ -955,13 +974,13 @@ pub async fn fetch_elections_data() -> Result<ElectionsData, String> {
     let delegate_keys = client
         .get_keys_paged(&delegates_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut delegates: Vec<Delegate> = Vec::new();
     if !delegate_keys.is_empty() {
         let values = client
             .query_storage_at(&delegate_keys)
             .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
+            .map_err(chain_rpc_err)?;
         for (key_hex, val_opt) in delegate_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -1089,13 +1108,13 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
     let disclosure_keys = client
         .get_keys_paged(&disclosures_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut asset_disclosures: Vec<AssetDisclosure> = Vec::new();
     if !disclosure_keys.is_empty() {
         let values = client
             .query_storage_at(&disclosure_keys)
             .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
+            .map_err(chain_rpc_err)?;
         for (key_hex, val_opt) in disclosure_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -1123,13 +1142,13 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
     let conflict_keys = client
         .get_keys_paged(&conflicts_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
     if !conflict_keys.is_empty() {
         let values = client
             .query_storage_at(&conflict_keys)
             .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
+            .map_err(chain_rpc_err)?;
         for (key_hex, val_opt) in conflict_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -1169,13 +1188,13 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
     let report_keys = client
         .get_keys_paged(&reports_prefix)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let mut reports: Vec<WhistleblowerReport> = Vec::new();
     if !report_keys.is_empty() {
         let values = client
             .query_storage_at(&report_keys)
             .await
-            .map_err(|e| format!("chain unreachable: {e}"))?;
+            .map_err(chain_rpc_err)?;
         for (key_hex, val_opt) in report_keys.iter().zip(values.iter()) {
             if let Some(val_hex) = val_opt {
                 let bytes = hex::decode(val_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -1210,7 +1229,7 @@ pub async fn fetch_anticorruption_data() -> Result<AntiCorruptionData, String> {
     let investigators_bytes = client
         .get_storage(&investigators_key)
         .await
-        .map_err(|e| format!("chain unreachable: {e}"))?;
+        .map_err(chain_rpc_err)?;
     let investigator_count = investigators_bytes
         .map(|bytes| decode_compact(&bytes).0)
         .unwrap_or(0);
