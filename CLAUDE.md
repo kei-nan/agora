@@ -226,7 +226,10 @@ All enforced by smart contract boundaries:
 - Level 2: Larger jury of 21 citizens (constitutional questions)
 - AI model updates require on-chain governance vote (supermajority)
 - Human overrides feed back as training signal
-- Rulings auto-enforce: invalidated law → contract paused, illegal treasury tx → frozen
+- Rulings auto-enforce: invalidated law → `LawStatus::Paused` in pallet-constitution (blocks
+  further amendment/repeal of that law within the pallet — there is no separate executable
+  "contract" anywhere in the codebase, and no other pallet reads `LawStatus`), illegal treasury
+  tx → department frozen in pallet-treasury-ledger, checked before every spend
 
 ## Treasury
 - Real-time public budget ledger (adapt Polkadot OpenGov pattern)
