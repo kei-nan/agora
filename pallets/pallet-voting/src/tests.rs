@@ -989,6 +989,60 @@ fn pending_delegation_expiry_schedule_entry_is_harmless_after_renewal() {
     });
 }
 
+/// Companion to the previous test, from the opposite direction: a renewal must not merely be
+/// *harmless* to leave the old schedule entry behind, it must actually remove it — otherwise
+/// repeated renewals/re-targets would accumulate one dead `PendingDelegationExpiry` entry per
+/// renewal forever, silently eating into `MaxExpiringDelegationsPerBlock` capacity at unrelated
+/// future blocks. After each renewal, exactly one live entry should exist for the delegator: the
+/// one at their current `expires_at`, never the stale one(s) from before.
+#[test]
+fn delegate_vote_renewal_removes_stale_pending_expiry_entry() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        set_total_citizens(10);
+        activate_citizen(1); // A
+        activate_citizen(2); // B
+        activate_citizen(3); // C — re-target destination for the second renewal
+
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MIN_DELEGATION_DURATION));
+        let first_expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        let first_cleanup_at = first_expires_at + 1;
+        assert!(PendingDelegationExpiry::<Test>::get(first_cleanup_at).contains(&(0u32, 1u64)));
+
+        // Renew to the same delegate before the first entry fires.
+        System::set_block_number(2);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 2, 0, MAX_DELEGATION_DURATION));
+        let second_expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        let second_cleanup_at = second_expires_at + 1;
+        assert_ne!(first_cleanup_at, second_cleanup_at);
+
+        // The stale first-schedule entry must be gone, not just harmless — and the new one must
+        // be present.
+        assert!(!PendingDelegationExpiry::<Test>::get(first_cleanup_at).contains(&(0u32, 1u64)));
+        assert!(PendingDelegationExpiry::<Test>::get(second_cleanup_at).contains(&(0u32, 1u64)));
+
+        // Re-target to a different delegate — same check applies to a re-target, not just a
+        // same-delegate renewal.
+        System::set_block_number(3);
+        assert_ok!(Voting::delegate_vote(RuntimeOrigin::signed(1), 3, 0, MIN_DELEGATION_DURATION));
+        let third_expires_at = Delegations::<Test>::get(0u32, 1u64).unwrap().expires_at;
+        let third_cleanup_at = third_expires_at + 1;
+        assert_ne!(second_cleanup_at, third_cleanup_at);
+
+        assert!(!PendingDelegationExpiry::<Test>::get(second_cleanup_at).contains(&(0u32, 1u64)));
+        assert!(PendingDelegationExpiry::<Test>::get(third_cleanup_at).contains(&(0u32, 1u64)));
+
+        // Running the (now-empty-of-this-entry) first and second schedule blocks must not touch
+        // the live delegation at all — confirming there really is only one live entry left.
+        System::set_block_number(first_cleanup_at);
+        let _ = Voting::on_initialize(first_cleanup_at);
+        System::set_block_number(second_cleanup_at);
+        let _ = Voting::on_initialize(second_cleanup_at);
+        assert!(Delegations::<Test>::get(0u32, 1u64).is_some());
+        assert_eq!(DelegatedWeight::<Test>::get((0u32, 3u64)), 1);
+    });
+}
+
 // ── revoke_delegation ────────────────────────────────────────────────────────
 
 #[test]

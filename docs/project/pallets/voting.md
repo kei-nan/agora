@@ -68,6 +68,40 @@ Delegation guards:
   weight out of a tally that was supposed to be fixed as of `end_block`. Same tradeoff as the
   `delegate_vote`-side guard: a delegator with an unrelated reason to revoke during this
   (normally near-zero) window is also blocked until finalization completes.
+- Scheduled expiry sweep (added commit `de03903`): before this, the ONLY paths that ever
+  reclaimed a naturally-expired delegation's weight out of `DelegatedWeight` were an explicit
+  `revoke_delegation` by the delegator, or `has_delegation_cycle`'s *incidental* lazy-cleanup walk
+  — a side effect of some other citizen's own `delegate_vote` happening to pass through that exact
+  stale record. If neither ever happened, the weight stayed stuck at the old delegate forever,
+  able to wrongly trip `DelegationCap` against new, entirely legitimate delegations to that
+  delegate. `delegate_vote` now also calls `schedule_delegation_expiry`, writing `(topic_id,
+  delegator)` into `PendingDelegationExpiry: BlockNumber → BoundedVec<(topic_id, AccountId),
+  MaxExpiringDelegationsPerBlock>` keyed at `expires_at + 1`; `on_initialize` drains the current
+  block's entries every block and calls `sweep_expired_delegation` on each, which re-checks the
+  live record and only tears it down (reclaiming its weight via
+  `remove_delegation_and_reclaim_weight`) if it's still present and still actually expired as of
+  `now` — a stale schedule entry left over from a delegation that was renewed or revoked before it
+  fired is therefore a safe no-op, not a bug. Bounded per block by
+  `MaxExpiringDelegationsPerBlock` (500 in the runtime); an entry that would overflow that bound
+  simply isn't scheduled and falls back to the pre-existing lazy-cleanup paths above — delegation
+  creation itself never fails because of this. See `PendingDelegationExpiry`'s and
+  `schedule_delegation_expiry`'s doc comments in `pallets/pallet-voting/src/lib.rs`.
+  - **Renewal-accumulation follow-on, fixed same day:** a review of `de03903` found that renewing
+    or re-targeting an existing delegation scheduled a fresh `PendingDelegationExpiry` entry for
+    the new `expires_at` but left the OLD entry (for the previous `expires_at`) in place. Each
+    stale entry was still handled safely when it eventually fired (per the no-op behavior above),
+    so this was never a correctness bug — but under heavy renewal churn a citizen who repeatedly
+    re-delegates could accumulate many dead entries, consuming `MaxExpiringDelegationsPerBlock`
+    capacity at unrelated future blocks and potentially pushing a genuine expiry at one of those
+    blocks into the slower lazy-cleanup fallback. Fixed by having `delegate_vote` call a new
+    `remove_pending_delegation_expiry(topic_id, &who, old_record.expires_at)` — using the pre-
+    overwrite `DelegationRecord` it already reads for the cap checks, so the old `expires_at` is
+    on hand for free — immediately before scheduling the new entry, whenever it is replacing an
+    existing record (renewal or re-target). `PendingDelegationExpiry` stays keyed by block number
+    (not by delegator alone), since re-keying it would have meant reworking the
+    `on_initialize`/`sweep_expired_delegation` sweep for no real benefit; removing the one stale
+    entry at the point where the old `expires_at` is already available was the simpler, lower-risk
+    fix. See `pallet_voting::tests::delegate_vote_renewal_removes_stale_pending_expiry_entry`.
 
 `Delegations` is only resolved into an actual tally for System 3 (Referenda) below, via
 `finalize_referendum`/`apply_delegated_weight` — a non-voting delegator's weight counts toward

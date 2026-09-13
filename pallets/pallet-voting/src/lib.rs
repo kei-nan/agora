@@ -331,11 +331,17 @@ pub mod pallet {
     /// gap in the general case: `on_initialize` drains the current block's entries and actually
     /// removes+reclaims-weight for any that are still present and still genuinely expired.
     ///
-    /// An entry here can go stale without causing incorrect cleanup: if the delegator renewed or
-    /// re-targeted their delegation after scheduling (giving the record a new, later
-    /// `expires_at`), or explicitly revoked it, the sweep re-reads the live record at fire time
-    /// and only acts if it is both still present and still expired relative to `now` — see
-    /// `Pallet::sweep_expired_delegation`.
+    /// A renewal/re-target (`delegate_vote` on top of an existing record) proactively removes the
+    /// entry scheduled for the OLD `expires_at` via `Pallet::remove_pending_delegation_expiry`
+    /// before scheduling the new one, so a citizen who repeatedly re-delegates doesn't accumulate
+    /// one dead entry per renewal. This is a cleanliness/capacity measure, not a correctness
+    /// requirement: even if an old entry were left in place (e.g. `revoke_delegation` does not
+    /// proactively clean up the entry it obsoletes), it would still be handled safely when it
+    /// eventually fires — the sweep re-reads the live record at fire time and only acts if it is
+    /// both still present and still expired relative to `now` — see `Pallet::sweep_expired_delegation`.
+    /// Left unremoved, such entries would just sit as harmless no-ops that consume
+    /// `MaxExpiringDelegationsPerBlock` capacity at unrelated future blocks, at worst pushing a
+    /// genuine expiry at that block into the slower lazy-cleanup fallback path.
     ///
     /// Bounded per block by `MaxExpiringDelegationsPerBlock` to keep `on_initialize`'s worst-case
     /// cost bounded; on overflow the entry is simply not scheduled here and relies on the
@@ -917,6 +923,17 @@ pub mod pallet {
                 who.clone(),
                 DelegationRecord { delegate: delegate.clone(), expires_at, resolved_weight },
             );
+            // If this call is renewing/re-targeting an existing delegation, drop the stale
+            // `PendingDelegationExpiry` entry scheduled for its OLD `expires_at` before scheduling
+            // the new one — otherwise it would linger forever as a dead entry (harmless when it
+            // eventually fires, per `sweep_expired_delegation`'s doc comment, but under heavy
+            // renewal churn these can accumulate and eat into `MaxExpiringDelegationsPerBlock`
+            // capacity at unrelated future blocks). `maybe_old` still holds the pre-overwrite
+            // record here, so its `expires_at` is exactly what was scheduled for it back when it
+            // was inserted.
+            if let Some(old_record) = maybe_old.as_ref() {
+                Self::remove_pending_delegation_expiry(topic_id, &who, old_record.expires_at);
+            }
             // Schedule the general expiry sweep so this record's weight is reclaimed even if no
             // other citizen's `has_delegation_cycle` walk ever happens to pass through it and
             // `who` never calls `revoke_delegation` — see `PendingDelegationExpiry`'s doc comment.
@@ -1710,6 +1727,26 @@ pub mod pallet {
             let cleanup_at = expires_at.saturating_add(BlockNumberFor::<T>::from(1u32));
             PendingDelegationExpiry::<T>::mutate(cleanup_at, |scheduled| {
                 let _ = scheduled.try_push((topic_id, delegator));
+            });
+        }
+
+        /// Removes the `PendingDelegationExpiry` entry for `(topic_id, delegator)` scheduled at
+        /// `old_expires_at + 1`, if one is still present. Called from `delegate_vote` immediately
+        /// before `schedule_delegation_expiry` whenever a call replaces an existing
+        /// `DelegationRecord` (a renewal or re-target), so the stale entry for the record's
+        /// previous `expires_at` doesn't linger alongside the fresh one — see
+        /// `schedule_delegation_expiry`'s doc comment for why leaving it would otherwise let dead
+        /// entries accumulate under repeated renewals. A no-op if the entry isn't there (e.g. it
+        /// was never scheduled in the first place because that block's list had already hit
+        /// `MaxExpiringDelegationsPerBlock`).
+        fn remove_pending_delegation_expiry(
+            topic_id: u32,
+            delegator: &T::AccountId,
+            old_expires_at: BlockNumberFor<T>,
+        ) {
+            let cleanup_at = old_expires_at.saturating_add(BlockNumberFor::<T>::from(1u32));
+            PendingDelegationExpiry::<T>::mutate(cleanup_at, |scheduled| {
+                scheduled.retain(|(t, d)| !(*t == topic_id && d == delegator));
             });
         }
 
