@@ -347,6 +347,9 @@ pub mod pallet {
         /// `Root` closed the bootstrap phase; `add_member`/`remove_member` can never be called
         /// successfully again (see `Bootstrapped`'s doc comment).
         BootstrapClosed,
+        /// `Root` used `emergency_reseed_legislature` to recover an empty legislature — see
+        /// that call's own doc comment for the bricked state this exists to fix.
+        EmergencyReseeded { who: BoundedVec<T::AccountId, T::MaxMembers> },
     }
 
     // ── Errors ───────────────────────────────────────────────────────────────────
@@ -392,6 +395,14 @@ pub mod pallet {
         /// `pallet_elections`'s `AccountabilityCouncilMember` skip at post-bootstrap automatic
         /// seating. See `AccountabilityCouncilChecker`'s doc comment.
         AccountabilityCouncilMember,
+        /// `emergency_reseed_legislature` was called while `Members` is non-empty. This call
+        /// exists only to recover from the specific bricked state where `Members` was left
+        /// empty — see that call's own doc comment — not as a general override of a
+        /// functioning legislature.
+        LegislatureNotEmpty,
+        /// `emergency_reseed_legislature` was called with an empty `members` list — that would
+        /// leave the legislature exactly as bricked as it started.
+        NoMembersProvided,
     }
 
     // ── Calls ────────────────────────────────────────────────────────────────────
@@ -603,6 +614,44 @@ pub mod pallet {
             ensure!(!Members::<T>::get().is_empty(), Error::<T>::NoMembersToBootstrap);
             Bootstrapped::<T>::put(true);
             Self::deposit_event(Event::BootstrapClosed);
+            Ok(())
+        }
+
+        /// `Root`-only recovery backstop for the one specific bricked state this call exists to
+        /// fix: `pallet_elections::run_election` seating zero eligible delegates. Because
+        /// `add_member`/`remove_member` are permanently refused once `Bootstrapped == true` (see
+        /// that storage item's doc comment), and `SeatLegislature::replace_members` (the
+        /// ongoing post-bootstrap membership mechanism) now deliberately refuses to be called
+        /// with an empty winners list (see `pallet_elections::Event::
+        /// SeatingSkippedNoEligibleCandidates`'s doc comment), an empty `Members` set — reached
+        /// only via `replace_members` itself, since `remove_member` and `close_bootstrap` both
+        /// separately guarantee non-emptiness — would otherwise be permanently unrecoverable:
+        /// no member remains to call `propose_motion` (which requires membership), and no other
+        /// call in this pallet can add one back post-bootstrap. This call is not a general
+        /// override of a functioning legislature: it is gated by `ensure!(Members::<T>::get().
+        /// is_empty(), Error::<T>::LegislatureNotEmpty)`, so it is structurally unusable except
+        /// in exactly the bricked state described above.
+        ///
+        /// **This is a placeholder, not the intended long-term mechanism.** Like
+        /// `pallet_constitution::Config::RevocationOrigin` and `pallet_elections::Config::
+        /// ConstitutionalOrigin` (both still bare `EnsureRoot<AccountId>` dev-only stand-ins —
+        /// see `runtime/src/configs/mod.rs`'s comments on each), gating this on bare `Root`
+        /// means it currently resolves to whoever holds the single genesis sudo key, not a
+        /// collective. A real deployment should wire this to a proper collective/governance
+        /// origin (e.g. a supermajority of the Accountability Council, or another body
+        /// structurally independent of the legislature it would be reseeding) before mainnet,
+        /// exactly as those two origins are already documented as needing.
+        #[pallet::call_index(7)]
+        #[pallet::weight(T::WeightInfo::emergency_reseed_legislature())]
+        pub fn emergency_reseed_legislature(
+            origin: OriginFor<T>,
+            members: BoundedVec<T::AccountId, T::MaxMembers>,
+        ) -> DispatchResult {
+            ensure_root(origin)?;
+            ensure!(Members::<T>::get().is_empty(), Error::<T>::LegislatureNotEmpty);
+            ensure!(!members.is_empty(), Error::<T>::NoMembersProvided);
+            Members::<T>::put(members.clone());
+            Self::deposit_event(Event::EmergencyReseeded { who: members });
             Ok(())
         }
     }

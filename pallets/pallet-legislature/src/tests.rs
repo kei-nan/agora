@@ -2,7 +2,7 @@ use crate::{
     mock::*, Bootstrapped, EnsureLegislatureMotion, Error, Event, Members, Motions, MotionVotes,
     NextMotionId, PendingLegislatureApproval,
 };
-use frame_support::{assert_noop, assert_ok, traits::EnsureOriginWithArg};
+use frame_support::{assert_noop, assert_ok, traits::EnsureOriginWithArg, BoundedVec};
 use sp_runtime::DispatchError;
 
 const CALL_HASH_A: [u8; 32] = [1u8; 32];
@@ -1032,5 +1032,97 @@ fn replace_members_discards_stale_pending_approval_on_full_reseat() {
             EnsureLegislatureMotion::<Test>::try_origin(new_member_origin, &CALL_HASH_A)
                 .is_err()
         );
+    });
+}
+
+// ─── emergency_reseed_legislature ───────────────────────────────────────────
+
+/// This is the actual bug this call exists to fix: an election cycle that seats zero
+/// eligible candidates must not call `replace_members` with an empty list at all (that's
+/// `pallet_elections::run_election`'s own fix -- see that pallet's tests), so here we
+/// simulate the state that a prior version of that bug *would* have produced and confirm
+/// the recovery path works: with `Members` empty and bootstrap closed (so `add_member` is
+/// permanently refused), only `emergency_reseed_legislature` can restore membership.
+#[test]
+fn emergency_reseed_legislature_fails_when_not_empty() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+        assert!(!Members::<Test>::get().is_empty());
+
+        let members: BoundedVec<u64, frame_support::traits::ConstU32<MAX_MEMBERS>> =
+            BoundedVec::try_from(vec![9, 10]).unwrap();
+        assert_noop!(
+            Legislature::emergency_reseed_legislature(RuntimeOrigin::root(), members),
+            Error::<Test>::LegislatureNotEmpty
+        );
+        // Untouched.
+        assert_eq!(Members::<Test>::get().to_vec(), vec![1]);
+    });
+}
+
+#[test]
+fn emergency_reseed_legislature_requires_root() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+        // Empty it via the election-driven path so we're in the exact bricked state.
+        use pallet_elections::pallet::SeatLegislature;
+        assert_ok!(<Legislature as SeatLegislature<u64>>::replace_members(vec![]));
+        assert!(Members::<Test>::get().is_empty());
+
+        let members: BoundedVec<u64, frame_support::traits::ConstU32<MAX_MEMBERS>> = BoundedVec::try_from(vec![9]).unwrap();
+        assert_noop!(
+            Legislature::emergency_reseed_legislature(RuntimeOrigin::signed(1), members),
+            DispatchError::BadOrigin
+        );
+    });
+}
+
+#[test]
+fn emergency_reseed_legislature_fails_with_no_members_provided() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+        use pallet_elections::pallet::SeatLegislature;
+        assert_ok!(<Legislature as SeatLegislature<u64>>::replace_members(vec![]));
+        assert!(Members::<Test>::get().is_empty());
+
+        let members: BoundedVec<u64, frame_support::traits::ConstU32<MAX_MEMBERS>> = BoundedVec::try_from(vec![]).unwrap();
+        assert_noop!(
+            Legislature::emergency_reseed_legislature(RuntimeOrigin::root(), members),
+            Error::<Test>::NoMembersProvided
+        );
+    });
+}
+
+/// The actual recovery: once the legislature is bricked empty (bootstrap closed, so
+/// `add_member` is permanently refused, and `replace_members` seated nobody), `Root` can
+/// use `emergency_reseed_legislature` to restore membership, and normal legislature
+/// operation (a member can propose a motion again) resumes.
+#[test]
+fn emergency_reseed_legislature_succeeds_when_empty_and_restores_function() {
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+        add(1);
+        assert_ok!(Legislature::close_bootstrap(RuntimeOrigin::root()));
+        use pallet_elections::pallet::SeatLegislature;
+        assert_ok!(<Legislature as SeatLegislature<u64>>::replace_members(vec![]));
+        assert!(Members::<Test>::get().is_empty());
+
+        let members: BoundedVec<u64, frame_support::traits::ConstU32<MAX_MEMBERS>> =
+            BoundedVec::try_from(vec![42, 43]).unwrap();
+        assert_ok!(Legislature::emergency_reseed_legislature(
+            RuntimeOrigin::root(),
+            members.clone()
+        ));
+        assert_eq!(Members::<Test>::get().to_vec(), vec![42, 43]);
+        System::assert_last_event(Event::EmergencyReseeded { who: members }.into());
+
+        // Normal operation resumes: a newly-seated member can propose a motion.
+        assert_ok!(Legislature::propose_motion(RuntimeOrigin::signed(42), CALL_HASH_B));
     });
 }

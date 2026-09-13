@@ -87,12 +87,63 @@ any plaintext per-citizen counter on-chain.
 ### Legislature elections
 
 Every `ElectionCycleBlocks` blocks, `on_initialize` ranks all `Active` delegates by backing
-count (stable sort, ties broken by storage order) and seats the top `LegislatureSeats` into
-pallet-legislature via the `SeatLegislature` trait (`replace_members`). Citizenship is
-re-checked at election time (not just trusted from whenever `Active` status was last granted)
-so a delegate suspended since (e.g. an Overturned `CitizenConduct` court ruling) can never be
-seated on stale status. Defaults: 100 seats, 2-year cycle (`DefaultElectionCycleBlocks`), max 5
-backings per citizen.
+count and seats the top `LegislatureSeats` into pallet-legislature via the `SeatLegislature`
+trait (`replace_members`). Citizenship is re-checked at election time (not just trusted from
+whenever `Active` status was last granted) so a delegate suspended since (e.g. an Overturned
+`CitizenConduct` court ruling) can never be seated on stale status. Defaults: 100 seats, 2-year
+cycle (`DefaultElectionCycleBlocks`), max 5 backings per citizen.
+
+**Tiebreak documentation (low-severity finding closed, 2026-09-13; no behavior change).** The
+final ranking is a stable sort by backing count descending
+(`candidates.sort_by(|a, b| b.1.cmp(&a.1))`). Ties (two or more candidates with exactly equal
+backing) are broken by drain order out of `ElectionCandidateSnapshot`, a `StorageMap` — i.e. by
+that map's key-hash order, which is deterministic for a given key set (not exploitable by an
+attacker picking *when* to transact) but is not principled in any human sense: not AccountId
+order, not registration order, nothing a candidate can reason about or influence. This only
+matters for the seat(s) on the `LegislatureSeats` boundary when candidates are exactly tied. No
+existing convention elsewhere in this pallet or pallet-legislature breaks ties by AccountId or
+another principled key, so this was left as documented-but-unchanged rather than fixed ad hoc; a
+real fix should be a deliberate governance decision (e.g. AccountId order, or an explicit random
+tiebreak) applied consistently. See `run_election`'s doc comment in
+`pallets/pallet-elections/src/lib.rs`.
+
+**`SeatingReplaceMembersFailed` (fixed `9535cde`, 2026-09-13).** `T::LegislatureSeating::
+replace_members`'s `Result` used to be silently discarded (`let _ = ...`). Its only failure mode
+(`winners.len() > MaxMembers`) isn't fully ruled out structurally — `set_election_params` lets
+`ConstitutionalOrigin` set `LegislatureSeats` to any value > 0 with no upper bound tied to
+`MaxMembers`, so an oversized `LegislatureSeats` plus a large eligible candidate pool could reach
+it in principle, even though it can't happen under today's configured seat count. `run_election`
+now matches on the `Result`: `Ok` still emits `LegislatureElectionRun { at_block, seated }`;
+`Err` emits `Event::SeatingReplaceMembersFailed { attempted }` instead and this cycle's seating
+is dropped — the previous `Members` set is left untouched rather than partially applied.
+
+**Empty-eligible-pool skip (HIGH-severity fix, 2026-09-13).** Before this fix, if every
+candidate was filtered out this cycle (zero backing, or skipped via the disclosure/
+Accountability-Council gates below) `winners` would be empty, and `run_election` called
+`replace_members(vec![])` anyway — happily wiping out the *existing* legislature. Combined with
+pallet-legislature's `Bootstrapped` gate (`add_member`/`remove_member` are refused
+unconditionally, even for `Root`, once bootstrap closes — see
+`docs/project/pallets/legislature.md`), an election cycle that seated zero eligible delegates
+would have **permanently bricked the legislature**: no member would remain to call
+`propose_motion` (which requires membership), with no recovery until the next
+`DefaultElectionCycleBlocks` cycle (~2 years) — and no guarantee that cycle would do any better.
+`run_election` now checks `winners.is_empty()` before calling `replace_members` at all: if the
+eligible pool is empty, the reseat is skipped entirely, the existing membership is left exactly
+as-is, and `Event::SeatingSkippedNoEligibleCandidates { at_block }` is emitted so the skip is
+visible on-chain — same skip-and-surface shape as `SeatingReplaceMembersFailed` above.
+
+**Recovery backstop for the already-bricked case.** Because the bug above could already have
+produced a bricked (empty-`Members`) legislature on a live chain before this fix landed — and
+because a determined edge case (e.g. every seated delegate later disqualified and no successor
+elected) could still theoretically empty `Members` some other way — pallet-legislature also
+gained a `Root`-gated `emergency_reseed_legislature(members)` extrinsic that succeeds **only**
+when `Members` is currently empty (`ensure!(Members::<T>::get().is_empty(),
+Error::<T>::LegislatureNotEmpty)`); it is structurally unusable against a functioning
+legislature. See `docs/project/pallets/legislature.md` for the full writeup, including the same
+"placeholder pending real collective wiring" honesty already applied to
+`pallet_constitution::Config::RevocationOrigin` and this pallet's own `ConstitutionalOrigin`
+(both still bare `EnsureRoot<AccountId>` — see the "Two placeholder origins" note in `CLAUDE.md`
+and the Config constants section below).
 
 **Zero-backing seating floor (fixed `601b936`, 2026-09-04).** Final seating used to be a plain
 `sort_by(...).take(seats)` with no floor filter, so a candidate pool smaller than

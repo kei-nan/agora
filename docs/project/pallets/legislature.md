@@ -35,6 +35,40 @@ Calls:
 - `close_bootstrap()` — root, one-time; requires at least one member already seated
   (`Error::NoMembersToBootstrap` otherwise). Sets `Bootstrapped = true`; there is no call that
   ever flips it back.
+- `emergency_reseed_legislature(members: BoundedVec<AccountId, MaxMembers>)` — root, and **only**
+  when `Members` is currently empty (`ensure!(Members::<T>::get().is_empty(),
+  Error::<T>::LegislatureNotEmpty)`); also rejects an empty `members` list
+  (`Error::NoMembersProvided`). See "Emergency reseed" below.
+
+### Emergency reseed (added 2026-09-13, HIGH-severity fix)
+
+`pallet_elections::run_election` used to call `SeatLegislature::replace_members` with an empty
+winners list whenever an election cycle seated zero eligible delegates (all disqualified via
+disclosure lapse, Accountability-Council overlap, or genuinely zero backing) — see
+`docs/project/pallets/elections.md`'s "Empty-eligible-pool skip" section. Combined with the
+Bootstrap lock above (`add_member`/`remove_member` refuse unconditionally, even for root, once
+`Bootstrapped == true`), that would have **permanently bricked the legislature**: an empty
+`Members` means no account can call `propose_motion` (member-only), and post-bootstrap there is
+no other call in this pallet that can add one back. `pallet_elections` is now fixed to never call
+`replace_members` with an empty list (skips the reseat and emits
+`SeatingSkippedNoEligibleCandidates` instead, leaving the existing legislature untouched), but
+this pallet also gained `emergency_reseed_legislature` as a backstop for the exact bricked state,
+in case it's ever reached anyway (e.g. it already happened once on a live chain before the
+elections-side fix landed, or some future bug reproduces it).
+
+`emergency_reseed_legislature` is deliberately **not** a general override of a functioning
+legislature — `ensure!(Members::<T>::get().is_empty(), ...)` makes it structurally unusable
+against any non-empty `Members`, so it can never be used to unilaterally pack or purge a working
+legislature the way the pre-`748625f` unlocked `add_member`/`remove_member` could.
+
+**This is a placeholder, not the intended long-term mechanism** — gating it on bare `Root` means
+it currently resolves to whoever holds the single genesis sudo key, not a collective, exactly
+like the two other placeholder Root-gated origins this codebase is already honest about:
+`pallet_constitution::Config::RevocationOrigin` and `pallet_elections::Config::
+ConstitutionalOrigin` (both still bare `EnsureRoot<AccountId>` in `runtime/src/configs/mod.rs` —
+see `CLAUDE.md`'s "Two placeholder origins" note). A real deployment should wire this to a proper
+collective/governance origin (e.g. a supermajority of the Accountability Council, or another body
+structurally independent of the legislature it would be reseeding) before mainnet.
 
 ### Bootstrap lock (fixed `748625f`, 2026-09-04)
 

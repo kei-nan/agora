@@ -141,5 +141,20 @@ mod benchmarks {
 		assert!(Bootstrapped::<T>::get());
 	}
 
+	#[benchmark]
+	fn emergency_reseed_legislature() {
+		// Worst case: `Members` starts empty (the only state this call ever succeeds in) and
+		// is reseeded with a full `MaxMembers` list.
+		let max = T::MaxMembers::get();
+		let new_members = seed_members::<T>(max);
+		let bounded =
+			BoundedVec::<T::AccountId, T::MaxMembers>::try_from(new_members.clone()).unwrap();
+
+		#[extrinsic_call]
+		emergency_reseed_legislature(RawOrigin::Root, bounded);
+
+		assert_eq!(Members::<T>::get().len(), max as usize);
+	}
+
 	impl_benchmark_test_suite!(Legislature, crate::mock::new_test_ext(), crate::mock::Test);
 }

@@ -735,6 +735,21 @@ pub mod pallet {
         /// currently sit on the Accountability Council — see `AccountabilityCouncilChecker`'s
         /// doc comment. Same skip-and-fall-through shape as `SeatingSkippedNoDisclosure`.
         SeatingSkippedAccountabilityCouncilMember { account: T::AccountId },
+        /// The eligible-candidate pool for this election cycle was empty after the
+        /// zero-backing filter and the disclosure/Accountability-Council skip-and-fall-through
+        /// gates above — e.g. every candidate was disqualified, or nobody has any matured
+        /// backing yet. `T::LegislatureSeating::replace_members` is deliberately **not called**
+        /// in this case: pallet-legislature's `Members` is a bootstrap-only-settable set (see
+        /// its `Bootstrapped` storage item's doc comment — once bootstrap closes, not even
+        /// `Root` can add a member back), so calling `replace_members` with an empty winners
+        /// list would permanently brick the legislature the moment bootstrap has closed — no
+        /// member would remain to call `propose_motion` (which requires membership), and there
+        /// would be no recovery until the next `DefaultElectionCycleBlocks` cycle (~2 years),
+        /// short of the `pallet_legislature::emergency_reseed_legislature` Root-gated backstop
+        /// (see that call's own doc comment). Instead, this cycle's seating is skipped entirely
+        /// and the *existing* legislature membership is left untouched, exactly as already
+        /// happens on `SeatingReplaceMembersFailed` above.
+        SeatingSkippedNoEligibleCandidates { at_block: BlockNumberFor<T> },
         /// Constitutional election parameters were updated.
         ElectionParamsChanged { seats: u32, cycle_blocks: u32, max_backings_per_citizen: u32 },
         /// `T::LegislatureSeating::replace_members` rejected this cycle's winners (the only
@@ -1370,6 +1385,15 @@ pub mod pallet {
         /// account so it is visible on-chain. The Accountability Council overlap gate just below
         /// it (`AccountabilityCouncilChecker`) is skip-and-fall-through for the identical reason,
         /// emitting `Event::SeatingSkippedAccountabilityCouncilMember` instead.
+        ///
+        /// ## Empty-candidate-pool: skip the reseat, don't brick the legislature
+        /// If every candidate is filtered out (zero backing, or skipped via the two gates
+        /// above) this cycle's `winners` list would be empty. `T::LegislatureSeating::
+        /// replace_members` is **never called with an empty list** — see
+        /// `Event::SeatingSkippedNoEligibleCandidates`'s doc comment for why: pallet-legislature
+        /// can only have members added back before its own bootstrap closes, so an empty
+        /// `replace_members` call after that point would permanently brick the legislature.
+        /// The existing membership is left exactly as-is and the skip is surfaced on-chain.
         /// Runs (or continues) the multi-block election-seating scan. Bounds each block's
         /// ranking work to `MaxElectionScanPerBlock` `Delegates` entries via
         /// `ElectionScanCursor`, the same cursor-based pattern `on_initialize`'s term-warning
@@ -1524,7 +1548,19 @@ pub mod pallet {
                 // are simply left empty rather than filled this way.
                 candidates.retain(|(_, backing)| *backing > 0);
 
-                // Stable sort by backing count descending — ties broken by drain order.
+                // Stable sort by backing count descending. Ties (equal backing counts) are
+                // broken by drain order out of the `ElectionCandidateSnapshot` `StorageMap` —
+                // i.e. by that map's underlying key hash order, which is deterministic for a
+                // given set of keys (so this is reproducible and not exploitable by an attacker
+                // picking when to transact) but is *not* principled in any human sense: it is
+                // not AccountId order, not registration order, and not anything a candidate can
+                // reason about or influence. This only matters for the seat(s) on the boundary
+                // of `LegislatureSeats` when two or more candidates are exactly tied on backing.
+                // No existing convention elsewhere in this pallet (or pallet-legislature) breaks
+                // ties by AccountId or another principled key, so this is left as-is rather than
+                // introduced ad hoc here — a real fix should be a deliberate governance decision
+                // (e.g. AccountId order, or a documented random tiebreak) applied consistently,
+                // not a local one-line change.
                 candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
                 let winners: alloc::vec::Vec<T::AccountId> = candidates
@@ -1534,17 +1570,26 @@ pub mod pallet {
                     .collect();
 
                 let seated = winners.len() as u32;
-                // `replace_members` can only fail if `winners.len() > MaxMembers` — see
-                // `Event::SeatingReplaceMembersFailed`'s doc comment for why that's not fully
-                // ruled out structurally (an oversized `LegislatureSeats` could get there), even
-                // though it can't happen under today's configured seat count. Surface it on-chain
-                // rather than silently discarding the `Result`, instead of panicking in an
-                // `on_initialize` hook. The rest of this cycle's bookkeeping (cursor/progress
-                // reset, `LastElectionBlock`) proceeds the same either way, exactly as before this
-                // Result was being checked at all.
-                match T::LegislatureSeating::replace_members(winners) {
-                    Ok(()) => Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated }),
-                    Err(_) => Self::deposit_event(Event::SeatingReplaceMembersFailed { attempted: seated }),
+                if winners.is_empty() {
+                    // See `Event::SeatingSkippedNoEligibleCandidates`'s doc comment: calling
+                    // `replace_members` with an empty list would wipe out the existing
+                    // legislature, which is unrecoverable once pallet-legislature's bootstrap
+                    // has closed. Skip the reseat entirely and leave the current membership
+                    // untouched.
+                    Self::deposit_event(Event::SeatingSkippedNoEligibleCandidates { at_block: now });
+                } else {
+                    // `replace_members` can only fail if `winners.len() > MaxMembers` — see
+                    // `Event::SeatingReplaceMembersFailed`'s doc comment for why that's not fully
+                    // ruled out structurally (an oversized `LegislatureSeats` could get there), even
+                    // though it can't happen under today's configured seat count. Surface it on-chain
+                    // rather than silently discarding the `Result`, instead of panicking in an
+                    // `on_initialize` hook. The rest of this cycle's bookkeeping (cursor/progress
+                    // reset, `LastElectionBlock`) proceeds the same either way, exactly as before this
+                    // Result was being checked at all.
+                    match T::LegislatureSeating::replace_members(winners) {
+                        Ok(()) => Self::deposit_event(Event::LegislatureElectionRun { at_block: now, seated }),
+                        Err(_) => Self::deposit_event(Event::SeatingReplaceMembersFailed { attempted: seated }),
+                    }
                 }
                 LastElectionBlock::<T>::put(now);
                 ElectionScanInProgress::<T>::put(false);

@@ -57,6 +57,7 @@ pub trait WeightInfo {
 	fn close_motion() -> Weight;
 	fn clear_stale_approval() -> Weight;
 	fn close_bootstrap() -> Weight;
+	fn emergency_reseed_legislature() -> Weight;
 }
 
 /// Weights for pallet_legislature.
@@ -115,6 +116,14 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(1_u64))
 	}
+	/// 1 read (`Members`, emptiness check) + 1 write (`Members`, the reseed itself). Same shape
+	/// as `add_member`/`remove_member` — a single `BoundedVec` write, just seeded with a full
+	/// member list instead of one push/removal, so costed the same.
+	fn emergency_reseed_legislature() -> Weight {
+		Weight::from_parts(12_000_000, 1_957)
+			.saturating_add(T::DbWeight::get().reads(1_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
 }
 
 // For backwards compatibility and tests.
@@ -152,6 +161,11 @@ impl WeightInfo for () {
 	fn close_bootstrap() -> Weight {
 		Weight::from_parts(11_000_000, 1_957)
 			.saturating_add(RocksDbWeight::get().reads(2_u64))
+			.saturating_add(RocksDbWeight::get().writes(1_u64))
+	}
+	fn emergency_reseed_legislature() -> Weight {
+		Weight::from_parts(12_000_000, 1_957)
+			.saturating_add(RocksDbWeight::get().reads(1_u64))
 			.saturating_add(RocksDbWeight::get().writes(1_u64))
 	}
 }

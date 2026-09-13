@@ -1727,12 +1727,12 @@ fn run_election_flash_backing_does_not_win_a_seat() {
 
         // Election 1: delegate 1 is the only candidate, but it has no matured checkpoint yet
         // (this is the very scan that seeds it), so it ranks 0 and the zero-backing filter
-        // excludes it -- the single seat is left empty rather than filled with a candidate
-        // nobody has confirmed durable backing for. This also just seeds its checkpoint at
-        // (block 20, count 3).
+        // excludes it -- the eligible-candidate pool is empty, so `replace_members` is not
+        // called at all (see `SeatingSkippedNoEligibleCandidates`) rather than seating nobody
+        // via an empty-list call. This also just seeds its checkpoint at (block 20, count 3).
         System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
-        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
+        assert!(seat_calls().is_empty());
         assert_eq!(LastBackingCheckpoint::<Test>::get(1), Some((DEFAULT_ELECTION_CYCLE_BLOCKS as u64, 3)));
 
         // Delegate 2 ("attacker"): registered only now, in the run-up to election 2's
@@ -1752,7 +1752,9 @@ fn run_election_flash_backing_does_not_win_a_seat() {
         // delegate 2's more-than-3x live lead.
         System::set_block_number(2 * DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
-        assert_eq!(seat_calls(), vec![Vec::<u64>::new(), vec![1]]);
+        // Election 1 never called `replace_members` at all (empty candidate pool), so this is
+        // the first and only entry in `seat_calls()`.
+        assert_eq!(seat_calls(), vec![vec![1]]);
 
         // The rent-and-withdraw pattern this closes: having already lost the election, the
         // attacker's later withdrawal changes nothing -- the attack already failed regardless
@@ -1805,7 +1807,11 @@ fn run_election_backing_counts_once_it_has_genuinely_matured() {
 
 /// The single candidate in this election has no matured checkpoint yet (it ranks 0), so even
 /// though `LegislatureSeats` (default 3) is nowhere near filled, the seat must be left empty --
-/// not filled with a delegate nobody has confirmed durable backing for.
+/// not filled with a delegate nobody has confirmed durable backing for. Crucially, this also
+/// means the eligible-candidate pool is empty: `replace_members` must not be called at all (see
+/// `SeatingSkippedNoEligibleCandidates`'s doc comment for why an empty-list call would be a
+/// HIGH-severity bug once pallet-legislature's bootstrap has closed -- it would permanently
+/// brick the legislature), and the previous membership (empty, in this fresh test) is left as-is.
 #[test]
 fn run_election_seats_nobody_when_the_only_candidate_has_zero_backing() {
     new_test_ext().execute_with(|| {
@@ -1820,11 +1826,51 @@ fn run_election_seats_nobody_when_the_only_candidate_has_zero_backing() {
         System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
 
-        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
+        assert!(seat_calls().is_empty());
         System::assert_last_event(
-            Event::LegislatureElectionRun {
+            Event::SeatingSkippedNoEligibleCandidates {
                 at_block: DEFAULT_ELECTION_CYCLE_BLOCKS as u64,
-                seated: 0,
+            }
+            .into(),
+        );
+    });
+}
+
+/// Regression test for the HIGH-severity fix itself: an election cycle that seats zero eligible
+/// candidates must not wipe out an *existing* legislature membership by calling
+/// `replace_members` with an empty list. Seeds a legislature membership directly (as if seated
+/// by a prior, successful election), then runs a cycle with zero eligible candidates and
+/// confirms membership is untouched and the skip event fires.
+#[test]
+fn run_election_with_no_eligible_candidates_does_not_wipe_existing_legislature() {
+    use crate::SeatLegislature;
+
+    new_test_ext().execute_with(|| {
+        System::set_block_number(1);
+
+        // Simulate a legislature already seated by a prior successful election cycle.
+        assert_ok!(<TestSeatLegislature as SeatLegislature<u64>>::replace_members(vec![
+            100, 101
+        ]));
+        assert_eq!(seat_calls(), vec![vec![100, 101]]);
+
+        // This cycle's only delegate has no matured checkpoint yet, so the eligible-candidate
+        // pool is empty.
+        set_min_backing_duration_blocks(5);
+        register_delegate(1);
+        back(2, 1);
+        back(3, 1);
+        back(4, 1);
+
+        System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
+        let _ = Elections::on_initialize(System::block_number());
+
+        // `replace_members` was not called a second time -- the existing legislature (100, 101)
+        // is left exactly as it was, not wiped out.
+        assert_eq!(seat_calls(), vec![vec![100, 101]]);
+        System::assert_last_event(
+            Event::SeatingSkippedNoEligibleCandidates {
+                at_block: DEFAULT_ELECTION_CYCLE_BLOCKS as u64,
             }
             .into(),
         );
@@ -1848,11 +1894,11 @@ fn run_election_leaves_extra_seats_empty_instead_of_padding_with_zero_backing_ca
         back(4, 1);
         assert_eq!(BackingCount::<Test>::get(1), 3);
 
-        // Election 1: seeds delegate 1's checkpoint. It ranks 0 (immature), so nothing is
-        // seated despite 3 seats being available.
+        // Election 1: seeds delegate 1's checkpoint. It ranks 0 (immature), so the
+        // eligible-candidate pool is empty and `replace_members` is not called at all.
         System::set_block_number(DEFAULT_ELECTION_CYCLE_BLOCKS as u64);
         let _ = Elections::on_initialize(System::block_number());
-        assert_eq!(seat_calls(), vec![Vec::<u64>::new()]);
+        assert!(seat_calls().is_empty());
 
         // Delegate 2 registers and is backed only after election 1 -- its checkpoint has no
         // chance to mature before election 2.
