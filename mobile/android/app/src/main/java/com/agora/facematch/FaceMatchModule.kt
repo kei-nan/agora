@@ -177,6 +177,17 @@ class FaceMatchModule(private val reactContext: ReactApplicationContext) :
     val top = box.top.coerceIn(0, bitmap.height - 1)
     val width = box.width().coerceAtMost(bitmap.width - left)
     val height = box.height().coerceAtMost(bitmap.height - top)
+    if (width <= 0 || height <= 0) {
+      // A degenerate ML Kit bounding box (e.g. a face clipped right at the frame edge) can
+      // coerce down to a zero/negative crop region; Bitmap.createBitmap throws
+      // IllegalArgumentException on that rather than failing gracefully. Throw the same
+      // IllegalStateException shape used elsewhere in matchAgainstPassport's try block (see
+      // the DG2/captured-photo decode checks above) so it's caught by that block's existing
+      // catch and surfaced as a normal FACE_MATCH_ERROR promise rejection, not a crash.
+      throw IllegalStateException(
+        "Degenerate face bounding box after clamping to image bounds (width=$width, height=$height)"
+      )
+    }
     val cropped = Bitmap.createBitmap(bitmap, left, top, width, height)
     val scaled = Bitmap.createScaledBitmap(cropped, INPUT_SIZE, INPUT_SIZE, true)
     // createBitmap/createScaledBitmap can each return the same object they were given
