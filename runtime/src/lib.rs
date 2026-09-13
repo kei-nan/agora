@@ -60,8 +60,29 @@ impl_opaque_keys! {
 	}
 }
 
+/// Suffix on `impl_name` (see `VERSION` below) that marks this runtime as a `dev-mode` build
+/// (always-accept passthrough ZK verifiers — see `runtime/Cargo.toml`'s `dev-mode` feature doc
+/// comment). This is the one place that distinguishes a dev-mode WASM build from a real
+/// production build in on-chain metadata (`system.version()`, block explorers, `Core_version`,
+/// etc.) — `spec_name` is left untouched since downstream tooling may match on it, and
+/// `spec_version` is left untouched since it has real transaction-versioning semantics.
+///
+/// Exported (rather than inlined as a node-side string literal) so `node/src/service.rs` can
+/// check for this exact suffix against the live on-chain `RuntimeVersion` without duplicating
+/// the string, including for a dev-mode runtime installed via forkless upgrade onto a node
+/// binary that was itself built without the `dev-mode` feature.
+pub const DEV_MODE_IMPL_NAME_SUFFIX: &str = "-devmode";
+
+// `VERSION` is defined twice, gated by `cfg(feature = "dev-mode")`, rather than once with a
+// computed `impl_name`: the `#[sp_version::runtime_version]` macro embeds these fields into a
+// WASM custom section at macro-expansion time and requires each field to be a literal (a `const`
+// identifier standing in for `impl_name` fails to compile with "a single literal argument is
+// expected"). Keep every other field identical between the two copies — only `impl_name` differs
+// (it must literally end with `DEV_MODE_IMPL_NAME_SUFFIX` above in the dev-mode copy).
+
 // To learn more about runtime versioning, see:
 // https://docs.substrate.io/main-docs/build/upgrade#runtime-versioning
+#[cfg(not(feature = "dev-mode"))]
 #[sp_version::runtime_version]
 pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: alloc::borrow::Cow::Borrowed("agora-runtime"),
@@ -72,6 +93,19 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	//   `spec_version`, and `authoring_version` are the same between Wasm and native.
 	// This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
 	//   the compatible custom types.
+	spec_version: 100,
+	impl_version: 1,
+	apis: apis::RUNTIME_API_VERSIONS,
+	transaction_version: 1,
+	system_version: 1,
+};
+
+#[cfg(feature = "dev-mode")]
+#[sp_version::runtime_version]
+pub const VERSION: RuntimeVersion = RuntimeVersion {
+	spec_name: alloc::borrow::Cow::Borrowed("agora-runtime"),
+	impl_name: alloc::borrow::Cow::Borrowed("agora-runtime-devmode"),
+	authoring_version: 1,
 	spec_version: 100,
 	impl_version: 1,
 	apis: apis::RUNTIME_API_VERSIONS,

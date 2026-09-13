@@ -57,6 +57,31 @@ pub fn new_partial(config: &Configuration) -> Result<Service, ServiceError> {
 		)?;
 	let client = Arc::new(client);
 
+	// Defense-in-depth: warn loudly if the runtime actually executing on this chain was
+	// compiled with the `dev-mode` feature (always-accept passthrough ZK verifiers — see
+	// `runtime/Cargo.toml`'s `dev-mode` feature doc comment). This inspects the live on-chain
+	// `RuntimeVersion.impl_name` rather than this node binary's own compile-time features, so it
+	// also catches a dev-mode WASM runtime installed via forkless upgrade onto a node that was
+	// itself built without `dev-mode`.
+	{
+		let best_hash = client.chain_info().best_hash;
+		match client.runtime_version_at(best_hash) {
+			Ok(rt_version) if rt_version.impl_name.ends_with(agora_runtime::DEV_MODE_IMPL_NAME_SUFFIX) => {
+				log::warn!(
+					"⚠️⚠️⚠️  THIS CHAIN IS RUNNING A dev-mode RUNTIME BUILD (impl_name = {:?}). \
+					 ZK/anchor/MACI-tally verification is a PASSTHROUGH that accepts ANY proof \
+					 unconditionally. This must never be used for a real testnet or mainnet \
+					 deployment.  ⚠️⚠️⚠️",
+					rt_version.impl_name,
+				);
+			},
+			Ok(_) => {},
+			Err(err) => {
+				log::debug!("Could not determine runtime dev-mode status at startup: {err}");
+			},
+		}
+	}
+
 	let telemetry = telemetry.map(|(worker, telemetry)| {
 		task_manager.spawn_handle().spawn("telemetry", None, worker.run());
 		telemetry

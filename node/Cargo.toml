@@ -24,6 +24,8 @@ frame-system.default-features = true
 frame-system.workspace = true
 futures = { features = ["thread-pool"], workspace = true }
 jsonrpsee = { features = ["server"], workspace = true }
+log.default-features = true
+log.workspace = true
 pallet-transaction-payment-rpc.default-features = true
 pallet-transaction-payment-rpc.workspace = true
 pallet-transaction-payment.default-features = true

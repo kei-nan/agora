@@ -41,6 +41,11 @@ always-accepting passthrough verifiers instead of real cryptographic ones, opt i
 ```bash
 WASM_BUILD_RUSTFLAGS="-C link-arg=--allow-undefined" cargo build --release --features dev-mode
 ```
+A `dev-mode` build is now self-reporting (fixed 2026-09-13): `runtime/src/lib.rs`'s `VERSION.impl_name`
+becomes `"agora-runtime-devmode"` instead of `"agora-runtime"` (`spec_name`/`spec_version` are untouched),
+visible in `system.version()`/block explorers, and `node/src/service.rs` reads the live on-chain
+`RuntimeVersion` at startup and logs a loud `log::warn!` if that suffix is present — so a dev-mode WASM
+is no longer indistinguishable from a real build just by looking at chain metadata or node logs.
 
 To run the dev chain (does **not** require the `dev-mode` feature — `--dev` only selects a
 runtime genesis preset that seeds balances/aura/grandpa/sudo, nothing identity/ZK-related):
