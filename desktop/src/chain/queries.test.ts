@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // queries.ts's only real dependency is the shared light-client `getApi()` from ./client — mock
 // that boundary so these tests exercise the byte-decoding logic this codebase actually wrote
@@ -13,7 +13,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // rejection, not just the bare helper in isolation.
 const { getApiMock, withTimeoutMock } = vi.hoisted(() => ({
   getApiMock: vi.fn(),
-  withTimeoutMock: vi.fn((promise: Promise<unknown>) => promise),
+  withTimeoutMock: vi.fn((promise: Promise<unknown>, _label: string, _timeoutMs?: number) => promise),
 }));
 vi.mock("./client", () => ({
   getApi: getApiMock,

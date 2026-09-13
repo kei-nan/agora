@@ -6,9 +6,10 @@ Location: `desktop/`
   frontend.** `desktop/src/chain/client.ts` drives `smoldot` via `@polkadot/api`'s `ScProvider`
   (a hand-written adapter bridges smoldot's async-iterator response API to the callback shape
   `ScProvider` expects; `@substrate/connect` itself isn't a dependency). `desktop/src/lib/
-  invoke.ts` routes nine command names — `chain_status`, `fetch_proposals`, `fetch_laws`,
+  invoke.ts` routes eleven command names — `chain_status`, `fetch_proposals`, `fetch_laws`,
   `fetch_treasury`, `fetch_department_budgets`, `fetch_rulings`, `fetch_legislature_data`,
-  `fetch_elections_data`, `fetch_anticorruption_data` — to `desktop/src/chain/queries.ts`
+  `fetch_elections_data`, `fetch_anticorruption_data`, `fetch_oracle_council_info`,
+  `fetch_oracle_pending_approvals` — to `desktop/src/chain/queries.ts`
   (light-client-backed) instead of Tauri IPC when running inside Tauri; browser-dev mode
   (`npm run dev`) is untouched and still serves `mocks.ts`. Requires the node to be started
   with an explicit `--listen-addr /ip4/0.0.0.0/tcp/30333/ws` — a plain `--dev --tmp` node
@@ -21,7 +22,7 @@ Location: `desktop/`
 - **Tauri backend** (`src-tauri/src/`): still a JSON-RPC client talking directly to the running
   node at `127.0.0.1:9944` — kept, not deleted, because it remains the real implementation
   behind `auth_verify_nullifier`, `chain_submit_extrinsic`, and the QR-auth callback server's
-  internal account lookup, none of which moved to the light client. The nine commands above are
+  internal account lookup, none of which moved to the light client. The eleven commands above are
   no longer called by the frontend through this path, but the Rust functions and their tests
   still exist as a reference/fallback (see `commands/chain.rs`'s top-of-module comment).
 - **Chain commands** (`commands/chain.rs`, registered in `src-tauri/src/lib.rs`'s `tauri::generate_handler![...]`): `chain_status`, `fetch_proposals`, `fetch_laws`, `fetch_treasury`, `fetch_department_budgets`, `fetch_rulings`, `fetch_ipfs_content`, `auth_verify_nullifier`, `fetch_legislature_data`, `fetch_elections_data`, `fetch_anticorruption_data`, `chain_submit_extrinsic` — the read commands (all but `auth_verify_nullifier` and `chain_submit_extrinsic`) read from real chain storage via `state_getKeysPaged` + `state_queryStorageAt`. As of changelog #089 these Rust read commands are no longer the frontend's actual call path (see above) but remain correct and tested.
@@ -42,7 +43,7 @@ Location: `desktop/`
 
 Frontend pages (`src/pages/`): Proposals (with tier chip for constitutional referenda), Laws, Legislature (members + motions), Elections (delegates/backing), Courts, Treasury (department budget table + IPFS audit fetching), Anti-Corruption (asset disclosures), auth QR page (`AuthPage.tsx`), Claude AI sidebar panel.
 
-Browser dev mode uses `desktop/src/lib/mocks.ts` stub data; when running as a native app, the nine chain-read commands above fire through the light client (`desktop/src/chain/`) and everything else fires through Tauri IPC as before.
+Browser dev mode uses `desktop/src/lib/mocks.ts` stub data; when running as a native app, the eleven chain-read commands above fire through the light client (`desktop/src/chain/`) and everything else fires through Tauri IPC as before.
 
 TODOs:
 - Mobile side of QR auth: phone NFC + ZK proof; `mobile/src/screens/AuthScreen.tsx` scaffolded (parses deep-link, signs challenge, POSTs to callback)

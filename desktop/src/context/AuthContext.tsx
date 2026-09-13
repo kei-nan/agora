@@ -105,8 +105,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setQrExpiresAt(null);
             cancelPoll();
           }
-        } catch {
-          // "pending" error is expected until mobile completes auth
+        } catch (err) {
+          // The backend rejects with "pending" (see `auth_poll_session` in `commands/auth.rs`)
+          // until the phone completes auth — that's the expected steady state of every poll
+          // tick but one, so swallow only that (Tauri may deliver it as the bare string or,
+          // as the mobile-less test harness does, wrapped in an Error). Anything else (an
+          // "unknown challenge" rejection, a lock-poisoning error, a network failure, ...) is a
+          // genuine failure and should surface immediately rather than silently waiting out the
+          // full 5-minute timeout below.
+          const isPending = err === "pending" || (err instanceof Error && err.message === "pending");
+          if (!isPending) {
+            setQrError(
+              toSafeErrorMessage(
+                err,
+                "[AuthContext] auth_poll_session failed",
+                "Unable to check authentication status. Please try again.",
+              ),
+            );
+            setQrChallenge(null);
+            setQrExpiresAt(null);
+            cancelPoll();
+          }
         }
       }, 2000);
 
